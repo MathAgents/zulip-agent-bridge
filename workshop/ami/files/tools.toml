@@ -1,0 +1,865 @@
+# The image's tools: the source of /etc/zab/tools.json (issue #474; workshop/ami/README.md).
+# build.sh runs every check below at the end of the build, through bin/tools_manifest.py, and
+# writes the manifest only if all of them pass; `build_ami.py --smoke` runs them again on a
+# fresh instance from the image. `!tools` and the agents' instructions are built from it.
+# Entries are grouped by area, the areas in the order of `areas`; tools_manifest.py enforces it.
+#
+# One [[tool]] per tool a participant or an agent would call, with one preferred way to call it
+# (where a tool exists twice, as GAP and Singular do, each copy is its own entry and says when
+# to prefer it):
+#   name      what people call it; unique
+#   area      one of `areas` below
+#   call      the preferred command line: one line, at most 100 characters, with an `@` only
+#             right after an ASCII letter, digit or `.` (the agents' instructions leave out a call
+#             with any other: Claude Code could read it as a file import; no `@var x y`)
+#   summary   what it is for: one line, at most 120 characters
+#   version   shell command printing the version on its first line (no spaces)
+#   check     shell command doing a small real computation, not just --version ...
+#   expect    ... whose output's last line must be exactly this
+#   timeout   seconds allowed for each of the two commands (default 300)
+#   requires  "magma" or "sage": only on images built with that component
+#   remote    true for a service off the VM (the LMFDB): its check is tried three times, and on
+#             `check` a version that moved since the build is reported, not a failure
+# The commands run under bash as agent, each in an empty scratch directory, with the services'
+# PATH (~/venv/bin, ~/.elan/bin, ~/.local/bin, /usr/local/bin, /usr/bin, /bin): `python3` is the
+# venv's, and every command resolves the way an agent's would. A failing check fails the build.
+schema = 1
+
+# The fixed set of areas, in display order, so that lists group well. Add one only for a tool
+# that fits none of them; every area must have a tool.
+areas = [
+  "Number theory",
+  "General computer algebra",
+  "Groups and representation theory",
+  "Commutative algebra and algebraic geometry",
+  "Polyhedral geometry and combinatorics",
+  "Low-dimensional topology",
+  "Optimization and constraint solving",
+  "Numerics, statistics and data",
+  "Formal proof",
+  "Documents and figures",
+]
+
+# ------------------------------------------------------------------------------- Number theory
+
+[[tool]]
+name = "PARI/GP"
+area = "Number theory"
+call = "gp -q file.gp </dev/null"
+summary = "Number fields, elliptic curves, L-functions; elldata, galdata, seadata, galpol, nflistdata"
+version = "gp --version-short"
+check = '''
+echo 'print(ellanalyticrank(ellinit("389a1"))[1])' | gp -q -f
+'''
+expect = "2"
+
+[[tool]]
+name = "cypari2"
+area = "Number theory"
+call = "python3 -c 'import cypari2; print(cypari2.Pari()(\"quadclassunit(-23).no\"))'"
+summary = "PARI from Python, in the venv"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("cypari2"))'
+'''
+check = '''
+python3 -c 'import cypari2; print(cypari2.Pari()("quadclassunit(-23).no"))'
+'''
+expect = "3"
+
+[[tool]]
+name = "LMFDB"
+area = "Number theory"
+call = "run_sql {\"sql\": \"SELECT count(*) FROM ec_curvedata WHERE conductor = 11\"}"
+summary = "LMFDB's lmfdb MCP server: run_sql, describe_table, overview, search_knowls; remote, its version is the server's"
+version = '''
+u=$(sed -n '/^\[mcp_servers\.lmfdb\]/,/^\[/s/^url = "\(.*\)"$/\1/p' ~/.codex/config.toml)
+curl -fsS -m 60 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"zab-tools","version":"1"}}}' \
+  "$u" | sed -n 's/^data: //p; t; /^{/p' | jq -r .result.serverInfo.version
+'''
+check = '''
+u=$(sed -n '/^\[mcp_servers\.lmfdb\]/,/^\[/s/^url = "\(.*\)"$/\1/p' ~/.codex/config.toml)
+curl -fsS -m 120 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_sql","arguments":{"sql":"SELECT count(*) AS n FROM ec_curvedata WHERE conductor = 11"}}}' \
+  "$u" | sed -n 's/^data: //p; t; /^{/p' | jq -r '.result.content[0].text | fromjson | .rows[0].n'
+'''
+expect = "3"
+remote = true
+
+# -------------------------------------------------------------------- General computer algebra
+
+[[tool]]
+name = "SageMath"
+area = "General computer algebra"
+call = "sage file.sage"
+summary = "Sage's own GAP 4.15, Singular, Maxima, Giac, eclib, PALP and R (conda env ~/miniforge/envs/sage)"
+version = "sage --version"
+check = '''
+sage -c 'print(EllipticCurve("389a1").rank(), giac("factor(x^4+4)"), gap("Size(SymmetricGroup(4))"), r("1+1"))' 2>/dev/null
+'''
+expect = "2 (x^2-2*x+2)*(x^2+2*x+2) 24 [1] 2"
+timeout = 600
+requires = "sage"
+
+[[tool]]
+name = "Magma"
+area = "General computer algebra"
+call = "magma -b file.m </dev/null"
+summary = "Number theory, geometry, groups; end scripts with quit; or close stdin, or Magma waits forever"
+version = '''
+echo 'a, b, c := GetVersion(); printf "%o.%o-%o\n", a, b, c;' | magma -b
+'''
+check = '''
+echo 'print #ClassGroup(QuadraticField(-23));' | magma -b
+'''
+expect = "3"
+requires = "magma"
+
+[[tool]]
+name = "Oscar.jl"
+area = "General computer algebra"
+call = "julia -e 'using Oscar; K, a = quadratic_field(-5); println(order(class_group(K)[1]))'"
+summary = "Hecke, Nemo, AbstractAlgebra, Singular, polymake, GAP in one Julia system; precompiled, never Pkg.update() it"
+version = '''
+julia -e 'using Pkg; println(Pkg.dependencies()[Base.UUID("f1435218-dba5-11e9-1e4d-f1a5fab5fc13")].version)'
+'''
+check = '''
+julia -e 'using Oscar; Qx, x = polynomial_ring(QQ, :x); K, a = number_field(x^2 + 5); println(order(class_group(K)[1]))'
+'''
+expect = "2"
+timeout = 900
+
+[[tool]]
+name = "Maxima"
+area = "General computer algebra"
+call = "maxima --very-quiet -b file.mac"
+summary = "Symbolic integration, simplification, ODEs, series"
+version = "maxima --version | sed 's/^Maxima //'"
+check = '''
+maxima --very-quiet --batch-string='display2d: false$ print(factor(x^4 + 4))$'
+'''
+expect = "(x^2-2*x+2)*(x^2+2*x+2)"
+
+[[tool]]
+name = "Giac"
+area = "General computer algebra"
+call = "~/miniforge/envs/sage/bin/giac file.cas"
+summary = "Giac/Xcas computer algebra: Sage's copy, not on PATH; giac(…) inside Sage reaches it too"
+version = '''
+~/miniforge/bin/conda list -n sage --json '^giac$' | jq -r '.[0].version'
+'''
+check = '''
+printf 'factor(x^4+4);\n' > t.cas && ~/miniforge/envs/sage/bin/giac t.cas 2>/dev/null
+'''
+expect = "(x^2-2*x+2)*(x^2+2*x+2)"
+requires = "sage"
+
+[[tool]]
+name = "SymPy"
+area = "General computer algebra"
+call = "python3 -c 'import sympy as s; print(s.factor(s.symbols(\"x\")**4 + 4))'"
+summary = "Symbolic mathematics in Python, in the venv"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("sympy"))'
+'''
+check = '''
+python3 -c 'import sympy as s; x = s.symbols("x"); print(s.factor(x**4 + 4))'
+'''
+expect = "(x**2 - 2*x + 2)*(x**2 + 2*x + 2)"
+
+# ------------------------------------------------------------ Groups and representation theory
+
+[[tool]]
+name = "GAP"
+area = "Groups and representation theory"
+call = "gap -q file.g </dev/null"
+summary = "GAP 4.12 with SmallGrp, TransGrp, PrimGrp, CTblLib, Alnuth (PARI), Polycyclic, FGA, LAGUNA"
+version = '''
+echo 'Print(GAPInfo.Version, "\n");' | gap -q
+'''
+check = '''
+echo 'Print(NrSmallGroups(64), " ", Size(CharacterTable("M11")), "\n");' | gap -q
+'''
+expect = "267 7920"
+
+[[tool]]
+name = "GAP 4.16 (Oscar)"
+area = "Groups and representation theory"
+call = "julia -e 'using Oscar; println(GAP.evalstr(\"NrSmallGroups(256)\"))'"
+summary = "Newer GAP inside Oscar, with digraphs, semigroups, guava, kbmag, anupq, nq and more packages than the apt GAP"
+version = '''
+julia -e 'using Oscar; println(String(GAP.Globals.GAPInfo.Version))'
+'''
+check = '''
+julia -e 'using Oscar; GAP.Packages.load("digraphs"); println(GAP.evalstr("DigraphNrEdges(CompleteDigraph(5))"))'
+'''
+expect = "20"
+timeout = 900
+
+[[tool]]
+name = "atlas"
+area = "Groups and representation theory"
+call = "atlas < file.at"
+summary = "Atlas of Lie Groups: real reductive groups, KLV polynomials, unitarity; scripts on stdin, own .at by absolute path"
+version = '''
+echo quit | script -qec atlas /dev/null | sed -n "s/.*This is .atlas. (version \([^,]*\),.*/\1/p"
+'''
+check = '''
+printf '%s\n' 'set G = Sp(4,R)' 'prints(#KGB(G), " ", is_unitary(trivial(G)))' | atlas | grep -v '^Bye\.$'
+'''
+expect = "11 true"
+
+# -------------------------------------------------- Commutative algebra and algebraic geometry
+
+[[tool]]
+name = "Macaulay2"
+area = "Commutative algebra and algebraic geometry"
+call = "M2 --script file.m2"
+summary = "Gröbner bases, free resolutions, sheaf cohomology, toric and tropical geometry (the official PPA's build)"
+version = "M2 --version"
+check = '''
+printf '%s\n' 'R = QQ[a..d];' 'I = minors(2, matrix{{a,b,c},{b,c,d}});' 'print(codim I, degree I)' > t.m2
+M2 --script t.m2
+'''
+expect = "(2, 3)"
+
+[[tool]]
+name = "Singular"
+area = "Commutative algebra and algebraic geometry"
+call = "Singular -q file.sing </dev/null"
+summary = "Polynomial computations, singularities, primary decomposition; for scripts (Oscar has a newer one)"
+version = '''
+Singular -v --version 2>&1 | sed -n '1s/.* version \([0-9.]*\) .*/\1/p'
+'''
+check = '''
+printf '%s\n' 'ring r = 0, (x,y,z), dp;' 'ideal i = x2+y2+z2-1, x-y, y-z;' 'print(vdim(std(i)));' 'quit;' > t.sing
+Singular -q t.sing
+'''
+expect = "2"
+
+[[tool]]
+name = "Singular (Oscar)"
+area = "Commutative algebra and algebraic geometry"
+call = "julia -e 'using Oscar; R, (x, y) = QQ[:x, :y]; println(dim(ideal(R, [x^2 - y^3])))'"
+summary = "The Singular 4.4 kernel behind Oscar's rings and ideals; prefer it for Julia code mixing algebra with Hecke or GAP"
+version = '''
+julia -e 'using Oscar; println(match(r"version (\S+)", unsafe_string(Singular.libSingular.versionString()))[1])'
+'''
+check = '''
+julia -e 'using Oscar; R, (x, y, z) = polynomial_ring(QQ, [:x, :y, :z]); I = ideal(R, [x^2 - y*z, y^2 - x*z, z^2 - x*y]); println(dim(I), " ", degree(I))'
+'''
+expect = "1 3"
+timeout = 900
+
+[[tool]]
+name = "msolve"
+area = "Commutative algebra and algebraic geometry"
+call = "msolve -f in.ms -o out.ms"
+summary = "Exact real roots of polynomial systems, Gröbner bases over prime fields"
+version = "msolve -V"
+check = '''
+printf 'x,y\n0\nx^2-4,\nx*y-2\n' > in.ms && msolve -f in.ms -o out.ms && tr -d ' \n' < out.ms
+'''
+expect = "[0,[1,[[[-2,-2],[-1,-1]],[[2,2],[1,1]]]]]:"
+
+[[tool]]
+name = "HomotopyContinuation.jl"
+area = "Commutative algebra and algebraic geometry"
+call = "julia -e 'using HomotopyContinuation; x, y = Variable.([:x, :y]); print(solve([x^2+y^2-4, x*y-1]))'"
+summary = "Numerical solutions of polynomial systems, monodromy; solve(F; show_progress = false) keeps its progress bar off stdout"
+version = '''
+julia -e 'using Pkg; println(Pkg.dependencies()[Base.UUID("f213a82b-91d6-5c5d-acf7-10f1c761b327")].version)'
+'''
+check = '''
+julia -e 'using HomotopyContinuation; x, y = Variable.([:x, :y]); println(nreal(solve([x^2 + y^2 - 4, x * y - 1]; show_progress = false)))'
+'''
+expect = "4"
+timeout = 900
+
+# ------------------------------------------------------- Polyhedral geometry and combinatorics
+
+[[tool]]
+name = "polymake"
+area = "Polyhedral geometry and combinatorics"
+call = "polymake --script file.pl"
+summary = "Polytopes, fans, tropical geometry, matroids, simplicial complexes"
+version = '''
+polymake --version 2>&1 | sed -n '1s/^polymake version //p'
+'''
+check = '''
+polymake 'print cube(3)->F_VECTOR, "\n";'
+'''
+expect = "8 12 6"
+
+[[tool]]
+name = "polymake (Oscar)"
+area = "Polyhedral geometry and combinatorics"
+call = "julia -e 'using Oscar; println(f_vector(cube(3)))'"
+summary = "polymake 4.15 inside Oscar: polytopes, fans, tropical geometry, from Julia"
+version = '''
+julia -e 'using Oscar; println(Polymake.version())'
+'''
+check = '''
+julia -e 'using Oscar; println(join(f_vector(cube(3)), " "))'
+'''
+expect = "8 12 6"
+timeout = 900
+
+[[tool]]
+name = "Normaliz"
+area = "Polyhedral geometry and combinatorics"
+call = "normaliz -c file.in"
+summary = "Hilbert bases, lattice points, Hilbert series of rational cones and polytopes"
+version = "normaliz --version | sed -n '1s/^Normaliz //p'"
+check = '''
+printf 'amb_space 2\ncone 2\n1 0\n1 2\nHilbertBasis\n' > c.in && normaliz -c c.in >/dev/null
+sed -n 's/^\([0-9]*\) Hilbert basis elements.*/\1/p' c.out
+'''
+expect = "3"
+
+[[tool]]
+name = "4ti2"
+area = "Polyhedral geometry and combinatorics"
+call = "4ti2-markov file"
+summary = "Markov and Graver bases, toric ideals, integer points; also 4ti2-groebner, 4ti2-hilbert, 4ti2-zsolve, …"
+version = '''
+dpkg-query -W -f='${Version}\n' 4ti2 | sed 's/[+~-].*//'
+'''
+check = '''
+printf '2 4\n1 1 1 1\n0 1 2 3\n' > m.mat && 4ti2-markov -q m >/dev/null && head -n 1 m.mar
+'''
+expect = "3 4"
+
+[[tool]]
+name = "gfan"
+area = "Polyhedral geometry and combinatorics"
+call = "gfan _bases < ideal.txt"
+summary = "Gröbner fans and tropical varieties; also gfan _tropicalstartingcone, _tropicaltraverse, …"
+version = "gfan _version | sed -n 's/^gfan//p'"
+check = '''
+echo 'Q[x,y]{x^2-y, y^2-x}' | gfan _bases | tr -d '\n' | grep -o '{[^{}]*}' | wc -l
+'''
+expect = "3"
+
+[[tool]]
+name = "TOPCOM"
+area = "Polyhedral geometry and combinatorics"
+call = "topcom-points2ntriangs < points.txt"
+summary = "Triangulations of point configurations, flip graphs; also topcom-points2triangs, …"
+version = '''
+dpkg-query -W -f='${Version}\n' topcom | sed 's/[+~-].*//'
+'''
+check = '''
+echo '[[0,0,1],[2,0,1],[3,1,1],[2,2,1],[0,2,1],[-1,1,1]]' | topcom-points2ntriangs
+'''
+expect = "14"
+
+[[tool]]
+name = "lrslib"
+area = "Polyhedral geometry and combinatorics"
+call = "lrs file.ine"
+summary = "Vertex and facet enumeration of polyhedra, exact arithmetic"
+version = '''
+lrs /dev/null 2>&1 | sed -n 's/^\*lrs:lrslib v\.\([0-9.]*\) .*/\1/p'
+'''
+check = '''
+printf 'cube\nH-representation\nbegin\n6 4 integer\n1 1 0 0\n1 -1 0 0\n1 0 1 0\n1 0 -1 0\n1 0 0 1\n1 0 0 -1\nend\n' > c.ine
+lrs c.ine | grep -c '^ 1 '
+'''
+expect = "8"
+
+[[tool]]
+name = "nauty"
+area = "Polyhedral geometry and combinatorics"
+call = "nauty-geng -c 8 > graphs.g6"
+summary = "Graph isomorphism, canonical labelling, generating graphs; Debian's names: nauty-geng, nauty-labelg, …"
+version = '''
+dpkg-query -W -f='${Version}\n' nauty | sed 's/[+~-].*//'
+'''
+check = "nauty-geng -cq 5 | wc -l"
+expect = "21"
+
+[[tool]]
+name = "NetworkX"
+area = "Polyhedral geometry and combinatorics"
+call = "python3 -c 'import networkx as nx; print(nx.diameter(nx.petersen_graph()))'"
+summary = "Graphs and networks in Python, in the venv"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("networkx"))'
+'''
+check = '''
+python3 -c 'import networkx as nx; G = nx.petersen_graph(); print(sum(1 for _ in nx.isomorphism.GraphMatcher(G, G).isomorphisms_iter()))'
+'''
+expect = "120"
+
+# -------------------------------------------------------------------- Low-dimensional topology
+
+[[tool]]
+name = "SnapPy"
+area = "Low-dimensional topology"
+call = "python3 -c 'import snappy; print(snappy.Manifold(\"m004\").volume())'"
+summary = "Hyperbolic 3-manifolds and knots: volumes, census manifolds, isometry signatures; headless, no GUI"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("snappy"))' 2>/dev/null
+'''
+check = '''
+python3 -c 'import snappy; print(round(float(snappy.Manifold("m004").volume()), 6))' 2>/dev/null
+'''
+expect = "2.029883"
+
+[[tool]]
+name = "Regina"
+area = "Low-dimensional topology"
+call = "python3 -c 'import regina; print(regina.Example3.lens(7, 1).homology())'"
+summary = "3- and 4-manifold triangulations, normal surfaces, census enumeration"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("regina"))'
+'''
+check = '''
+python3 -c 'import regina; print(regina.Example3.lens(7, 1).homology())'
+'''
+expect = "Z_7"
+
+# --------------------------------------------------------- Optimization and constraint solving
+
+[[tool]]
+name = "HiGHS"
+area = "Optimization and constraint solving"
+call = "python3 file.py"
+summary = "Linear and mixed-integer programming: import highspy, or scipy.optimize.linprog(method=\"highs\")"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("highspy"))'
+'''
+check = '''
+python3 - <<'PY'
+import highspy
+h = highspy.Highs()
+h.setOptionValue("output_flag", False)
+x, y = h.addVariable(lb=0), h.addVariable(lb=0)
+h.addConstr(x + 2 * y <= 4)
+h.addConstr(3 * x + y <= 6)
+h.maximize(x + y)
+print(round(h.getInfo().objective_function_value, 6))
+PY
+'''
+expect = "2.8"
+
+[[tool]]
+name = "SCIP (PySCIPOpt)"
+area = "Optimization and constraint solving"
+call = "python3 file.py"
+summary = "Mixed-integer and constraint programming with SCIP: from pyscipopt import Model"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("pyscipopt"))'
+'''
+check = '''
+python3 - <<'PY'
+from pyscipopt import Model
+m = Model()
+m.hideOutput()
+x, y = m.addVar(vtype="I", lb=0), m.addVar(vtype="I", lb=0)
+m.addCons(x + 2 * y <= 4)
+m.addCons(3 * x + y <= 6)
+m.setObjective(2 * x + 3 * y, "maximize")
+m.optimize()
+print(round(m.getObjVal()))
+PY
+'''
+expect = "6"
+
+[[tool]]
+name = "PuLP"
+area = "Optimization and constraint solving"
+call = "python3 file.py"
+summary = "Linear and integer programming models (import pulp), solved with the bundled CBC (PuLP 3)"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("pulp"))'
+'''
+check = '''
+python3 - <<'PY'
+import pulp
+p = pulp.LpProblem("t", pulp.LpMaximize)
+x = pulp.LpVariable("x", lowBound=0, cat="Integer")
+y = pulp.LpVariable("y", lowBound=0, cat="Integer")
+p += 2 * x + 3 * y
+p += x + 2 * y <= 4
+p += 3 * x + y <= 6
+p.solve(pulp.PULP_CBC_CMD(msg=False))
+print(round(pulp.value(p.objective)))
+PY
+'''
+expect = "6"
+
+[[tool]]
+name = "CVXPY"
+area = "Optimization and constraint solving"
+call = "python3 file.py"
+summary = "Convex optimization (import cvxpy): least squares, SOCP, SDP with Clarabel, OSQP, SCS"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("cvxpy"))'
+'''
+check = '''
+python3 - <<'PY'
+import cvxpy as cp
+import numpy as np
+x = cp.Variable(2)
+prob = cp.Problem(cp.Minimize(cp.sum_squares(x - np.array([1.0, 2.0]))), [cp.sum(x) == 1])
+prob.solve()
+print(round(prob.value, 6))
+PY
+'''
+expect = "2.0"
+
+[[tool]]
+name = "OR-Tools"
+area = "Optimization and constraint solving"
+call = "python3 file.py"
+summary = "CP-SAT constraint programming, routing, linear solvers: from ortools.sat.python import cp_model"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("ortools"))'
+'''
+check = '''
+python3 - <<'PY'
+from ortools.sat.python import cp_model
+m = cp_model.CpModel()
+x, y = m.new_int_var(0, 10, "x"), m.new_int_var(0, 10, "y")
+m.add(2 * x + 3 * y == 12)
+m.maximize(x)
+s = cp_model.CpSolver()
+s.solve(m)
+print(s.value(x), s.value(y))
+PY
+'''
+expect = "6 0"
+
+[[tool]]
+name = "CSDP"
+area = "Optimization and constraint solving"
+call = "csdp problem.dat-s solution.sol"
+summary = "Semidefinite programming, SDPA sparse format"
+version = '''
+dpkg-query -W -f='${Version}\n' coinor-csdp | sed 's/[+~-].*//'
+'''
+check = '''
+printf '1\n1\n2\n1.0\n0 1 1 1 1.0\n0 1 2 2 2.0\n1 1 1 1 1.0\n1 1 2 2 1.0\n' > t.dat-s
+csdp t.dat-s t.sol | sed -n 's/^Primal objective value: *//p'
+'''
+expect = "2.0000000e+00"
+
+[[tool]]
+name = "Z3"
+area = "Optimization and constraint solving"
+call = "z3 file.smt2"
+summary = "SMT solver: integer and real arithmetic, bit-vectors, quantifiers"
+version = "z3 --version | awk '{print $3}'"
+check = '''
+echo '(declare-const x Int) (assert (= (* x x) 49)) (assert (> x 0)) (check-sat) (get-value (x))' | z3 -in
+'''
+expect = "((x 7))"
+
+[[tool]]
+name = "CaDiCaL"
+area = "Optimization and constraint solving"
+call = "cadical file.cnf"
+summary = "SAT solver for DIMACS CNF"
+version = "cadical --version"
+check = '''
+printf 'p cnf 6 9\n1 2 0\n3 4 0\n5 6 0\n-1 -3 0\n-1 -5 0\n-3 -5 0\n-2 -4 0\n-2 -6 0\n-4 -6 0\n' > php.cnf
+cadical -q php.cnf | grep '^s '
+'''
+expect = "s UNSATISFIABLE"
+
+# ------------------------------------------------------------- Numerics, statistics and data
+
+[[tool]]
+name = "Python"
+area = "Numerics, statistics and data"
+call = "python3 file.py"
+summary = "Python 3.12 in ~/venv with every Python package listed here; more with uv pip install --python ~/venv/bin/python"
+version = '''
+python3 -c 'import sys; print(sys.version.split()[0])'
+'''
+check = '''
+python3 -c 'import sys, math; print(sys.prefix, math.comb(10, 3))'
+'''
+expect = "/home/agent/venv 120"
+
+[[tool]]
+name = "NumPy"
+area = "Numerics, statistics and data"
+call = "python3 -c 'import numpy as np; print(np.linalg.det(np.array([[2.0, 1.0], [1.0, 3.0]])))'"
+summary = "Arrays and linear algebra, in the venv"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("numpy"))'
+'''
+check = '''
+python3 -c 'import numpy as np; print(round(np.linalg.det(np.array([[2.0, 1.0], [1.0, 3.0]]))))'
+'''
+expect = "5"
+
+[[tool]]
+name = "SciPy"
+area = "Numerics, statistics and data"
+call = "python3 file.py"
+summary = "Integration, optimization, special functions, sparse linear algebra, statistics: import scipy"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("scipy"))'
+'''
+check = '''
+python3 -c 'import math; from scipy.integrate import quad; print(round(quad(lambda t: math.exp(-t * t), -math.inf, math.inf)[0] ** 2, 10))'
+'''
+expect = "3.1415926536"
+
+[[tool]]
+name = "pandas"
+area = "Numerics, statistics and data"
+call = "python3 file.py"
+summary = "Data frames (import pandas): tables, grouping, joins, CSV and JSON"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("pandas"))'
+'''
+check = '''
+python3 -c 'import pandas as pd; df = pd.DataFrame({"a": [1, 2, 3, 4], "b": [1, 1, 2, 2]}); print(df.groupby("b")["a"].sum().tolist())'
+'''
+expect = "[3, 7]"
+
+[[tool]]
+name = "statsmodels"
+area = "Numerics, statistics and data"
+call = "python3 file.py"
+summary = "Regression, time series, statistical tests: import statsmodels.api as sm"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("statsmodels"))'
+'''
+check = '''
+python3 -c 'import numpy as np, statsmodels.api as sm; x = np.arange(10.0); print(*[round(float(p), 6) for p in sm.OLS(2 * x + 1, sm.add_constant(x)).fit().params])'
+'''
+expect = "1.0 2.0"
+
+[[tool]]
+name = "scikit-learn"
+area = "Numerics, statistics and data"
+call = "python3 file.py"
+summary = "Machine learning (import sklearn): classification, regression, clustering, model selection"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("scikit-learn"))'
+'''
+check = '''
+python3 -c 'from sklearn.datasets import load_iris; from sklearn.tree import DecisionTreeClassifier; X, y = load_iris(return_X_y=True); print(DecisionTreeClassifier(random_state=0).fit(X, y).score(X, y))'
+'''
+expect = "1.0"
+
+[[tool]]
+name = "R"
+area = "Numerics, statistics and data"
+call = "Rscript file.R"
+summary = "R 4.3 with the recommended packages, tidyverse, data.table, rmarkdown, knitr; r-base-dev for install.packages"
+version = '''
+Rscript -e 'cat(format(getRversion()), "\n")'
+'''
+check = '''
+Rscript -e 'suppressMessages({library(tidyverse); library(data.table); library(knitr); library(rmarkdown); library(MASS)}); cat(as.data.table(mtcars)[order(cyl), .N, by = cyl]$N, "\n")'
+'''
+expect = "11 7 14"
+
+[[tool]]
+name = "Octave"
+area = "Numerics, statistics and data"
+call = "octave-cli file.m"
+summary = "MATLAB-compatible numerical computing; octave-cli --eval '…' for one line"
+version = "octave-cli --version | sed -n '1s/^GNU Octave, version //p'"
+check = '''
+octave-cli --quiet --no-init-file --eval 'printf("%d\n", rank(magic(4)))'
+'''
+expect = "3"
+
+[[tool]]
+name = "Julia"
+area = "Numerics, statistics and data"
+call = "julia file.jl"
+summary = "Julia 1.12; its default environment holds Oscar and HomotopyContinuation"
+version = "julia --version | sed 's/^julia version //'"
+check = '''
+julia -e 'using LinearAlgebra; println(round(Int, det([2 1; 1 3])))'
+'''
+expect = "5"
+
+[[tool]]
+name = "Jupyter"
+area = "Numerics, statistics and data"
+call = "jupyter nbconvert --to notebook --execute nb.ipynb"
+summary = "Notebooks, with Python (the venv) and R kernels; run them headless with nbconvert"
+version = "jupyter nbconvert --version"
+check = '''
+python3 -c 'import nbformat as f; f.write(f.v4.new_notebook(cells=[f.v4.new_code_cell("print(6 * 7)")]), "nb.ipynb")' \
+  && jupyter nbconvert --to notebook --execute nb.ipynb 2>/dev/null \
+  && python3 -c 'import json; print("".join(json.load(open("nb.nbconvert.ipynb"))["cells"][0]["outputs"][0]["text"]).strip())'
+'''
+expect = "42"
+
+[[tool]]
+name = "IRkernel"
+area = "Numerics, statistics and data"
+call = "jupyter nbconvert --to notebook --execute --ExecutePreprocessor.kernel_name=ir nb.ipynb"
+summary = "R in Jupyter notebooks: the kernel \"ir\""
+version = '''
+Rscript -e 'cat(as.character(packageVersion("IRkernel")), "\n")'
+'''
+check = '''
+python3 -c 'import nbformat as f; f.write(f.v4.new_notebook(cells=[f.v4.new_code_cell("cat(6 * 7)")]), "nb.ipynb")' \
+  && jupyter nbconvert --to notebook --execute --ExecutePreprocessor.kernel_name=ir nb.ipynb 2>/dev/null \
+  && python3 -c 'import json; print("".join(json.load(open("nb.nbconvert.ipynb"))["cells"][0]["outputs"][0]["text"]).strip())'
+'''
+expect = "42"
+
+# ------------------------------------------------------------------------------- Formal proof
+
+[[tool]]
+name = "Lean 4 and Mathlib"
+area = "Formal proof"
+call = "cd ~/lean/workspace && lake env lean File.lean"
+summary = "Lean with Mathlib v4.34.1, built once and shared read-only; new projects with lean-project DIR"
+version = '''
+lean --version | sed -n 's/^Lean (version \([^,]*\),.*/\1/p'
+'''
+check = '''
+cd ~/lean/workspace && lake env lean /usr/local/share/workshop/smoke/Smoke.lean
+'''
+expect = "1024"
+timeout = 900
+
+[[tool]]
+name = "comparator"
+area = "Formal proof"
+call = "comparator-run config.json"
+summary = "Checks that a Lean solution proves exactly the challenge's statement; run it in a Lean v4.34.1 project"
+version = "cut -c1-7 /usr/local/lib/comparator/COMMIT"
+check = '''
+cp -r /usr/local/share/workshop/smoke/comparator/. . && comparator-run config.json >/dev/null 2>&1 && echo accepted
+'''
+expect = "accepted"
+timeout = 600
+
+# ------------------------------------------------------------------------ Documents and figures
+
+[[tool]]
+name = "TeX Live"
+area = "Documents and figures"
+call = "latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex"
+summary = "LaTeX (also latexmk -lualatex, -xelatex) with amsart, tikz-cd, xy, biblatex, biber, cleveref, quiver"
+version = '''
+tex --version | sed -n '1s/.*(TeX Live \([0-9]*\).*/\1/p'
+'''
+check = '''
+cp /usr/local/share/workshop/smoke/smoke.tex /usr/local/share/workshop/smoke/smoke.bib .
+latexmk -pdf -interaction=nonstopmode -halt-on-error smoke.tex >/dev/null 2>&1 \
+  && grep -c 'family={Serre}' smoke.bbl
+'''
+expect = "1"
+
+[[tool]]
+name = "pandoc"
+area = "Documents and figures"
+call = "pandoc in.md -o out.html"
+summary = "Converts between Markdown, LaTeX, HTML, Word and more (-o out.tex, .docx, .pdf)"
+version = "pandoc --version | sed -n '1s/^pandoc //p'"
+check = '''
+echo '*hello* $x^2$' | pandoc -t latex
+'''
+expect = '\emph{hello} \(x^2\)'
+
+[[tool]]
+name = "matplotlib"
+area = "Documents and figures"
+call = "python3 file.py"
+summary = "Plots and figures from Python: plt.savefig(\"fig.png\", dpi=150)"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("matplotlib"))'
+'''
+check = '''
+python3 -c 'import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt; plt.plot([0, 1], [0, 1]); plt.savefig("f.png", dpi=50); from PIL import Image; print(Image.open("f.png").size)'
+'''
+expect = "(320, 240)"
+
+[[tool]]
+name = "seaborn"
+area = "Documents and figures"
+call = "python3 file.py"
+summary = "Statistical plots on top of matplotlib: import seaborn"
+version = '''
+python3 -c 'from importlib.metadata import version; print(version("seaborn"))'
+'''
+check = '''
+python3 -c 'import matplotlib; matplotlib.use("Agg"); import seaborn as sns; ax = sns.histplot([1, 2, 2, 3, 3, 3], bins=3); print([int(p.get_height()) for p in ax.patches])'
+'''
+expect = "[1, 2, 3]"
+
+[[tool]]
+name = "Graphviz"
+area = "Documents and figures"
+call = "dot -Tpng graph.dot -o graph.png"
+summary = "Graph drawing from the DOT language (dot, neato, circo, …)"
+version = "dot -V 2>&1 | sed -n 's/^dot - graphviz version \\([^ ]*\\).*/\\1/p'"
+check = '''
+echo 'digraph { a -> b; b -> c; a -> c }' | dot -Tsvg | grep -c 'class="node"'
+'''
+expect = "3"
+
+[[tool]]
+name = "gnuplot"
+area = "Documents and figures"
+call = "gnuplot file.gp"
+summary = "Function and data plots; set terminal png and output in the script"
+version = "gnuplot --version | awk '{print $2 \".\" $4}'"
+check = '''
+gnuplot -e 'set terminal png; set output "p.png"; plot sin(x)' && identify -format '%wx%h\n' p.png
+'''
+expect = "640x480"
+
+[[tool]]
+name = "ImageMagick"
+area = "Documents and figures"
+call = "convert in.png -resize 50% out.png"
+summary = "Image conversion and editing (PDF input is blocked by its policy: use pdftoppm)"
+version = "convert -version | sed -n '1s/^Version: ImageMagick \\([^ ]*\\) .*/\\1/p'"
+check = '''
+convert -size 64x48 xc:red png:- | identify -format '%wx%h\n' -
+'''
+expect = "64x48"
+
+[[tool]]
+name = "Poppler"
+area = "Documents and figures"
+call = "pdftoppm -png -r 150 in.pdf page"
+summary = "PDF pages to PNG; also pdftotext, pdfinfo, pdfunite"
+version = "pdfinfo -v 2>&1 | sed -n '1s/^pdfinfo version //p'"
+check = '''
+gs -q -dSAFER -sDEVICE=pdfwrite -o t.pdf -c '/Helvetica findfont 20 scalefont setfont 72 720 moveto (zab) show showpage'
+pdftotext t.pdf - | head -n 1
+'''
+expect = "zab"
+
+[[tool]]
+name = "librsvg"
+area = "Documents and figures"
+call = "rsvg-convert -o out.png in.svg"
+summary = "SVG to PNG, or to PDF with -f pdf"
+version = "rsvg-convert --version | awk '{print $3}'"
+check = '''
+echo '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="30"><circle cx="20" cy="15" r="10"/></svg>' > c.svg
+rsvg-convert -o c.png c.svg && identify -format '%wx%h\n' c.png
+'''
+expect = "40x30"
+
+[[tool]]
+name = "Ghostscript"
+area = "Documents and figures"
+call = "gs -dSAFER -sDEVICE=png16m -r150 -o page%d.png in.pdf"
+summary = "PostScript and PDF interpreter: rendering, conversion, PDF repair"
+version = "gs --version"
+check = '''
+gs -q -dSAFER -sDEVICE=pdfwrite -dDEVICEWIDTHPOINTS=200 -dDEVICEHEIGHTPOINTS=100 -dFIXEDMEDIA \
+  -o t.pdf -c '20 50 moveto 160 0 rlineto stroke showpage'
+gs -q -dSAFER -sDEVICE=png16m -r72 -o t.png t.pdf && identify -format '%wx%h\n' t.png
+'''
+expect = "200x100"

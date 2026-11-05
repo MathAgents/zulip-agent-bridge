@@ -1,0 +1,2 @@
+# Install only in the central waker's virtualenv, alongside the zab wheel.
+boto3>=1.35,<2

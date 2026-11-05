@@ -1,0 +1,51 @@
+# docs/ADMIN.md §1.2, §4.3: the read-only console on 127.0.0.1:8090, behind Caddy. It holds no
+# key and sees, of /var/lib/zab-admin, only console/: the snapshot, the audit view and the
+# sign-in tokens, which it deletes on use.
+[Unit]
+Description=zab console: the read-only fleet view
+Wants=zab-admin-imds.service
+After=zab-admin-imds.service
+
+[Service]
+User=zab-console
+Group=zab-console
+ExecStart=/opt/zab-admin/current/.venv/bin/python -I -m zab.admin console --config /etc/zab-admin/admin.toml
+# Its cookie-signing secret, /var/lib/zab-console/secret (§1.3)
+StateDirectory=zab-console
+StateDirectoryMode=0700
+TemporaryFileSystem=/var/lib/zab-admin:ro
+BindReadOnlyPaths=/var/lib/zab-admin/console
+BindPaths=/var/lib/zab-admin/console/tokens
+InaccessiblePaths=-/etc/zab-admin/secrets
+# Caddy's requests in, nothing out: no IMDS, no internet (§1.2)
+IPAddressDeny=any
+IPAddressAllow=localhost
+Restart=always
+RestartSec=5
+MemoryMax=256M
+TasksMax=64
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

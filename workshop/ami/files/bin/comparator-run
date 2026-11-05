@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# comparator-run [config.json]: run leanprover/comparator on the Lake project in the current
+# directory (libraries Challenge and Solution, Lean v4.34.1), the way its README recommends:
+# in a transient systemd user unit without AF_UNIX sockets, with landrun as the sandbox and
+# lean4export (and the nanoda kernel) from /usr/local/lib/comparator. workshop/ami/README.md.
+set -euo pipefail
+LIB=/usr/local/lib/comparator
+cfg=${1:-config.json}
+if [ ! -f "$cfg" ]; then
+  echo "comparator-run: no $cfg here; run it from the project root (see the instructions file)" >&2
+  exit 2
+fi
+command -v lake >/dev/null || { echo "comparator-run: lake is not on PATH (~/.elan/bin)" >&2; exit 2; }
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+exec systemd-run --user --pipe --wait --collect --quiet \
+  --property=RestrictAddressFamilies=~AF_UNIX \
+  -E PATH="$LIB:$PATH" -E HOME="$HOME" \
+  -E COMPARATOR_LANDRUN="$LIB/landrun" -E COMPARATOR_LEAN4EXPORT="$LIB/lean4export" \
+  --working-directory "$PWD" -- lake env "$LIB/comparator" "$cfg"

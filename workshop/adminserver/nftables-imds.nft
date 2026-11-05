@@ -1,0 +1,7 @@
+#!/usr/sbin/nft -f
+# /etc/zab-admin/nftables-imds.nft: what nftables.service loads when it starts or reloads, through
+# its drop-in (docs/ADMIN.md §1.2). One `nft -f` is one transaction, includes and all: the
+# system's rules, which begin with `flush ruleset`, and the IMDS rule commit together, so the
+# ruleset is never without the rule. A broken nftables.conf is refused whole, the rule kept.
+include "/etc/nftables.conf"
+include "/etc/zab-admin/imds.nft"

@@ -1,0 +1,30 @@
+# The participant's Python environment, ~/venv (build.sh step 4; issue #474). Compiled, with
+# hashes, into venv-requirements.txt, which build.sh installs with --require-hashes:
+#   cd workshop/ami/files && uv pip compile -q --python-version 3.12 \
+#     --python-platform x86_64-manylinux_2_39 --exclude-newer 2026-10-17T00:00:00Z \
+#     --generate-hashes venv-requirements.in -o venv-requirements.txt
+# PyX, the one sdist, builds with setuptools from venv-build-constraints.txt (hashes, same pin).
+# The image's first five, unpinned until issue #474:
+numpy
+sympy
+matplotlib
+jupyter
+cypari2
+# Numerics, data, graphs and statistics:
+scipy
+pandas
+networkx
+statsmodels
+scikit-learn
+seaborn
+# Optimization: HiGHS, SCIP, PuLP (with CBC), CVXPY, OR-Tools. PuLP 4.0 (Sep 25, 2026) dropped
+# the bundled CBC and the `LpVariable("x", lowBound=0)` constructor that most PuLP code uses:
+# 3.x keeps both.
+highspy
+pyscipopt
+pulp<4
+cvxpy
+ortools
+# Low-dimensional topology (both run headless):
+snappy
+regina

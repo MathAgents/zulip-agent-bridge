@@ -1,0 +1,43 @@
+# docs/ADMIN.md §1.2: load /etc/zab-admin/imds.nft at boot, before the network comes up, after
+# the users exist and after nftables.service. nftables.service's own drop-in
+# (nftables.service.d/zab-admin-imds.conf) commits the rule in the same transaction as each of
+# its flushes, on start, reload and stop, enabled or not. This unit needs CAP_NET_ADMIN, its one
+# capability. There is no ExecStop: stopping it leaves the rule in place. Caddy Requires it, so
+# a rule that fails to load (an unknown user, say) keeps Caddy down.
+[Unit]
+Description=zab admin: confine the instance metadata service to root and zab-admin
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+After=systemd-sysusers.service nftables.service
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/zab-admin/imds.nft
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# Not ProtectKernelModules: loading the rule may autoload nf_tables modules.
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+[Install]
+WantedBy=sysinit.target

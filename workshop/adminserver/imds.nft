@@ -1,0 +1,20 @@
+#!/usr/sbin/nft -f
+# /etc/zab-admin/imds.nft (docs/ADMIN.md §1.2). Only root, zab-admin (the bots and the
+# collector) and zab-starter (the waker's start path) may reach the instance metadata service,
+# and so the role's credentials. Every other user is refused: Caddy, the console, the waker (it
+# asks the starter, over a socket), zab-build, ubuntu, and EC2 Instance Connect's helper, which
+# is meant to fail.
+# Reject rather than drop, so that a refused client fails at once instead of timing out.
+# Loaded by zab-admin-imds.service at boot; included, in the same transaction as each flush, by
+# nftables-imds.nft and nftables-stop-imds.nft, which nftables.service runs through its drop-in.
+# Its own table, replaced whole and atomically on every load.
+table inet zab_imds
+delete table inet zab_imds
+
+table inet zab_imds {
+	chain output {
+		type filter hook output priority filter; policy accept;
+		ip daddr 169.254.169.254 meta skuid != { "root", "zab-admin", "zab-starter" } counter reject
+		ip6 daddr fd00:ec2::254 meta skuid != { "root", "zab-admin", "zab-starter" } counter reject
+	}
+}

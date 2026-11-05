@@ -1,0 +1,105 @@
+# zab configuration: annotated example (SPEC §5). Copy to ~/.config/zab/config.toml, or run `zab init`.
+# Empty strings mean "use the agent's own default". Unknown keys are an error.
+
+[bridge]
+# Optional service environment; workshop init sets ~/venv/bin and VIRTUAL_ENV.
+service_path_prepend = []
+service_env = {}
+# Run in each new topic worktree: an argument list (no shell), 60 s, failures only logged.
+# The workshop VMs link committed Lean projects to the shared Mathlib (issue #205):
+# worktree_post_create = ["/usr/local/bin/lean-project", "--repair-all"]
+worktree_post_create = []
+
+machine = "laptop"                 # shown on session cards; default: short hostname
+state_dir = "~/.local/state/zab"   # SQLite database, logs, lock files
+projects_root = "~/src"            # where auto-cloned projects go
+default_project = ""               # used for channels with no [[projects]] entry (the workshop sets this)
+auto_clone = false                 # clone `repo: owner/name` from the channel description (§5.4)
+multi_party = true                # owner mentions trigger; shared-channel discussion is context (§4.5)
+allow_public_channels = false      # sessions only in private channels (§4.3)
+mention_after_s = 120              # @-mention the owner when a turn ran at least this long (§4.8)
+status_edit_interval_s = 300       # seconds between status refreshes, at least 60 (§4.9)
+max_concurrent_turns = 3           # per backend (§7.10)
+default_workspace = "shared"       # "shared" | "worktree" (§10.1)
+
+# One entry per Zulip bot. Each bot belongs to exactly one bridge and one backend (§4.2).
+[[bots]]
+name = "codex"
+zuliprc = "~/.config/zab/codex.zuliprc"   # mode 0600
+backend = "codex"
+allow_user_ids = []                # IDs and resolved emails below are combined
+allow_emails = []                  # e.g. ["participant@example.org"]; case-insensitive
+# Only when BOTH lists are empty: use the bot owner. Unresolved emails authorize nobody.
+# Resolve at startup and on user changes; includes DMs. Before workshop invites, set
+# Organization settings -> Default user settings -> Privacy settings ->
+# Who can access user's email address = Everyone. Existing users set their own visibility.
+
+# [[bots]]
+# name = "claude"
+# zuliprc = "~/.config/zab/claude.zuliprc"
+# backend = "claude"
+
+[backends.codex]
+# Commit as the Zulip bot; also supported for Claude. Or "Name <email>" / "off".
+git_identity = "auto"
+kind = "codex"
+connect = "daemon"                 # "daemon": connect to `codex app-server --listen unix://`; "spawn": stdio child
+socket = ""                        # empty = $CODEX_HOME/app-server-control/app-server-control.sock
+codex_home = ""                    # empty = inherit (~/.codex)
+answer_external_approvals = false  # also answer approvals for turns started in the TUI (§8.6)
+defaults = { model = "", effort = "", approval = "never", sandbox = "workspace-write" }
+
+[backends.claude]
+kind = "claude"
+binary = "claude"
+accounts = { main = "~/.claude" }  # name -> CLAUDE_CONFIG_DIR; e.g. add alt = "~/.claude2"
+default_account = "main"
+defaults = { model = "", approval = "bypassPermissions" }   # approval = --permission-mode
+allowed_tools = []                 # passed as --allowedTools when non-empty
+disallowed_tools = []
+steer = true                       # messages sent during a turn steer it; false holds them (§9.7)
+# Restricted mode for a machine that is not dedicated to the agent (SPEC §9.5): every tool call
+# that would have prompted is denied except the listed tools. Allowing an interpreter (python,
+# gp, bash) allows everything; on a personal machine the real protection is a separate user.
+# defaults = { model = "", approval = "dontAsk" }
+# allowed_tools = ["Read", "Glob", "Grep", "Edit", "Write"]
+
+# Channel -> project checkout on this machine (§5.4). Paths are machine-specific; they never go in Zulip.
+[[projects]]
+channel = "g2-torsion"             # channel name or numeric id
+path = "~/src/Genus2Torsion"
+workspace = "worktree"             # optional override of bridge.default_workspace
+subdir = ""                        # optional working directory inside the project
+backend_defaults = { claude = { account = "main" } }
+
+[render]
+auto_upload_ext = ["png", "jpg", "jpeg", "gif", "svg", "pdf"]
+max_upload_mb = 10                 # also capped by the server's max_file_upload_size_mib
+diff_inline_max_lines = 300        # larger diffs are uploaded as a file (§11.8)
+# text files a final answer references that would otherwise show as *(local)* are uploaded as
+# <name>.<ext>.txt (§11.3): UTF-8 only, at most max_text_upload_kb each, max_text_uploads per answer
+auto_upload_text_ext = ["lean", "tex", "bib", "sty", "py", "sage", "gp", "m", "g", "mag", "txt", "md", "json", "csv", "toml", "yaml", "yml", "sh", "c", "h", "cpp", "rs", "jl", "log", "out"]
+max_text_upload_kb = 512
+max_text_uploads = 10              # 0 turns text uploads off
+# the central file server (§10.7): a turn whose answer or diff links a file pushes its snapshot
+# as refs/zab/turns/<session>/<turn> and links {refserve_url}/{repo}/{sha}/{path}; empty = off.
+# Only for a checkout of a repository of refserve_owner, the GitHub organization the server
+# serves (its ZAB_FILES_ORG). push_config.py writes both for the workshop VMs, from the
+# workshop's refserve_url and github_org (#693).
+refserve_url = ""
+refserve_owner = "MathAgents"      # the GitHub owner the server serves; set yours
+
+[lean]
+# Stop a Lean server that a Codex thread holds (its `lake serve`, `lean --server` and workers)
+# once it has been idle this many minutes (the same processes, under 0.04 s of CPU a minute
+# each, at least 0.1 s), in any directory; the thread's next Lean call starts a fresh one.
+# Never lean-lsp-mcp, builds or Claude's (§7.12).
+reap_idle_minutes = 30             # 0 turns it off
+
+# --- Workshop profile (`zab init --profile workshop`) differs as follows:
+# [bridge] machine = "<github>", default_project = "~/work/<repo>", max_concurrent_turns = 2
+# (the workshop VMs' config comes from workshop/admin/push_config.py, which also sets
+#  default_workspace = "worktree": each topic its own worktree and branch, shared by its agents)
+# [[bots]] codex and claude, each with allow_user_ids = [<participant's Zulip user id>]
+# [backends.codex] defaults.approval = "never", defaults.sandbox = "danger-full-access"
+# [backends.claude] defaults.approval = "bypassPermissions"

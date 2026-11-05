@@ -1,0 +1,5 @@
+#!/usr/sbin/nft -f
+# /etc/zab-admin/nftables-stop-imds.nft: what nftables.service runs when it stops, through its
+# drop-in (docs/ADMIN.md §1.2): the system's rules go, the IMDS rule stays, in one transaction.
+flush ruleset
+include "/etc/zab-admin/imds.nft"

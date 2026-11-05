@@ -1,0 +1,29 @@
+# /etc/caddy/Caddyfile on the admin server (docs/ADMIN.md §4.3), as for the files host.
+# <CONSOLE_HOST> is the host of console_url in admin.toml (Q4), filled in at install.
+# A client that trickles its request is Caddy's to hold, never the console's (the review of
+# #496): Caddy gives a request's headers and body 10 s each, and reads the whole body, at most
+# 16 KB, before it passes the request on, so a console slot is held only while a complete
+# request is answered.
+{
+	admin off
+	servers {
+		timeouts {
+			read_header 10s
+			read_body 10s
+		}
+	}
+}
+
+<CONSOLE_HOST> {
+	encode zstd gzip
+	header Strict-Transport-Security "max-age=31536000"
+	header -Server
+	# The console takes only the sign-in form's POST.
+	request_body {
+		max_size 16KB
+	}
+	reverse_proxy 127.0.0.1:8090 {
+		buffer_requests
+	}
+	# No access log. Caddy error logs can still contain request URIs.
+}

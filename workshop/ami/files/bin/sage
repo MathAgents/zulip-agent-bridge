@@ -1,0 +1,9 @@
+#!/bin/sh
+# sage: SageMath with its conda environment's bin first on PATH, as `conda activate sage` would
+# put it (issue #474, review on #480). conda's own launcher doesn't, and then Sage's giac(), r()
+# and gap() interfaces find no program, or a system copy (apt's GAP 4.12, apt's R) that isn't
+# Sage's. build.sh installs this as ~agent/.local/bin/sage; SAGE_ENV is for tests.
+SAGE_ENV="${SAGE_ENV:-/home/agent/miniforge/envs/sage}"
+PATH="$SAGE_ENV/bin:$PATH"
+export PATH
+exec "$SAGE_ENV/bin/sage" "$@"

@@ -1,0 +1,84 @@
+# The files the admin server runs (docs/ADMIN.md §1.6). deploy.sh installs exactly these from a
+# signed tag, and shows their full diff since the running release; a path new to this list, and
+# not under one it held, is shown whole. Of these, the paths of privileged-paths are what Drew
+# reads himself (DECISIONS D31). The rest of the repository, the bridge included, never reaches
+# the server.
+# A zab module that joins the import closure of zab.admin goes here, in the reviewed diff:
+# tests/workshop/test_adminserver_deploy.py checks it, and the server's self-check fails without.
+build-constraints.txt
+pyproject.toml
+uv.lock
+src/zab/__init__.py
+src/zab/admin
+# zab.admin.scrub's two imports and their package (#319): each imports only `re`.
+src/zab/render/__init__.py
+src/zab/render/mentions.py
+src/zab/render/redact.py
+# zab.admin.bot's Zulip transport (#341): the client and its request budget, and the two
+# helpers they import, which import only the standard library. Both packages' __init__.py are
+# empty.
+src/zab/zulip/__init__.py
+src/zab/zulip/client.py
+src/zab/zulip/budget.py
+src/zab/core/__init__.py
+src/zab/core/metrics.py
+src/zab/core/watchdog.py
+# zab.waker's runtime closure (#348): zab-waker.service runs `python -I -m zab.waker run`. The
+# Zulip transport above is the bot's and the waker's; these are the waker's own. The deploy tests
+# walk its closure from that entry point against this whole list, which names each path once.
+src/zab/waker
+src/zab/config.py
+src/zab/core/store.py
+src/zab/core/types.py
+src/zab/zulip/poster.py
+# An unmentioned follow-up's addressees (#683): the bridge's reading of mentions, and its code
+# protection, which import only the standard library.
+src/zab/core/addressing.py
+src/zab/render/code.py
+# workshop/: what the server runs or installs, and nothing else (#432). The deploy tests derive it
+# from the entry points (the units, deploy.sh, zab.admin.checks.SCRIPTS, the runbooks' commands
+# under /opt/zab-admin/current), through each script's imports and the files it names beside
+# itself, and fail on a path missing here or listed for nothing. Not here: the files host
+# (workshop/files, and workshop/waker, which push_waker.py reads only in its files-host mode),
+# the AMI build (workshop/ami, but two files push_config.py uploads), the laptop's
+# join_server.py and move_bots.py, and the READMEs.
+workshop/adminserver
+workshop/admin/admin_common.py
+workshop/admin/archive_check.py
+workshop/admin/collect_exports.py
+workshop/admin/final_sync.py
+workshop/admin/new_workshop.py
+workshop/admin/provision_repos.py
+workshop/admin/push_config.py
+workshop/admin/push_waker.py
+workshop/admin/roster_import.py
+workshop/admin/roster_sync.py
+workshop/admin/scan_hosts.py
+workshop/admin/stage_server.py
+workshop/admin/status.py
+workshop/admin/zulip_provision.py
+workshop/aws/adopt_spare.py
+workshop/aws/aws_common.py
+workshop/aws/grow_disk.py
+workshop/aws/import_key_pair.py
+workshop/aws/launch.py
+workshop/aws/power.py
+workshop/aws/protect.py
+workshop/aws/spare_idle_stop.py
+workshop/aws/teardown.py
+# What the scripts above copy to the VMs or into a repository: collect_exports.py's export.sh,
+# final_sync.py's remote half, push_config.py's five scripts, the Oct 9 image's list of its
+# software and the AMI's three files it installs again (the sage wrapper since #482), and
+# provision_repos.py's template, an empty repository's first commit.
+workshop/admin/export.sh
+workshop/admin/final_sync_remote.py
+workshop/admin/agent_instructions.py
+workshop/admin/idle_stop.py
+workshop/admin/sage_wrapper.py
+workshop/admin/tools_list.py
+workshop/admin/tools-nt-agents-2026-v3.json
+workshop/admin/warm_cache.py
+workshop/ami/files/agent-instructions.md
+workshop/ami/files/bin/lean-project
+workshop/ami/files/bin/sage
+workshop/template

@@ -1,0 +1,68 @@
+# /etc/zab-admin/admin.toml (root 0644): an example, never the real one (docs/ADMIN.md §2.1).
+# It holds no secrets: the console reads it. Every ID, AMI and group below is made up.
+# The names are the MathAgents deployment's, which the tests' goldens use: use your own.
+# One server, several workshops, each in one region with its own admin bot.
+# The role's policy depends on [global] alone (#422): render it again (render_policy.py)
+# only when the scope, a region or an instance type changes, never for a new workshop.
+
+provider = "aws"
+admins = [101, 102]             # Zulip user IDs who may act through every bot
+deployers = [101]               # SSH and deploy (and !upgrade-server, not built)
+destructive_approvals = 2       # the test server uses 1
+plan_ttl_minutes = 10
+release = "final"               # final tags only; the test server takes "rc" too
+console_url = "https://admin.example.org"   # Q4; its host goes into the Caddyfile
+
+[global]
+scope = "mathagents"            # the fleet's tag zab-scope=mathagents, on everything it makes (§5)
+regions = ["us-east-2", "us-west-2"]        # each set up once: its zab-fleet group and image
+instance_types = ["m7a.2xlarge", "m7a.xlarge"]   # the role launches only these
+# tags = ["zab-role=test"]      # more scope tags, on every resource: the test server's
+zuliprc = "/etc/zab-admin/secrets/global.zuliprc"   # the global admin bot (optional): !version
+user_id = 900
+channels = [40]
+
+[[workshop]]
+name = "harvard-2026"           # its fleet's tag workshop=harvard-2026, beside [global]'s
+github_org = "MathAgents"
+refserve_url = "https://files.mathagents.org"
+roster = "/var/lib/zab-admin/ws/harvard-2026/roster.csv"
+out_dir = "/var/lib/zab-admin/ws/harvard-2026/out"
+organizers = [103, 104]         # this workshop's bot only
+alerts_channel = 46             # #harvard-2026-fleet-alerts: the waker's (!waker on); no bot's
+[workshop.bot]
+zuliprc = "/etc/zab-admin/secrets/bots/harvard-2026.zuliprc"
+user_id = 901
+email = "harvard-admin-bot@example.zulipchat.com"
+channels = [42]                 # its #organizers; a channel belongs to one bot
+[workshop.aws]
+region = "us-east-2"            # one of [global] regions
+ami = "ami-0123456789abcdef0"   # the region's zab-fleet image and group, tagged zab-scope (§5)
+security_group = "sg-0123456789abcdef0"
+instance_types = ["m7a.2xlarge"]            # the first is the default; of [global]'s
+key_name = "zab-admin-harvard-2026"         # imported by the server from its own fleet key
+admin_keys = ["/etc/zab-admin/break-glass/zab-deployer.pub"]
+
+# A second workshop, here one whose VMs were launched before the server (docs/ADMIN.md §8.4),
+# which needs no flag: join_server.py gives them the server's key over a break-glass key, and
+# stage_server.py brings their kept rows and bot keys. Its VMs carry the scope's tags too.
+[[workshop]]
+name = "nt-agents-2026"
+github_org = "MathAgents"
+refserve_url = "https://files.mathagents.org"
+roster = "/var/lib/zab-admin/ws/nt-agents-2026/roster.csv"
+out_dir = "/var/lib/zab-admin/ws/nt-agents-2026/out"
+organizers = [105]              # its own organizers; the admins act through every bot
+alerts_channel = 47             # #nt-agents-2026-fleet-alerts, zab-provisioner subscribed (§2.9)
+[workshop.bot]
+zuliprc = "/etc/zab-admin/secrets/bots/nt-agents-2026.zuliprc"
+user_id = 902
+email = "nt-agents-admin-bot@example.zulipchat.com"
+channels = [43]                 # #nt-agents-2026-organizers
+[workshop.aws]
+region = "us-west-2"            # its spares come from the region's zab-fleet image and group
+ami = "ami-00000000000000001"
+security_group = "sg-00000000000000001"
+instance_types = ["m7a.2xlarge", "m7a.xlarge"]
+key_name = "zab-admin-nt-agents-2026"
+admin_keys = ["/etc/zab-admin/break-glass/zab-deployer.pub"]

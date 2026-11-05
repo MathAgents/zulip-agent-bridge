@@ -1,0 +1,6 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::<FILES_HOST_ACCOUNT_ID>:role/zab-files-host"}, "Action": "sts:AssumeRole"}
+  ]
+}

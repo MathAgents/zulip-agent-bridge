@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# zab runtime and secrets: never commit (CONTRIBUTING.md, rule 1)
+.zab/
+*.zuliprc
+zuliprc
+.env
+.env.*
+auth.json
+.credentials.json
+
+# workshop personal data and generated credentials
+roster*.csv
+workshop/admin/out/
+
+# unscrubbed fixture recordings (commit only scrubbed files)
+tests/fixtures/**/raw/
+
+# Claude Code worktrees created by the harness for forked agents
+.claude/worktrees/
+
+# Magma files for the AMI build are copied from Drew's machine, never committed (DECISIONS D19)
+workshop/ami/magma*
+*magmapassfile*

@@ -1,0 +1,262 @@
+{
+ "at": 1800000000.0,
+ "schema": 1,
+ "waker_at": "2027-01-15T07:59:40Z",
+ "workshops": {
+  "harvard-2026": {
+   "channels": [
+    42
+   ],
+   "cost": {
+    "hours_today": 2.17,
+    "month": 8.76,
+    "projected": 57.4,
+    "running": 2,
+    "spares": 1,
+    "spares_running": 1,
+    "unpriced": [],
+    "unpriced_region": null,
+    "vms": 3
+   },
+   "ec2": {
+    "at": "2027-01-15T08:00:00Z",
+    "error": null
+   },
+   "plans": [
+    {
+     "approvals": 0,
+     "expires_at": "2027-01-15T08:08:05Z",
+     "needed": 1,
+     "plan": "P-7",
+     "requester": "Olga Organizer",
+     "since": "2027-01-15T07:58:05Z",
+     "state": "pending",
+     "targets": [
+      "bob"
+     ],
+     "verb": "stop",
+     "workshop": "harvard-2026"
+    }
+   ],
+   "region": "us-west-2",
+   "site": "https://zulip.example.com",
+   "vms": [
+    {
+     "cost": {
+      "hours_month": 1.0,
+      "hours_today": 1.0,
+      "month": 2.4,
+      "projected": 15.74,
+      "unpriced": []
+     },
+     "instance": "i-a",
+     "kind": "participant",
+     "launched_at": "2027-01-15T07:00:00Z",
+     "protected": true,
+     "slug": "alice",
+     "state": "running",
+     "status": {
+      "active_sessions": 1,
+      "at": 1799999700.0,
+      "bridge": "active",
+      "claude_login": "FAIL",
+      "codex_login": "ok",
+      "disk": {
+       "available_bytes": 61263003648,
+       "size_bytes": 103865303040,
+       "used_bytes": 42585522176
+      },
+      "disk_percent": 42,
+      "doctor_failures": [
+       "claude: not signed in"
+      ],
+      "git_push": "ok",
+      "idle_stop": {
+       "active": true,
+       "enabled": true,
+       "last_verdict": "busy: 1 session",
+       "minutes": 60
+      },
+      "last_activity": "2027-01-15T07:30:00Z",
+      "last_error": "token [redacted secret]",
+      "load": {
+       "cpus": 8,
+       "load1": 0.5
+      },
+      "math_tools": "ok",
+      "memory": {
+       "total_bytes": 34359738368,
+       "used_bytes": 8589934592
+      },
+      "running_turns": [],
+      "sentinel": "ok",
+      "slug": "alice",
+      "source": "!status",
+      "strained": [],
+      "zab_version": "0.2.6"
+     },
+     "type": "m7a.2xlarge",
+     "waker": {
+      "at": "2027-01-15T07:59:35Z",
+      "last_wake": "2027-01-15T06:00:00Z",
+      "opted_in": true,
+      "state": "running"
+     }
+    },
+    {
+     "cost": {
+      "hours_month": 0.0,
+      "hours_today": 0.0,
+      "month": 1.94,
+      "projected": 12.71,
+      "unpriced": []
+     },
+     "instance": "i-b",
+     "kind": "participant",
+     "launched_at": "2027-01-13T08:00:00Z",
+     "protected": false,
+     "slug": "bob",
+     "state": "stopped",
+     "status": null,
+     "type": "m7a.2xlarge",
+     "waker": {
+      "opted_in": false
+     }
+    },
+    {
+     "cost": {
+      "hours_month": 0.17,
+      "hours_today": 0.17,
+      "month": 2.02,
+      "projected": 13.21,
+      "unpriced": []
+     },
+     "instance": "i-s",
+     "kind": "spare",
+     "launched_at": "2027-01-15T07:50:00Z",
+     "protected": false,
+     "slug": "zab-spare-1",
+     "state": "running",
+     "status": null,
+     "type": "m7a.2xlarge",
+     "waker": {
+      "opted_in": false
+     }
+    },
+    {
+     "cost": {
+      "hours_month": 1.0,
+      "hours_today": 1.0,
+      "month": 2.4,
+      "projected": 15.74,
+      "unpriced": []
+     },
+     "instance": "i-z",
+     "kind": "unlisted",
+     "launched_at": "2027-01-15T07:00:00Z",
+     "protected": false,
+     "slug": "zed",
+     "state": "running",
+     "status": null,
+     "type": "m7a.2xlarge",
+     "waker": {
+      "opted_in": false
+     }
+    },
+    {
+     "kind": "participant",
+     "slug": "carol",
+     "state": "no VM",
+     "status": {
+      "active_sessions": 1,
+      "at": 1799999700.0,
+      "bridge": "unreachable",
+      "claude_login": "FAIL",
+      "codex_login": "ok",
+      "disk": {
+       "available_bytes": 61263003648,
+       "size_bytes": 103865303040,
+       "used_bytes": 42585522176
+      },
+      "disk_percent": 42,
+      "doctor_failures": [
+       "claude: not signed in"
+      ],
+      "git_push": "ok",
+      "idle_stop": {
+       "active": true,
+       "enabled": true,
+       "last_verdict": "busy: 1 session",
+       "minutes": 60
+      },
+      "last_activity": "2027-01-15T07:30:00Z",
+      "last_error": null,
+      "load": {
+       "cpus": 8,
+       "load1": 0.5
+      },
+      "math_tools": "ok",
+      "memory": {
+       "total_bytes": 34359738368,
+       "used_bytes": 8589934592
+      },
+      "running_turns": [],
+      "sentinel": "ok",
+      "slug": "carol",
+      "source": "!status",
+      "strained": [],
+      "zab_version": "0.2.6"
+     }
+    }
+   ],
+   "waker_down": null
+  },
+  "zab-test": {
+   "channels": [
+    43
+   ],
+   "cost": {
+    "hours_today": 1.0,
+    "month": 2.4,
+    "projected": 15.74,
+    "running": 1,
+    "spares": 0,
+    "spares_running": 0,
+    "unpriced": [],
+    "unpriced_region": null,
+    "vms": 1
+   },
+   "ec2": {
+    "at": "2027-01-15T08:00:00Z",
+    "error": null
+   },
+   "plans": [],
+   "region": "us-east-1",
+   "site": "https://zulip.example.com",
+   "vms": [
+    {
+     "cost": {
+      "hours_month": 1.0,
+      "hours_today": 1.0,
+      "month": 2.4,
+      "projected": 15.74,
+      "unpriced": []
+     },
+     "instance": "i-e",
+     "kind": "participant",
+     "launched_at": "2027-01-15T07:00:00Z",
+     "protected": false,
+     "slug": "erin",
+     "state": "running",
+     "status": null,
+     "type": "m7a.2xlarge",
+     "waker": {
+      "opted_in": false
+     }
+    }
+   ],
+   "waker_down": null
+  }
+ },
+ "written_at": "2027-01-15T08:00:00Z"
+}

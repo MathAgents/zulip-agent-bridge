@@ -1,0 +1,54 @@
+# docs/ADMIN.md §1.2; SPEC §13.4. The waker handles any Zulip user's messages to opted-in
+# participant bots, so it runs as its own user and sees, of /var/lib/zab-admin, only waker/: its
+# config and those bots' zuliprcs, which the bot writes zab-admin:zab-waker 0640. It holds none
+# of the provisioner key, the GitHub token or the fleet SSH key, and not the instance role
+# either: no IMDS, here and in imds.nft. It asks the starter, on its socket (root:zab-waker
+# 0660), for its VMs' states and for starts; connect() needs no writable mount, so it writes
+# nothing outside its own state. That state is 0711 for status/ (tmpfiles.conf), where it
+# writes the status file the collector reads. It exits when its config changes, and restarts.
+# MemoryMax: its start-up peaks under 90 MB for 150 to 340 bots, and at up to about 270 MB
+# after a long outage in a channel the VMs share (tests/waker/load_rig.py, #717): 512M is nearly twice that.
+[Unit]
+Description=zab waker: start opted-in workshop VMs on their owners' messages
+Wants=network-online.target zab-admin-imds.service zab-admin-starter.socket
+After=network-online.target zab-admin-imds.service zab-admin-starter.socket
+
+[Service]
+User=zab-waker
+Group=zab-waker
+ExecStart=/opt/zab-admin/current/.venv/bin/python -I -m zab.waker run --wait-for-config --config /var/lib/zab-admin/waker/config.toml
+StateDirectory=zab-waker
+StateDirectoryMode=0711
+TemporaryFileSystem=/var/lib/zab-admin:ro
+BindReadOnlyPaths=/var/lib/zab-admin/waker
+InaccessiblePaths=-/etc/zab-admin/secrets
+IPAddressDeny=169.254.169.254 fd00:ec2::254
+Restart=always
+RestartSec=5
+MemoryMax=512M
+TasksMax=64
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

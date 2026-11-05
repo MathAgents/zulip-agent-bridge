@@ -1,0 +1,40 @@
+# docs/ADMIN.md §1.2, §4.1: EC2 state every minute and status sweeps, into console/snapshot.json.
+# It runs as zab-admin, with the bot's keys used read-only, and writes only console/ and its
+# own state, collector/ (the cost history and the status values, which a restart keeps).
+[Unit]
+Description=zab admin collector: the fleet snapshot for the console
+Wants=network-online.target zab-admin-imds.service
+After=network-online.target zab-admin-imds.service
+
+[Service]
+User=zab-admin
+Group=zab-admin
+ExecStart=/opt/zab-admin/current/.venv/bin/python -I -m zab.admin collector --config /etc/zab-admin/admin.toml
+ReadWritePaths=/var/lib/zab-admin/console /var/lib/zab-admin/collector
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+# zab's per-checkout state (worktrees, inbox): local to the VM, never committed
+.zab/
+# Python
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+# LaTeX build files (keep the PDF)
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+# Lean build output
+.lake/

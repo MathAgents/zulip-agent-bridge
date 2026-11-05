@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling>=1.27"]  # PEP 639: `license` as an SPDX expression, `license-files`
+build-backend = "hatchling.build"
+
+[project]
+name = "zulip-agent-bridge"
+version = "0.2.18"
+description = "Drive Codex and Claude Code sessions on your own machines from Zulip topics"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Andrew V. Sutherland" }]
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.27",
+  "websockets>=13",
+]
+
+[project.urls]
+Repository = "https://github.com/MathAgents/zulip-agent-bridge"
+
+[project.scripts]
+zab = "zab.cli:main"
+waker = "zab.waker.__main__:main"
+
+[dependency-groups]
+# The admin server's venv: installed from uv.lock with hashes, never built there
+# (docs/ADMIN.md §1.6; workshop/adminserver/deploy.sh). Not a zab runtime dependency.
+admin = [
+  "boto3>=1.35,<2",
+  "httpx>=0.27",
+]
+dev = [
+  "jsonschema>=4",
+  # the file server's renderer (workshop/files, issue #256); never a zab runtime dependency
+  "markdown-it-py[linkify]==4.2.0",
+  "mdit-py-plugins==0.6.1",
+  "pygments==2.21.0",
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  # a hung test fails by name, with stacks, instead of the CI step's limit (#491)
+  "pytest-timeout>=2.3",
+  "pytest-xdist>=3.6",
+  "ruff>=0.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zab"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Per test, setup and teardown included (pytest-timeout; #491, DECISIONS): 4x the slowest test
+# a pull request runs on CI's runners. `slow` tests get SLOW_TIMEOUT, the live suites none
+# (tests/conftest.py)
+timeout = 120
+markers = [
+  "contract: backend adapters against recorded fixtures (SPEC §15.1)",
+  "integration: core with fake Zulip and fake backends",
+  "live: needs a real CLI login or Zulip dev bot; runs only with ZAB_LIVE / ZAB_LIVE_ZULIP set",
+  "e2e: the end-to-end suite against the test VM (issue #263); runs only with ZAB_LIVE=e2e",
+  "scenario(n): the issue #263 scenario an e2e test belongs to (ZAB_E2E_SCENARIOS selects)",
+  "slow: offline, several seconds: a PR's CI leaves it out (-m 'not slow'), a push to main runs it (#473); in the e2e suite, a part of a fast scenario that stops the VM: it runs with the slow group only",
+  "timing: offline, a bound on CPU against a reference timed in the same run: CI runs it in its timing job, one test at a time, not beside another xdist worker, whose load on a runner's second thread (two vCPUs, one core) swings a process's CPU by up to 1.7 times (#485)",
+  "admin_e2e: the admin end-to-end suite on the rig (issue #356); runs only with ZAB_LIVE=admin-e2e",
+  "admin_scenario(label): the ADMIN.md §7 scenario (A1 to A20, A10b) an admin e2e test belongs to",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+# Python scripts without a .py extension, which ruff would otherwise skip (review on #258)
+extend-include = ["workshop/ami/files/bin/lean-project"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "S", "RUF", "TID251"]
+# S101: assert is fine in tests. UP047: generic functions keep their `TypeVar`s, not PEP 695's
+# `def f[T]`, a rewrite that nothing needs (#774)
+ignore = ["S101", "UP047"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"asyncio.wait_for".msg = "on Python 3.11 it can drop a cancel (gh-86296, #491): use `async with asyncio.timeout(...)`"
+
+[tool.ruff.lint.per-file-ignores]
+# The ban covers the admin server and the tests' two fake Zulips, whose long polls a stop
+# cancels. A test may bound its own waits with it: no one cancels a test. The bridge's, the
+# waker's and the tools' uses are #498.
+"!{src/zab/admin/**,src/zab/testing/**,tests/admin/fake_realm.py}" = ["TID251"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["zab"]

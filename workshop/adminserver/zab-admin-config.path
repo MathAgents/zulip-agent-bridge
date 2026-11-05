@@ -1,0 +1,11 @@
+# docs/ADMIN.md §1.2, §2.9: start the config helper when !new-workshop's apply has written its
+# request (renamed into place by zab-admin). The helper deletes the request once read.
+[Unit]
+Description=zab admin config helper: watch for a !new-workshop request
+
+[Path]
+PathExists=/var/lib/zab-admin-config/requests/request.json
+Unit=zab-admin-config.service
+
+[Install]
+WantedBy=paths.target

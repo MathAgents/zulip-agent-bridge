@@ -1,0 +1,34 @@
+/* files.mathagents.org rendered pages (issue #256): GitHub-like Markdown and source views. */
+body { margin: 0; color: #1f2328; background: #fff;
+  font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; }
+header { display: flex; gap: 1em; align-items: center; padding: 8px 16px;
+  border-bottom: 1px solid #d1d9e0; background: #f6f8fa; font-size: 14px; }
+header .path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; flex: 1;
+  overflow-wrap: anywhere; }
+header .raw { padding: 2px 10px; border: 1px solid #d1d9e0; border-radius: 6px; color: #1f2328;
+  text-decoration: none; background: #fff; }
+main.markdown { max-width: 980px; margin: 0 auto; padding: 32px 16px; overflow-wrap: break-word; }
+main.markdown h1, main.markdown h2 { border-bottom: 1px solid #d1d9e0; padding-bottom: .3em; }
+main.markdown a { color: #0969da; }
+main.markdown code, main.markdown pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas,
+  monospace; font-size: 85%; }
+main.markdown :not(pre) > code { background: #eff1f3; padding: .2em .4em; border-radius: 6px; }
+main.markdown pre { background: #f6f8fa; padding: 16px; overflow: auto; border-radius: 6px;
+  line-height: 1.45; }
+main.markdown table { border-collapse: collapse; display: block; overflow: auto; }
+main.markdown th, main.markdown td { border: 1px solid #d1d9e0; padding: 6px 13px; }
+main.markdown tr:nth-child(2n) { background: #f6f8fa; }
+main.markdown blockquote { margin: 0; padding: 0 1em; color: #59636e; border-left: .25em solid #d1d9e0; }
+main.markdown img { max-width: 100%; }
+main.markdown .task-list-item { list-style: none; }
+main.markdown .task-list-item-checkbox { margin: 0 .3em 0 -1.4em; }
+main.markdown div.math.display { overflow-x: auto; overflow-y: hidden; margin: 1em 0; }
+main.source { padding: 8px 0; overflow-x: auto; }
+table.source { border-collapse: collapse; width: 100%;
+  font: 12px/20px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+table.source td.ln { width: 1%; min-width: 50px; padding: 0 10px; text-align: right;
+  user-select: none; vertical-align: top; }
+table.source td.ln a { color: #59636e; text-decoration: none; }
+table.source td.code { padding: 0 10px; white-space: pre; tab-size: 4; }
+table.source tr:target { background: #fff8c5; }
+table.source tr:target td.ln a { color: #1f2328; font-weight: 600; }

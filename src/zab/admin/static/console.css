@@ -1,0 +1,125 @@
+/* The zab console's only stylesheet (docs/ADMIN.md §4.3): the pages carry no style attribute,
+   so a bar's length and colour are classes (w0..w10; #204's green, yellow, orange, red). */
+:root {
+  --bg: #ffffff;
+  --fg: #1d1f23;
+  --muted: #5d6470;
+  --line: #d9dde3;
+  --head: #f3f5f8;
+  --link: #1f5fbf;
+  --problem: #b3261e;
+  --strain: #9a5b00;
+  --empty: #e6e9ee;
+  --green: #2e9e4f;
+  --yellow: #d6b300;
+  --orange: #e67e22;
+  --red: #d33a2c;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15171a;
+    --fg: #e6e8eb;
+    --muted: #9aa1ab;
+    --line: #2d3138;
+    --head: #1e2126;
+    --link: #7fb0ff;
+    --problem: #ff8a80;
+    --strain: #ffcc80;
+    --empty: #2d3138;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--head);
+}
+header .home { font-weight: 600; color: var(--fg); text-decoration: none; }
+header .who { margin: 0; color: var(--muted); }
+header button, .who button {
+  font: inherit;
+  margin-left: 0.5rem;
+  padding: 0.15rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+main { padding: 0.5rem 1rem 2rem; max-width: 100%; overflow-x: auto; }
+h1 { font-size: 1.35rem; margin: 0.6rem 0; }
+h2 { font-size: 1.1rem; margin: 1.4rem 0 0.4rem; }
+a { color: var(--link); }
+p.note { color: var(--muted); font-size: 0.9em; margin: 0.3rem 0; }
+p.warn {
+  margin: 0.5rem 0;
+  padding: 0.4rem 0.7rem;
+  border-left: 4px solid var(--problem);
+  background: var(--head);
+  color: var(--problem);
+  font-weight: 600;
+}
+span.problem { color: var(--problem); font-weight: 600; }
+span.strain { color: var(--strain); font-weight: 600; }
+span.note { color: var(--muted); font-size: 0.9em; }
+table { border-collapse: collapse; margin: 0.3rem 0; }
+th, td {
+  border-bottom: 1px solid var(--line);
+  padding: 0.3rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+th { background: var(--head); font-weight: 600; white-space: nowrap; }
+table.fleet td { white-space: nowrap; }
+table.actions td { font-size: 0.95em; }
+table.totals th, table.detail th { display: none; }
+table.totals td:first-child, table.detail td:first-child { color: var(--muted); }
+a.problem { color: var(--problem); font-weight: 600; }
+a.strain { color: var(--strain); font-weight: 600; }
+.kind { color: var(--muted); font-size: 0.85em; }
+.bar {
+  display: inline-block;
+  width: 5rem;
+  height: 0.7rem;
+  background: var(--empty);
+  border-radius: 2px;
+  vertical-align: middle;
+  overflow: hidden;
+}
+.fill { display: block; height: 100%; }
+.w0 { width: 0; }
+.w1 { width: 10%; }
+.w2 { width: 20%; }
+.w3 { width: 30%; }
+.w4 { width: 40%; }
+.w5 { width: 50%; }
+.w6 { width: 60%; }
+.w7 { width: 70%; }
+.w8 { width: 80%; }
+.w9 { width: 90%; }
+.w10 { width: 100%; }
+.green { background: var(--green); }
+.yellow { background: var(--yellow); }
+.orange { background: var(--orange); }
+.red { background: var(--red); }
+.num { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 0.9em; }
+ul.commands { padding-left: 1.2rem; }
+ul.commands code {
+  user-select: all;
+  padding: 0.1rem 0.35rem;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--head);
+}
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }

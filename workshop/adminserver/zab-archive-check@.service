@@ -1,0 +1,79 @@
+# docs/ADMIN.md §1.2; #374. One instance per connection to zab-archive-check.socket: it re-packs
+# one participant's export archive (workshop/admin/archive_check.py), untrusted input to gzip and
+# tarfile, and answers on that connection only. The archive comes as a read-only descriptor, so
+# the instance needs no path to it. Each instance runs as a user of its own, allocated when it
+# starts and released when it ends (DynamicUser, named after the instance: the connection's
+# number, the caller's pid and uid), so no two instances, and no other process, share a uid.
+# It has no network, can reach none of the admin server's keys or state, writes nothing, and
+# makes no socket, by socket() or io_uring. It answers only root and zab-admin (SO_PEERCRED).
+# Its limits match archive_check.py's own (limit()), which it sets again before it reads a byte.
+[Unit]
+Description=zab archive check: re-pack one export archive, sandboxed
+Requires=zab-archive-check.socket
+After=zab-archive-check.socket
+CollectMode=inactive-or-failed
+
+[Service]
+DynamicUser=yes
+User=zab-ac-%i
+ExecStart=/opt/zab-admin/current/.venv/bin/python -I -S -B /opt/zab-admin/current/workshop/admin/archive_check.py serve --peer zab-admin
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+# collect_exports.py gives up after 900 s; this ends an instance it left
+RuntimeMaxSec=960
+MemoryMax=256M
+MemorySwapMax=0
+CPUQuota=100%
+# the bots come first when the server is busy
+CPUWeight=20
+TasksMax=4
+LimitAS=256M
+LimitCPU=600
+LimitFSIZE=0
+LimitNOFILE=32
+LimitCORE=0
+InaccessiblePaths=-/etc/zab-admin -/var/lib/zab-admin -/var/lib/zab-starter -/var/lib/zab-waker -/var/lib/zab-console -/dev/shm
+# and, for depth, the sockets under /run that others may reach: D-Bus, resolved's and userdb's
+# varlink, journald's stdout, users' runtime directories, the starter's. Never /run or
+# /run/systemd as a whole: PID 1 needs /run/systemd to set the unit up, and every instance
+# then exits 226/NAMESPACE (A19 on the rig, #392; a user manager runs it regardless)
+InaccessiblePaths=-/run/dbus -/run/systemd/resolve -/run/systemd/userdb -/run/systemd/journal/stdout -/run/user -/run/zab-admin-starter
+# PrivateTmp gives it its own /tmp and /var/tmp: read-only too, so that it creates nothing there
+ReadOnlyPaths=/tmp /var/tmp
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+DevicePolicy=closed
+PrivateNetwork=true
+PrivateIPC=true
+IPAddressDeny=any
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+KeyringMode=private
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# no socket of its own: the connection is systemd's
+RestrictAddressFamilies=none
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @process @setuid @chown @keyring @memlock @mount @clock @debug @module @raw-io @reboot @swap @obsolete @cpu-emulation
+# io_uring (in @aio) makes sockets and connects without socket() or connect(), past
+# RestrictAddressFamilies (the review of #384); userfaultfd serves no re-pack
+SystemCallFilter=~@aio userfaultfd
+SystemCallFilter=~socket socketpair connect bind listen accept accept4 process_vm_readv process_vm_writev memfd_create
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=

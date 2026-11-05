@@ -1,0 +1,8 @@
+participant  host         codex login  claude login  git push  math tools  bridge                   sentinel  sessions       load     mem       disk                 last error                                         
+-----------  -----------  -----------  ------------  --------  ----------  -----------------------  --------  -------------  -------  --------  -------------------  ---------------------------------------------------
+alice        203.0.113.5  ok           no            ok        ok          active, sign-in pending  ok        2 (1 running)  0.4/8    3/31G     42%                  preflight claude -p: not logged in                 
+bob          203.0.113.6  ?            ?             ?         ?           no zab                   ?         ?              9.7/8 !  29/31G !  94% ! (6.2 GB free)                                                     
+carol        203.0.113.7  ?            ?             ?         ?           stopped                  ?         ?              ?        ?         ?                                                                       
+dave         203.0.113.8  no           no            ?         FAIL        active, doctor FAIL      ?         0 (0 running)  0.4/8    3/31G     42%                  codex:login: not signed in: send !login to this bot
+under strain: bob (load, mem, disk)
+signed in: 0 both, 1 Codex only, 0 Claude only, 1 neither; 1 unreachable, 1 stopped, 1 doctor FAIL

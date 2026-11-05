@@ -1,0 +1,162 @@
+{
+  "schema": 1,
+  "vms": [
+    {
+      "slug": "alice",
+      "host": "203.0.113.5",
+      "bridge": "active, sign-in pending",
+      "sentinel": "ok",
+      "zab_version": "0.2.4",
+      "codex_login": "ok",
+      "claude_login": "no",
+      "git_push": "ok",
+      "math_tools": "ok",
+      "active_sessions": 2,
+      "running_turns": [
+        {
+          "bot": "claude",
+          "backend": "claude",
+          "started_at": "2026-10-14T16:50:00Z"
+        }
+      ],
+      "last_activity": "2026-10-14T16:55:00Z",
+      "load": {
+        "load1": 0.42,
+        "cpus": 8
+      },
+      "memory": {
+        "used_bytes": 3298534400,
+        "total_bytes": 32985348096
+      },
+      "disk_percent": 42,
+      "disk": {
+        "size_bytes": 103865303040,
+        "used_bytes": 42585522176,
+        "available_bytes": 61263003648
+      },
+      "strained": [],
+      "idle_stop": {
+        "enabled": true,
+        "active": true,
+        "minutes": 30,
+        "last_verdict": "2026-10-14T16:58:00Z stay up: zab active 3 min ago"
+      },
+      "doctor_failures": [],
+      "last_error": "preflight claude -p: not logged in"
+    },
+    {
+      "slug": "bob",
+      "host": "203.0.113.6",
+      "bridge": "no zab",
+      "sentinel": null,
+      "zab_version": null,
+      "codex_login": null,
+      "claude_login": null,
+      "git_push": null,
+      "math_tools": null,
+      "active_sessions": null,
+      "running_turns": null,
+      "last_activity": null,
+      "load": {
+        "load1": 9.7,
+        "cpus": 8
+      },
+      "memory": {
+        "used_bytes": 30937348096,
+        "total_bytes": 32985348096
+      },
+      "disk_percent": 94,
+      "disk": {
+        "size_bytes": 103865303040,
+        "used_bytes": 97280000000,
+        "available_bytes": 6585303040
+      },
+      "strained": [
+        "load",
+        "mem",
+        "disk"
+      ],
+      "idle_stop": {
+        "enabled": false,
+        "active": false,
+        "minutes": null,
+        "last_verdict": null
+      },
+      "doctor_failures": [],
+      "last_error": null
+    },
+    {
+      "slug": "carol",
+      "host": "203.0.113.7",
+      "bridge": "stopped",
+      "sentinel": null,
+      "zab_version": null,
+      "codex_login": null,
+      "claude_login": null,
+      "git_push": null,
+      "math_tools": null,
+      "active_sessions": null,
+      "running_turns": null,
+      "last_activity": null,
+      "load": null,
+      "memory": null,
+      "disk_percent": null,
+      "disk": null,
+      "strained": [],
+      "idle_stop": null,
+      "doctor_failures": [],
+      "last_error": null
+    },
+    {
+      "slug": "dave",
+      "host": "203.0.113.8",
+      "bridge": "active, doctor FAIL",
+      "sentinel": null,
+      "zab_version": "0.2.3",
+      "codex_login": "no",
+      "claude_login": "no",
+      "git_push": null,
+      "math_tools": "FAIL",
+      "active_sessions": 0,
+      "running_turns": [],
+      "last_activity": null,
+      "load": {
+        "load1": 0.42,
+        "cpus": 8
+      },
+      "memory": {
+        "used_bytes": 3298534400,
+        "total_bytes": 32985348096
+      },
+      "disk_percent": 42,
+      "disk": {
+        "size_bytes": 103865303040,
+        "used_bytes": 42585522176,
+        "available_bytes": 61263003648
+      },
+      "strained": [],
+      "idle_stop": {
+        "enabled": false,
+        "active": false,
+        "minutes": null,
+        "last_verdict": null
+      },
+      "doctor_failures": [
+        "codex:login: not signed in: send !login to this bot",
+        "claude account main: not signed in: send !login",
+        "zulip:claude: 401"
+      ],
+      "last_error": "codex:login: not signed in: send !login to this bot"
+    }
+  ],
+  "summary": {
+    "both": 0,
+    "codex_only": 1,
+    "claude_only": 0,
+    "neither": 1,
+    "unreachable": 1,
+    "stopped": 1,
+    "doctor_fail": 1
+  },
+  "ec2_error": null
+}

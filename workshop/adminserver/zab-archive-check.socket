@@ -1,0 +1,19 @@
+# docs/ADMIN.md §1.2; #374: the export re-pack's socket. collect_exports.py, run by the bot as
+# zab-admin, connects here; each connection starts an instance of zab-archive-check@.service of
+# its own, which gets that connection and nothing else. Only root and the zab-admin group may
+# connect; the directory is root's. A connection past MaxConnections is closed unanswered, which
+# refuses that archive (`!export` again).
+[Unit]
+Description=zab archive check: the export re-pack's socket
+
+[Socket]
+ListenStream=/run/zab-archive-check/check.sock
+SocketUser=root
+SocketGroup=zab-admin
+SocketMode=0660
+DirectoryMode=0755
+Accept=yes
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target

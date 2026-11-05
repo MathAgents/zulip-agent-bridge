@@ -1,0 +1,69 @@
+# docs/ADMIN.md §1.2, §2.9: the root helper of !new-workshop (zab.admin.confighelper). Started
+# by zab-admin-config.path, it reads and deletes the bot's request, validates the new entry and
+# the whole new admin.toml with the strict loader, then writes the new bot's key (root:zab-admin
+# 0640, never over a file) and admin.toml (atomically, keeping admin.toml.bak). Its outcome, and
+# a record of each change the bot can't alter, stay in its own state directory. It restarts
+# nothing: the bot that asked restarts itself once its apply has posted its result.
+# Root, with two capabilities: CAP_DAC_OVERRIDE to read and delete the request in zab-admin's
+# 0700 directory, CAP_CHOWN to give the key its group. No network.
+# What root runs (§1.6, #437): the system interpreter the release's venv is built from
+# (deploy.sh's PYTHON), not the venv's: zab-build builds the venv while third-party code runs,
+# and its pyvenv.cfg would choose the stdlib. Nothing of the venv runs as root. -I -B -S: no
+# environment, no site processing (no .pth line), no bytecode written; sys.path is the standard
+# library and the release's src/, resolved once through `current`. The helper imports
+# confighelper, config and checks, and the standard library (tests/admin/test_admin_imports.py,
+# HELPER_IMPORTS).
+# What it writes (#437): ProtectSystem=strict makes everything read-only but these.
+# - /etc/zab-admin, the directory: admin.toml is replaced by a rename there, which needs its
+#   directory writable (admin.toml.new; admin.toml.bak.new, a link to the old file; then both
+#   renames). A read-only mount on admin.toml would make the rename fail.
+# - /etc/zab-admin/secrets/bots: the new bot's key, created with O_EXCL. The rest of secrets/
+#   is hidden, under an empty read-only tmpfs.
+# - /var/lib/zab-admin-config, root's: its outcome, its record, and requests/, the bot's (it
+#   deletes the request there): no path the bot can swap is named here (review of #421).
+# Every other file deploy.sh installs in /etc/zab-admin is a read-only mount: the trust files,
+# the break-glass keys, and the nftables files root loads, which keep the console, the waker
+# and Caddy off the role. Each without "-": a missing one would be one the helper could create,
+# so the unit doesn't start instead. A deploy test checks this list against what a bootstrap
+# installs there. What stays open: the other bots' keys in secrets/bots (systemd names only
+# paths that exist when the unit starts), and any file an operator leaves in /etc/zab-admin by
+# hand, such as a rollback copy of admin.toml: nothing the helper can't do through admin.toml.
+# /var/lib/zab-admin (the fleet key, the bot's state, the participants' keys) is hidden.
+[Unit]
+Description=zab admin config helper: add a !new-workshop entry to admin.toml
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B -S -c "import os, sys; sys.path.append(os.path.realpath('/opt/zab-admin/current/src')); from zab.admin.confighelper import main; sys.exit(main())"
+ReadWritePaths=/etc/zab-admin /var/lib/zab-admin-config
+ReadOnlyPaths=/etc/zab-admin/allowed_signers /etc/zab-admin/backup_recipients /etc/zab-admin/break-glass
+ReadOnlyPaths=/etc/zab-admin/imds.nft /etc/zab-admin/nftables-imds.nft /etc/zab-admin/nftables-stop-imds.nft
+TemporaryFileSystem=/etc/zab-admin/secrets:ro
+BindPaths=/etc/zab-admin/secrets/bots
+InaccessiblePaths=-/var/lib/zab-admin
+TimeoutStartSec=60
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+IPAddressDeny=any
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE

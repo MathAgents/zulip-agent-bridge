@@ -1,0 +1,27 @@
+\documentclass{amsart}
+\usepackage{amssymb,mathtools,mathrsfs,stmaryrd}
+\usepackage{tikz-cd}
+\usepackage[all]{xy}
+\usepackage[backend=biber,style=alphabetic]{biblatex}
+\addbibresource{smoke.bib}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\newtheorem{theorem}{Theorem}
+\title{AMI smoke test}
+\begin{document}
+\maketitle
+\begin{theorem}\label{thm:main}
+For every prime $p$ the ring $\mathbb{Z}_p$ is local with maximal ideal $\mathfrak{m} = p\mathbb{Z}_p$,
+and $\mathscr{O}_X$ is a sheaf; see \cite{Serre}. Here $\llbracket a, b \rrbracket$ is an interval.
+\end{theorem}
+\Cref{thm:main} is illustrated by
+\[
+\begin{tikzcd}
+A \arrow[r, "f"] \arrow[d] & B \arrow[d, "g"] \\
+C \arrow[r] & D
+\end{tikzcd}
+\qquad
+\xymatrix{ A \ar[r] & B }
+\]
+\printbibliography
+\end{document}

@@ -1,0 +1,215 @@
+{
+ "schema": 1,
+ "image": "nt-agents-2026-v3",
+ "built": "2026-10-05",
+ "note": "The software of the Oct 9 fleet image (nt-agents-2026-v3, copied as zab-fleet-20261009), which push_config.py installs as /etc/zab/tools.json where an image has none (#475; tools_list.py). Versions come from workshop/ami/build.sh's pins, docs/DECISIONS.md, workshop/ami/files/julia/Manifest.toml and Ubuntu 24.04's archive (each entry's source); none is guessed, so some are empty. `unverified` marks what the image build's smoke test didn't run: the Sage environment's programs other than sage itself, and FLINT. `requires` lists the paths that must all exist on a VM for the entry to be installed there. `with` holds an entry's fields for a feature the rollout found on the VM (`sage-wrapper`: ~agent/.local/bin/sage is the image's wrapper, #482; sage_wrapper.py). `note`, `source`, `requires` and `with` are left out of the installed file.",
+ "tools": [
+  {
+   "name": "PARI/GP",
+   "version": "2.17.4",
+   "area": "Number theory",
+   "call": "gp -q < file.gp",
+   "summary": "with elldata, galdata, seadata, galpol and nflistdata",
+   "requires": ["/usr/local/bin/gp"],
+   "source": "build.sh PARI_VERSION; smoke test"
+  },
+  {
+   "name": "Magma",
+   "version": "",
+   "area": "Number theory",
+   "call": "magma -b file.m </dev/null",
+   "summary": "stdin closed, or a script ending in quit;: with stdin left open it waits at its prompt after the script, for good",
+   "requires": ["/usr/local/bin/magma"],
+   "source": "build.sh (tarball; its version isn't recorded); smoke test"
+  },
+  {
+   "name": "eclib (mwrank)",
+   "version": "",
+   "area": "Number theory",
+   "call": "~/miniforge/envs/sage/bin/mwrank -q < curves.txt",
+   "summary": "Cremona's ranks and generators of elliptic curves over Q; one curve a line, as [a1,a2,a3,a4,a6]",
+   "unverified": true,
+   "requires": ["/home/agent/miniforge/envs/sage/bin/mwrank"],
+   "source": "in the SageMath environment (software-stack proposal §1)"
+  },
+  {
+   "name": "FLINT",
+   "version": "3.0.1",
+   "area": "Number theory",
+   "call": "cc file.c -lflint -lgmp",
+   "summary": "C library for fast number theory and polynomial arithmetic (Ubuntu's libflint-dev)",
+   "unverified": true,
+   "requires": ["/usr/include/flint/flint.h"],
+   "source": "build.sh apt libflint-dev; Ubuntu 24.04's archive has 3.0.1"
+  },
+  {
+   "name": "LMFDB",
+   "version": "",
+   "area": "Number theory",
+   "call": "",
+   "summary": "the `lmfdb` MCP server: read-only SQL over the LMFDB database",
+   "requires": [],
+   "source": "build.sh LMFDB_MCP_URL and the first boot; smoke test"
+  },
+  {
+   "name": "SageMath",
+   "version": "10.9",
+   "area": "General computer algebra",
+   "call": "sage file.sage",
+   "summary": "or `sage -c '…'`; its gap(), giac() and r() need `PATH=~/miniforge/envs/sage/bin:$PATH` (libgap, Singular, Maxima, PALP and eclib work as is)",
+   "requires": ["/home/agent/miniforge/envs/sage/bin/sage"],
+   "with": {"sage-wrapper": {"summary": "or `sage -c '…'`; Sage's own GAP, Singular, Maxima, Giac, eclib, PALP and R work from it, gap(), giac() and r() included (conda env ~/miniforge/envs/sage)"}},
+   "source": "build.sh SAGE_VERSION; smoke test; the PATH caveat from the review of #480 (Sage's pexpect interfaces find their programs on PATH); with the sage wrapper, which the rollout installs in place of the image's link (#482), the image's own summary less the versions it didn't record"
+  },
+  {
+   "name": "Oscar",
+   "version": "1.8.2",
+   "area": "General computer algebra",
+   "call": "julia -e 'using Oscar; …'",
+   "summary": "Hecke, Nemo, Singular, polymake and GAP 4.16 in Julia; precompiled in the default environment: never Pkg.update() it",
+   "requires": ["/usr/local/bin/julia", "/home/agent/.julia/compiled/v1.12/Oscar"],
+   "source": "build.sh OSCAR_VERSION and julia/Manifest.toml; smoke test"
+  },
+  {
+   "name": "Julia",
+   "version": "1.12.7",
+   "area": "General computer algebra",
+   "call": "julia file.jl",
+   "summary": "Oscar's environment is the default one",
+   "requires": ["/usr/local/bin/julia"],
+   "source": "build.sh JULIA_VERSION; smoke test"
+  },
+  {
+   "name": "Maxima",
+   "version": "",
+   "area": "General computer algebra",
+   "call": "~/miniforge/envs/sage/bin/maxima --very-quiet -b file.mac </dev/null",
+   "summary": "symbolic computation, the SageMath environment's",
+   "unverified": true,
+   "requires": ["/home/agent/miniforge/envs/sage/bin/maxima"],
+   "source": "in the SageMath environment (software-stack proposal §1)"
+  },
+  {
+   "name": "GAP",
+   "version": "4.12.1",
+   "area": "Groups and representation theory",
+   "call": "gap -q < file.g",
+   "summary": "with SmallGrp, TransGrp, PrimGrp, AutPGrp, Alnuth, FactInt, Polycyclic and the character table library; GAP 4.16 also comes with Oscar",
+   "requires": ["/usr/bin/gap"],
+   "source": "build.sh apt gap; Ubuntu 24.04's archive has 4.12.1; smoke test"
+  },
+  {
+   "name": "Singular",
+   "version": "",
+   "area": "Commutative algebra and algebraic geometry",
+   "call": "~/miniforge/envs/sage/bin/Singular -q < file.sing",
+   "summary": "the SageMath environment's; Singular 4.4 also comes with Oscar",
+   "unverified": true,
+   "requires": ["/home/agent/miniforge/envs/sage/bin/Singular"],
+   "source": "in the SageMath environment (software-stack proposal §1); Oscar's from Singular_jll 404.101.510"
+  },
+  {
+   "name": "gfan",
+   "version": "",
+   "area": "Commutative algebra and algebraic geometry",
+   "call": "~/miniforge/envs/sage/bin/gfan < input",
+   "summary": "Gröbner fans and tropical varieties, the SageMath environment's",
+   "unverified": true,
+   "requires": ["/home/agent/miniforge/envs/sage/bin/gfan"],
+   "source": "in the SageMath environment (software-stack proposal §1)"
+  },
+  {
+   "name": "polymake",
+   "version": "4.15",
+   "area": "Polyhedral geometry and combinatorics",
+   "call": "julia -e 'using Oscar; …'",
+   "summary": "through Oscar (Polymake.jl); normaliz, 4ti2, TOPCOM, lrs, cddlib and nauty come with it",
+   "requires": ["/usr/local/bin/julia", "/home/agent/.julia/compiled/v1.12/Oscar"],
+   "source": "julia/Manifest.toml: polymake_jll 400.1500.5"
+  },
+  {
+   "name": "PALP",
+   "version": "",
+   "area": "Polyhedral geometry and combinatorics",
+   "call": "~/miniforge/envs/sage/bin/poly.x -f < polytope.txt",
+   "summary": "lattice polytopes, the SageMath environment's",
+   "unverified": true,
+   "requires": ["/home/agent/miniforge/envs/sage/bin/poly.x"],
+   "source": "in the SageMath environment (software-stack proposal §1)"
+  },
+  {
+   "name": "GLPK",
+   "version": "",
+   "area": "Optimization and constraint solving",
+   "call": "~/miniforge/envs/sage/bin/glpsol --lp file.lp",
+   "summary": "linear and integer programming, the SageMath environment's; SCIP and Ipopt come with Oscar",
+   "unverified": true,
+   "requires": ["/home/agent/miniforge/envs/sage/bin/glpsol"],
+   "source": "in the SageMath environment (software-stack proposal §1)"
+  },
+  {
+   "name": "R",
+   "version": "",
+   "area": "Numerics, statistics and data",
+   "call": "~/miniforge/envs/sage/bin/Rscript file.R",
+   "summary": "the SageMath environment's",
+   "unverified": true,
+   "requires": ["/home/agent/miniforge/envs/sage/bin/Rscript"],
+   "source": "in the SageMath environment (software-stack proposal §1)"
+  },
+  {
+   "name": "Python",
+   "version": "3.12",
+   "area": "Numerics, statistics and data",
+   "call": "python3 file.py",
+   "summary": "the default python (~/venv), with numpy, sympy, matplotlib, jupyter and cypari2",
+   "requires": ["/home/agent/venv/bin/python"],
+   "source": "build.sh uv venv --python 3.12; smoke test"
+  },
+  {
+   "name": "Lean 4 and Mathlib",
+   "version": "v4.34.1",
+   "area": "Formal proof",
+   "call": "cd ~/lean/workspace && lake env lean File.lean",
+   "summary": "Mathlib v4.34.1 is built there; import narrowly",
+   "requires": ["/home/agent/lean/workspace"],
+   "source": "docs/DECISIONS.md versions table; smoke test"
+  },
+  {
+   "name": "lean-project",
+   "version": "",
+   "area": "Formal proof",
+   "call": "lean-project DIR",
+   "summary": "a Lean project in DIR on the VM's one shared, built Mathlib",
+   "requires": ["/usr/local/bin/lean-project"],
+   "source": "push_config.py --lean-shared (#205), not the image: listed from the rollout after the one that installs it, since the tools step runs before --lean-shared's"
+  },
+  {
+   "name": "comparator",
+   "version": "d03acab",
+   "area": "Formal proof",
+   "call": "comparator-run config.json",
+   "summary": "from a Lake project's root with a config.json: checks that a solution proves the challenge's statement with only the permitted axioms",
+   "requires": ["/usr/local/bin/comparator-run"],
+   "source": "docs/DECISIONS.md versions table; smoke test"
+  },
+  {
+   "name": "lean-lsp",
+   "version": "0.31.0",
+   "area": "Formal proof",
+   "call": "",
+   "summary": "the `lean-lsp` MCP server: goals, diagnostics, hover and search in Lean files",
+   "requires": ["/home/agent/.local/bin/lean-lsp-mcp"],
+   "source": "build.sh LEAN_LSP_MCP_VERSION; smoke test"
+  },
+  {
+   "name": "TeX Live",
+   "version": "2023",
+   "area": "Documents and figures",
+   "call": "latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex",
+   "summary": "or `-lualatex`, `-xelatex`; amsart, tikz-cd, xy, biblatex with biber, cleveref, stmaryrd, mathrsfs and quiver; chktex and latexdiff",
+   "requires": ["/usr/bin/latexmk"],
+   "source": "build.sh apt texlive-*; Ubuntu 24.04's archive has 2023; smoke test"
+  }
+ ]
+}

@@ -1,0 +1,15 @@
+# docs/ADMIN.md §1.2, §5: the waker's start path. Only root and the zab-waker group may connect;
+# the directory is root's, so the waker can create nothing in it.
+[Unit]
+Description=zab admin starter: the waker's start-request socket
+
+[Socket]
+ListenStream=/run/zab-admin-starter/start.sock
+SocketUser=root
+SocketGroup=zab-waker
+SocketMode=0660
+DirectoryMode=0755
+Accept=no
+
+[Install]
+WantedBy=sockets.target

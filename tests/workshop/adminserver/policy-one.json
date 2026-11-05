@@ -1,0 +1,241 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyServer",
+      "Effect": "Deny",
+      "Action": "ec2:*",
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/zab-admin": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyServerTag",
+      "Effect": "Deny",
+      "Action": "ec2:*",
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/zab-admin": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyScopeRetag",
+      "Effect": "Deny",
+      "Action": "ec2:CreateTags",
+      "Resource": "*",
+      "Condition": {
+        "ForAnyValue:StringEqualsIgnoreCase": {
+          "aws:TagKeys": [
+            "workshop",
+            "zab-admin",
+            "zab-scope"
+          ]
+        },
+        "Null": {
+          "ec2:CreateAction": "true"
+        }
+      }
+    },
+    {
+      "Sid": "DenyUntag",
+      "Effect": "Deny",
+      "Action": "ec2:DeleteTags",
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyExistingInterface",
+      "Effect": "Deny",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:*:*:network-interface/eni-*"
+    },
+    {
+      "Sid": "Read",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeAddresses",
+        "ec2:DescribeImages",
+        "ec2:DescribeInstances",
+        "ec2:DescribeKeyPairs",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeVolumesModifications"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-2"
+        }
+      }
+    },
+    {
+      "Sid": "UsEast2Launch",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:us-east-2:*:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/zab-scope": "mathagents",
+          "ec2:InstanceType": [
+            "m7a.2xlarge",
+            "m7a.xlarge"
+          ]
+        },
+        "Null": {
+          "aws:RequestTag/workshop": "false"
+        }
+      }
+    },
+    {
+      "Sid": "UsEast2LaunchVolume",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:us-east-2:*:volume/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/zab-scope": "mathagents"
+        },
+        "Null": {
+          "aws:RequestTag/workshop": "false"
+        }
+      }
+    },
+    {
+      "Sid": "UsEast2LaunchFrom",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:us-east-2:*:image/*",
+        "arn:aws:ec2:us-east-2:*:key-pair/*",
+        "arn:aws:ec2:us-east-2:*:security-group/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/zab-scope": "mathagents"
+        }
+      }
+    },
+    {
+      "Sid": "UsEast2Create",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AllocateAddress",
+        "ec2:ImportKeyPair"
+      ],
+      "Resource": [
+        "arn:aws:ec2:us-east-2:*:elastic-ip/*",
+        "arn:aws:ec2:us-east-2:*:key-pair/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/zab-scope": "mathagents"
+        },
+        "Null": {
+          "aws:RequestTag/workshop": "false"
+        }
+      }
+    },
+    {
+      "Sid": "UsEast2TagAtCreation",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": [
+        "arn:aws:ec2:us-east-2:*:elastic-ip/*",
+        "arn:aws:ec2:us-east-2:*:instance/*",
+        "arn:aws:ec2:us-east-2:*:key-pair/*",
+        "arn:aws:ec2:us-east-2:*:volume/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/zab-scope": "mathagents",
+          "ec2:CreateAction": [
+            "AllocateAddress",
+            "ImportKeyPair",
+            "RunInstances"
+          ]
+        },
+        "Null": {
+          "aws:RequestTag/workshop": "false"
+        }
+      }
+    },
+    {
+      "Sid": "UsEast2Retag",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": [
+        "arn:aws:ec2:us-east-2:*:elastic-ip/*",
+        "arn:aws:ec2:us-east-2:*:instance/*",
+        "arn:aws:ec2:us-east-2:*:volume/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/zab-scope": "mathagents"
+        },
+        "Null": {
+          "aws:ResourceTag/workshop": "false"
+        },
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "Name",
+            "participant"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "UsEast2Fleet",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstanceAttribute",
+        "ec2:GetConsoleOutput",
+        "ec2:ModifyInstanceAttribute",
+        "ec2:StartInstances",
+        "ec2:StopInstances",
+        "ec2:TerminateInstances",
+        "ec2:AssociateAddress",
+        "ec2:DisassociateAddress",
+        "ec2:ReleaseAddress"
+      ],
+      "Resource": [
+        "arn:aws:ec2:us-east-2:*:elastic-ip/*",
+        "arn:aws:ec2:us-east-2:*:instance/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/zab-scope": "mathagents"
+        },
+        "Null": {
+          "aws:ResourceTag/workshop": "false"
+        }
+      }
+    },
+    {
+      "Sid": "UsEast2Volume",
+      "Effect": "Allow",
+      "Action": "ec2:ModifyVolume",
+      "Resource": "arn:aws:ec2:us-east-2:*:volume/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/zab-scope": "mathagents"
+        },
+        "Null": {
+          "aws:ResourceTag/workshop": "false"
+        }
+      }
+    },
+    {
+      "Sid": "LaunchNetwork",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:us-east-2:*:network-interface/*",
+        "arn:aws:ec2:us-east-2:*:subnet/*"
+      ]
+    }
+  ]
+}

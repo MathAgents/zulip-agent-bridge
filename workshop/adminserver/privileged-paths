@@ -1,0 +1,25 @@
+# The release's privileged surface (DECISIONS D31, D32; docs/ADMIN.md §1.6): what root runs or
+# installs, and what decides the code `deploy.sh --wheel` builds with on the deployer's laptop.
+# Drew reads these files himself before he signs; `deploy.sh --review` marks them P, shows their
+# diff first, and shows whole once a file that joins the set. Each is a release path, or under
+# one, and the list must hold workshop/adminserver: deploy.sh checks both.
+#
+# D31 (Drew, Oct 17): workshop/adminserver, whole. deploy.sh, which root runs; what it installs
+# as root (sysusers.conf, tmpfiles.conf, the nftables rules, every unit, socket, path unit and
+# drop-in, the Caddyfile); render_policy.py, whose output bounds the role; this list and
+# release-paths. A file added there is privileged at once.
+workshop/adminserver
+# D32 (Drew, Oct 18): the root helper of !new-workshop (zab-admin-config.service, as root): its
+# own code, and the two modules whose functions it runs as root, the strict loader of what it
+# writes into admin.toml and the key checks.
+src/zab/admin/confighelper.py
+src/zab/admin/config.py
+src/zab/admin/checks.py
+# D32: what `deploy.sh --wheel` builds with, pyproject.toml (which deploy.sh holds to hatchling's
+# own build) and the backend's pins, build-constraints.txt; and uv.lock, the third-party code of
+# the server's venv, which the bot (with the fleet key), the starter (with the role) and the
+# other units run, read through the review's summary by package. (The helper, since #438, runs
+# the system python3 with -S: nothing of the venv.)
+pyproject.toml
+build-constraints.txt
+uv.lock

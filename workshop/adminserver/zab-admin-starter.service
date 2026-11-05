@@ -1,0 +1,48 @@
+# docs/ADMIN.md §1.2, §5: the waker's start path (zab.admin.starter, PR 21). It reads requests
+# from zab-admin-starter.socket: a workshop and instance IDs to describe, or one to start. It
+# describes them and checks each against admin.toml's fleets (scope tags, participant tag, no
+# zab-admin tag, region), rate-limits starts, and calls StartInstances; DescribeInstances and
+# StartInstances are the only calls it makes. It exits when admin.toml changes; the socket
+# starts it again. It holds the role but no key. It runs as its own user, zab-starter: as
+# zab-admin it could read the bot's keys through /proc/<pid>/root, whatever its mounts hide.
+# Its rate-limit state is in /var/lib/zab-starter, 0711 for log/, its start log, which only the
+# bots read (tmpfiles.conf, #359); it can read nothing of zab-admin's.
+[Unit]
+Description=zab admin starter: start a fleet VM for the waker, after checks
+Requires=zab-admin-starter.socket
+Wants=network-online.target zab-admin-imds.service
+After=zab-admin-starter.socket network-online.target zab-admin-imds.service
+
+[Service]
+User=zab-starter
+Group=zab-starter
+ExecStart=/opt/zab-admin/current/.venv/bin/python -I -m zab.admin starter --config /etc/zab-admin/admin.toml
+StateDirectory=zab-starter
+StateDirectoryMode=0711
+InaccessiblePaths=-/var/lib/zab-admin -/etc/zab-admin/secrets
+Restart=on-failure
+RestartSec=5
+MemoryMax=256M
+TasksMax=32
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=

@@ -1,0 +1,855 @@
+#!/usr/bin/env python3
+"""lean-project: Lean projects that share one read-only Mathlib per VM (issue #205).
+
+    lean-project [--name NAME] DIR      a new project in DIR, linked to the shared Mathlib
+    lean-project --repair [DIR]         link an existing project that pins the shared revision
+    lean-project --repair-all [DIR]     the same for every project under DIR (depth 3 or less)
+    lean-project --check [--comparator] time a one-file Mathlib build in a scratch project
+    lean-project --install WORKSPACE    (root) make WORKSPACE's packages the shared copy
+    lean-project --uninstall WORKSPACE  (root) undo --install, after a failed --check
+    lean-project --reclaim [--apply] DIR replace private copies on the shared pins under DIR
+
+A Lean project normally unpacks its own Mathlib into `.lake/packages` (about 8 GB, minutes).
+Here every project on the shared pins gets a symlink instead, to the read-only
+`/opt/lean/packages/<tag>` (`<tag>` from `lean-toolchain`, such as `v4.34.1`), and new
+projects copy `lean-toolchain`, `lakefile.toml` and `lake-manifest.json` from
+`/opt/lean/template/<tag>`. A project on other pins is left alone, with a plain note: a
+private copy costs gigabytes, so the participant should be asked first. Nothing here downloads
+or builds Mathlib. The VERIFY behind this (Lake, `cache get`, lean-lsp and concurrent builds
+through the symlink; loud failures for other revisions) is in docs/DECISIONS.md, 2026-10-12.
+
+The shared copy keeps the owner of the workspace it came from (`agent`, who runs Lean), with
+every write bit off. It must not belong to root: Lake runs git in every dependency each time it
+loads a project, git refuses a repository another user owns ("dubious ownership"), and Lake
+then tries to delete and re-clone the package, and fails. Root ownership would protect nothing
+more, since `agent` has passwordless sudo.
+
+Standard library only: the VM's system Python runs it. `LEAN_PROJECT_ROOT` replaces `/opt/lean`
+in tests.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from collections import Counter
+from pathlib import Path
+
+ROOT = Path(os.environ.get("LEAN_PROJECT_ROOT", "/opt/lean"))
+CONFIG = ("lean-toolchain", "lakefile.toml", "lake-manifest.json")
+SKIP = {".lake", ".zab", ".git", "node_modules"}
+DEPTH = 3
+PLACEHOLDER_NAME, PLACEHOLDER_LIB = "@NAME@", "@LIB@"
+
+
+class Refused(Exception):
+    """A plain one-line reason; nothing was changed."""
+
+
+# ----------------------------------------------------------------------------- pins
+
+
+def toolchain(project: Path) -> str:
+    return (project / "lean-toolchain").read_text().strip()
+
+
+def tag_of(toolchain_text: str) -> str:
+    """`leanprover/lean4:v4.34.1` -> `v4.34.1`."""
+    tag = toolchain_text.rsplit(":", 1)[-1].strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", tag):
+        raise Refused(f"unexpected lean-toolchain {toolchain_text!r}")
+    return tag
+
+
+def manifest(project: Path) -> dict:
+    return lake_manifest(json.loads((project / "lake-manifest.json").read_text()))
+
+
+def lake_manifest(data: object) -> dict:
+    """`data` if it has a Lake manifest's shape, else ValueError (codex round 3 on #258)."""
+    packages = data.get("packages", []) if isinstance(data, dict) else None
+    if not isinstance(packages, list) or not all(
+        isinstance(p, dict) and isinstance(p.get("name"), str) for p in packages
+    ):
+        raise ValueError("lake-manifest.json isn't a Lake manifest")
+    return data
+
+
+def pins(data: dict) -> dict[str, str]:
+    return {p["name"]: p.get("rev", "") for p in data.get("packages", [])}
+
+
+def sources(data: dict) -> dict[str, tuple[str, ...]]:
+    """What Lake loads each package from: its kind, its revision and its directory. Not its
+    URL: Lake v4.34.1 compares URLs only when a checkout isn't at the manifest's revision
+    (`PackageEntry.materialize`), so a fork at the same commit loads the same files from the
+    shared copy (review on #262, correcting codex round 4 on #258)."""
+    keys = ("type", "rev", "subDir", "dir")
+    return {p["name"]: tuple(str(p.get(k) or "") for k in keys) for p in data.get("packages", [])}
+
+
+def mathlib_rev(data: dict) -> str:
+    rev = pins(data).get("mathlib", "")
+    inputs = {p["name"]: p.get("inputRev") for p in data.get("packages", [])}
+    return f"{inputs.get('mathlib') or '?'} = {rev[:8]}" if rev else "no Mathlib"
+
+
+class Shared:
+    """One toolchain's shared packages and template."""
+
+    def __init__(self, tag: str, root: Path | None = None) -> None:
+        root = root or ROOT
+        self.tag = tag
+        self.packages = root / "packages" / tag
+        self.template = root / "template" / tag
+
+    @property
+    def ready(self) -> bool:
+        return self.packages.is_dir() and (self.template / "lake-manifest.json").is_file()
+
+    def matches(self, project: Path) -> bool:
+        return (
+            toolchain(project) == toolchain(self.template)
+            and sources(manifest(project)) == sources(manifest(self.template))
+            and manifest(project).get("packagesDir", ".lake/packages") == ".lake/packages"
+        )
+
+
+def version_key(tag: str) -> tuple[tuple[int, ...], int, tuple[str | int, ...]]:
+    """Sorts `v4.9.0` < `v4.34.1-rc2` < `v4.34.1`: numbers as numbers, and a pre-release
+    before its release."""
+    m = re.fullmatch(r"v?(\d+(?:\.\d+)*)(?:-(.+))?", tag)
+    if not m:
+        return ((), 0, (tag,))
+    pre = m.group(2) or ""
+    parts = tuple(int(x) if x.isdigit() else x for x in re.split(r"(\d+)", pre))
+    return (tuple(int(n) for n in m.group(1).split(".")), 0 if pre else 1, parts)
+
+
+def installed(root: Path | None = None) -> list[Shared]:
+    """The shared toolchains, oldest first."""
+    root = root or ROOT
+    tags = sorted((p.name for p in (root / "template").glob("*") if p.is_dir()), key=version_key)
+    return [s for s in (Shared(t, root) for t in tags) if s.ready]
+
+
+def free_gb(path: Path) -> float:
+    usage = shutil.disk_usage(path)
+    return usage.free / 1e9
+
+
+# ----------------------------------------------------------------------------- link
+
+
+def link(project: Path, shared: Shared) -> str:
+    """Point `.lake/packages` at the shared copy; never touches an existing directory."""
+    packages = project / ".lake" / "packages"
+    if packages.is_symlink():
+        if os.path.realpath(packages) == os.path.realpath(shared.packages):
+            return "already linked to the shared Mathlib"
+        return f"left alone: .lake/packages points to {os.readlink(packages)}"
+    if packages.exists():
+        return (
+            "left alone: it has its own copy of Mathlib in .lake/packages (several GB); "
+            "the organizers can replace it with the shared one"
+        )
+    packages.parent.mkdir(exist_ok=True)
+    packages.symlink_to(shared.packages)
+    return f"linked to the shared Mathlib ({shared.tag})"
+
+
+def other_pins_note(project: Path, shared: list[Shared]) -> str:
+    try:
+        data = manifest(project)
+        have = f"Lean {tag_of(toolchain(project))}, Mathlib {mathlib_rev(data)}"
+        for s in shared:  # the same versions, so say what else differs
+            if toolchain(project) == toolchain(s.template) and pins(data) == pins(
+                manifest(s.template)
+            ):
+                ours = sources(manifest(s.template))
+                other = sorted(n for n, src in sources(data).items() if src != ours.get(n))
+                have += (
+                    f", but another source for {', '.join(other)} (kind or directory)"
+                    if other
+                    else ", but its manifest puts the packages outside .lake/packages"
+                )
+                break
+    except (OSError, ValueError, KeyError, Refused):
+        have = "pins this VM can't read"
+    offer = ", ".join(f"Lean {s.tag}, Mathlib {mathlib_rev(manifest(s.template))}" for s in shared)
+    return (
+        f"not linked: it uses {have}; the shared copy is {offer or 'not installed'}. A private "
+        f"copy takes about 8 GB and several minutes ({free_gb(project):.0f} GB free): ask the "
+        "participant before running `lake exe cache get` here."
+    )
+
+
+def repair(project: Path, root: Path | None = None) -> str:
+    if not ((project / "lakefile.toml").is_file() or (project / "lakefile.lean").is_file()):
+        raise Refused(f"{project} is not a Lean project (no lakefile)")
+    if not (project / "lake-manifest.json").is_file():
+        return (
+            "not linked: there is no lake-manifest.json, so Lake would resolve and download "
+            "everything; create projects with lean-project"
+        )
+    if not (project / "lean-toolchain").is_file():
+        return "not linked: there is no lean-toolchain"
+    shared = installed(root)
+    for s in shared:
+        if s.matches(project):
+            return link(project, s)
+    return other_pins_note(project, shared)
+
+
+def projects(top: Path, depth: int = DEPTH) -> list[Path]:
+    """Lean projects (a lakefile) under `top`, `depth` levels deep at most."""
+    found: list[Path] = []
+
+    def walk(d: Path, level: int) -> None:
+        if (d / "lakefile.toml").is_file() or (d / "lakefile.lean").is_file():
+            found.append(d)
+            return  # a project's own subdirectories are its sources
+        if level == depth:
+            return
+        try:
+            children = sorted(p for p in d.iterdir() if p.is_dir() and not p.is_symlink())
+        except OSError:
+            return
+        for child in children:
+            if child.name not in SKIP:
+                walk(child, level + 1)
+
+    walk(top, 0)
+    return found
+
+
+# ----------------------------------------------------------------------------- new
+
+
+#: Root modules of Lean and of the shared packages. A library of one of these names takes their
+#: modules over and `lake build` fails ("bad import 'Lean.Elab.Command'"), so `lean-project
+#: lean`, the instructions' example, makes the library LeanProject.
+TAKEN = frozenset(
+    "Init Std Lean Lake Mathlib Archive Counterexamples Batteries Aesop Qq ProofWidgets "
+    "Plausible ImportGraph LeanSearchClient Cli".split()
+)
+
+
+def lib_name(name: str) -> str:
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", name) if p]
+    lib = "".join(p[:1].upper() + p[1:] for p in parts) or "Project"
+    lib = lib if lib[0].isalpha() else "P" + lib
+    return f"{lib}Project" if lib in TAKEN else lib
+
+
+def package_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", name).strip("-") or "project"
+
+
+def same_pins(mine: Path, shared: Path) -> bool:
+    """Whether an existing lean-toolchain or lake-manifest.json agrees with the template's."""
+    try:
+        if mine.name == "lean-toolchain":
+            return mine.read_text().strip() == shared.read_text().strip()
+        data = lake_manifest(json.loads(mine.read_text()))
+        # the symlink is .lake/packages: a manifest pointing Lake elsewhere would bypass it
+        # (codex round 2 on #258)
+        return (
+            sources(data) == sources(lake_manifest(json.loads(shared.read_text())))
+            and data.get("packagesDir", ".lake/packages") == ".lake/packages"
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def new(directory: Path, name: str | None, root: Path | None = None) -> str:
+    if (directory / "lakefile.toml").exists() or (directory / "lakefile.lean").exists():
+        raise Refused(f"{directory} is already a Lean project: use lean-project --repair")
+    shared = installed(root)
+    if not shared:
+        raise Refused(f"no shared Mathlib is installed in {root or ROOT}")
+    s = shared[-1]
+    clash = [
+        f
+        for f in ("lean-toolchain", "lake-manifest.json")
+        if (directory / f).is_file() and not same_pins(directory / f, s.template / f)
+    ]
+    if clash:
+        # the shared packages can't serve other pins: refuse before writing anything (codex
+        # round 1 on #258)
+        raise Refused(
+            f"{directory} already has {' and '.join(clash)} for other pins than the shared "
+            f"Lean {s.tag}; nothing was changed"
+        )
+    packages = directory / ".lake" / "packages"
+    if (packages.exists() or packages.is_symlink()) and os.path.realpath(
+        packages
+    ) != os.path.realpath(s.packages):
+        # its own copy, or a link elsewhere: link() would leave it, so nothing would be shared
+        # (codex round 2 on #258)
+        raise Refused(
+            f"{directory} already has .lake/packages that isn't the shared Mathlib; nothing "
+            "was changed"
+        )
+    pkg = package_name(name or directory.resolve().name)
+    lib = lib_name(name or directory.resolve().name)
+    directory.mkdir(parents=True, exist_ok=True)
+    for src in sorted(p for p in s.template.rglob("*") if p.is_file()):
+        rel = Path(str(src.relative_to(s.template)).replace(PLACEHOLDER_LIB, lib))
+        dest = directory / rel
+        text = src.read_text().replace(PLACEHOLDER_NAME, pkg).replace(PLACEHOLDER_LIB, lib)
+        if dest.name == ".gitignore" and dest.exists():
+            current = dest.read_text()
+            if "/.lake" not in current.split():
+                dest.write_text(current.rstrip("\n") + "\n/.lake\n")
+            continue
+        if dest.exists():
+            continue  # never overwrite the participant's files
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text)
+    link(directory, s)
+    return (
+        f"Created the Lean project {pkg} (library {lib}) in {directory}, using the shared "
+        f"Mathlib ({s.tag}): nothing to download. Check a file with `lake env lean File.lean`, "
+        "build with `lake build`. Never run `lake update` or `lake exe cache get` here."
+    )
+
+
+# ----------------------------------------------------------------------------- install (root)
+
+
+def device(path: Path) -> int:
+    return os.stat(path).st_dev
+
+
+def template_lakefile(text: str) -> str:
+    """The workspace's lakefile with its package and library names as placeholders."""
+    name = re.search(r'^name\s*=\s*"([^"]+)"', text, re.M)
+    lib = re.search(r'\[\[lean_lib\]\]\s*\nname\s*=\s*"([^"]+)"', text)
+    if not name or not lib or 'name = "mathlib"' not in text:
+        raise Refused("the workspace's lakefile.toml isn't the `lake new … math` one")
+    text = text[: name.start(1)] + PLACEHOLDER_NAME + text[name.end(1) :]
+    return text.replace(f'"{lib.group(1)}"', f'"{PLACEHOLDER_LIB}"')
+
+
+def entries(top: Path) -> list[str]:
+    """`top` and everything under it; symlinks are listed, never followed."""
+    found = [str(top)]
+    for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
+        found += [os.path.join(dirpath, name) for name in [*dirnames, *filenames]]
+    return found
+
+
+def read_only(top: Path, *, owner: tuple[int, int] | None) -> None:
+    """Every write bit off, and every entry given to `owner` (uid, gid) unless that is None;
+    symlinks are never followed."""
+    for p in entries(top):
+        if owner is not None:
+            os.lchown(p, *owner)
+        if not os.path.islink(p):
+            os.chmod(p, os.lstat(p).st_mode & 0o7555)
+
+
+def bits_record(s: Shared) -> Path:
+    """Where install() records the write bits the packages had, for --uninstall."""
+    return s.packages.parent / f"{s.tag}.write-bits.json"
+
+
+def save_bits(top: Path, record: Path) -> None:
+    """The write bits of everything under `top`, by path relative to it: the commonest value
+    once, the others path by path."""
+    had = {
+        os.path.relpath(p, top): os.lstat(p).st_mode & 0o222
+        for p in entries(top)
+        if not os.path.islink(p)
+    }
+    common = Counter(had.values()).most_common(1)[0][0] if had else 0
+    others = {path: bits for path, bits in had.items() if bits != common}
+    record.write_text(json.dumps({"default": common, "paths": others}))
+
+
+def template_files(workspace: Path) -> dict[str, str]:
+    """The template's files, from the workspace's configuration; Refused if it can't be one."""
+    data = manifest(workspace)
+    data["name"] = PLACEHOLDER_NAME
+    return {
+        "lean-toolchain": toolchain(workspace) + "\n",
+        "lakefile.toml": template_lakefile((workspace / "lakefile.toml").read_text()),
+        "lake-manifest.json": json.dumps(data, indent=1) + "\n",
+        ".gitignore": "/.lake\n",
+        f"{PLACEHOLDER_LIB}.lean": f"import {PLACEHOLDER_LIB}.Basic\n",
+        f"{PLACEHOLDER_LIB}/Basic.lean": "import Mathlib.Tactic\n",
+    }
+
+
+def write_template(s: Shared, files: dict[str, str], as_root: bool) -> None:
+    for dirpath, _, _ in os.walk(s.template):  # a rerun rewrites the read-only template
+        os.chmod(dirpath, 0o755)  # noqa: S103 - everyone reads it; read_only drops the w below
+    s.template.mkdir(parents=True, exist_ok=True)
+    for rel, text in files.items():
+        dest = s.template / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            os.chmod(dest, 0o644)
+        dest.write_text(text)
+    read_only(s.template, owner=(0, 0) if as_root else None)  # only read: no git runs there
+
+
+def install(workspace: Path, root: Path | None = None) -> str:
+    """Move WORKSPACE/.lake/packages to the shared place (a rename), make it read-only and link
+    it back; write the template. Idempotent.
+
+    Everything that can be checked is checked before anything changes, and the record of the
+    write bits is written before the rename; any failure after it puts the workspace back as
+    it was (review on #262)."""
+    s = Shared(tag_of(toolchain(workspace)), root)
+    packages = workspace / ".lake" / "packages"
+    ws = os.stat(workspace)
+    as_root = os.geteuid() == 0
+    # the workspace owner's, never root's: as another user, git refuses the packages and every
+    # Lake command fails (review on #258); a rerun as root gives a root-owned copy back
+    owner = (ws.st_uid, ws.st_gid) if as_root else None
+    files = template_files(workspace)
+    if packages.is_symlink():
+        if os.path.realpath(packages) != os.path.realpath(s.packages):
+            raise Refused(f"{packages} already points to {os.readlink(packages)}")
+        read_only(s.packages, owner=owner)
+        write_template(s, files, as_root)
+        return f"already shared; read-only; template {s.template}"
+    if not packages.is_dir():
+        raise Refused(f"{packages} doesn't exist: build the workspace first")
+    if s.packages.exists():
+        raise Refused(f"{s.packages} exists but {packages} isn't linked to it")
+    s.packages.parent.mkdir(parents=True, exist_ok=True)
+    if device(packages) != device(s.packages.parent):
+        raise Refused(
+            f"{packages} and {s.packages.parent} are on different filesystems; moving "
+            "would copy gigabytes"
+        )
+    save_bits(packages, bits_record(s))
+    try:
+        os.rename(packages, s.packages)
+        packages.symlink_to(s.packages)
+        if owner is not None:
+            os.lchown(packages, *owner)
+        read_only(s.packages, owner=owner)
+        write_template(s, files, as_root)
+    except BaseException:
+        restore(s, packages)
+        raise
+    return f"moved {packages} to {s.packages}; read-only; template {s.template}"
+
+
+def restore(s: Shared, packages: Path) -> None:
+    """Put the packages back in the workspace (`packages`) with the write bits recorded before
+    the move, from wherever a move stopped; then remove the template and the record. The owner
+    isn't restored: the copy was the workspace owner's before, as Lake made it."""
+    record = bits_record(s)
+    data = json.loads(record.read_text())
+    common, others = int(data["default"]), {k: int(v) for k, v in data["paths"].items()}
+    if s.packages.is_dir() and not s.packages.is_symlink():
+        for p in entries(s.packages):
+            if not os.path.islink(p):
+                bits = others.get(os.path.relpath(p, s.packages), common)
+                os.chmod(p, os.lstat(p).st_mode | bits)
+        if packages.is_symlink():
+            packages.unlink()
+        if not packages.exists():
+            os.rename(s.packages, packages)
+    for dirpath, _, _ in os.walk(s.template):
+        os.chmod(dirpath, 0o755)  # noqa: S103 - only so that it can be deleted
+    shutil.rmtree(s.template, ignore_errors=True)
+    record.unlink()
+
+
+def uninstall(workspace: Path, root: Path | None = None) -> str:
+    """Undo the install() that moved WORKSPACE's packages: they go back, with the write bits
+    they had, and the template goes. For a rollout whose check failed, so that Lean keeps
+    working as before (review on #259). A project linked in between keeps a dangling link."""
+    s = Shared(tag_of(toolchain(workspace)), root)
+    packages = workspace / ".lake" / "packages"
+    record = bits_record(s)
+    if not packages.is_symlink() or os.path.realpath(packages) != os.path.realpath(s.packages):
+        raise Refused(f"{packages} isn't the link to {s.packages}: nothing to undo")
+    if not record.is_file():
+        raise Refused(f"{record} is missing, so the write bits are unknown; nothing was changed")
+    restore(s, packages)
+    return f"moved {s.packages} back to {packages}, writable as before; template removed"
+
+
+# ----------------------------------------------------------------------------- reclaim
+
+
+def size_bytes(top: Path) -> int:
+    """Disk used under `top` (allocated blocks), symlinks not followed."""
+    total = 0
+    for dirpath, _, filenames in os.walk(top, followlinks=False):
+        for name in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def checkouts(top: Path) -> list[Path]:
+    """`top` and the checkouts in it (the participant's ~/work), each with its topic worktrees
+    (`.zab/worktrees/*`), which `projects()` alone skips."""
+    found: list[Path] = []
+    candidates = [top]
+    if top.is_dir():
+        candidates += sorted(p for p in top.iterdir() if p.is_dir() and not p.is_symlink())
+    for repo in candidates:
+        found.append(repo)
+        worktrees = repo / ".zab" / "worktrees"
+        if worktrees.is_dir():
+            found += sorted(p for p in worktrees.iterdir() if p.is_dir() and not p.is_symlink())
+    return found
+
+
+def live_lean(project: Path, proc: Path = Path("/proc")) -> list[int]:
+    """PIDs of `lake` or `lean` processes working in `project` (cwd or a path argument)."""
+    root = os.path.realpath(project)
+    pids: list[int] = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = [
+                a.decode(errors="replace") for a in (entry / "cmdline").read_bytes().split(b"\0")
+            ]
+            if os.path.basename(argv[0]) not in ("lake", "lean"):
+                continue
+            cwd = os.readlink(entry / "cwd")
+        except (OSError, IndexError):
+            continue
+        # relative arguments name paths from the process's cwd (codex round 1 on #262)
+        paths = [cwd] + [
+            os.path.normpath(os.path.join(cwd, a)) for a in argv[1:] if a and a[0] != "-"
+        ]
+        if any(p == root or p.startswith(root + os.sep) for p in paths):
+            pids.append(int(entry.name))
+    return pids
+
+
+def git_out(repo: Path, *args: str, trust: bool = False) -> str | None:
+    """`git -C repo args` output, stripped; None when git fails. `trust` marks the shared
+    clone as safe for this one command, in case another user owns it (a copy installed before
+    the review on #258 belonged to root): git then refuses it ("dubious ownership"), and
+    command-line config is one git honours for safe.directory (codex round 5 on #262)."""
+    safe = ["-c", f"safe.directory={os.path.realpath(repo)}"] if trust else []
+    try:
+        run = subprocess.run(  # noqa: S603 - a fixed argument list
+            ["git", *safe, "-C", str(repo), *args],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return run.stdout.strip() if run.returncode == 0 else None
+
+
+def tags(checkout: Path, *, trust: bool = False) -> dict[str, str] | None:
+    """A checkout's tags, name → object id; None when git fails."""
+    out = git_out(
+        checkout, "for-each-ref", "--format=%(refname) %(objectname)", "refs/tags", trust=trust
+    )
+    if out is None:
+        return None
+    return dict(line.split(" ", 1) for line in out.splitlines() if " " in line)
+
+
+def unsaved_work(packages: Path, data: dict, shared: Path | None = None) -> str | None:
+    """Why deleting this private copy could lose work, or None: every package must be the
+    manifest's, a checkout at its pinned revision, with no changed or untracked files and no
+    commit of its own, on a branch or in the reflog (codex round 1 on #262), or behind a tag
+    the shared copy (`shared`, the same repositories, cloned clean) doesn't have (round 4).
+
+    Files git ignores (a dependency's own `.lake` build, for example) aren't checked: they
+    are build output, and work kept there would be lost."""
+    pinned = pins(data)
+    extra = sorted(p.name for p in packages.iterdir() if p.name not in pinned)
+    if extra:
+        return f"packages not in the manifest ({', '.join(extra)})"
+    for name, rev in pinned.items():
+        checkout = packages / name
+        if not checkout.exists():
+            continue
+        if git_out(checkout, "rev-parse", "HEAD") != rev:
+            return f"{name} is not at its pinned revision"
+        # explicit, whatever status.showUntrackedFiles says (codex round 2 on #262)
+        status = git_out(checkout, "status", "--porcelain", "--untracked-files=all")
+        if status is None or status:
+            return f"{name} has local changes"
+        # Lake clones whole repositories, so a local branch is usually ahead of the pin with
+        # upstream commits; only commits found on no remote-tracking branch are someone's own,
+        # on a branch or only in the reflog (made on a detached HEAD, then left)
+        ahead = git_out(
+            checkout, "rev-list", "--count", "--branches", "--reflog", "--not", "--remotes", rev
+        )
+        if ahead != "0":
+            return f"{name} has commits of its own"
+        # a stash keeps its changes in refs/stash after the reflog expires (codex round 7)
+        if git_out(checkout, "rev-parse", "--verify", "--quiet", "refs/stash"):
+            return f"{name} has stashed changes"
+        # a tag of one's own outlives the reflog (90 days); upstream tags, many of them on
+        # no remote branch, are in the clean shared clone too, so only the others count
+        mine, upstream = tags(checkout), tags(shared / name, trust=True) if shared else {}
+        if mine is None or upstream is None:
+            return f"{name}: its tags can't be read"
+        for tag, target in mine.items():
+            if upstream.get(tag) == target:
+                continue
+            beyond = git_out(checkout, "rev-list", "--count", target, "--not", "--remotes", rev)
+            if beyond != "0":
+                return f"{name} has a tag of its own ({tag.removeprefix('refs/tags/')})"
+    return None
+
+
+def delete_tree(top: Path) -> None:
+    """`shutil.rmtree`, once every directory in it is the owner's to read and write: Lake
+    leaves read-only ones, and an unreadable one made the old rmtree error hook raise
+    TypeError (review on #262). Symlinks are never followed, nor changed."""
+    os.chmod(top, 0o700)
+    for dirpath, dirnames, _ in os.walk(top, followlinks=False):
+        for name in dirnames:
+            p = os.path.join(dirpath, name)
+            if not os.path.islink(p):
+                os.chmod(p, 0o700)
+    shutil.rmtree(top)
+
+
+def reclaim_one(
+    project: Path, shared: list[Shared], apply: bool, proc: Path, broken: dict[str, str]
+) -> tuple[str, int]:
+    """One project's line, and the bytes it frees (or would free). `broken`: the shared
+    copies that failed their git check, by tag."""
+    packages = project / ".lake" / "packages"
+    try:
+        match = next((s for s in shared if s.matches(project)), None)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, Refused):
+        match = None
+    if match is None:
+        return "its own copy is on other pins: kept", 0
+    if match.tag in broken:
+        return "kept: the shared copy failed its git check", 0
+    size = size_bytes(packages)
+    why = unsaved_work(packages, manifest(project), match.packages)
+    if why:
+        return f"{size / 1e9:.1f} GB, kept: {why}", 0
+    busy = live_lean(project, proc)
+    if busy:
+        pids = ", ".join(map(str, busy))
+        return f"{size / 1e9:.1f} GB, skipped: lake or lean is running there (pid {pids})", 0
+    if not apply:
+        return f"{size / 1e9:.1f} GB would be freed", size
+    trash = project / ".lake" / f"packages.reclaim-{os.getpid()}"
+    os.rename(packages, trash)
+    try:
+        packages.symlink_to(match.packages)
+    except OSError:
+        os.rename(trash, packages)  # the project keeps its own copy
+        raise
+    try:
+        delete_tree(trash)
+    except Exception as exc:  # linked already: say so, whatever went wrong
+        return f"linked to the shared Mathlib, but {trash.name} is left over ({exc})", 0
+    return f"freed {size / 1e9:.1f} GB", size
+
+
+def reclaim(
+    top: Path, apply: bool, root: Path | None = None, proc: Path = Path("/proc")
+) -> list[str]:
+    """Each project under `top` whose `.lake/packages` is a private copy on the shared pins:
+    reported with its size or, with `apply`, replaced by the link and deleted. Projects on
+    other pins and those a `lake` or `lean` process is working in are left alone; one that
+    fails is reported, and never stops the others."""
+    shared = installed(root)
+    seen: set[str] = set()
+    lines: list[str] = []
+    total = 0
+    # each shared copy once, as the user who runs Lean, before anything is linked to it: one
+    # git refuses would break every project linked to it (review on #262)
+    broken: dict[str, str] = {}
+    for s in shared:
+        try:
+            problem = git_problem(manifest(s.template), s.packages)
+        except (OSError, ValueError, KeyError) as exc:
+            problem = f"its manifest can't be read ({exc})"
+        if problem:
+            broken[s.tag] = problem
+            lines.append(f"{s.packages}: not used: {problem}")
+    for checkout in checkouts(top):
+        for project in projects(checkout):
+            if str(project) in seen:
+                continue
+            seen.add(str(project))
+            packages = project / ".lake" / "packages"
+            if packages.is_symlink() or not packages.is_dir():
+                continue
+            try:
+                line, size = reclaim_one(project, shared, apply, proc, broken)
+            except Exception as exc:  # one broken project never stops the others
+                line, size = f"skipped ({type(exc).__name__}: {exc})", 0
+            lines.append(f"{project}: {line}")
+            total += size
+    what = "freed" if apply else "to free (a dry run: --apply frees it)"
+    lines.append(f"total: {total / 1e9:.1f} GB {what}")
+    return lines
+
+
+# ----------------------------------------------------------------------------- check
+
+
+# Lean sources: the double-struck Z and Q are Mathlib's notation, not look-alike letters
+CHECK = (
+    "import Mathlib.Tactic\n\n"
+    "example (a b : ℤ) : (a + b) ^ 2 = a ^ 2 + 2 * a * b + b ^ 2 := by ring\n"  # noqa: RUF001
+)
+CHALLENGE = "import Mathlib.Tactic\n\ntheorem two_add_two : (2 : ℚ) + 2 = 4 := by sorry\n"  # noqa: RUF001
+SOLUTION = "import Mathlib.Tactic\n\ntheorem two_add_two : (2 : ℚ) + 2 = 4 := by norm_num\n"  # noqa: RUF001
+
+
+def git_problem(data: dict, packages: Path) -> str | None:
+    """Why git can't read the packages (`packages`, for the manifest `data`) at their pins as
+    this user, or None. Lake runs git in each one whenever it loads a project, and as a user
+    other than the copy's owner git refuses ("dubious ownership"), so every Lake command fails
+    (review on #258)."""
+    for package in data["packages"]:
+        if package.get("type") != "git":
+            continue
+        name, rev = package["name"], str(package.get("rev", ""))
+        try:
+            run = subprocess.run(  # noqa: S603 - an argument list; the name is the manifest's
+                ["git", "-C", str(packages / name), "rev-parse", "HEAD"],  # noqa: S607
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return f"git can't run in the shared {name}: {exc}"
+        if run.returncode != 0:
+            why = (run.stderr.strip().splitlines() or [f"exit {run.returncode}"])[0]
+            return f"git refuses the shared {name} as this user: {why}"
+        if run.stdout.strip() != rev:
+            return f"the shared {name} is at {run.stdout.strip()[:8]}, not at its pin {rev[:8]}"
+    return None
+
+
+def check(comparator: bool, max_seconds: float | None, root: Path | None = None) -> str:
+    """A scratch project from the template: git in each shared package, then `lake env lean`
+    on a Mathlib file, timed; with `comparator`, a Mathlib challenge through comparator-run as
+    well."""
+    base = Path(tempfile.mkdtemp(prefix="lean-project-check-"))
+    try:
+        project = base / "check"
+        new(project, "check", root)
+        problem = git_problem(manifest(project), project / ".lake" / "packages")
+        if problem:
+            raise Refused(f"{problem}; Lake would fail too")
+        (project / "Check.lean").write_text(CHECK)
+        start = time.monotonic()
+        run = subprocess.run(
+            ["lake", "env", "lean", "Check.lean"],  # noqa: S607
+            cwd=project,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        seconds = time.monotonic() - start
+        if run.returncode != 0:
+            raise Refused(f"lake env lean failed: {(run.stderr or run.stdout).strip()[-400:]}")
+        report = f"Mathlib.Tactic file checked in {seconds:.1f} s"
+        if max_seconds is not None and seconds > max_seconds:
+            raise Refused(f"{report}, over the {max_seconds:g} s limit")
+        if comparator:
+            (project / "Challenge.lean").write_text(CHALLENGE)
+            (project / "Solution.lean").write_text(SOLUTION)
+            with (project / "lakefile.toml").open("a") as f:
+                f.write('\n[[lean_lib]]\nname = "Challenge"\n\n[[lean_lib]]\nname = "Solution"\n')
+            (project / "config.json").write_text(
+                json.dumps(
+                    {
+                        "challenge_module": "Challenge",
+                        "solution_module": "Solution",
+                        "theorem_names": ["two_add_two"],
+                        "permitted_axioms": ["propext", "Quot.sound", "Classical.choice"],
+                    }
+                )
+            )
+            run = subprocess.run(
+                ["comparator-run", "config.json"],  # noqa: S607
+                cwd=project,
+                capture_output=True,
+                text=True,
+                timeout=1800,
+            )
+            if run.returncode != 0:
+                raise Refused(f"comparator-run failed: {(run.stderr or run.stdout).strip()[-400:]}")
+            report += "; comparator accepted a Mathlib solution through the shared packages"
+        return report
+    finally:
+        link_path = base / "check" / ".lake" / "packages"
+        if link_path.is_symlink():
+            link_path.unlink()  # never let the cleanup reach the shared copy
+        shutil.rmtree(base, ignore_errors=True)
+
+
+# ----------------------------------------------------------------------------- main
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="lean-project", description=__doc__.splitlines()[0])
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--repair", action="store_true", help="link the project in DIR")
+    mode.add_argument("--repair-all", action="store_true", help="link every project under DIR")
+    mode.add_argument("--check", action="store_true", help="time a Mathlib file (self-test)")
+    mode.add_argument("--install", action="store_true", help="(root) share WORKSPACE's packages")
+    mode.add_argument("--uninstall", action="store_true", help="(root) undo --install")
+    mode.add_argument("--reclaim", action="store_true", help="private copies under DIR (dry run)")
+    p.add_argument("--name", help="package name of a new project (default: the directory's)")
+    p.add_argument("--comparator", action="store_true", help="with --check: run comparator too")
+    p.add_argument("--max-seconds", type=float, help="with --check: fail if slower")
+    p.add_argument("--apply", action="store_true", help="with --reclaim: replace and delete")
+    p.add_argument("dir", nargs="?", help="the project (default: the current directory)")
+    args = p.parse_args(argv)
+    target = Path(args.dir or ".").absolute()
+    try:
+        if args.check:
+            print(f"lean-project: {check(args.comparator, args.max_seconds)}")
+        elif args.install or args.uninstall:
+            if not args.dir:
+                p.error("--install and --uninstall need the workspace directory")
+            print(f"lean-project: {(install if args.install else uninstall)(target)}")
+        elif args.reclaim:
+            for line in reclaim(target, args.apply):
+                print(f"lean-project: {line}")
+        elif args.repair:
+            print(f"lean-project: {target}: {repair(target)}")
+        elif args.repair_all:
+            for project in projects(target):
+                try:
+                    print(f"lean-project: {project}: {repair(project)}")
+                except Exception as exc:  # one broken project never stops the others
+                    print(f"lean-project: {project}: skipped ({exc})")
+        else:
+            if not args.dir:
+                p.error("give the new project's directory (or --repair, --check, ...)")
+            print(f"lean-project: {new(target, args.name)}")
+    except (Refused, OSError, ValueError) as exc:
+        print(f"lean-project: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

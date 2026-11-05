@@ -1,0 +1,45 @@
+[Unit]
+Description=Read-only turn snapshots and share links
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=zab-files
+Group=zab-files
+ExecStart=/opt/zab-files/venv/bin/python /opt/zab-files/workshop/files/server.py
+Environment=PYTHONPATH=/opt/zab-files/src
+LoadCredential=github-token:/etc/zab-files/github-token
+CacheDirectory=zab-files
+CacheDirectoryMode=0700
+# share links (#710): kept apart from the disposable cache, and never removed with a mirror
+StateDirectory=zab-files
+StateDirectoryMode=0700
+# the GitHub organization served (#693): ZAB_FILES_ORG=<organization>, README §3
+EnvironmentFile=-/etc/zab-files/zab-files.env
+Restart=on-failure
+RestartSec=5
+# exit 78 (EX_CONFIG): no organization, or a name GitHub can't have, which no restart mends
+RestartPreventExitStatus=78
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+SystemCallFilter=@system-service
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryMax=1G
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target
