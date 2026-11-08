@@ -270,7 +270,8 @@ async def test_a_closed_parent_is_reopened_as_its_next_turn_would(codex):
     fake, backend = codex
     parent = (await backend.create_session(spec("/w/parent", "topic"))).native_id
     first = await turn(backend, parent, "first")
-    backend.mapper.closed.add(parent)  # thread/closed: the app-server unloaded it
+    fake.loaded.discard(parent)  # the app-server unloaded it, and said so (thread/closed)
+    backend.mapper.closed.add(parent)
     await backend.fork_session(parent, spec("/w/fork", "f"))
     assert "thread/resume" in [c["method"] for c in fake.calls]
     assert fake.requests("thread/fork")[0]["lastTurnId"] == first
@@ -291,18 +292,27 @@ async def test_the_fake_speaks_the_pinned_schemas(codex):
     await backend.interrupt(parent)
     await until(backend, t.TurnCompleted, parent)
 
-    def validator(name, closed=False):
-        schema = json.loads(next(SCHEMAS.rglob(f"{name}.json")).read_text())
-        if closed:  # the pinned *Params leave additional properties open (review of #568)
-            for key, definition in schema["definitions"].items():
-                if key.endswith("Params") and definition.get("type") == "object":
-                    definition["additionalProperties"] = False
-        return Draft7Validator(schema)
+    stray = {"id": 1, "method": "thread/fork", "params": {"threadId": "t", "effort": "low"}}
+    closed = validator("ClientRequest", closed=True)
+    assert not closed.is_valid(stray)  # a field 0.157.1 doesn't define fails
+    checked = check_wire(fake)
+    assert {"thread/fork", "thread/turns/list", "turn/start", "turn/completed"} <= checked
 
+
+def validator(name, closed=False):
+    schema = json.loads(next(SCHEMAS.rglob(f"{name}.json")).read_text())
+    if closed:  # the pinned *Params leave additional properties open (review of #568)
+        for key, definition in schema["definitions"].items():
+            if key.endswith("Params") and definition.get("type") == "object":
+                definition["additionalProperties"] = False
+    return Draft7Validator(schema)
+
+
+def check_wire(fake) -> set[str]:
+    """Validate every message of `fake.wire`, both ways, against the pinned schemas, the
+    requests' params closed; the methods seen."""
     sides = {s: validator(s) for s in ("ClientNotification", "ServerNotification")}
     sides["ClientRequest"] = validator("ClientRequest", closed=True)
-    stray = {"id": 1, "method": "thread/fork", "params": {"threadId": "t", "effort": "low"}}
-    assert not sides["ClientRequest"].is_valid(stray)  # a field 0.157.1 doesn't define fails
     methods, checked = {}, set()
     for direction, message in fake.wire:
         if "method" in message:
@@ -315,4 +325,4 @@ async def test_the_fake_speaks_the_pinned_schemas(codex):
             name = {"ThreadNameSet": "ThreadSetName"}.get(name, name)
             validator(f"{name}Response").validate(message["result"])
         checked.add(message.get("method") or methods[message["id"]])
-    assert {"thread/fork", "thread/turns/list", "turn/start", "turn/completed"} <= checked
+    return checked

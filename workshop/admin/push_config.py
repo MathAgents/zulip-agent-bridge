@@ -158,6 +158,9 @@ TOOLS_NONE = "tools: none in the instructions"
 #: anything else alone; where the wrapper is in place afterwards, the list's SageMath entry says
 #: that the interfaces work (`tools_list.py install --with sage-wrapper`). `--uninstall` leaves it.
 SAGE_SCRIPT = pathlib.Path(__file__).resolve().parent / "sage_wrapper.py"
+#: `apt_repair.py repair`, as root (#947): the image's expired Macaulay2 snapshot source removed,
+#: so that the VM's `apt-get update` works again, and Macaulay2's packages held.
+APT_SCRIPT = pathlib.Path(__file__).resolve().parent / "apt_repair.py"
 SAGE_WRAPPER = pathlib.Path(__file__).resolve().parents[1] / "ami" / "files" / "bin" / "sage"
 SAGE_FEATURE = "sage-wrapper"
 #: The script's outcomes after which `~agent/.local/bin/sage` is the wrapper
@@ -562,7 +565,10 @@ def render_config_toml(
     bridge: dict[str, Any] = {
         "machine": slug,
         "default_project": default_project(row),
-        "max_concurrent_turns": 4,  # per backend: Drew, Fri Oct 9 (2 queued too many turns)
+        # per backend, 20 turns a VM (#919; 4 from Oct 9, 2 before): a turn waiting on the
+        # model uses little of the VM, and SPEC §7.10 says why 10 fits an m7a.2xlarge. A raise
+        # raises status.py's MAX_ITEMS too (a test ties them), or `!status` cuts the turns
+        "max_concurrent_turns": 10,
         "mention_after_s": mention_after_s,  # the workshop's (admin.toml; #711)
         # every topic in its own git worktree (Drew's rehearsal, issue #36, Mon 18:15): in one
         # shared checkout the agents overwrite each other's files and the turn diff mixes
@@ -1179,6 +1185,7 @@ def rollout_vm(row: Mapping[str, str], opts: Options, runner: Runner) -> VmResul
                     (str(TOOLS_LIST), TOOLS_LIST.name),
                     (str(SAGE_SCRIPT), SAGE_SCRIPT.name),
                     (str(SAGE_WRAPPER), SAGE_WRAPPER.name),
+                    (str(APT_SCRIPT), APT_SCRIPT.name),
                 ]
             )
             wheel_name = None
@@ -1291,6 +1298,8 @@ def rollout_vm(row: Mapping[str, str], opts: Options, runner: Runner) -> VmResul
             # below are made from
             wrapped = sage_step(result, runner, ssh, staging)
             tools_step(result, runner, ssh, staging, (SAGE_FEATURE,) if wrapped else ())
+            # The image's expired apt source (#947), so that the VM's `apt-get update` works
+            apt_step(result, runner, ssh, staging)
             # Last, and never a reason to stop the rollout: the agents' instructions (the
             # managed block replaced, the participant's own section kept; agent_instructions.py,
             # PM on issue #36, Mon 19:00). A file with broken markers, or not UTF-8, is left
@@ -1510,6 +1519,26 @@ def sage_step(result: VmResult, runner: Runner, ssh: Any, staging: str) -> bool:
     if not line.startswith(SAGE_IN_PLACE[2]):
         result.notes.append(line or "sage: the wrapper's step said nothing")
     return line.startswith(SAGE_IN_PLACE)
+
+
+def apt_cmd(staging: str) -> str:
+    """As root: `apt_repair.py`, the uploaded copy, with the system Python alone."""
+    return remote_chain(["sudo", VM_PYTHON, f"{staging}/{APT_SCRIPT.name}"])
+
+
+def apt_step(result: VmResult, runner: Runner, ssh: Any, staging: str) -> bool:
+    """Every release rollout (#947): the image's expired Macaulay2 snapshot source removed and
+    Macaulay2's packages held, where the VM has that source; a no-op where it hasn't. Noted when
+    it removed it, or kept a file it couldn't vouch for (`apt: kept …`), so that a VM whose apt
+    may still fail shows; a failure is recorded and holds nothing up."""
+    res = runner(ssh(apt_cmd(staging)), timeout_s=180)
+    line = next((first_line(x, 200) for x in res.stdout.splitlines() if x.startswith("apt: ")), "")
+    if not res.ok:
+        result.failures.append(f"apt source: {line or first_line(res.stderr) or 'failed'}")
+        return False
+    if line and not line.startswith("apt: nothing to repair"):
+        result.notes.append(line)
+    return True
 
 
 def tools_cmd(staging: str, features: tuple[str, ...] = ()) -> str:
@@ -1777,6 +1806,7 @@ _DRY_NAMES = {
     SPARE_TIMER_OFF_CMD: "spare's idle stop removal",
     WARM_OFF_CMD: "warm-up removed",
     warm_on_cmd(DRY_STAGING): "warm-up on",
+    apt_cmd(DRY_STAGING): "apt source",
     LEAN_SHARED_UNDO_CMD: "lean rollback",
     remote_chain(["rm", "-rf", "--", DRY_STAGING]): "staging removed",
     idle_stop_on_cmd(DRY_STAGING): "idle stop installed",

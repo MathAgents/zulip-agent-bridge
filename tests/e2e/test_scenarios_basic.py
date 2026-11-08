@@ -17,6 +17,7 @@ from e2e.harness.flows import (
     Turn,
     answer,
     echo,
+    set_rule,
     topic_name,
 )
 from e2e.harness.zulip_user import dm_narrow, mention, topic_narrow
@@ -101,6 +102,51 @@ async def test_typed_mention(chat: Chat, scenario, nonce):
     again = await chat.user.send(chat.stream, topic, "And you both: " + echo(f"BOTH-{token}"))
     for kind, took in await each_answers(chat, topic, again, f"BOTH-{token}"):
         scenario.timing(f"{kind}: the follow-up without a mention, its answer", took)
+
+
+#: What a failed clean-up of the part below leaves: the later scenarios expect `all`.
+UNMENTIONED_LAST = "the VM's rule for a message without a mention is still `last`"
+
+
+@pytest.mark.scenario(1)
+async def test_unmentioned_last(chat: Chat, scenario, nonce):
+    """#878, criterion 8: `!unmentioned last` (to Codex's bot); a mention of Claude, then a
+    message without one, which only Claude answers; a mention of both, then one without, which
+    both answer. Then `!unmentioned all` (to Claude's bot): after a mention of Claude, a message
+    without one reaches both again. `all` is restored at the end, after a failure too, as the
+    later scenarios expect (SPEC §4.5, "The rule `last`")."""
+    topic = topic_name(1, nonce, "last")
+    narrow = topic_narrow(chat.stream, topic)
+    restored = False
+    try:
+        await set_rule(chat, "codex", "last")
+        token = f"LAST-{nonce}"
+        await chat.reply(await chat.say("claude", topic, echo(token)), answer(token))
+        sent = await chat.user.send(chat.stream, topic, "And now: " + echo(f"ONE-{token}"))
+        turn = Turn(narrow, sent, chat.bots["claude"], time.monotonic())
+        _, took = await chat.reply(turn, answer(f"ONE-{token}"))
+        scenario.timing("claude: under last, the follow-up without a mention, its answer", took)
+        others = await chat.user.silent(
+            narrow, after_id=sent, senders=[chat.bots["codex"]], seconds=QUIET_S
+        )
+        first = others[0]["content"][:80] if others else ""
+        assert not others, f"Codex took a follow-up to Claude under last: {first}"
+        both = " ".join(mention(chat.names[kind], chat.bots[kind]) for kind in KINDS)
+        sent = await chat.user.send(chat.stream, topic, f"{both} " + echo(f"BOTH-{token}"))
+        await each_answers(chat, topic, sent, f"BOTH-{token}")
+        sent = await chat.user.send(chat.stream, topic, "Again: " + echo(f"AGAIN-{token}"))
+        for kind, took in await each_answers(chat, topic, sent, f"AGAIN-{token}"):
+            scenario.timing(f"{kind}: under last, after both were named, its answer", took)
+        await set_rule(chat, "claude", "all")
+        restored = True
+        topic, again = topic_name(1, nonce, "all"), f"ALL-{token}"
+        await chat.reply(await chat.say("claude", topic, echo(again)), answer(again))
+        sent = await chat.user.send(chat.stream, topic, "And you both: " + echo(f"TWO-{token}"))
+        for kind, took in await each_answers(chat, topic, sent, f"TWO-{token}"):
+            scenario.timing(f"{kind}: back under all, the follow-up, its answer", took)
+    finally:
+        if not restored:
+            await undo(UNMENTIONED_LAST, lambda: set_rule(chat, "claude", "all"))
 
 
 async def each_answers(chat: Chat, topic: str, mid: int, token: str) -> list[tuple[str, float]]:

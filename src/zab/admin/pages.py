@@ -256,7 +256,7 @@ def resources(vm: dict[str, Any]) -> tuple[str, str, str]:
 SENTINEL_DOWN_STATES = ("not installed", "down", "no mark", "stale")
 SENTINEL_STATES = (*SENTINEL_DOWN_STATES, "unknown", "warn")
 _STATE = "|".join(SENTINEL_STATES)
-_SENTINEL = re.compile(rf"ok|(?:{_STATE})(?:, (?:{_STATE}))*")
+_SENTINEL = re.compile(rf"ok|(?:{_STATE})(?:, (?:{_STATE}))*+")  # possessive: the VM's text (#833)
 #: ... said after a state of `SENTINEL_DOWN_STATES` (as `zab doctor` does).
 SENTINEL_DOWN = "DM !restart is unavailable, and the bridge answers DM !vm itself"
 

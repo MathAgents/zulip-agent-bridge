@@ -17,6 +17,8 @@ read where they are used, and never printed.
 | `ZAB_ADMIN_E2E_SSH_GROUP` | `zab-test-ssh`: the server's group admits SSH from its sources |
 | `ZAB_ADMIN_E2E_REPORT_DIR` | `~/.local/state/zab-admin-e2e` |
 | `ZAB_E2E_TESTER_ZULIPRC`, `ZAB_E2E_TESTER2_ZULIPRC` | as for #263 (`harness/config.py`) |
+| `ZAB_ADMIN_E2E_RELEASE_REPO` | none: A10b's release repository, private, `MathAgents/zab-test*` |
+| `ZAB_ADMIN_E2E_RELEASE_TOKEN_FILE` | none: a file (yours, 0600) of that repository's token |
 
 Optional inputs (ADMIN §10, Q9), in the rig's directory: `github-token`, the test server's PAT
 for `MathAgents/zab-test*`; `provisioner.zuliprc`, `zab-tester`'s zuliprc as the test

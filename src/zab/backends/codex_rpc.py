@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import itertools
 import json
 import os
 import random
+import socket as socketlib
+import struct
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,33 @@ OPT_OUT = [
 ]
 
 
+#: The kernel's id of the running boot (Linux), which every boot draws anew, and its processes.
+BOOT_ID = "/proc/sys/kernel/random/boot_id"
+PROC = "/proc"
+
+
+def app_server_instance(pid: int | None) -> str | None:
+    """The run of the app-server a connection reaches (#830, §5.5): the boot's id, then the
+    process's id and start time (`/proc/<pid>/stat`, field 22), which no other process of the
+    same boot has. None where they can't be read (no pid, not Linux, a file not as expected):
+    no record of an earlier connection then vouches for a load, and the connection goes on. The
+    record of the identity the bridge applied to a thread carries it, so that one from an
+    earlier boot or run of the daemon, whose loads are all gone, is never taken for the
+    thread's load now."""
+    if not pid:
+        return None
+    try:
+        boot = Path(BOOT_ID).read_text(encoding="ascii").strip()
+        # bytes: the name, in parentheses, may hold spaces, parentheses or any other byte
+        fields = Path(PROC, str(pid), "stat").read_bytes().rpartition(b")")[2].split()
+        started = fields[19].decode("ascii") if len(fields) >= 20 else ""
+    except (OSError, ValueError):  # UnicodeDecodeError is a ValueError (review of #854, N1)
+        return None
+    if not boot or not started.isdigit():
+        return None
+    return f"{boot}/{pid}/{started}"
+
+
 class RpcError(Exception):
     def __init__(self, error: dict[str, Any]) -> None:
         super().__init__(error.get("message", "Codex RPC error"))
@@ -75,6 +103,7 @@ class CodexRpc:
         self.process: asyncio.subprocess.Process | None = None
         self.send_lock = asyncio.Lock()
         self.identity: dict[str, Any] = {}
+        self.instance: str | None = None  # `app_server_instance`, at the connect
         self.up = False
 
     async def connect(
@@ -118,10 +147,27 @@ class CodexRpc:
             expected = await asyncio.to_thread(Path(home).resolve)
             if actual != expected:
                 raise ValueError("app-server CODEX_HOME differs from configured home")
+            self.instance = await asyncio.to_thread(app_server_instance, self._peer())
             await self.send({"method": "initialized"})
         except BaseException:
             await self.close()
             raise
+
+    def _peer(self) -> int | None:
+        """The app-server's process id: the child spawned, or the process listening on the
+        daemon's socket (`SO_PEERCRED`, Linux), the app-server itself."""
+        if self.process:
+            return self.process.pid
+        option = getattr(socketlib, "SO_PEERCRED", None)
+        transport = getattr(self.socket, "transport", None)
+        sock = transport.get_extra_info("socket") if transport else None
+        if option is None or sock is None:
+            return None
+        try:
+            creds = sock.getsockopt(socketlib.SOL_SOCKET, option, struct.calcsize("3i"))
+        except OSError:
+            return None
+        return struct.unpack("3i", creds)[0] or None
 
     async def send(self, message: dict[str, Any]) -> None:
         if not self.up:
@@ -198,8 +244,10 @@ class CodexRpc:
             self.socket = None
         if self.reader:
             self.reader.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.reader
+            # Not an `await` under `suppress(CancelledError)`: it swallowed a cancel of the
+            # caller too, and `CodexBackend._run`, cancelled by `close()` while it waited here,
+            # went on to reconnect, `close()` waiting for it forever (review of #965).
+            await asyncio.wait({self.reader})
             self.reader = None
         if self.process and self.process.returncode is None:
             self.process.terminate()

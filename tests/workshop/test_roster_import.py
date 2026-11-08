@@ -18,6 +18,8 @@ import pytest
 import roster_import as ri
 import zulip_provision as zp
 
+from .scope import with_scope
+
 HEADER = (
     "slug,first_name,last_name,email,repo,github,host,ip,region,host_keys,zulip_user_id,"
     "zulip_invite,zulip_channel_id,notes,repo_status,github_invite"
@@ -111,7 +113,7 @@ def run(paths, upload, *extra, checks=None):
     roster, up = paths
     up.write_text(upload, encoding="utf-8")
     args = ["--roster", str(roster), "--input", str(up), *extra]
-    return ri.main(args, checks=FakeChecks() if checks is None else checks)
+    return with_scope(ri.main, args, checks=FakeChecks() if checks is None else checks)
 
 
 def rows(path):
@@ -201,6 +203,36 @@ def test_keeps_script_filled_columns_and_writes_atomically_with_bak(paths, capsy
         "roster.csv.bak",
         "upload.csv",
     ]
+
+
+def test_keep_until_is_set_by_its_column_and_kept_by_an_empty_cell_or_none(paths, capsys):
+    """#570: a kept VM's end, which `!keep-until` writes too: an upload without the column, or
+    with its cell empty, keeps the recorded value, as for `region`; a value sets it, in the form
+    `!keep-until` takes (`t` read as `T`)."""
+    with_column = SAME.replace("email,notes\n", "email,notes,keep_until\n", 1)
+    with_column = with_column.replace("alice@example.org,\n", "alice@example.org,,2026-11-30\n")
+    with_column = with_column.replace("bob@example.org,\n", "bob@example.org,,2026-12-01t09:30\n")
+    with_column = with_column.replace("early leaver\n", "early leaver,\n")
+    with_column = with_column.replace("erin@example.org,\n", "erin@example.org,,\n")
+    assert run(paths, with_column) == 0
+    out = capsys.readouterr().out
+    assert '~ alice\n    keep_until: "" -> "2026-11-30"' in out
+    assert '~ bob\n    keep_until: "" -> "2026-12-01T09:30"' in out
+    after = rows(paths[0])
+    assert [after[s]["keep_until"] for s in ("alice", "bob", "carol", "erin")] == [
+        "2026-11-30",
+        "2026-12-01T09:30",
+        "",
+        "",
+    ]
+    blank = with_column.replace(",2026-11-30\n", ",\n").replace(",2026-12-01t09:30\n", ",\n")
+    for upload in (SAME, blank):  # without the column, then with every cell empty
+        assert run(paths, upload, "--dry-run") == ri.NOTHING
+        assert capsys.readouterr().out.endswith("no changes: nothing to write\n")
+    added = with_column + "frank,Frank,Example,frank@example.org,,2027-01-31\n"
+    assert run(paths, added) == 0
+    assert '+ frank\n    first_name: "Frank"' in capsys.readouterr().out
+    assert rows(paths[0])["frank"]["keep_until"] == "2027-01-31"
 
 
 def test_a_new_row_ignores_script_columns(paths, capsys):
@@ -732,6 +764,10 @@ def test_a_login_given_as_a_handle_or_a_profile_url_is_the_login(paths, capsys):
         ("slug,email,notes\nfrank,f@example.org," + "x" * 200_000 + "\n", "field larger"),
         ("slug,email,notes\n" + "frank,f@example.org," + "x" * ri.MAX_UPLOAD_BYTES + "\n",
          "larger than"),
+        # a kept VM's end, as `!keep-until` takes it (#570); a spreadsheet's own form is not
+        ("slug,email,keep_until\nfrank,f@example.org,11/30/2026\n",
+         "frank: keep_until '11/30/2026' is not a date like 2026-11-30, or 2026-11-30T15:00"),
+        ("slug,email,keep_until\nfrank,f@example.org,2026-11-31\n", "frank: keep_until"),
     ],
 )  # fmt: skip
 def test_refuses_malformed_uploads(paths, capsys, upload, reason):
@@ -993,11 +1029,11 @@ def test_the_workshop_tag_and_region_come_from_the_command_line(paths, capsys, m
     FakeEc2.made, FakeEc2.instances = [], [instance("carol", "eu-west-1", workshop="w2")]
     args = ["--roster", str(paths[0]), "--input", str(paths[1]), "--tag", "workshop=w2"]
     paths[1].write_text(WITHOUT_CAROL)
-    assert ri.main([*args, "--region", "eu-west-1"]) == 1
+    assert with_scope(ri.main, [*args, "--region", "eu-west-1"]) == 1
     assert seen["scope"] == {"workshop": "w2"} and FakeEc2.made == ["eu-west-1"]
     assert "carol: a VM tagged participant=carol is in eu-west-1" in capsys.readouterr().err
-    assert ri.main([*args, "--tag", "participant=x"]) == 2
-    assert ri.main([*args, "--region", "us west"]) == 2
+    assert with_scope(ri.main, [*args, "--tag", "participant=x"]) == 2
+    assert with_scope(ri.main, [*args, "--region", "us west"]) == 2
 
 
 def github_answers(routes):

@@ -1,4 +1,9 @@
+import asyncio
+import itertools
 import os
+import subprocess
+import uuid
+from pathlib import Path
 from shutil import which as real_which
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -472,3 +477,113 @@ def test_an_inactive_daemon_starts_from_the_new_unit(setup, monkeypatch, capsys)
     enabled = [call.args for call in control.call_args_list if call.args[0] == "enable"]
     assert enabled and "codex-app-server.service" in enabled[0]
     assert "open-file limit" not in capsys.readouterr().out
+
+
+def test_the_bridge_unit_backs_off_its_restarts(tmp_path, monkeypatch):
+    """#806: the bridge's automatic restarts back off from `RestartSec` (5 s) to 120 s in 5
+    steps (`service.RESTART_BACKOFF`), with no start limit, which would leave it `failed` until
+    `!restart` (review round 1 of #813); the sentinel's and Codex's units keep theirs."""
+    monkeypatch.setattr(service, "binary", lambda name: "/usr/bin/" + name)
+    config = Config(
+        tmp_path / "config.toml",
+        BridgeConfig(),
+        [],
+        {"codex": BackendConfig(kind="codex", socket=str(tmp_path / "decoy.sock"))},
+        [],
+        RenderConfig(),
+    )
+    rendered = service.units(config)
+    bridge = rendered["zab.service"]
+    assert "Restart=on-failure\nRestartSec=5\nRestartSteps=5\nRestartMaxDelaySec=120\n" in bridge
+    assert "StartLimit" not in bridge
+    for other in (rendered[service.SENTINEL], rendered["codex-app-server.service"]):
+        assert "RestartSteps" not in other and "RestartMaxDelaySec" not in other
+
+
+def _user_manager() -> bool:
+    tool = real_which("systemctl")
+    if not (tool and os.environ.get("XDG_RUNTIME_DIR")):
+        return False
+    return subprocess.run([tool, "--user", "show-environment"], capture_output=True).returncode == 0  # noqa: S603
+
+
+# 15 s. On a pull request, the unit's text (above) and the sentinel's commands
+# (tests/tools/test_sentinel.py) are checked without systemd.
+@pytest.mark.slow
+@pytest.mark.skipif(not _user_manager(), reason="no user systemd manager")
+async def test_a_bridge_failing_at_start_backs_off_and_recovers_on_its_own(tmp_path, monkeypatch):
+    """#806 on a real user manager: a unit with the bridge's backoff, its times a fifth of the
+    shipped ones (`RestartSec` 1 s, growing to 24 s in the same 5 steps), whose process fails
+    at start while its cause lasts (a file: Zulip down, say). Its restarts come further and
+    further apart, each delay about 1.9 times the last, and it never ends `failed`. Once the
+    cause clears, the next restart starts it, with no `!restart`. The sentinel's `!restart`
+    (`reset-failed`, then `restart --no-block`) starts it at once, as before."""
+    from zab.tools import sentinel as sn
+
+    monkeypatch.setattr(service, "binary", lambda name: "/usr/bin/" + name)
+    config = Config(tmp_path / "config.toml", BridgeConfig(), [], {}, [], RenderConfig())
+    rendered = service.units(config)["zab.service"]
+    shipped = dict(
+        line.split("=", 1) for line in rendered.splitlines() if line.startswith("Restart")
+    )
+    scaled = [  # a fifth of the times, the same steps
+        "Restart=on-failure",
+        f"RestartSec={int(shipped['RestartSec']) / 5}",
+        f"RestartSteps={shipped['RestartSteps']}",
+        f"RestartMaxDelaySec={int(shipped['RestartMaxDelaySec']) / 5}",
+    ]
+    cause, starts = tmp_path / "zulip-down", tmp_path / "starts"
+    cause.touch()
+    # A start is recorded once it has seen the cause, so that the test, seeing it, knows how it
+    # ends; `%%`, as systemd expands `%` in a command
+    record = f"date +%%s.%%N >> {starts}"
+    run = f"if [ -e {cause} ]; then {record}; exit 1; fi; {record}; exec sleep 300"
+    name = f"zab-test-{uuid.uuid4().hex[:12]}-backoff.service"
+    units = Path(os.environ["XDG_RUNTIME_DIR"]) / "systemd" / "user"
+    units.mkdir(parents=True, exist_ok=True)
+    (units / name).write_text(
+        "\n".join(["[Service]", f"ExecStart=/bin/sh -c '{run}'", *scaled, ""])
+    )
+    me = SimpleNamespace(run=sn.run_command)  # the sentinel's own way to run systemctl
+
+    async def systemctl(*args: str) -> int:
+        return (await sn.run_command(["systemctl", "--user", *args], 30))[0]
+
+    def times() -> list[float]:
+        return [float(t) for t in starts.read_text().split()] if starts.exists() else []
+
+    async def until(condition, seconds: float) -> bool:
+        for _ in range(int(seconds / 0.05)):
+            if await condition():
+                return True
+            await asyncio.sleep(0.05)
+        return False
+
+    async def started(count: int) -> bool:
+        return len(times()) >= count
+
+    async def active() -> bool:
+        return await sn.Sentinel.unit_state(me, name) == "active"
+
+    try:
+        assert await systemctl("daemon-reload") == 0
+        assert await systemctl("start", "--no-block", name) == 0
+        assert await until(lambda: started(4), 60)
+        # The delays, 1, 1.89 and 3.57 s (24 ** (n / 5)), are each gap's least: a loaded
+        # machine only adds to them, so the gaps are checked from below (review round 2)
+        gaps = [b - a for a, b in itertools.pairwise(times())]
+        assert [g >= 0.95 * 24 ** (n / 5) for n, g in enumerate(gaps)] == [True] * 3, gaps
+        cause.unlink()  # Zulip answers again: the next restart, about 6.8 s later, starts it
+        # `Type=simple`: active once the process is forked, maybe before it records its start
+        assert await until(lambda: started(5), 60) and await until(active, 15)
+        assert len(times()) == 5
+        await asyncio.sleep(1)
+        assert await active()
+        cause.touch()  # down again: the sentinel's `!restart` starts it at once all the same
+        assert await sn.Sentinel.restart(me, [name], block=False) == 0
+        assert await until(lambda: started(6), 15)
+    finally:
+        await systemctl("stop", name)
+        await systemctl("reset-failed", name)
+        (units / name).unlink(missing_ok=True)
+        await systemctl("daemon-reload")

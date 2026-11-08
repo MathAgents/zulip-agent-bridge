@@ -120,6 +120,35 @@ def test_sign_in_is_merged_when_the_agents_agree(states, text):
     assert vm.sign_in_text(states) == text
 
 
+def answering(seconds: float, state: bool = False) -> SimpleNamespace:
+    """A backend whose `signed_in` hook answers `state` after `seconds`."""
+
+    async def signed_in():
+        await asyncio.sleep(seconds)
+        return state
+
+    return SimpleNamespace(signed_in=signed_in)
+
+
+@pytest.mark.parametrize("wait", [0.05, None])
+async def test_signed_in_gives_up_after_the_wait_it_is_given(monkeypatch, wait):
+    """#805 (the review of #788): `vm.signed_in` stops waiting for its hook after `wait`, or
+    after `SIGNED_IN_WAIT_S` without one. A hook that never answers is then unknown (None),
+    long before `SIGNED_IN_OWN_WAIT_S`, the long wait, which a stretched `wait` would reach.
+    In real time, with a margin of 100 times: `asyncio.timeout` runs on the event loop's
+    clock, which the tests' fake clocks don't drive."""
+    monkeypatch.setattr(vm, "SIGNED_IN_WAIT_S", 0.05)
+    assert vm.SIGNED_IN_OWN_WAIT_S > 5  # the default, 15 s
+    assert await asyncio.wait_for(vm.signed_in(answering(30), wait), 5) is None
+
+
+async def test_signed_in_waits_its_whole_wait(monkeypatch):
+    """...and not less: a hook that answers after 0.1 s, within a wait of 10 s, is heard,
+    though `SIGNED_IN_WAIT_S` is shorter."""
+    monkeypatch.setattr(vm, "SIGNED_IN_WAIT_S", 0.01)
+    assert await vm.signed_in(answering(0.1, True), 10) is True
+
+
 @pytest.mark.parametrize(
     ("running", "text"), [(0, "no turns running"), (1, "1 turn running"), (2, "2 turns running")]
 )

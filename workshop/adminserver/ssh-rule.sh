@@ -17,6 +17,8 @@
 #   --profile P        the AWS profile of the account's owner, --region R the group's region
 #   --key FILE         the dedicated key, whose fingerprint the agent must hold, alone
 #                      (BOOTSTRAP §2.1); each of the three overrides the saved one
+#   --group-name NAME  the admin server's group by another name than zab-admin, still with the
+#                      zab-admin tag, such as a test server's. Not with --files-host
 #   --home-unknown     no home address to refuse, for a run away from home with none recorded
 #
 # There are no built-in values: with neither a flag nor a saved value for the profile and the
@@ -50,6 +52,7 @@ HOMEFILE=$HOME/.config/zab/homeip
 HOME_DAYS=30 # a home address recorded longer ago than this gets a warning
 CHECKIP=https://checkip.amazonaws.com
 ADMIN_GROUP=zab-admin        # BOOTSTRAP §3.1: the group's name, and a tag key it carries
+GROUP=$ADMIN_GROUP           # the name looked up: --group-name's, or that one
 FILES_INSTANCE=zab-central-files # workshop/files/README.md §1: the files host's Name tag
 ANY=0.0.0.0/0
 # shellcheck disable=SC2016 # JMESPath's literals are in backticks, for the AWS CLI
@@ -72,7 +75,7 @@ warn() { printf 'warning: %s\n' "$*" >&2; }
 
 ((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1] >= 404)) || stop "bash 4.4 or newer, please (macOS: brew install bash)"
 
-files=0 close=0 dry=0 record=0 unknown=0 save=0 valued=0
+files=0 close=0 dry=0 record=0 unknown=0 save=0 valued=0 named=0
 while (($#)); do
   case $1 in
   --files-host) files=1 ;;
@@ -81,7 +84,7 @@ while (($#)); do
   --record-home) record=1 ;;
   --home-unknown) unknown=1 ;;
   --save-defaults) save=1 ;;
-  --profile | --region | --key)
+  --profile | --region | --key | --group-name)
     if (($# < 2)) || [[ -z $2 || $2 == -* ]]; then
       usage "$1 needs a value"
     fi
@@ -89,6 +92,7 @@ while (($#)); do
     --profile) PROFILE=$2 ;;
     --region) REGION=$2 ;;
     --key) KEY=$2 ;;
+    --group-name) GROUP=$2 named=1 ;;
     esac
     valued=1
     shift
@@ -105,11 +109,14 @@ done
 ((!record || !(files + unknown + valued))) || usage "--record-home records the address alone: no other option but --dry-run"
 ((!save || !(files + unknown + dry))) || usage "--save-defaults takes --profile, --region and --key alone"
 ((!close || !unknown)) || usage "--close checks no address: --home-unknown has nothing to skip"
+((!named || !(files + save))) || usage "--group-name names the admin server's group: not with --files-host or --save-defaults"
 
 PROFILE_RE='^[A-Za-z0-9_.+=@-]+$'
 REGION_RE='^[a-z]{2}(-[a-z]+)+-[0-9]$'
+GROUP_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$'
 [[ -z $PROFILE || $PROFILE =~ $PROFILE_RE ]] || usage "--profile: not a profile name: $PROFILE"
 [[ -z $REGION || $REGION =~ $REGION_RE ]] || usage "--region: not a region: $REGION"
+[[ $GROUP =~ $GROUP_RE ]] || usage "--group-name: not a group name ([A-Za-z0-9._-]): $GROUP"
 
 if ((save)); then
   [[ -n $PROFILE && -n $REGION && -n $KEY ]] || usage "--save-defaults needs --profile, --region and --key"
@@ -282,9 +289,10 @@ if ((files)); then
     --query 'Reservations[].Instances[].SecurityGroups[].GroupId' --output text)
 else
   what="the admin server's group"
+  ((!named)) || what="the admin server's group $GROUP"
   desc="deployer"
   SG=$(ec2 describe-security-groups \
-    --filters "Name=group-name,Values=$ADMIN_GROUP" "Name=tag-key,Values=$ADMIN_GROUP" \
+    --filters "Name=group-name,Values=$GROUP" "Name=tag-key,Values=$ADMIN_GROUP" \
     --query 'SecurityGroups[].GroupId' --output text)
 fi
 [[ $SG =~ ^sg-[0-9a-f]+$ ]] || stop "not one group for $what: '${SG:0:80}'"

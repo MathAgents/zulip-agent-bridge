@@ -81,15 +81,19 @@ async def test_runtime_caps_manager_at_registered_server_limit(tmp_path, monkeyp
             self.bot, self.manager = bot, manager
             self.client = SimpleNamespace(limits={"max_file_upload_size_mib": 10})
             self.actors = {}
-            self.initialized = False
+            self.initialized = self.unverified = False
             self.close = AsyncMock()
 
         async def initialize(self):
             self.initialized = True
 
+        def unverify(self):
+            self.unverified = True
+
         async def start(self):
             assert len(self.all_bridges) == 3
             assert all(b.initialized for b in self.all_bridges)
+            assert all(b.unverified for b in self.all_bridges)  # before any replay (#878)
 
     monkeypatch.setattr(run, "BotBridge", Bridge)
     config = Config(

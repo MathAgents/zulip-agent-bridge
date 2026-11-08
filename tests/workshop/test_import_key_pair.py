@@ -122,4 +122,4 @@ def test_the_command_line_needs_a_scope(tmp_path, capsys):
     key.write_text(KEY + "\n")
     with pytest.raises(SystemExit):
         ikp.main(["--region", "us-east-2", "--key-name", NAME, "--public-key", str(key)])
-    assert "--tag workshop=NAME" in capsys.readouterr().err
+    assert "the following arguments are required: --tag" in capsys.readouterr().err

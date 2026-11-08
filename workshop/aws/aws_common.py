@@ -2,8 +2,9 @@
 workshop/admin/README.md §4).
 
 Standalone scripts, not part of the `zab` package: run them with `uv run --with boto3 python
-workshop/aws/launch.py …` from a machine with AWS credentials (Drew's laptop). boto3 is imported
-lazily inside `Ec2`, so this module, the roster helpers and the tests need no AWS library.
+workshop/aws/launch.py …` from a machine with AWS credentials, or through the admin bot, which
+runs them on the admin server. boto3 is imported lazily inside `Ec2`, so this module, the roster
+helpers and the tests need no AWS library.
 Everything that touches AWS goes through `Ec2`; tests replace it with a fake.
 """
 
@@ -27,16 +28,16 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
-#: The tag that scopes every lookup, creation and teardown to this workshop (README.md, "The VMs").
-#: The scripts take `--tag KEY=VALUE` to override it (for example for a dry-run fleet), repeatable:
-#: the test rig's VM carries `zab-role=test` and `workshop=zab-test` (issue #263). Every scope tag
-#: goes on every resource created, and every lookup requires all of them (`parse_tags`).
-WORKSHOP_TAG = ("workshop", "nt-agents-2026")
+#: The tags that scope every lookup, creation and teardown to a workshop (README.md, "The VMs"):
+#: the scripts take them as `--tag KEY=VALUE`, repeatable and required, such as
+#: `workshop=<name>`, or the test rig's `zab-role=test` and `workshop=zab-test` (issue #263).
+#: Every scope tag goes on every resource created, and every lookup requires all of them
+#: (`parse_tags`). No default: one would name a deployment, and a script run without it would
+#: reach that deployment's VMs (#808).
 #: Where a release tag installs from, `git+URL@TAG`: the public repository, whose tags are the
 #: releases (#593). `ZAB_REPO` overrides it in push_config.py, build_ami.py and build.sh; it
 #: must be a URL uv installs from (https:// or ssh://), not scp-style `git@host:path`.
 ZAB_REPO_URL = "https://github.com/MathAgents/zulip-agent-bridge"
-DEFAULT_TAG_SPEC = f"{WORKSHOP_TAG[0]}={WORKSHOP_TAG[1]}"
 #: Tags set per participant (`launch.participant_tags`), never part of a scope.
 RESERVED_TAG_KEYS = frozenset({"Name", "participant"})
 #: The admin server's fleet-wide scope tag (docs/ADMIN.md §5): one value for every workshop of
@@ -354,10 +355,16 @@ def is_spare_name(name: str) -> bool:
 #: at every first boot so that they hold whether or not the image already carries them. Every step
 #: is idempotent and runs as root (cloud-init). Mirrored in `workshop/ami/build.sh`.
 #: - An 8 GiB swap file: Ubuntu AMIs have no swap, and a participant's big Magma or Sage job
-#:   would otherwise get an agent, or the bridge, OOM-killed.
+#:   would otherwise get an agent, or the bridge, OOM-killed. Its `/etc/fstab` line is added
+#:   only when no `/swapfile` line is there, separated by a space or a tab: an image may carry
+#:   one, written by hand perhaps, and the file needs only one (#799).
 #: - Claude Code's auto-updater off through the managed settings file, which the participant's
 #:   own settings cannot override and which the CLI reads under `zab.service` too (verified on
 #:   2.1.285: `claude doctor` reports "Auto-updates: disabled (set by env: DISABLE_AUTOUPDATER)").
+#:   The same file sets `CLAUDE_CODE_CERT_STORE=system` (#882): the requests that take Claude
+#:   Code's own CA list trust the system store alone, not also its bundled roots; a plain `fetch`
+#:   still gets those (build.sh, step 6). Every other key of the file is kept; a file that isn't a
+#:   JSON object is left as it is (the snippet fails before it writes).
 #: - Codex's update check off (`check_for_update_on_startup`, in the 0.157.1 config schema),
 #:   written at the top of the file so that it stays a root key even when the file ends inside a
 #:   table such as `[projects."…"]` (codex round 1 on PR #53); the MCP table goes at the end.
@@ -369,7 +376,7 @@ if ! swapon --show=NAME --noheadings | grep -qx /swapfile; then
   fallocate -l 8G /swapfile && chmod 0600 /swapfile && mkswap /swapfile >/dev/null \\
     && swapon /swapfile
 fi
-grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw,nofail 0 0' >> /etc/fstab
+grep -q '^/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw,nofail 0 0' >> /etc/fstab
 managed=/etc/claude-code/managed-settings.json
 install -d -m 0755 /etc/claude-code
 python3 - "$managed" <<'PY'
@@ -377,6 +384,7 @@ import json, os, sys
 path = sys.argv[1]
 data = json.load(open(path)) if os.path.exists(path) else {}
 data.setdefault("env", {})["DISABLE_AUTOUPDATER"] = "1"
+data["env"]["CLAUDE_CODE_CERT_STORE"] = "system"  # Claude Code's own CA list (#882)
 data["disableClaudeAiConnectors"] = True  # claude.ai connectors off (issue #36, DECISIONS)
 with open(path, "w") as f:
     json.dump(data, f)
@@ -945,9 +953,10 @@ Scope = tuple[str, str] | Mapping[str, str]
 def parse_tags(specs: str | Iterable[str] | None) -> dict[str, str]:
     """The scope from `--tag KEY=VALUE` (repeatable): every tag in it goes on every resource a
     script creates, and a lookup matches only resources that carry all of them (issue #263: the
-    test VM is `zab-role=test` and `workshop=zab-test`). None or no spec is the default
-    workshop tag; a single string is one spec (the option before it was repeatable). A key given
-    twice with two values, and the per-participant keys `Name` and `participant`, are refused."""
+    test VM is `zab-role=test` and `workshop=zab-test`). None or no spec is refused: a scope is
+    required (#808). A single string is one spec (the option before it was repeatable). A key
+    given twice with two values, and the per-participant keys `Name` and `participant`, are
+    refused."""
     if specs is None:
         specs = []
     elif isinstance(specs, str):
@@ -960,17 +969,21 @@ def parse_tags(specs: str | Iterable[str] | None) -> dict[str, str]:
         if scope.get(key, value) != value:
             raise ValueError(f"--tag {key} given twice: {scope[key]!r} and {value!r}")
         scope[key] = value
-    return scope or {WORKSHOP_TAG[0]: WORKSHOP_TAG[1]}
+    if not scope:
+        raise ValueError("no scope: give the workshop's --tag, such as --tag workshop=<name>")
+    return scope
 
 
 def add_tag_argument(parser: Any) -> None:
-    """The scripts' `--tag KEY=VALUE` option, repeatable; `parse_tags(opts.tag)` reads it."""
+    """The scripts' `--tag KEY=VALUE` option, repeatable and required (#808);
+    `parse_tags(opts.tag)` reads it."""
     parser.add_argument(
         "--tag",
         action="append",
+        required=True,
         metavar="KEY=VALUE",
-        help=f"workshop scope tag (repeatable: resources carry all of them, and lookups require "
-        f"all of them; default {DEFAULT_TAG_SPEC})",
+        help="the workshop's scope tag, such as workshop=NAME (required, repeatable: resources "
+        "carry all of them, and lookups require all of them)",
     )
 
 
@@ -988,7 +1001,7 @@ def scope_tags(scope: Scope) -> dict[str, str]:
 
 
 def scope_text(scope: Scope) -> str:
-    """`workshop=nt-agents-2026` or `zab-role=test, workshop=zab-test`, for messages."""
+    """`workshop=harvard-2026` or `zab-role=test, workshop=zab-test`, for messages."""
     return ", ".join(f"{k}={v}" for k, v in scope_tags(scope).items())
 
 

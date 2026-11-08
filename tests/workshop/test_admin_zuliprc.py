@@ -24,6 +24,8 @@ import push_waker
 import pytest
 import zulip_provision as zp
 
+from .scope import scoped
+
 ADMIN = pathlib.Path(__file__).resolve().parents[2] / "workshop" / "admin"
 DECOY = "DECOY-SECRET-523"  # a decoy, never a real key
 SITE = "https://zulip.example.org"
@@ -200,7 +202,7 @@ def test_roster_import(bad, tmp_path):
     upload = tmp_path / "upload.csv"
     upload.write_text(ROSTER.replace("carol@", "carol2@"))
     code, out = run("roster_import.py", "--roster", roster(tmp_path), "--input", upload,
-                    "--zuliprc", path, "--dry-run")  # fmt: skip
+                    "--zuliprc", path, "--dry-run", *scoped([]))  # fmt: skip
     assert code == 1
     assert out == (
         f"refused: carol: e-mail change: cannot check the old address: {path}: {why}\n"

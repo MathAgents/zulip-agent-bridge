@@ -28,6 +28,6 @@ tests/fixtures/**/raw/
 # Claude Code worktrees created by the harness for forked agents
 .claude/worktrees/
 
-# Magma files for the AMI build are copied from Drew's machine, never committed (DECISIONS D19)
+# Magma files for the AMI build are copied from the build's machine, never committed (DECISIONS D19)
 workshop/ami/magma*
 *magmapassfile*

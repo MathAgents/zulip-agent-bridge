@@ -1,6 +1,8 @@
 """The admin server's users, units, IMDS rule and Caddyfile (docs/ADMIN.md §1.2, §1.3, §4.3;
 issue #324). The checks that need systemd-analyze, systemd-sysusers, a user systemd manager,
-nft, unshare or shellcheck skip where the tool is missing."""
+nft, unshare or shellcheck skip where the tool is missing; the nftables ones also where nft
+can't load an inet `reject` in a user namespace, but fail instead with `ZAB_REQUIRE_NFT=1`,
+which CI sets (#785)."""
 
 import functools
 import io
@@ -45,6 +47,8 @@ CAPABILITIES = {
     "zab-admin.conf": "CAP_NET_BIND_SERVICE",
     # #418: read and delete the request in zab-admin's 0700 directory, give the key its group
     "zab-admin-config.service": "CAP_CHOWN CAP_DAC_OVERRIDE",
+    # #569: read and delete the request in zab-admin's 0700 directory, as the config helper does
+    "zab-admin-upgrade-plan.service": "CAP_DAC_OVERRIDE",
 }
 IMDS_USERS = {"root", "zab-admin", "zab-starter"}
 
@@ -77,12 +81,16 @@ def test_the_units_are_the_ones_of_section_1_2():
         "zab-admin-config.service",
         "zab-admin-imds.service",
         "zab-admin-starter.service",
+        "zab-admin-upgrade-plan.service",
+        "zab-admin-upgrade.service",
         "zab-archive-check@.service",
         "zab-console.service",
         "zab-waker.service",
     ]
     assert [s.name for s in SOCKETS] == ["zab-admin-starter.socket", "zab-archive-check.socket"]
-    assert [p.name for p in PATHS] == ["zab-admin-config.path"]
+    assert [p.name for p in PATHS] == [
+        "zab-admin-config.path", "zab-admin-upgrade-plan.path", "zab-admin-upgrade.path",
+    ]  # fmt: skip
 
 
 #: The config helper's command (#437): the system interpreter deploy.sh builds the venv from,
@@ -122,13 +130,81 @@ def test_the_config_helper_starts_on_a_request_and_writes_only_its_paths():
     assert helper["BindPaths"] == [f"{etc}/secrets/bots"]  # but the bots' keys: the new one
     assert helper["InaccessiblePaths"] == ["-/var/lib/zab-admin"]  # the fleet key, ws/, …
     bot = settings(SERVER / "zab-admin-bot.service")
-    assert bot["ReadWritePaths"] == ["/var/lib/zab-admin -/var/lib/zab-admin-config/requests"]
+    requests = "-/var/lib/zab-admin-config/requests -/var/lib/zab-admin-upgrade/requests"
+    assert bot["ReadWritePaths"] == [f"/var/lib/zab-admin {requests}"]
     assert helper["PrivateNetwork"] == ["true"] and helper["IPAddressDeny"] == ["any"]
     assert helper["RestrictAddressFamilies"] == ["AF_UNIX"]
     assert "Restart" not in helper  # a request's run, then nothing: it restarts no unit
 
 
-@pytest.mark.parametrize("path", [*UNITS, CADDY], ids=lambda p: p.name)
+UPGRADE_LAUNCH = (
+    "import os, sys; sys.path.append(os.path.realpath('/opt/zab-admin/current/src')); "
+    "from zab.admin.upgradehelper import main; sys.exit(main(['{}']))"
+)
+
+
+def test_the_upgrade_plan_helper_starts_on_a_request_in_its_sandbox():
+    """#569, §1.6: `!upgrade-server`'s dry run starts the plan helper, which a deployer's request
+    starts before any approval: it runs as the config helper does (the system interpreter, -I -B
+    -S), writes only its own state, sees the deploy key and no other secret, nor the bot's state,
+    and reaches the network (GitHub) but not IMDS."""
+    watch = settings(SERVER / "zab-admin-upgrade-plan.path")
+    assert watch["PathExists"] == ["/var/lib/zab-admin-upgrade/requests/plan.json"]
+    assert watch["Unit"] == ["zab-admin-upgrade-plan.service"]
+    plan = settings(SERVER / "zab-admin-upgrade-plan.service")
+    assert plan["Type"] == ["oneshot"]
+    assert plan["ExecStart"] == [f'{HELPER_PYTHON} -I -B -S -c "{UPGRADE_LAUNCH.format("plan")}"']
+    assert plan["ReadWritePaths"] == ["/var/lib/zab-admin-upgrade"]  # requests/ is inside, root's
+    assert plan["TemporaryFileSystem"] == ["/etc/zab-admin/secrets:ro"]
+    assert plan["BindReadOnlyPaths"] == ["-/etc/zab-admin/secrets/release-key"]  # made by hand
+    hidden = "-/var/lib/zab-admin -/var/lib/zab-console -/var/lib/caddy -/etc/ssh -/etc/shadow"
+    assert plan["InaccessiblePaths"] == [f"{hidden} -/etc/gshadow"]
+    assert plan["IPAddressDeny"] == [IMDS] and "PrivateNetwork" not in plan
+    from zab.admin.upgradehelper import GIT_SECONDS, REVIEW_SECONDS
+
+    # review of #893, B1: systemd never stops it before its own limits, so it always answers
+    assert int(plan["TimeoutStartSec"][0]) >= GIT_SECONDS + REVIEW_SECONDS + 240
+    assert plan["RestrictAddressFamilies"] == ["AF_UNIX AF_INET AF_INET6"]
+    assert "Restart" not in plan and "StateDirectory" not in plan
+    tmpfiles = (SERVER / "tmpfiles.conf").read_text()
+    for line in ("/var/lib/zab-admin-upgrade 0755 root root",
+                 "/var/lib/zab-admin-upgrade/requests 0700 zab-admin zab-admin",
+                 "/var/lib/zab-admin-upgrade/results 0755 root root"):  # fmt: skip
+        assert re.search(r"^d +" + r" +".join(map(re.escape, line.split())) + " ", tmpfiles, re.M)
+
+
+#: The units that are the deploy itself, with root's system as `sudo bash deploy.sh --server`
+#: over SSH has (#569): `test_every_unit_is_hardened` leaves them out, and the next test says
+#: what they keep.
+DEPLOYING = {"zab-admin-upgrade.service"}
+
+
+def test_the_upgrade_apply_helper_is_the_deploy():
+    """#569, §1.6: an approved `!upgrade-server`'s apply starts the apply helper, which runs the
+    release's deploy.sh --server: it installs users, units, tmpfiles entries, Caddy's
+    configuration and the release under /opt, so it has root's system and every capability,
+    as the SSH path's root has. It keeps no new privileges, its own /tmp, no home directories,
+    /usr and /boot read-only, UMask=0077, and a start timeout above deploy.sh's own limit."""
+    watch = settings(SERVER / "zab-admin-upgrade.path")
+    assert watch["PathExists"] == ["/var/lib/zab-admin-upgrade/requests/apply.json"]
+    assert watch["Unit"] == ["zab-admin-upgrade.service"]
+    apply = settings(SERVER / "zab-admin-upgrade.service")
+    assert apply["Type"] == ["oneshot"]
+    assert apply["ExecStart"] == [f'{HELPER_PYTHON} -I -B -S -c "{UPGRADE_LAUNCH.format("apply")}"']
+    kept = {"NoNewPrivileges": "true", "PrivateTmp": "true", "ProtectHome": "true"}
+    kept |= {"ProtectSystem": "true", "UMask": "0077"}
+    assert {key: apply[key] for key in kept} == {key: [value] for key, value in kept.items()}
+    assert "User" not in apply and "CapabilityBoundingSet" not in apply  # root, as over SSH
+    from zab.admin.upgradehelper import DEPLOY_SECONDS, WHEEL_SECONDS
+
+    # it writes its outcome before systemd would stop it: the wheel's run and the upgrade's (#569)
+    assert int(apply["TimeoutStartSec"][0]) > WHEEL_SECONDS + DEPLOY_SECONDS + 60
+    assert "Restart" not in apply
+
+
+@pytest.mark.parametrize(
+    "path", [*(u for u in UNITS if u.name not in DEPLOYING), CADDY], ids=lambda p: p.name
+)
 def test_every_unit_is_hardened(path):
     found = settings(path)
     for key, value in HARDENING.items():
@@ -151,6 +227,8 @@ def test_who_runs_what_and_who_reaches_imds():
         "zab-admin-config.service": "root",
         "zab-admin-imds.service": "root",
         "zab-admin-starter.service": "zab-starter",
+        "zab-admin-upgrade-plan.service": "root",
+        "zab-admin-upgrade.service": "root",
         "zab-archive-check@.service": "zab-ac-%i",
         "zab-console.service": "zab-console",
         "zab-waker.service": "zab-waker",
@@ -408,13 +486,17 @@ def test_sysusers_and_tmpfiles_parse(tmp_path, monkeypatch):
     assert loaded["status_file"] == "/var/lib/zab-waker/status/waker.json"
 
 
-NFT_PROBE = """
+#: What an IPv6 case does first in its namespace (`NFT_PROBE`), and so `_ipv6_unusable` too
+IPV6_ADDR = ("ip", "-6", "addr", "add", "fd00:ec2::254/128", "dev", "lo", "nodad")
+NFT_PROBE = f"""
 import socket, subprocess, sys
 rule, ip = sys.argv[1], sys.argv[2]
 run = lambda *a: subprocess.run(a, check=True)
 run("ip", "link", "set", "lo", "up")
-run("ip", "addr", "add", "169.254.169.254/32", "dev", "lo")
-run("ip", "-6", "addr", "add", "fd00:ec2::254/128", "dev", "lo", "nodad")
+if ":" in ip:  # the family under test alone: a host without IPv6 runs the IPv4 cases (#805)
+    run(*{IPV6_ADDR!r})
+else:
+    run("ip", "addr", "add", "169.254.169.254/32", "dev", "lo")
 server = socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET)
 server.bind((ip, 80)); server.listen()
 run("nft", "-f", rule)
@@ -426,19 +508,167 @@ except ConnectionRefusedError:
 """
 
 
-def _nft_usable() -> bool:
-    if not (shutil.which("nft") and shutil.which("unshare") and shutil.which("ip")):
-        return False
-    return run("unshare", "-rn", "nft", "list", "ruleset").returncode == 0
+#: The shipped rule's kinds of match and verdict, in a table of its own: an `ip` and an `ip6`
+#: line, each with a set of two users (nft makes a real set of two, where it folds one into a
+#: comparison; numbers, so that no name is looked up), a counter and a `reject` (#805). An
+#: `inet` table's `reject` needs the kernel module nft_reject_inet: on a host where the
+#: namespace's nft doesn't get it, the rule fails at its `reject` with ENOENT (#785).
+NFT_REJECT = """table inet zab_probe {
+\tchain output {
+\t\ttype filter hook output priority filter; policy accept;
+\t\tip daddr 169.254.169.254 meta skuid != { 0, 1 } counter reject
+\t\tip6 daddr fd00:ec2::254 meta skuid != { 0, 1 } counter reject
+\t}
+}
+"""
+NO_REJECT = (
+    "nft can't load an inet `reject` rule in an unprivileged network namespace ({error}). "
+    "That `reject` needs the kernel module nft_reject_inet: loading it on the host "
+    "(`sudo modprobe nft_reject_inet`) may let these tests run here. CI runs them (#785)"
+)
 
 
-@pytest.mark.skipif(not _nft_usable(), reason="no nft, or no unprivileged network namespace")
+def _nft_unusable(run=run, which=shutil.which) -> str:
+    """Why the rule's tests can't run nft here, or "" (#785): a tool missing, no unprivileged
+    network namespace, or one in which nft can't load `NFT_REJECT`."""
+    if missing := [tool for tool in ("nft", "unshare", "ip") if not which(tool)]:
+        return "no " + ", ".join(missing)
+    if (listed := run("unshare", "-rn", "nft", "list", "ruleset")).returncode:
+        return f"no unprivileged network namespace for nft ({_said(listed)})"
+    loaded = run("unshare", "-rn", "nft", "-f", "-", input=NFT_REJECT)
+    return NO_REJECT.format(error=_said(loaded)) if loaded.returncode else ""
+
+
+def _ipv6_unusable(run=run) -> str:
+    """Why the IPv6 cases can't run here, or "" (#805): the address they add, refused in a new
+    network namespace, as on a host booted with IPv6 disabled (`ipv6.disable=1`). The probe of
+    `_nft_unusable` passes there, and the IPv4 cases run."""
+    added = run("unshare", "-rn", *IPV6_ADDR)
+    if not added.returncode:
+        return ""
+    return f"no IPv6 in a network namespace here ({_said(added)}). CI runs these tests (#805)"
+
+
+def _said(result: subprocess.CompletedProcess) -> str:
+    """A failed command's error, for a skip's reason: what follows nft's `Error: `, without
+    its file and position, else the first line of its stderr, else its exit code."""
+    lines = result.stderr.splitlines()
+    error = next((x.split("Error: ", 1)[1] for x in lines if "Error: " in x), None)
+    return (error or (lines or [f"exit {result.returncode}"])[0]).strip()
+
+
+def need_nft(why: str, required: bool) -> None:
+    """Skip a test that runs nft where it can't run (`why`), as the other tests do for a tool
+    that is missing, but fail it where it must run: `ZAB_REQUIRE_NFT=1`, which CI sets (#785)."""
+    if why and required:
+        pytest.fail(f"ZAB_REQUIRE_NFT=1, but {why}", pytrace=False)
+    if why:
+        pytest.skip(why)
+
+
+@functools.cache
+def _nft_here() -> str:
+    return _nft_unusable()
+
+
+@functools.cache
+def _ipv6_here() -> str:
+    return _ipv6_unusable()
+
+
+def _required() -> bool:
+    return os.environ.get("ZAB_REQUIRE_NFT") == "1"
+
+
+@pytest.fixture
+def nft() -> None:
+    need_nft(_nft_here(), _required())
+
+
+def fake_run(listed: int, loaded: int, stderr: str = ""):
+    """A `run` whose `nft list ruleset` and `nft -f -` exit with these codes; its calls."""
+    calls = []
+
+    def fake(*argv, **options):
+        calls.append((argv, options))
+        code = loaded if argv[-2:] == ("-f", "-") else listed
+        return subprocess.CompletedProcess(argv, code, "", stderr if code else "")
+
+    return fake, calls
+
+
+#: nft's error for the shipped rule on a host without nft_reject_inet (#785: kernel 7.2.6,
+#: nftables 1.0.9), its first line as printed there
+ENOENT = "imds.nft:17:81-86: Error: Could not process rule: No such file or directory\n"
+EPERM = "unshare: unshare failed: Operation not permitted\n"  # a made-up refusal
+
+
+def test_without_an_inet_reject_the_nftables_tests_skip_but_not_on_ci():
+    """#785: the probe's decision, with its result injected. A namespace where the table with
+    a `reject` doesn't load skips the tests, naming the module; with `ZAB_REQUIRE_NFT=1` it
+    fails them instead. Where it loads, they run."""
+    fake, calls = fake_run(0, 1, ENOENT)
+    why = _nft_unusable(fake, which=lambda tool: f"/usr/bin/{tool}")
+    assert why == NO_REJECT.format(error="Could not process rule: No such file or directory")
+    assert "sudo modprobe nft_reject_inet" in why and "CI runs them" in why
+    (_, (argv, options)) = calls
+    assert argv == ("unshare", "-rn", "nft", "-f", "-") and options == {"input": NFT_REJECT}
+    rules = [line.strip() for line in NFT_REJECT.splitlines() if "daddr" in line]
+    assert NFT_REJECT.startswith("table inet ") and [r.split()[0] for r in rules] == ["ip", "ip6"]
+    assert all(r.endswith("meta skuid != { 0, 1 } counter reject") for r in rules)
+    with pytest.raises(pytest.skip.Exception, match="nft_reject_inet"):
+        need_nft(why, required=False)
+    with pytest.raises(pytest.fail.Exception, match=r"^ZAB_REQUIRE_NFT=1, but nft can't load"):
+        need_nft(why, required=True)
+    fake, calls = fake_run(0, 0)
+    assert _nft_unusable(fake, which=lambda tool: f"/usr/bin/{tool}") == "" and len(calls) == 2
+    need_nft("", required=True)  # runs
+
+
+@pytest.mark.parametrize(
+    ("which", "listed", "why"),
+    [
+        (lambda tool: None if tool == "ip" else tool, 0, "no ip"),
+        (lambda tool: tool, 1, f"no unprivileged network namespace for nft ({EPERM.strip()})"),
+    ],
+)
+def test_the_nft_probe_stops_at_the_first_lack(which, listed, why):
+    fake, calls = fake_run(listed, 0, EPERM)
+    assert _nft_unusable(fake, which=which) == why
+    assert all(argv[-2:] != ("-f", "-") for argv, _ in calls)  # no table loaded
+
+
+def test_without_ipv6_the_ipv6_cases_skip_but_not_on_ci():
+    """#805: on a host without IPv6, the IPv6 cases skip with the reason, or fail with
+    `ZAB_REQUIRE_NFT=1`; the probe adds the very address they add."""
+    calls = []
+
+    def refused(*argv, **_):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 2, "", "RTNETLINK answers: a made-up refusal\n")
+
+    why = _ipv6_unusable(refused)
+    assert why == (
+        "no IPv6 in a network namespace here (RTNETLINK answers: a made-up refusal). "
+        "CI runs these tests (#805)"
+    )
+    assert calls == [("unshare", "-rn", *IPV6_ADDR)] and f"run(*{IPV6_ADDR!r})" in NFT_PROBE
+    with pytest.raises(pytest.skip.Exception, match=r"^no IPv6"):
+        need_nft(why, required=False)
+    with pytest.raises(pytest.fail.Exception, match=r"^ZAB_REQUIRE_NFT=1, but no IPv6"):
+        need_nft(why, required=True)
+    assert _ipv6_unusable(lambda *argv, **_: subprocess.CompletedProcess(argv, 0, "", "")) == ""
+
+
+@pytest.mark.usefixtures("nft")
 @pytest.mark.parametrize("ip", IMDS.split())
 @pytest.mark.parametrize(("allowed", "want"), [("root", "open"), ("bin", "refused")])
 def test_the_imds_rule_refuses_other_users(tmp_path, ip, allowed, want):
     """In a private network namespace, where this test is root: the rule as shipped, with
     zab-admin swapped for a user that exists here, lets root through, and refuses it once root
-    is swapped out of the set too."""
+    is swapped out of the set too. The IPv6 cases need IPv6 (#805)."""
+    if ":" in ip:
+        need_nft(_ipv6_here(), _required())
     rule = (
         (SERVER / "imds.nft")
         .read_text()
@@ -464,7 +694,7 @@ for step, f in (("boot", "imds.nft"), ("start", "start.nft"), ("reload", "start.
 """
 
 
-@pytest.mark.skipif(not _nft_usable(), reason="no nft, or no unprivileged network namespace")
+@pytest.mark.usefixtures("nft")
 def test_each_nftables_transaction_keeps_the_rule(tmp_path):
     """The two files nftables.service now loads, with their includes pointed here, and a stand-in
     for /etc/nftables.conf that flushes and adds its own table: start and reload keep both

@@ -29,7 +29,7 @@ def test_recorder_folds_parts_into_one_row():
     rec.finish(2, "test_catchup", "skipped", 0, "bridge unit missing")
     assert rec.rows[2].outcome == "skipped"
     with pytest.raises(ValueError):
-        rec.row(17)
+        rec.row(18)
 
 
 def test_scenarios_are_selected_by_number_or_group(monkeypatch):

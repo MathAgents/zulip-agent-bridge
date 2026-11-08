@@ -7,10 +7,12 @@
 
 provider = "aws"
 admins = [101, 102]             # Zulip user IDs who may act through every bot
-deployers = [101]               # SSH and deploy (and !upgrade-server, not built)
+deployers = [101]               # SSH and deploy, and request and approve !upgrade-server
 destructive_approvals = 2       # the test server uses 1
 plan_ttl_minutes = 10
 release = "final"               # final tags only; the test server takes "rc" too
+# !upgrade-server's repository, fetched with the server's deploy key (§1.6); unset, it is off
+# release_repo = "git@github.com:MathAgents/zulip-agent-bridge.git"
 console_url = "https://admin.example.org"   # Q4; its host goes into the Caddyfile
 
 [global]

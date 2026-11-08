@@ -12,6 +12,8 @@ import build_ami as ba
 import push_config as pc
 import pytest
 
+from .scope import with_build
+
 PUBLIC = "https://github.com/MathAgents/zulip-agent-bridge"
 FORK = "https://git.example.org/fork/zab"
 
@@ -21,12 +23,13 @@ def dry(monkeypatch, tmp_path):
     """`build_ami.py --dry-run …`: no boto3, no network; (exit status, what it printed)."""
     monkeypatch.setitem(sys.modules, "boto3", None)
     monkeypatch.setattr(ba, "egress_ip", lambda *a: pytest.fail("no network in a dry run"))
+    monkeypatch.setattr(ba.m2_debs, "origin_repo", lambda *a: "o/r")  # whatever the checkout's
     key = tmp_path / "id_ed25519.pub"
     key.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTests test@example\n")
 
     def run(*args: str, capsys) -> tuple[int, str]:
         argv = ["--dry-run", "--account-id", "123456789012", "--ssh-public-key", str(key)]
-        rc = ba.main([*argv, *args])
+        rc = with_build(ba.main, [*argv, *args])
         out = capsys.readouterr()
         return rc, out.out + out.err
 

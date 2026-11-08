@@ -13,19 +13,21 @@ import pytest
 
 from e2e.admin import conftest
 from e2e.admin import test_scenarios_1_server as server
+from e2e.admin import test_scenarios_1_upgrade as in_band
 from e2e.admin import test_scenarios_2_bot as bot
 from e2e.admin import test_scenarios_3_defaults as defaults
 from e2e.admin import test_scenarios_3_late_joiner as joiner
 from e2e.admin import test_scenarios_4_grow_disk as grow
 from e2e.admin import test_scenarios_8_later as later
 from e2e.admin import test_scenarios_8_the_end as end
+from e2e.admin import test_scenarios_8_the_end_of_month as month
 from e2e.admin import test_scenarios_8_the_kept_fleet as kept
 from e2e.admin import test_scenarios_9_checks as checks
 
 #: The scenario parts, in the order pytest runs them (file, then definition order).
 PARTS = [
     fn
-    for module in (server, bot, defaults, joiner, grow, later, end, kept, checks)
+    for module in (server, in_band, bot, defaults, joiner, grow, later, end, month, kept, checks)
     for name, fn in vars(module).items()
     if name.startswith("test_") and callable(fn)
 ]
@@ -40,12 +42,13 @@ Q9_GATED = (
 
 
 def test_the_parts_run_in_their_files_order():
-    """Pytest runs the files in name order (conftest): A23 after the bot scenarios (A8's waker
-    among them) and before A20, whose idle stop it must not find on its VM; A20 before A9,
-    which finds the fleet as A20 leaves it; A9 after the later stages' hooks; A18 after A9,
-    which ends the first workshop's VMs; then the checks that sweep what they did (A12,
-    A13)."""
-    modules = (server, bot, defaults, joiner, grow, later, end, kept, checks)
+    """Pytest runs the files in name order (conftest): A10b after A10, on the release it
+    deployed; A23 after the bot scenarios (A8's waker among them) and before A20, whose idle
+    stop it must not find on its VM; A20 before A9, which finds the fleet as A20 leaves it; A9
+    after A16; A17 after A9,
+    which ends the first workshop's VMs, and before A18, so that each runs at most three
+    instances; then the checks that sweep what they did (A12, A13)."""
+    modules = (server, in_band, bot, defaults, joiner, grow, later, end, month, kept, checks)
     assert sorted(m.__name__ for m in modules) == [m.__name__ for m in modules]
 
 
@@ -79,6 +82,7 @@ def walk(*, q9_answered: bool) -> dict[str, bool]:
 #: later stage's hook, aside): a new part must say where it belongs (reviewer on #368).
 WHILE_Q9_IS_OPEN = {
     "test_deploy_gate": True,
+    "test_upgrade_server_in_band": True,  # A10b, after A10: its test release repository aside
     "test_a2_the_first_import": True,
     "test_a3_binding": True,
     "test_a4_launch_and_protect": True,
@@ -112,7 +116,6 @@ WHILE_Q9_IS_OPEN = {
     "test_a21_a_size_that_doesnt_grow_is_refused": True,
     "test_a21_a_running_vm_grows_online": True,
     "test_a21_a_stopped_vm_grows_at_its_next_boot": True,
-    "test_later_stage": True,
     "test_a16_new_workshop": False,  # the provisioner's key makes its bot and channels
     # A9: the provisioner's key makes the throwaway row's bots, which !deactivate-bots ends; the
     # final sync runs its --strict refusal of a row without a repository, then skips (Q9)
@@ -131,6 +134,8 @@ WHILE_Q9_IS_OPEN = {
     "test_a9_deactivate_bots": False,
     "test_a9_a_rebind_is_not_offered_yet": True,
     "test_a9_the_rig_config_again": True,
+    # A17 (#570): its own rows; without Q9 it checks what runs, and notes what it can't
+    "test_a17_month_end": True,
     # A18: only the move needs the test provisioner's key; the rest, the development machine's and
     # the bot's
     "test_a18_a_vm_launched_without_the_servers_key": True,
@@ -237,6 +242,182 @@ def test_a18_skips_naming_the_running_vms_when_more_would_run(monkeypatch):
         asyncio.run(kept.test_a18_a_vm_launched_without_the_servers_key(
             scenario=None, admin_rig=None, rigged=None, aws=aws, tester=None, tester2=None,
             laptop=None))  # fmt: skip
+
+
+def test_a17_skips_naming_the_running_vms_when_more_would_run():
+    """§7 (review of #839, N8): A17 runs two instances of its own beside the server, so any
+    other one of the rig's skips it, named; its own two, left by an earlier run, don't."""
+    aws = SimpleNamespace(fleet=lambda: [vm("zab-test-c", "running"), vm("zab-test-r", "running")])
+    with pytest.raises(pytest.skip.Exception, match=r"\['zab-test-c'\] run besides the server"):
+        asyncio.run(month.test_a17_month_end(
+            scenario=None, admin_rig=None, rigged=None, server=None, aws=aws, tester=None,
+            tester2=None, nonce="x"))  # fmt: skip
+    ours = [vm("zab-test-r", "running"), vm("zab-test-n", "pending"), vm("zab-test-a", "stopped")]
+    assert month.crowded(SimpleNamespace(fleet=lambda: ours)) == []
+
+
+async def test_a17s_waits_match_what_the_bot_says(tmp_path):
+    """Codex round 2 on #839: each pattern A17 waits for, and each text it looks for in what
+    comes, against the text the bot builds with its own functions, so that one that can't
+    match fails here, not at the end of a live wait."""
+    import dataclasses
+    import re
+    import sqlite3
+
+    from zab.admin import monthend, planning
+    from zab.admin.grammar import keep_until_end
+
+    r, n, schedule = month.R, month.N, "P-60"
+    entry = monthend.Entry(
+        workshop="zab-admin-e2e", slug=r, plan=60, keep_until="2026-11-30T15:10",
+        ends=keep_until_end("2026-11-30T15:10"), vms="i-1", tagged="i-1", bots=(),
+        zulip_user_id="2002", warned=(), state=monthend.SCHEDULED, note="", changed=0.0,
+    )  # fmt: skip
+    notice = monthend.notice(entry, "zab-admin-e2e", "MathAgents/zab-test-r")
+    assert re.search(month.NOTICE_RE, notice) and month.bots_named(r) in notice, notice[:200]
+    heard = {f"{monthend.NOTICE} {monthend.SENT}": [r], f"{monthend.NOTICE} {monthend.NO_ID}": [n]}
+    line = monthend.look_line(schedule, heard)
+    assert re.search(month.looked(schedule), line), line
+    assert not re.search(month.dropped_out(schedule), line), line
+    assert month.warned(r) in line and month.unreached(n) in line, line
+    later = "2026-12-01T15:10"
+    fleet = SimpleNamespace(rows=[SimpleNamespace(slug=n, excluded=False, keep_until=later)],
+                            present=lambda slug: True, retired={})  # fmt: skip
+    why = monthend.changed(dataclasses.replace(entry, slug=n), fleet, {})
+    line = monthend.look_line(schedule, {"dropped": [f"{n} ({why})"]})  # as `month_end` puts it
+    assert re.search(month.dropped_out(schedule), line), line
+    assert month.dropped_why(n, later) in line, line
+    line = monthend.look_line(schedule, {f"{monthend.NOTICE} {monthend.REFUSED}": [n]})  # #883
+    assert re.search(month.refused_out(schedule), line) and month.stopped_by(n) in line, line
+    assert f"`!retire {n}`" in monthend.refused_note(n, monthend.NOTICE)
+    assert month.TRIES == monthend.TRIES and month.NO_SUCH_USER.isdigit()
+    assert f": {monthend.counted(2)} scheduled" == month.SCHEDULED
+    assert planning.NONE.startswith("**Commands:** none")
+    assert set(month.ENDED) == {monthend.STOPPED, monthend.DONE, monthend.DROPPED,
+                                monthend.CANCELLED}  # fmt: skip
+
+    @dataclasses.dataclass(frozen=True)
+    class Planned:  # the fields of an `Action` that `Planning._noted` reads
+        workshop: str
+        targets: tuple[str, ...]
+        notes: tuple[str, ...] = ()
+
+    roster = tmp_path / "roster.csv"
+    roster.write_text(f"slug,zulip_user_id\n{r},2002\n{n},\n")
+    db = sqlite3.connect(":memory:")
+    monthend.setup(db)
+    planner = SimpleNamespace(server=SimpleNamespace(store=SimpleNamespace(db=db)))
+    noted = await planning.Planning._noted(
+        planner, Planned("zab-admin-e2e", (r, n)), SimpleNamespace(workshop=SimpleNamespace(
+            roster=str(roster))),
+    )  # fmt: skip
+    assert any(month.unwarned(n) in note for note in noted.notes), noted.notes
+
+
+def test_a17_reads_a_missing_roster_as_empty():
+    """Live run 1: the rig's setup leaves no `roster.csv`, which A17 alone reads as none; any
+    other failure to read it fails A17."""
+    from e2e.harness.vm import Result
+
+    def server(result):
+        return SimpleNamespace(run=lambda argv, **kw: result)
+
+    missing = Result(1, "", "cat: /var/lib/zab-admin/ws/zab-admin-e2e/roster.csv: No such file "
+                            "or directory\n")  # fmt: skip
+    assert month.roster_text(server(missing)) == ""
+    assert month.roster_text(server(Result(0, "slug,email\n", ""))) == "slug,email\n"
+    with pytest.raises(AssertionError, match="Permission denied"):
+        month.roster_text(server(Result(1, "", "cat: roster.csv: Permission denied")))
+    # the review of live run 1: only cat's own word for the roster's path, with its exit 1
+    warning = "Warning: Identity file /home/x/.ssh/k not accessible: No such file or directory"
+    for refused in (Result(255, "", warning), Result(1, "", warning),
+                    Result(2, "", missing.stderr),
+                    Result(1, "", "cat: /tmp/other.csv: No such file or directory")):  # fmt: skip
+        with pytest.raises(AssertionError, match=r"roster\.csv can.t be read"):
+            month.roster_text(server(refused))
+    assert month.roster_text(server(Result(1, "", f"{warning}\n{missing.stderr}"))) == ""
+
+
+def test_a17_alone_imports_its_two_rows_into_no_roster(monkeypatch):
+    """Live run 1, through A17 itself with fakes: with no roster on the server and no other
+    VM running, it gets as far as its import, of its two rows alone."""
+    from e2e.admin.fakes import fake_ids
+    from e2e.harness.vm import Result
+
+    imported = []
+
+    class Imported(Exception):
+        pass
+
+    async def import_roster(t, rows, name):
+        imported.extend(rows)
+        raise Imported
+
+    monkeypatch.setattr(month, "import_roster", import_roster)
+    missing = Result(1, "", f"cat: {month.WS}/roster.csv: No such file or directory\n")
+    server = SimpleNamespace(run=lambda argv, **kw: missing)
+    with pytest.raises(Imported):
+        asyncio.run(month.test_a17_month_end(
+            scenario=None, admin_rig=SimpleNamespace(region="us-east-1"),
+            rigged=SimpleNamespace(ids=fake_ids), server=server,
+            aws=SimpleNamespace(fleet=lambda: []), tester=SimpleNamespace(), tester2=None,
+            nonce="x"))  # fmt: skip
+    assert [row["slug"] for row in imported] == [month.R, month.N]
+
+
+def test_a17_binds_zab_test_r_with_no_other_row_holding_its_id():
+    """The full run after A9: `zab-test-b` holds zab-tester2's Zulip ID. A17's set-up gives it
+    to `zab-test-r` and clears it from `zab-test-b`, so that no two rows share one, which
+    `keep_until.py` refuses; a row with none, or another, keeps what it has."""
+    fields = ["slug", "email", "zulip_user_id"]
+    rows = [
+        {"slug": "zab-test-a", "email": "a@example.com", "zulip_user_id": ""},
+        {"slug": "zab-test-b", "email": "b@example.com", "zulip_user_id": "1207965"},
+        {"slug": "zab-test-c", "email": "c@example.com", "zulip_user_id": "1234567"},
+        {"slug": month.R, "email": "r@example.com", "zulip_user_id": ""},
+    ]
+    assert month.rebound(fields, rows, month.R, "1207965") == ["zab-test-b"]
+    ids = {r["slug"]: r["zulip_user_id"] for r in rows}
+    assert ids == {"zab-test-a": "", "zab-test-b": "", "zab-test-c": "1234567",
+                   month.R: "1207965"}  # fmt: skip
+    alone = [{"slug": month.R, "email": "r@example.com"}]  # no column yet: A17 alone
+    names = ["slug", "email"]
+    assert month.rebound(names, alone, month.R, "1207965") == [] and "zulip_user_id" in names
+    assert "def rebound(" in month.EDIT and "rebound(fields, rows, slug, uid[0])" in month.EDIT
+
+
+def test_a17s_edit_script_runs_as_on_the_server(tmp_path):
+    """`EDIT` itself, as zab-admin runs it on the server, against a roster of the full run
+    after A9: it binds `zab-test-r`, clears `zab-test-b`, and says so."""
+    import csv
+    import json
+    import subprocess
+    import sys
+
+    roster = tmp_path / "roster.csv"
+    roster.write_text(
+        f"slug,email,zulip_user_id\nzab-test-b,b@example.com,1207965\n{month.R},r@example.com,\n"
+    )
+    script = month.EDIT.replace('"/var/lib/zab-admin/ws/zab-admin-e2e/"', repr(f"{tmp_path}/"))
+    done = subprocess.run(  # noqa: S603 - this interpreter, A17's own script
+        [sys.executable, "-I", "-c", script, str(roster), month.R, "1207965"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(done.stdout) == {"cleared": ["zab-test-b"]}
+    with roster.open(newline="") as f:
+        ids = {r["slug"]: r["zulip_user_id"] for r in csv.DictReader(f)}
+    assert ids == {"zab-test-b": "", month.R: "1207965"}
+    roster.write_text(f"slug,host,ip\n{month.R},ws-r,198.51.100.9\n")  # the other edit
+    done = subprocess.run(  # noqa: S603 - this interpreter, A17's own script
+        [sys.executable, "-I", "-c", script, str(roster), month.R],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(done.stdout) == {"cleared": []}
+    assert roster.read_text().splitlines()[1] == f"{month.R},,"
 
 
 def test_a18_runs_beside_one_other_vm():

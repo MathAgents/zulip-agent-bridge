@@ -32,6 +32,7 @@ from .botkit import (
     OSCAR,
     PAT,
     TEST_CH,
+    audit_text,
     incoming,
     make_site,
     until,
@@ -225,7 +226,7 @@ async def converse(site, failure):
 
 
 def records(site):
-    return [json.loads(line) for line in site.audit.read_text().splitlines()]
+    return [json.loads(line) for line in audit_text(site.audit).splitlines()]
 
 
 def normal(site, text):

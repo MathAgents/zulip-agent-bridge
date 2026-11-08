@@ -6,8 +6,10 @@ requests against the bot's 150 per minute, before it read the message that woke 
 """
 
 import asyncio
+import contextlib
 import json
 import time
+from dataclasses import replace
 from urllib.parse import parse_qs
 
 import httpx
@@ -48,14 +50,13 @@ def dm_replies(fake):
     return [m for m in fake.messages.values() if m["type"] == "private" and m["sender_id"] == 1]
 
 
-async def test_waking_messages_are_answered_before_the_housekeeping_of_300_sessions(
-    tmp_path, bridge
-):
-    """Criterion 3: the DM that woke the VM and a mention in a new topic are answered
-    before any housekeeping request, without a wait on the budget; a DM during the
-    housekeeping is answered at once too; the housekeeping then confirms every card and
-    reconciles every topic, within the budget minus its reserve."""
-    _, _, backend = bridge  # the fixture's mocks; this test runs its own bridge
+@contextlib.asynccontextmanager
+async def many_sessions(tmp_path, bridge, count=300):
+    """A bridge of its own on the fixture's mocks, its budget on a still clock, every request
+    logged as (time, method, path, query), with `count` recent idle sessions from earlier
+    runs, each with its card. Yields the bridge, its fake Zulip, the clock, the log and the
+    cards (message id -> topic)."""
+    _, _, backend = bridge
     clock, log = FrozenClock(), []
     fake = FakeZulip()
 
@@ -78,7 +79,7 @@ async def test_waking_messages_are_answered_before_the_housekeeping_of_300_sessi
         "https://zulip.example", "bot", "decoy", transport=httpx.MockTransport(recorded)
     )
     client.budget.clock = clock
-    store = Store(tmp_path / "state300")
+    store = Store(tmp_path / f"state{count}")
     b = BotBridge(
         config,
         config.bots[0],
@@ -92,7 +93,7 @@ async def test_waking_messages_are_answered_before_the_housekeeping_of_300_sessi
     try:
         await b.initialize()
         cards = {}
-        for i in range(300):  # 300 recent idle sessions from earlier runs, each with its card
+        for i in range(count):
             fake._message_id += 1
             cards[fake._message_id] = f"topic {i}"
             fake.messages[fake._message_id] = {
@@ -124,6 +125,50 @@ async def test_waking_messages_are_answered_before_the_housekeeping_of_300_sessi
                 updated_at=time.time() - 86400,
             )
         store.set("catchup_cursor:bot", fake._message_id)
+        yield b, fake, clock, log, cards
+    finally:
+        clock.advance(3600)  # release whatever still waits on the budget, then close
+        client.budget.clock = None
+        await b.close()
+        store.close()
+
+
+async def housekeeping_done(b, clock):
+    """Run the housekeeping to its end, one budget window at a time."""
+    for _ in range(30):
+        if b.housekeeping.done():
+            break
+        clock.advance(61)
+        await until(lambda: b.housekeeping.done() or b.client.budget.free() <= b.poster.reserve)
+    await b.housekeeping
+
+
+def card_ids(log, since=0):
+    """The messages fetched one by one (`GET /messages/{id}`: card checks) from `since` on."""
+    return {path[9:] for _, m, path, _ in log[since:] if m == "GET" and path[9:].isdigit()}
+
+
+def reconciled(log, since=0):
+    """The topics fetched by channel and topic (reconciliation, §7.8.2) from `since` on."""
+    topics = set()
+    for _, method, path, query in log[since:]:
+        if method == "GET" and path == "messages" and "narrow" in query:
+            narrow = json.loads(query["narrow"][0])
+            if {term["operator"] for term in narrow} == {"channel", "topic"}:
+                topics.add(next(term["operand"] for term in narrow if term["operator"] == "topic"))
+    return topics
+
+
+async def test_waking_messages_are_answered_before_the_housekeeping_of_300_sessions(
+    tmp_path, bridge
+):
+    """Criterion 3: the DM that woke the VM and a mention in a new topic are answered
+    before any housekeeping request, without a wait on the budget; a DM during the
+    housekeeping is answered at once too; the housekeeping then confirms every card and
+    reconciles every topic, within the budget minus its reserve."""
+    _, _, backend = bridge
+    async with many_sessions(tmp_path, bridge) as (b, fake, clock, log, cards):
+        store = b.store
         fake.post_as(20, "!status")  # the DM that woke the VM
         fake.post_as(20, "@**Test Bot** NEW-TOPIC-question", topic="new topic")
         await asyncio.wait_for(b.start(), 10)
@@ -148,25 +193,10 @@ async def test_waking_messages_are_answered_before_the_housekeeping_of_300_sessi
         await asyncio.wait_for(b.handle({"type": "message", "message": live}), 5)
         assert len(dm_replies(fake)) == 2 and clock.now == 1000.0
 
-        for _ in range(30):  # one window at a time
-            if b.housekeeping.done():
-                break
-            clock.advance(61)
-            await until(lambda: b.housekeeping.done() or b.client.budget.free() <= reserve)
-        await b.housekeeping
+        await housekeeping_done(b, clock)
         assert not b.unverified
-        assert {path[9:] for _, m, path, _ in log if m == "GET" and path[9:].isdigit()} >= {
-            str(card) for card in cards
-        }
-        topics = set()
-        for _, method, path, query in log:
-            if method == "GET" and path == "messages" and "narrow" in query:
-                narrow = json.loads(query["narrow"][0])
-                if {term["operator"] for term in narrow} == {"channel", "topic"}:
-                    topics.add(
-                        next(term["operand"] for term in narrow if term["operator"] == "topic")
-                    )
-        assert topics >= set(cards.values())
+        assert card_ids(log) >= {str(card) for card in cards}
+        assert reconciled(log) >= set(cards.values())
         assert store.get("catchup_reconcile:bot") is None
         # Never more than the budget in a window, and housekeeping never past its share.
         times = [when for when, *_ in log]
@@ -180,11 +210,68 @@ async def test_waking_messages_are_answered_before_the_housekeeping_of_300_sessi
             assert sum(start <= x < start + 60 for x in times) <= limit
         for start in house:
             assert sum(start <= x < start + 60 for x in house) <= limit - reserve
-    finally:
-        clock.advance(3600)  # release whatever still waits on the budget, then close
-        client.budget.clock = None
-        await b.close()
-        store.close()
+
+
+async def test_a_lost_event_queue_answers_before_the_housekeeping_of_300_sessions(tmp_path, bridge):
+    """E2e scenario 4 at v0.2.19's candidate (#964): Zulip blocked for 12 minutes, the turn's
+    answer refused meanwhile and the event queue lost. The recovery confirmed every card and
+    reconciled every recent topic inline, about two requests per session against the bot's
+    150 a minute, before it retried the answer or read the gap's new topic; on the test VM's
+    hundreds of sessions that passed the scenario's ten minutes. Both now come first, without
+    a wait on the budget, and the housekeeping follows in the background, as at start-up
+    (SPEC §7.8.2, §7.1, §4.4)."""
+    from unittest.mock import AsyncMock
+
+    _, _, backend = bridge
+    async with many_sessions(tmp_path, bridge) as (b, fake, clock, log, cards):
+        await asyncio.wait_for(b.start(), 10)
+        b.listener.cancel()  # this test drives the listener itself
+        with contextlib.suppress(asyncio.CancelledError):
+            await b.listener
+        await housekeeping_done(b, clock)
+        clock.advance(61)
+        await user_message(b, fake, "@**Test Bot** sleep, then answer", topic="busy")
+        actor = b.actors["native"]
+        assert actor.row["state"] == "running"
+        fake.offline = True  # Zulip goes away; the turn then finishes
+        actor.put(
+            t.TurnCompleted(
+                session_id="native",
+                turn_id="turn1",
+                status=t.TurnStatus.COMPLETED,
+                final_text="OUTAGE-token",
+            )
+        )
+        await actor.inbox.join()
+        assert actor.completion and actor.row["state"] == "error"
+        backend.create_session.return_value = replace(
+            backend.create_session.return_value, native_id="native2"
+        )
+        fake.post_as(20, "@**Test Bot** DURING-token", topic="during")  # Zulip has it
+        fake.lose_queues()  # nobody polled it for ten minutes
+        fake.offline = False
+        clock.advance(61)  # a window of its own for the recovery
+        back, since = clock.now, len(log)
+        b.client.events = AsyncMock(
+            side_effect=[ZulipError("BAD_EVENT_QUEUE_ID", 400), [], asyncio.CancelledError()]
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(b.listen(), 10)
+
+        def answered(text):
+            return any(m["sender_id"] == 1 and text in m["content"] for m in fake.messages.values())
+
+        await until(lambda: answered("OUTAGE-token") and backend.start_turn.await_count == 2)
+        await settle(b)
+        assert backend.start_turn.call_args.args[1].text.endswith("DURING-token")
+        assert actor.completion is None and actor.row["state"] == "idle"
+        assert clock.now == back, "the answers waited on the budget"
+        assert not b.housekeeping.done()  # the 300 sessions are still to come
+        await housekeeping_done(b, clock)
+        assert not b.unverified
+        assert card_ids(log, since) >= {str(card) for card in cards}
+        assert reconciled(log, since) >= set(cards.values())
+        assert b.store.get("catchup_reconcile:bot") is None
 
 
 @pytest.mark.parametrize("age_days", [0, 30])
@@ -357,7 +444,12 @@ async def test_channel_privacy_is_cached_until_a_stream_event(bridge):
     assert backend.steer.await_count == 2
 
 
-async def test_queue_loss_stops_the_startup_housekeeping_and_recovers_inline(bridge):
+async def test_queue_loss_stops_the_startup_housekeeping_and_runs_it_after_the_replay(
+    bridge, monkeypatch
+):
+    """The recovery confirms only the cards of sessions with work, replays the gap, then
+    starts the housekeeping again in the background (SPEC §7.8.2), as a start-up does: once
+    the replay has ended, so that reconciliation claims nothing past what it read (§7.8.1)."""
     from unittest.mock import AsyncMock
 
     b, _fake, _backend = bridge
@@ -366,13 +458,190 @@ async def test_queue_loss_stops_the_startup_housekeeping_and_recovers_inline(bri
     b.client.events = AsyncMock(
         side_effect=[ZulipError("BAD_EVENT_QUEUE_ID", 400), asyncio.CancelledError()]
     )
+    order = []
     b.refresh_cards = AsyncMock()
-    b.reconcile_messages = AsyncMock()
+    b.reconcile_messages = AsyncMock(
+        side_effect=lambda **kw: order.append(("reconcile", kw, kw["catchup"].end))
+    )
+    replay = Catchup.replay
+
+    async def replayed(catchup):
+        await asyncio.sleep(0.05)  # time for a housekeeping started too soon to reconcile
+        count = await replay(catchup)
+        order.append(("replayed", catchup))
+        return count
+
+    monkeypatch.setattr(Catchup, "replay", replayed)
     with pytest.raises(asyncio.CancelledError):
         await b.listen()
-    assert running.cancelled() and b.housekeeping is None
-    b.refresh_cards.assert_awaited_once()
-    b.reconcile_messages.assert_awaited_once()
+    assert running.cancelled() and b.housekeeping is not running
+    await b.housekeeping
+    b.refresh_cards.assert_not_awaited()
+    assert [step[0] for step in order] == ["replayed", "reconcile"]
+    (_, catchup), (_, kw, end) = order
+    assert kw == {"catchup": catchup, "background": True} and end is not None
+
+
+async def test_a_queue_loss_confirms_the_cards_of_sessions_with_work_first(bridge, monkeypatch):
+    """Review of #965: the gap's card moves were lost with the queue. Before the replay, the
+    recovery has confirmed the card of a session with work in flight (its turn), which moved
+    with its topic, and forgotten that of an idle one, moved too, which the housekeeping
+    confirms after the replay (SPEC §7.8.2 steps 1 and 5, §4.4)."""
+    from unittest.mock import AsyncMock
+
+    b, fake, backend = bridge
+    await user_message(b, fake, "@**Test Bot** idle", topic="idle")
+    idle = b.actors["native"]
+    await idle.event(completed())
+    backend.create_session.return_value = replace(
+        backend.create_session.return_value, native_id="native2"
+    )
+    await user_message(b, fake, "@**Test Bot** busy", topic="busy")
+    busy = b.actors["native2"]
+    assert busy.turn and not idle.turn
+    for message in fake.messages.values():  # both topics move while the queue is gone
+        message["subject"] = {"idle": "idle moved", "busy": "busy moved"}.get(
+            message["subject"], message["subject"]
+        )
+    seen = []
+    replay = Catchup.replay
+
+    async def recorded(catchup):
+        for actor in (busy, idle):
+            row = b.store.rows("sessions", id=actor.row["id"])[0]
+            seen.append((row["topic"], row["id"] in b.unverified))
+        return await replay(catchup)
+
+    monkeypatch.setattr(Catchup, "replay", recorded)
+    b.client.events = AsyncMock(
+        side_effect=[ZulipError("BAD_EVENT_QUEUE_ID", 400), asyncio.CancelledError()]
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await b.listen()
+    assert seen == [("busy moved", False), ("idle", True)]
+    await b.housekeeping
+    assert b.store.rows("sessions", id=idle.row["id"])[0]["topic"] == "idle moved"
+    assert not b.unverified
+
+
+def slow_housekeeping(b):
+    """A housekeeping whose cancellation takes 0.2 s to unwind, as a session creation's
+    workspace clean-up inside a reconciliation can: an event set once it unwinds."""
+    unwinding = asyncio.Event()
+
+    async def housekeep():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            unwinding.set()
+            await asyncio.sleep(0.2)
+            raise
+
+    b.housekeeping = asyncio.create_task(housekeep())
+    return unwinding
+
+
+def polls(b, *, lose_first=False):
+    """The listener's polls, counted: each answers nothing after 10 ms; the first, with
+    `lose_first`, finds the queue gone."""
+    count = [0]
+
+    async def events(queue_id, last, dont_block=False):
+        count[0] += 1
+        if lose_first and count[0] == 1:
+            raise ZulipError("BAD_EVENT_QUEUE_ID", 400)
+        await asyncio.sleep(0.01)
+        return []
+
+    b.client.events = events
+    return count
+
+
+async def test_close_during_a_queue_loss_stops_the_listener(bridge):
+    """Review of #965 (N1): `close()` cancels the listener while the listener, at a queue
+    loss, waits for the housekeeping it cancelled. The listener's cancellation must not be
+    taken for the housekeeping's: it was swallowed, the listener re-registered and went on
+    polling, and `close()` never returned."""
+    b, _fake, _backend = bridge
+    unwinding = slow_housekeeping(b)
+    count = polls(b, lose_first=True)
+    b.listener = asyncio.create_task(b.listen())
+    await asyncio.wait_for(unwinding.wait(), 5)  # the listener waits for it now
+    closer = asyncio.create_task(b.close())
+    try:
+        await asyncio.wait_for(asyncio.shield(closer), 5)
+    finally:
+        b.listener.cancel()  # a hung close() returns once the listener really ends
+        await asyncio.wait_for(closer, 5)
+    assert count[0] == 1  # the poll that found the queue gone, and none after
+    assert b.housekeeping is None
+
+
+async def test_close_stops_the_listener_before_the_housekeeping(bridge):
+    """Review of #965: nothing the listener reads after `close()` began is handled, and no
+    recovery of its starts a housekeeping behind `close()`'s back: the listener goes first,
+    then the housekeeping, however long that takes to unwind."""
+    b, _fake, _backend = bridge
+    unwinding = slow_housekeeping(b)
+    count = polls(b)
+    b.listener = asyncio.create_task(b.listen())
+    await until(lambda: count[0] >= 2)
+    closer = asyncio.create_task(b.close())
+    await asyncio.wait_for(unwinding.wait(), 5)
+    assert b.listener.done()
+    before = count[0]
+    await asyncio.wait_for(closer, 5)
+    assert count[0] == before and b.housekeeping is None
+
+
+async def test_a_second_queue_loss_during_the_recoverys_housekeeping(tmp_path, bridge):
+    """Review of #965: a queue lost again while the first recovery's housekeeping confirms the
+    cards. The second recovery's housekeeping reconciles from the older boundary: a message
+    whose event was lost, older than the newest the listener handled, so no catch-up reads
+    it, still reaches its session's topic, and the boundary is cleared once it is done."""
+    _, _, backend = bridge
+    async with many_sessions(tmp_path, bridge) as (b, fake, clock, _log, _cards):
+        await asyncio.wait_for(b.start(), 10)
+        b.listener.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await b.listener
+        await housekeeping_done(b, clock)
+        clock.advance(61)
+        lost = fake.post_as(20, "@**Test Bot** LOST-token", topic="topic 7")  # its event lost
+        seen = fake.post_as(20, "@**Test Bot** SEEN-token", topic="seen topic")
+        backend.create_session.return_value = replace(
+            backend.create_session.return_value, native_id="native2"
+        )
+        first: list[asyncio.Task] = []
+        count = [0]
+
+        async def events(queue_id, last, dont_block=False):
+            count[0] += 1
+            if count[0] == 1:  # the listener handles SEEN: the catch-ups start after it
+                message = {"type": "message", "message": dict(seen), "flags": ["mentioned"]}
+                return [message | {"id": 10**6}]
+            if count[0] in (2, 4):  # 4: once the first housekeeping has spent its share
+                if first:
+                    await until(lambda: b.client.budget.free() <= b.poster.reserve)
+                    assert not first[0].done()
+                raise ZulipError("BAD_EVENT_QUEUE_ID", 400)
+            if count[0] == 3:  # the first recovery's first poll
+                first.append(b.housekeeping)
+                return []
+            if count[0] == 5:
+                return []
+            raise asyncio.CancelledError
+
+        b.client.events = events
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(b.listen(), 10)
+        assert first[0].cancelled() and b.housekeeping is not first[0]
+        assert not b.store.rows("inbound", bot="bot", message_id=lost["id"])
+        clock.advance(61)
+        await housekeeping_done(b, clock)
+        rows = b.store.rows("inbound", bot="bot", message_id=lost["id"])
+        assert rows and rows[0]["session_id"] == "s7"
+        assert b.store.get("catchup_reconcile:bot") is None
 
 
 async def test_card_search_without_the_sender_narrow_still_finds_the_card(bridge):

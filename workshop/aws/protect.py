@@ -1,12 +1,12 @@
 """Termination protection and stop-on-shutdown for kept VMs (issue #207; README.md, "protect.py").
 
-    uv run --with boto3 python workshop/aws/protect.py [--tag workshop=nt-agents-2026] \\
-        [--region us-west-2] [--only SLUG …] [--off] [--dry-run] [--no-wait]
+    uv run --with boto3 python workshop/aws/protect.py --tag workshop=NAME [--tag …] \\
+        --region REGION [--only SLUG …] [--off] [--dry-run] [--no-wait]
 
-Standalone script (boto3 is not a zab dependency), run by Drew for a workshop; agents run it only
-on test infrastructure, resources tagged `zab-role=test`. For every live
-instance with the workshop tag and a `participant` tag (or only the `--only` participants) it
-makes sure that:
+Standalone script (boto3 is not a zab dependency), run by the admin bot or a deployer for a
+workshop; agents run it only on test infrastructure, resources tagged `zab-role=test`. For
+every live instance with the workshop tag and a `participant` tag (or only the `--only`
+participants) it makes sure that:
 
 - **termination protection** is on (`DisableApiTermination`), so a stray `teardown.py`, or a
   click in the console, cannot delete a VM somebody kept; `--off` turns it off again, the step
@@ -183,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Termination protection and stop-on-shutdown for kept workshop VMs."
     )
     add_tag_argument(parser)
-    parser.add_argument("--region", default="us-west-2")
+    parser.add_argument("--region", required=True, help="the workshop's region")
     parser.add_argument(
         "--only", action="append", default=[], metavar="SLUG", help="one participant (repeatable)"
     )

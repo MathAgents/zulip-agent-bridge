@@ -894,7 +894,7 @@ async def the_retired_rows(t: Talk, server: Any, retired: list[str], scenario: A
             pytest.fail(f"a !launch of {slug}, retired, whose roster keeps its host")
         said = await refusal(t, refused.value)
         assert "the roster keeps its host or ip" in said, said[:400]
-        assert "a deployer clears its host and ip in the workshop's roster.csv" in said, said
+        assert "clears its host and ip in roster.csv and reactivates its bots" in said, said
         scenario.notes.append(f"!launch {slug}: refused, its roster keeping its host")
     scenario.notes.append(f"retired, and left out of all, !status all and the console: {retired}")
 

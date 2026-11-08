@@ -12,6 +12,7 @@ import pytest
 from e2e.admin import run as admin_run
 from e2e.admin.fakes import FakeEc2, FakeIam, FakeZulip
 from e2e.admin.harness import rig as rigs
+from e2e.admin.harness import upgrade
 from e2e.admin.harness.aws_rig import AwsRig, fingerprint
 from e2e.admin.harness.gate import Aws, Gate, NotTestInfrastructure
 from e2e.admin.harness.release import Deployed, Releases, local
@@ -21,6 +22,7 @@ from e2e.admin.test_harness_aws import KEY
 from e2e.harness import report
 from e2e.harness.config import CHECKOUT
 from e2e.harness.secret_files import SecretFileError
+from e2e.harness.startup import Timeline
 from e2e.harness.vm import Result
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -70,8 +72,16 @@ class FakeServer:
         self.rig = rig
         return self
 
-    def reachable(self):
-        return True
+    def probe(self):
+        return Result(0, "", "")
+
+    def sweep_deploy_dirs(self):  # deploy.sh's leftovers in /tmp (#804)
+        self.events.append("sweep")
+        return []
+
+    def run(self, argv, check=True, timeout=None):  # `cloud-init status --wait` (#804)
+        assert argv == ["cloud-init", "status", "--wait"] and not check
+        return Result(0, "status: done\n", "")
 
     def running(self):
         return self.now
@@ -118,7 +128,8 @@ def make_setup(tmp_path, rig, *, dry, ec2, iam, zulip, server, events):
     out = tmp_path / ("dry" if dry else f"run{len(events)}")
     out.mkdir(exist_ok=True)
     setup = Setup(rig, gate, aws, FakeReleases(rig, events),
-                  zulip_clients=lambda: (zulip, FakeZulip(12)), server=server, out=out)  # fmt: skip
+                  zulip_clients=lambda: (zulip, FakeZulip(12)), server=server, out=out,
+                  timeline=Timeline(log=lambda line: None))  # fmt: skip
     return setup, gate, lines, out
 
 
@@ -150,8 +161,8 @@ def test_a_first_run_bootstraps_and_a_second_upgrades(tmp_path):
                            server=server, events=events)  # fmt: skip
     first = setup.run(SHA)
     assert events == [
-        "ssh 198.51.100.10", "repo", "tag v0.2.4rc1", "deploy --bootstrap v0.2.4rc1",
-        "bot stop", "reset", "bot start", "deploy --wheel v0.2.4rc1",
+        "ssh 198.51.100.10", "sweep", "repo", "tag v0.2.4rc1", "deploy --bootstrap v0.2.4rc1",
+        "bot stop", "reset", "bot start", "deploy --wheel v0.2.4rc1", "sweep",
     ]  # fmt: skip
     assert first.release == "v0.2.4rc1" and first.wheel.endswith("0.2.4rc1-py3-none-any.whl")
     assert (rig.etc / "admin.toml").exists() and (rig.etc / "break-glass" / "deployer.pub").exists()
@@ -164,10 +175,10 @@ def test_a_first_run_bootstraps_and_a_second_upgrades(tmp_path):
     rig.github_token.write_text("github_pat_from_drew\n")  # Q9 answered, for the token only
     second = setup.run(SHA)
     assert events == [
-        "ssh 198.51.100.10", "repo", "tag v0.2.4rc1", "tag v0.2.4rc2", "install admin.toml",
-        "install allowed_signers", "install backup_recipients", "deploy v0.2.4rc2",
-        "install secret github-token", "bot stop", "reset", "bot start",
-        "deploy --wheel v0.2.4rc2",
+        "ssh 198.51.100.10", "sweep", "repo", "tag v0.2.4rc1", "tag v0.2.4rc2",
+        "install admin.toml", "install allowed_signers", "install backup_recipients",
+        "deploy v0.2.4rc2", "install secret github-token", "bot stop", "reset", "bot start",
+        "deploy --wheel v0.2.4rc2", "sweep",
     ]  # fmt: skip
     assert second.github_token is True and first.github_token is False
     assert second.provisioner is False and first.provisioner is False  # no yes from Drew yet
@@ -286,6 +297,102 @@ def test_a_rig_secret_in_pytests_output_is_redacted_and_a_run_problem(env):
     assert report.Report.read(path).problems == [
         "pytest.log held rig secrets, now redacted: github-token"
     ]
+    assert (path.parent / "pytest.log").read_text() == "E   input = 'token=<github-token>'\n"
+
+
+def test_a10bs_token_in_pytests_output_is_redacted_too(env, monkeypatch):
+    """#902's re-review, B1: A10b's token for the test release repository is no rig secret, so
+    the sweep reads it from its file as well, and labels it by its variable."""
+    token = env / "release-token"
+    token.write_text("github_pat_DECOY902\n")
+    token.chmod(0o600)
+    monkeypatch.setenv(upgrade.TOKEN_ENV, str(token))
+    logged = "E   token = 'github_pat_DECOY902'\n"
+    assert run_main(["--scenarios", "A10"], aws=FakeAws(), setup=FakeSetup(), logged=logged) == 1
+    (path,) = reports(env)
+    assert report.Report.read(path).problems == [
+        f"pytest.log held rig secrets, now redacted: ${upgrade.TOKEN_ENV}"
+    ]
+    assert (path.parent / "pytest.log").read_text() == f"E   token = '<${upgrade.TOKEN_ENV}>'\n"
+
+
+@pytest.mark.parametrize(
+    ("text", "mode", "why"),
+    [("github_pat_DECOY902_0123\n", 0o644, "mode 0600"),
+     ("github_pat_DECOY902_0123 github_pat_OTHER902_4567\n", 0o600, "holds no single token")],
+)  # fmt: skip
+def test_a_refused_token_file_is_named_and_still_swept(env, monkeypatch, text, mode, why):
+    """#902's Codex round 2: a token file `release_token` refuses is a run problem, named and
+    never quoted, and pytest.log is swept all the same, for each long word of the file: a
+    traceback of that refusal could have printed them."""
+    token = env / "release-token"
+    token.write_text(text)
+    token.chmod(mode)
+    monkeypatch.setenv(upgrade.TOKEN_ENV, str(token))
+    logged = "E   text = 'github_pat_DECOY902_0123'\n"
+    argv = ["--scenarios", "A10,A10b"]
+    assert run_main(argv, aws=FakeAws(), setup=FakeSetup(), logged=logged) == 1
+    (path,) = reports(env)
+    refused, redacted = report.Report.read(path).problems
+    assert refused.startswith("A10b's token file was refused: ") and why in refused
+    assert "DECOY902" not in refused
+    label = f"${upgrade.TOKEN_ENV} (word 1)"
+    assert redacted == f"pytest.log held rig secrets, now redacted: {label}"
+    assert (path.parent / "pytest.log").read_text() == f"E   text = '<{label}>'\n"
+
+
+def test_a_refused_token_file_fails_only_a_run_that_selects_a10b(env, monkeypatch):
+    """#902's review, N3: without A10b, the refusal is no run problem; the sweep is the same."""
+    token = env / "release-token"
+    token.write_text("github_pat_DECOY902_0123\n")
+    token.chmod(0o644)
+    monkeypatch.setenv(upgrade.TOKEN_ENV, str(token))
+    logged = "E   text = 'github_pat_DECOY902_0123'\n"
+    assert run_main(["--scenarios", "A10"], aws=FakeAws(), setup=FakeSetup(), logged=logged) == 1
+    (path,) = reports(env)
+    label = f"${upgrade.TOKEN_ENV} (word 1)"
+    assert report.Report.read(path).problems == [
+        f"pytest.log held rig secrets, now redacted: {label}"
+    ]
+    clean = run_main(["--scenarios", "A10"], aws=FakeAws(), setup=FakeSetup())
+    assert clean == 0  # no problem at all: the run passes
+
+
+def test_a_token_put_in_the_variable_itself_is_never_reported(env, monkeypatch):
+    """#902's review, B1: the token set as the variable's value, not a file's path: the
+    refusal says it is no path, quoting nothing, and the sweep takes the value itself."""
+    given = "github_pat_ENVVALUE902_0123456789"
+    monkeypatch.setenv(upgrade.TOKEN_ENV, given)
+    logged = f"E   GH_TOKEN = '{given}'\n"
+    argv = ["--scenarios", "A10,A10b"]
+    assert run_main(argv, aws=FakeAws(), setup=FakeSetup(), logged=logged) == 1
+    (path,) = reports(env)
+    refused, redacted = report.Report.read(path).problems
+    assert refused.startswith(f"A10b's token file was refused: ValueError: {upgrade.TOKEN_ENV}")
+    assert "(not a path)" in refused
+    label = f"${upgrade.TOKEN_ENV} (its value)"
+    assert redacted == f"pytest.log held rig secrets, now redacted: {label}"
+    for name in ("pytest.log", "report.json", "summary.md"):
+        assert given not in (path.parent / name).read_text(), name
+
+
+def test_a_directory_as_the_token_file_leaves_the_rigs_sweep_on(env, monkeypatch):
+    """#902's review, B2: a directory opens, and reading it raised IsADirectoryError, which
+    turned off the whole sweep. Now it is refused as no regular file, and the rig's own secrets
+    are swept whatever the token file is."""
+    secrets = rigs.load({"HOME": str(env)}).secrets
+    secrets.mkdir(parents=True)
+    (secrets / "github-token").write_text("github_pat_DECOY123\n")
+    folder = env / "token-dir"
+    folder.mkdir(mode=0o700)
+    monkeypatch.setenv(upgrade.TOKEN_ENV, str(folder))
+    logged = "E   input = 'token=github_pat_DECOY123'\n"
+    argv = ["--scenarios", "A10,A10b"]
+    assert run_main(argv, aws=FakeAws(), setup=FakeSetup(), logged=logged) == 1
+    (path,) = reports(env)
+    refused, redacted = report.Report.read(path).problems
+    assert refused.startswith("A10b's token file was refused: ") and "regular file" in refused
+    assert redacted == "pytest.log held rig secrets, now redacted: github-token"
     assert (path.parent / "pytest.log").read_text() == "E   input = 'token=<github-token>'\n"
 
 

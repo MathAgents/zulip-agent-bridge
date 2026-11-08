@@ -11,7 +11,7 @@ import pytest
 from zab.admin import pages, wakerdown
 from zab.admin.wakerdown import DOWN, DOWN_AFTER, OFF, UP
 
-from .botkit import HARVARD, make_site
+from .botkit import HARVARD, audit_text, make_site
 
 pytestmark = pytest.mark.integration
 ALERTS = 44
@@ -75,7 +75,7 @@ def alerts(site):
 
 
 def records(site):
-    text = site.audit.read_text() if site.audit.exists() else ""
+    text = audit_text(site.audit)
     rows = [json.loads(line) for line in text.splitlines()]
     return [r for r in rows if r["event"] == "waker"]
 

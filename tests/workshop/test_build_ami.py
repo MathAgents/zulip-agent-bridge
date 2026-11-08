@@ -16,7 +16,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import build_ami as ba
+import m2_debs
 import pytest
+
+from .scope import with_build
+
+#: The real ones: the autouse fixture `deps` replaces them for main()
+DEPS_TARBALL = ba.deps_tarball
+ORIGIN_REPO = m2_debs.origin_repo
 
 CONSOLE = """
 cloud-init[800]: -----BEGIN SSH HOST KEY FINGERPRINTS-----
@@ -154,6 +161,26 @@ class FakeSsh:
         self.calls.append(("copy", ip, Path(local).name, remote))
 
 
+@pytest.fixture(autouse=True)
+def deps(monkeypatch, tmp_path):
+    """main() fetches the pinned sets first (#945), the Macaulay2 packages and PARI's data
+    packages: here a tarball of nothing each, and the calls, so that no test runs `gh`."""
+    calls: list[tuple] = []
+
+    def fake(opts, work, log, kind=m2_debs.M2):
+        prefix = kind.option.removeprefix("--").replace("-", "_")
+        calls.append(
+            (kind.attr, getattr(opts, f"{prefix}_release"), getattr(opts, f"{prefix}_dir"))
+        )
+        tar = work / kind.tarball
+        tar.write_bytes(b"")
+        return str(tar)
+
+    monkeypatch.setattr(ba, "deps_tarball", fake)
+    monkeypatch.setattr(ba.m2_debs, "origin_repo", lambda *a: "o/r")  # the checkout's origin
+    return calls
+
+
 @pytest.fixture
 def quiet_time(monkeypatch):
     monkeypatch.setattr(ba.time, "sleep", lambda s: None)
@@ -176,6 +203,7 @@ def opts(**kw):
         "account_id": "123456789012",
         "region": "us-west-2",
         "name": "nt-agents-2026-v1",
+        "tag": [("workshop", "nt-agents-2026")],  # required (#808): the first fleet's, as data
         "instance_type": "m7a.xlarge",
         "smoke_instance_type": "m7a.2xlarge",
         "smoke_warm": False,
@@ -193,6 +221,12 @@ def opts(**kw):
         "magma_dir": None,
         "magma_passfile": None,
         "magma_licence_setup": None,
+        "deps_release": m2_debs.RELEASE,
+        "deps_dir": None,
+        "m2_debs": None,
+        "pari_data_release": m2_debs.PARI_RELEASE,
+        "pari_data_dir": None,
+        "pari_data": None,
         "with_sage": False,
         "sage_version": "10.9",
         "smoke": False,
@@ -303,9 +337,72 @@ def test_pin_host_key_stores_the_scanned_key_and_ssh_is_strict(tmp_path, monkeyp
     def no_key(argv, **kw):
         return SimpleNamespace(returncode=1, stdout="", stderr="")
 
+    clock = FakeClock(monkeypatch)
     monkeypatch.setattr(ba.subprocess, "run", no_key)
-    with pytest.raises(RuntimeError, match="no ed25519 host key"):
+    with pytest.raises(RuntimeError, match=r"no ed25519 host key scanned from \S+ in 120 s"):
         ssh.pin_host_key("198.51.100.7")
+    assert clock.slept == [5.0] * 24  # 25 tries, 5 s apart, the last at 120 s
+
+
+class FakeClock:
+    """`time.monotonic` and `time.sleep` for the build: a sleep moves the clock."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.now, self.slept = 1000.0, []
+        monkeypatch.setattr(ba.time, "monotonic", lambda: self.now)
+        monkeypatch.setattr(ba.time, "sleep", self.sleep)
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def test_pin_host_key_tries_again_until_the_key_is_served(tmp_path, monkeypatch):
+    """#953: a fresh instance's port 22 can accept before its first boot serves the host key,
+    so `ssh-keyscan` finds nothing at first. The scan is tried again every 5 s: nothing twice,
+    then the key, which is pinned. A scan that times out is a try like the others."""
+    known = tmp_path / "known_hosts"
+    ssh = ba.Ssh(None, str(known), lambda s: None)
+    clock = FakeClock(monkeypatch)
+    answers = [
+        SimpleNamespace(returncode=1, stdout="", stderr="198.51.100.7: Connection closed\n"),
+        subprocess.TimeoutExpired(["ssh-keyscan"], 60),
+        SimpleNamespace(returncode=0, stdout="198.51.100.7 ssh-ed25519 AAAAC3late\n", stderr=""),
+    ]
+    scans = []
+
+    def fake_run(argv, **kw):
+        if argv[0] == "ssh-keyscan":
+            scans.append(clock.now)
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        return SimpleNamespace(
+            returncode=0, stdout="256 SHA256:late+key= 198.51.100.7 (ED25519)\n", stderr=""
+        )
+
+    monkeypatch.setattr(ba.subprocess, "run", fake_run)
+    assert ssh.pin_host_key("198.51.100.7") == "SHA256:late+key="
+    assert known.read_text() == "198.51.100.7 ssh-ed25519 AAAAC3late\n"
+    assert scans == [1000.0, 1005.0, 1010.0] and clock.slept == [5.0, 5.0]
+
+
+def test_pin_host_key_says_how_long_it_tried(tmp_path, monkeypatch):
+    """#953: the failure names the time spent, the tries and the scan's last word."""
+    ssh = ba.Ssh(None, str(tmp_path / "known_hosts"), lambda s: None)
+    FakeClock(monkeypatch)
+
+    def refused(argv, **kw):
+        return SimpleNamespace(returncode=1, stdout="", stderr="198.51.100.7: Connection reset\n")
+
+    monkeypatch.setattr(ba.subprocess, "run", refused)
+    with pytest.raises(RuntimeError) as caught:
+        ssh.pin_host_key("198.51.100.7", every_s=10.0, for_s=30.0)
+    assert str(caught.value) == (
+        "no ed25519 host key scanned from 198.51.100.7 in 30 s (4 tries, 10 s apart): "
+        "198.51.100.7: Connection reset"
+    )
 
 
 def test_security_group_is_registered_before_its_rule(quiet_time):
@@ -327,12 +424,17 @@ def test_build_flow_copies_files_runs_build_sh_and_images(tmp_path, quiet_time):
     hook.write_text(HOOK)
     wheel = tmp_path / "zulip_agent_bridge-0.0.2-py3-none-any.whl"
     wheel.write_bytes(b"PK")
+    debs, pari = tmp_path / "m2-debs.tar", tmp_path / "pari-data.tar"
+    debs.write_bytes(b"")
+    pari.write_bytes(b"")
     o = opts(
         zab_wheel=str(wheel),
         magma_dir=str(root),
         magma_passfile=str(passfile),
         magma_licence_setup=str(hook),
         with_sage=True,
+        m2_debs=str(debs),
+        pari_data=str(pari),
     )
     ec2, ssh, res, log = FakeEc2(), FakeSsh(), ba.Resources(), []
     ba.prepare(ec2, o, res, log.append)
@@ -354,6 +456,8 @@ def test_build_flow_copies_files_runs_build_sh_and_images(tmp_path, quiet_time):
     assert copied == [
         "build.sh",
         "ami-files.tar.gz",
+        "m2-debs.tar",
+        "pari-data.tar",
         wheel.name,
         "magma.tar.gz",
         "pass",
@@ -363,6 +467,7 @@ def test_build_flow_copies_files_runs_build_sh_and_images(tmp_path, quiet_time):
     assert ("copy", "198.51.100.7", "licence-setup.sh", "magma-licence-setup") in ssh.calls
     assert "rm -f magmapassfile magma.tar.gz magma-licence-setup " in ba.FINAL_CLEANUP
     assert "test ! -e magma-licence-setup" in ba.FINAL_CLEANUP
+    assert " m2-debs.tar pari-data.tar" in ba.FINAL_CLEANUP.split("&&")[0]  # with the copies
     assert ("run", "198.51.100.7", "chmod 0600 magmapassfile") in ssh.calls
     assert ("run", "198.51.100.7", "chmod 0700 magma-licence-setup") in ssh.calls
     stream = next(c for c in ssh.calls if c[0] == "stream")[2]
@@ -376,6 +481,8 @@ def test_build_flow_copies_files_runs_build_sh_and_images(tmp_path, quiet_time):
         "MAGMA_TARBALL=/home/ubuntu/magma.tar.gz",
         "MAGMA_PASSFILE=/home/ubuntu/magmapassfile",
         "MAGMA_LICENCE_SETUP=/home/ubuntu/magma-licence-setup",
+        "M2_DEBS=/home/ubuntu/m2-debs.tar",
+        "PARI_DATA=/home/ubuntu/pari-data.tar",
         "WITH_SAGE=1",
         "SAGE_VERSION=10.9",
     ):
@@ -474,7 +581,8 @@ def test_main_cleans_up_when_build_sh_fails(monkeypatch, pubkey, capsys, quiet_t
     ec2.sg_busy = 2  # the group is busy until the instance is gone: retried
     monkeypatch.setattr(ba, "Ec2", lambda region, profile: ec2)
     monkeypatch.setattr(ba, "Ssh", lambda key, known_hosts, log: ssh)
-    rc = ba.main(
+    rc = with_build(
+        ba.main,
         [
             "--account-id",
             "123456789012",
@@ -485,7 +593,7 @@ def test_main_cleans_up_when_build_sh_fails(monkeypatch, pubkey, capsys, quiet_t
             "--ssh-public-key",
             pubkey,
             "--smoke",
-        ]
+        ],
     )
     out = capsys.readouterr().out
     assert rc == 1 and "build.sh exited 3" in out
@@ -501,7 +609,8 @@ def test_main_cleans_up_when_build_sh_fails(monkeypatch, pubkey, capsys, quiet_t
     ec2, ssh = FakeEc2(), FakeSsh(build_exit=3)
     monkeypatch.setattr(ba, "Ec2", lambda region, profile: ec2)
     monkeypatch.setattr(ba, "Ssh", lambda key, known_hosts, log: ssh)
-    rc = ba.main(
+    rc = with_build(
+        ba.main,
         [
             "--account-id",
             "123456789012",
@@ -512,7 +621,7 @@ def test_main_cleans_up_when_build_sh_fails(monkeypatch, pubkey, capsys, quiet_t
             "--ssh-public-key",
             pubkey,
             "--keep",
-        ]
+        ],
     )
     kinds = [c[0] for c in ec2.calls]
     assert rc == 1 and "terminate" not in kinds
@@ -540,7 +649,7 @@ def test_keep_also_applies_when_the_smoke_checks_fail(monkeypatch, pubkey, capsy
             "--smoke-only",
             "ami-x",
         ]
-        rc = ba.main(argv + (["--keep"] if keep else []))
+        rc = with_build(ba.main, argv + (["--keep"] if keep else []))
         out = capsys.readouterr().out
         kinds = [c[0] for c in ec2.calls]
         assert rc == 1 and "smoke test FAILED" in out
@@ -560,7 +669,8 @@ def test_main_builds_then_smokes_and_reports_the_ami(monkeypatch, pubkey, capsys
     ec2, ssh = FakeEc2(), FakeSsh()
     monkeypatch.setattr(ba, "Ec2", lambda region, profile: ec2)
     monkeypatch.setattr(ba, "Ssh", lambda key, known_hosts, log: ssh)
-    rc = ba.main(
+    rc = with_build(
+        ba.main,
         [
             "--account-id",
             "123456789012",
@@ -571,7 +681,7 @@ def test_main_builds_then_smokes_and_reports_the_ami(monkeypatch, pubkey, capsys
             "--ssh-public-key",
             pubkey,
             "--smoke",
-        ]
+        ],
     )
     out = capsys.readouterr().out
     assert rc == 0 and "AMI ami-new" in out and "smoke test passed" in out
@@ -583,7 +693,8 @@ def test_main_builds_then_smokes_and_reports_the_ami(monkeypatch, pubkey, capsys
     ec2, ssh = FakeEc2(), FakeSsh()
     monkeypatch.setattr(ba, "Ec2", lambda region, profile: ec2)
     monkeypatch.setattr(ba, "Ssh", lambda key, known_hosts, log: ssh)
-    rc = ba.main(
+    rc = with_build(
+        ba.main,
         [
             "--account-id",
             "123456789012",
@@ -596,7 +707,7 @@ def test_main_builds_then_smokes_and_reports_the_ami(monkeypatch, pubkey, capsys
             "--smoke-only",
             "ami-x",
             "--assume-magma",
-        ]
+        ],
     )
     assert rc == 0 and "create_image" not in [c[0] for c in ec2.calls]
     assert ec2.calls[[c[0] for c in ec2.calls].index("run_instance")][1]["ImageId"] == "ami-x"
@@ -614,15 +725,22 @@ def test_dry_run_touches_nothing_and_needs_no_boto3(monkeypatch, capsys, tmp_pat
     base = ["--dry-run", "--account-id", "123456789012", "--zab-tag", "v0.0.2"]
     base += ["--ssh-public-key", pubkey, *magma]
     hook = ["--magma-licence-setup", str(tmp_path / "hook")]
-    rc = ba.main([*base, *hook, "--with-sage", "--smoke"])
+    rc = with_build(ba.main, [*base, *hook, "--with-sage", "--smoke"])
     out = capsys.readouterr().out
     assert rc == 0 and "would launch one m7a.xlarge builder" in out
     assert "MAGMA_PASSFILE=/home/ubuntu/magmapassfile" in out and "WITH_SAGE=1" in out
     assert "magmapassfile, magma-licence-setup" in out
     assert "MAGMA_LICENCE_SETUP=/home/ubuntu/magma-licence-setup" in out
     assert "would create image" in out and "smoke-test checks" in out
+    # the pinned Macaulay2 packages (#945): planned, not fetched (no network in a dry run)
+    assert f"would fetch the Macaulay2 packages from release o/r@{m2_debs.RELEASE} (with gh)" in out
+    assert "ami-files.tar.gz, m2-debs.tar, pari-data.tar, " in out
+    assert (
+        "M2_DEBS=/home/ubuntu/m2-debs.tar" in out and "PARI_DATA=/home/ubuntu/pari-data.tar" in out
+    )
+    assert f"PARI's data packages from release o/r@{m2_debs.PARI_RELEASE} (with gh)" in out
     # without the licence setup, Magma still goes on the image, and the plan says what it means
-    assert ba.main(base) == 0
+    assert with_build(ba.main, base) == 0
     out = capsys.readouterr().out
     assert "MAGMA_TARBALL=/home/ubuntu/magma.tar.gz" in out and "MAGMA_LICENCE_SETUP" not in out
     assert "no --magma-licence-setup: Magma will run only if its licence file alone suffices" in out
@@ -632,20 +750,21 @@ def test_main_refuses_half_magma_options_and_a_licence_setup_it_cannot_run(
     tmp_path, capsys, pubkey
 ):
     base = ["--account-id", "123456789012", "--zab-tag", "v0.0.2", "--ssh-public-key", pubkey]
-    rc = ba.main([*base, "--magma-dir", str(tmp_path)])
+    rc = with_build(ba.main, [*base, "--magma-dir", str(tmp_path)])
     assert rc == 2 and "go together" in capsys.readouterr().err
     (tmp_path / "pass").write_text("x")
     (tmp_path / "hook").write_text(HOOK)
-    rc = ba.main([*base, "--magma-licence-setup", str(tmp_path / "hook")])
+    rc = with_build(ba.main, [*base, "--magma-licence-setup", str(tmp_path / "hook")])
     assert rc == 2 and "needs --magma-dir and --magma-passfile" in capsys.readouterr().err
     magma = [*base, "--magma-dir", str(tmp_path), "--magma-passfile", str(tmp_path / "pass")]
-    rc = ba.main([*magma, "--magma-licence-setup", str(tmp_path / "missing")])
+    rc = with_build(ba.main, [*magma, "--magma-licence-setup", str(tmp_path / "missing")])
     assert rc == 2 and "no such file" in capsys.readouterr().err
     # systemd runs the script itself, so without an interpreter line it could not start
     (tmp_path / "no-shebang").write_text(": no interpreter line\n")
-    rc = ba.main([*magma, "--magma-licence-setup", str(tmp_path / "no-shebang")])
+    rc = with_build(ba.main, [*magma, "--magma-licence-setup", str(tmp_path / "no-shebang")])
     assert rc == 2 and "no #! line" in capsys.readouterr().err
-    rc = ba.main(
+    rc = with_build(
+        ba.main,
         [
             "--account-id",
             "123456789012",
@@ -653,7 +772,7 @@ def test_main_refuses_half_magma_options_and_a_licence_setup_it_cannot_run(
             "v0.0.2",
             "--ssh-public-key",
             str(tmp_path / "missing.pub"),
-        ]
+        ],
     )
     assert rc == 2 and "no such public key" in capsys.readouterr().err
 
@@ -769,7 +888,8 @@ def test_final_cleanup_is_checked_and_a_failure_prevents_imaging(
     ssh.fail_cleanup = True
     monkeypatch.setattr(ba, "Ec2", lambda region, profile: ec2)
     monkeypatch.setattr(ba, "Ssh", lambda key, known_hosts, log: ssh)
-    rc = ba.main(
+    rc = with_build(
+        ba.main,
         [
             "--account-id",
             "123456789012",
@@ -779,7 +899,7 @@ def test_final_cleanup_is_checked_and_a_failure_prevents_imaging(
             "203.0.113.5",
             "--ssh-public-key",
             pubkey,
-        ]
+        ],
     )
     kinds = [c[0] for c in ec2.calls]
     assert rc == 1 and "create_image" not in kinds
@@ -796,7 +916,8 @@ def test_account_is_checked_before_anything_is_created(monkeypatch, pubkey, caps
     ec2, ssh = FakeEc2(), FakeSsh()
     monkeypatch.setattr(ba, "Ec2", lambda region, profile: ec2)
     monkeypatch.setattr(ba, "Ssh", lambda key, known_hosts, log: ssh)
-    rc = ba.main(
+    rc = with_build(
+        ba.main,
         [
             "--account-id",
             "999999999999",
@@ -806,21 +927,24 @@ def test_account_is_checked_before_anything_is_created(monkeypatch, pubkey, caps
             "203.0.113.5",
             "--ssh-public-key",
             pubkey,
-        ]
+        ],
     )
     assert rc == 2 and "not 999999999999" in capsys.readouterr().err
     assert [c[0] for c in ec2.calls] == ["identity"]
-    rc = ba.main(["--account-id", "12", "--zab-tag", "v0.0.2", "--ssh-public-key", pubkey])
+    rc = with_build(
+        ba.main, ["--account-id", "12", "--zab-tag", "v0.0.2", "--ssh-public-key", pubkey]
+    )
     assert rc == 2 and "12-digit" in capsys.readouterr().err
     with pytest.raises(SystemExit):  # required: no default
-        ba.main(["--ssh-public-key", pubkey, "--dry-run"])
+        with_build(ba.main, ["--ssh-public-key", pubkey, "--dry-run"])
 
 
 def test_image_name_must_be_free(monkeypatch, pubkey, capsys, quiet_time):
     ec2, ssh = FakeEc2(), FakeSsh()
     monkeypatch.setattr(ba, "Ec2", lambda region, profile: ec2)
     monkeypatch.setattr(ba, "Ssh", lambda key, known_hosts, log: ssh)
-    rc = ba.main(
+    rc = with_build(
+        ba.main,
         [
             "--account-id",
             "123456789012",
@@ -832,7 +956,7 @@ def test_image_name_must_be_free(monkeypatch, pubkey, capsys, quiet_time):
             pubkey,
             "--name",
             "taken",
-        ]
+        ],
     )
     assert rc == 1 and "already exists" in capsys.readouterr().out
     assert "run_instance" not in [c[0] for c in ec2.calls]  # checked before the builder launches
@@ -841,7 +965,8 @@ def test_image_name_must_be_free(monkeypatch, pubkey, capsys, quiet_time):
 def test_wheel_must_come_from_the_tag(tmp_path, pubkey, capsys):
     wrong = tmp_path / "zulip_agent_bridge-0.1.0.dev3-py3-none-any.whl"
     wrong.write_bytes(b"PK")
-    rc = ba.main(
+    rc = with_build(
+        ba.main,
         [
             "--account-id",
             "123456789012",
@@ -852,13 +977,14 @@ def test_wheel_must_come_from_the_tag(tmp_path, pubkey, capsys):
             "--zab-wheel",
             str(wrong),
             "--dry-run",
-        ]
+        ],
     )
     assert rc == 2 and "not a v0.0.2 wheel" in capsys.readouterr().err
     right = tmp_path / "zulip_agent_bridge-0.0.2-py3-none-any.whl"
     right.write_bytes(b"PK")
     assert (
-        ba.main(
+        with_build(
+            ba.main,
             [
                 "--account-id",
                 "123456789012",
@@ -869,7 +995,7 @@ def test_wheel_must_come_from_the_tag(tmp_path, pubkey, capsys):
                 "--zab-wheel",
                 str(right),
                 "--dry-run",
-            ]
+            ],
         )
         == 0
     )
@@ -891,7 +1017,8 @@ def test_sigterm_runs_cleanup(monkeypatch, pubkey, capsys, quiet_time):
     monkeypatch.setattr(ba, "Ec2", lambda region, profile: ec2)
     monkeypatch.setattr(ba, "Ssh", lambda key, known_hosts, log: ssh)
     before = sig.getsignal(sig.SIGTERM)
-    rc = ba.main(
+    rc = with_build(
+        ba.main,
         [
             "--account-id",
             "123456789012",
@@ -901,7 +1028,7 @@ def test_sigterm_runs_cleanup(monkeypatch, pubkey, capsys, quiet_time):
             "203.0.113.5",
             "--ssh-public-key",
             pubkey,
-        ]
+        ],
     )
     out = capsys.readouterr().out
     kinds = [c[0] for c in ec2.calls]
@@ -924,7 +1051,8 @@ def test_magma_dir_is_resolved_and_validated_before_aws(tmp_path, pubkey, capsys
     assert ba.validate_magma_dir(str(link)) == root.resolve()
     (tmp_path / "pass").write_text("x")
     (tmp_path / "hook").write_text(HOOK)
-    rc = ba.main(
+    rc = with_build(
+        ba.main,
         [
             "--account-id",
             "123456789012",
@@ -939,7 +1067,7 @@ def test_magma_dir_is_resolved_and_validated_before_aws(tmp_path, pubkey, capsys
             "--magma-licence-setup",
             str(tmp_path / "hook"),
             "--dry-run",
-        ]
+        ],
     )
     assert rc == 2 and "not a Magma installation" in capsys.readouterr().err
 
@@ -1038,7 +1166,8 @@ def test_a_second_signal_does_not_cut_the_cleanup_short(monkeypatch, pubkey, cap
     ec2.terminate = terminate
     monkeypatch.setattr(ba, "Ec2", lambda region, profile: ec2)
     monkeypatch.setattr(ba, "Ssh", lambda key, known_hosts, log: ssh)
-    rc = ba.main(
+    rc = with_build(
+        ba.main,
         [
             "--account-id",
             "123456789012",
@@ -1048,7 +1177,7 @@ def test_a_second_signal_does_not_cut_the_cleanup_short(monkeypatch, pubkey, cap
             "203.0.113.5",
             "--ssh-public-key",
             pubkey,
-        ]
+        ],
     )
     kinds = [c[0] for c in ec2.calls]
     assert rc == 1
@@ -1122,7 +1251,12 @@ def test_dry_run_of_smoke_only_plans_no_build(capsys, pubkey):
         "--ssh-public-key",
         pubkey,
     ]
-    assert ba.main([*argv, "--smoke-only", "ami-0123456789abcdef0", "--my-ip", "203.0.113.5"]) == 0
+    assert (
+        with_build(
+            ba.main, [*argv, "--smoke-only", "ami-0123456789abcdef0", "--my-ip", "203.0.113.5"]
+        )
+        == 0
+    )
     out = capsys.readouterr()
     text = out.out + out.err
     assert "m7a.2xlarge instance from ami-0123456789abcdef0" in text
@@ -1150,16 +1284,197 @@ def test_the_smoke_script_runs_from_a_readable_directory():
     assert lines[:2] == ["set -u", "cd /"]
 
 
-def test_tag_option_replaces_the_workshop_scope_tag():
-    """`--tag` (repeatable) scopes a test build to `zab-role=test` (test infrastructure)."""
+@pytest.mark.parametrize("missing", ["--tag", "--region", "--name"])
+def test_main_refuses_a_build_without_its_scope_region_or_name(missing, capsys):
+    """#808: no default, which would name the first deployment: argparse stops a build without
+    `--tag` or `--region`, and `main` one without `--name`, before any AWS call."""
+    argv = ["--account-id", "123456789012", "--zab-tag", "v0.0.2", "--dry-run", "--tag",
+            "zab-build=ami", "--region", "us-east-2", "--name", "zab-workshop-1"]  # fmt: skip
+    at = argv.index(missing)
+    with pytest.raises(SystemExit) as stop:
+        ba.main(argv[:at] + argv[at + 2 :])
+    assert stop.value.code == 2
+    err = capsys.readouterr().err
+    if missing == "--name":
+        assert "--name is required to build an image" in err
+    else:
+        assert f"the following arguments are required: {missing}" in err
+
+
+def test_tag_option_gives_the_scope_and_is_required():
+    """`--tag` (repeatable) scopes a build: a test build's is `zab-role=test` (test
+    infrastructure). There is no default scope, which would name a deployment (#808)."""
     assert ba.parse_tag("zab-role=test") == ("zab-role", "test")
     with pytest.raises(argparse.ArgumentTypeError):
         ba.parse_tag("zab-role")
     o = opts()
     assert ba.scope_tags(o) == {"workshop": "nt-agents-2026"}
+    with pytest.raises(SystemExit, match="give the build's scope"):
+        ba.scope_tags(opts(tag=None))
     o.tag = [("zab-role", "test"), ("workshop", "zab-test")]
     tags = {
         t["Key"]: t["Value"]
         for t in ba.instance_params(o, "ami", "sg", "kp", "n")["TagSpecifications"][0]["Tags"]
     }
     assert tags == {"Name": "n", "zab-role": "test", "workshop": "zab-test", "role": "ami-build"}
+
+
+def test_main_checks_the_macaulay2_packages_before_anything_in_aws(
+    monkeypatch, pubkey, capsys, deps, quiet_time
+):
+    """#945: the pinned packages are fetched and checked first; a missing or changed one stops
+    the build before any AWS call, with the message that names it. `--smoke-only` needs none."""
+
+    def mismatch(opts, work, log, kind):
+        raise m2_debs.DepsError("gfan_0.8~beta-2~ubuntu24.04.1.dsc (gfan): sha256 x, pinned y")
+
+    monkeypatch.setattr(ba, "deps_tarball", mismatch)
+    monkeypatch.setattr(ba, "Ec2", lambda *a: pytest.fail("no AWS call before the packages"))
+    argv = ["--account-id", "123456789012", "--zab-tag", "v0.0.2", "--ssh-public-key", pubkey]
+    assert with_build(ba.main, argv) == 2
+    assert "(gfan): sha256 x, pinned y" in capsys.readouterr().err
+    monkeypatch.setattr(ba, "deps_tarball", lambda *a: pytest.fail("--smoke-only fetches none"))
+    ec2 = FakeEc2()
+    monkeypatch.setattr(ba, "Ec2", lambda region, profile: ec2)
+    monkeypatch.setattr(ba, "Ssh", lambda key, known_hosts, log: FakeSsh())
+    with_build(ba.main, [*argv, "--my-ip", "203.0.113.5", "--smoke-only", "ami-0123"])
+
+
+def test_main_passes_the_release_or_the_directory_on(
+    monkeypatch, pubkey, capsys, deps, tmp_path, quiet_time
+):
+    ec2, ssh = FakeEc2(), FakeSsh(build_exit=3)  # stop after build.sh: enough to see the copy
+    monkeypatch.setattr(ba, "Ec2", lambda region, profile: ec2)
+    monkeypatch.setattr(ba, "Ssh", lambda key, known_hosts, log: ssh)
+    argv = ["--account-id", "123456789012", "--zab-tag", "v0.0.2", "--ssh-public-key", pubkey]
+    argv += ["--my-ip", "203.0.113.5"]
+    with_build(ba.main, [*argv, "--deps-release", "o/r@deps/x"])
+    with_build(ba.main, [*argv, "--deps-dir", str(tmp_path), "--pari-data-release", "o/r@p"])
+    with_build(ba.main, [*argv, "--pari-data-dir", str(tmp_path)])
+    assert deps == [  # a directory needs no release
+        ("m2_debs", "o/r@deps/x", None),
+        ("pari_data", f"o/r@{m2_debs.PARI_RELEASE}", None),
+        ("m2_debs", None, str(tmp_path)),
+        ("pari_data", "o/r@p", None),
+        ("m2_debs", f"o/r@{m2_debs.RELEASE}", None),
+        ("pari_data", None, str(tmp_path)),
+    ]
+    assert ("copy", "198.51.100.7", "m2-debs.tar", "m2-debs.tar") in ssh.calls
+    assert ("copy", "198.51.100.7", "pari-data.tar", "pari-data.tar") in ssh.calls
+    stream = next(c for c in ssh.calls if c[0] == "stream")[2]
+    assert "M2_DEBS=/home/ubuntu/m2-debs.tar" in stream
+    assert "PARI_DATA=/home/ubuntu/pari-data.tar" in stream
+
+
+def test_deps_tarball_holds_the_checked_files(monkeypatch, tmp_path):
+    """The files m2_debs gives, checked, go into one tarball at its top level, for M2_DEBS."""
+    seen = []
+
+    def give(source, dest, *rest, kind=m2_debs.M2):
+        seen.append((source, kind.attr))
+        (dest / "a~1.deb").write_bytes(b"a")
+        (dest / "a~1.dsc").write_bytes(b"d")
+        return [dest / "a~1.deb", dest / "a~1.dsc"]
+
+    monkeypatch.setattr(ba.m2_debs, "fetch", give)
+    monkeypatch.setattr(ba.m2_debs, "from_dir", give)
+    (tmp_path / "w1").mkdir()
+    (tmp_path / "w2").mkdir()
+    log: list[str] = []
+    tar = DEPS_TARBALL(opts(), tmp_path / "w1", log.append)  # the release, with gh
+    with tarfile.open(tar) as t:
+        assert sorted(t.getnames()) == ["a~1.deb", "a~1.dsc"]
+        assert t.extractfile("a~1.dsc").read() == b"d"
+    DEPS_TARBALL(opts(deps_dir="/copy"), tmp_path / "w2", log.append)
+    (tmp_path / "w3").mkdir()
+    pari = DEPS_TARBALL(opts(), tmp_path / "w3", log.append, m2_debs.PARI_DATA)
+    assert Path(pari).name == "pari-data.tar"
+    assert seen == [
+        (m2_debs.RELEASE, "m2_debs"),
+        (Path("/copy"), "m2_debs"),
+        (m2_debs.PARI_RELEASE, "pari_data"),
+    ]
+    assert f"release {m2_debs.RELEASE} (gh)" in log[0] and "from /copy" in log[2]
+    assert f"PARI's pinned data packages from release {m2_debs.PARI_RELEASE}" in log[4]
+
+
+def test_the_release_is_resolved_and_checked_before_anything_else(
+    monkeypatch, pubkey, capsys, deps
+):
+    """Review of #950: the default release is origin's; without an origin, or with a malformed
+    `--deps-release`, the build stops with exit 2, a dry run too, before any AWS call."""
+    monkeypatch.setattr(ba, "Ec2", lambda *a: pytest.fail("no AWS call"))
+    argv = ["--account-id", "123456789012", "--zab-tag", "v0.0.2", "--ssh-public-key", pubkey]
+    assert with_build(ba.main, [*argv, "--dry-run"]) == 0
+    assert f"release o/r@{m2_debs.RELEASE} (with gh)" in capsys.readouterr().out
+    assert with_build(ba.main, [*argv, "--dry-run", "--deps-release", "not a release"]) == 2
+    assert "is not OWNER/REPO@TAG" in capsys.readouterr().err
+
+    def no_origin(*a):
+        raise m2_debs.DepsError("no GitHub origin …; pass --deps-release OWNER/REPO@TAG")
+
+    monkeypatch.setattr(ba.m2_debs, "origin_repo", no_origin)
+    assert with_build(ba.main, argv) == 2
+    assert "pass --deps-release" in capsys.readouterr().err
+    assert deps == []  # nothing fetched
+
+
+@pytest.mark.parametrize(
+    ("url", "code"),
+    [
+        ("https://x-access-token:ghp_FAKETOKEN0123@github.com/someone/zab.git", 0),
+        ("https://ghp_FAKETOKEN0123@github.com/someone/zab.git", 0),
+        ("https://ghp_FAKETOKEN0123@gitlab.com/someone/zab.git", 2),
+    ],
+)
+def test_an_origin_with_a_token_never_reaches_the_output(monkeypatch, pubkey, capsys, url, code):
+    """Review round 2 on #950: an origin carrying credentials resolves without them, or is
+    refused without showing them; the build log never holds the token."""
+    monkeypatch.setattr(ba.m2_debs, "origin_repo", ORIGIN_REPO)  # the real one, with a fake git
+
+    def git(argv, **kw):
+        return subprocess.CompletedProcess(argv, 0, url + "\n", "")
+
+    monkeypatch.setattr(ba.m2_debs.subprocess, "run", git)
+    argv = ["--account-id", "123456789012", "--zab-tag", "v0.0.2", "--ssh-public-key", pubkey]
+    assert with_build(ba.main, [*argv, "--dry-run"]) == code
+    out = capsys.readouterr()
+    assert "FAKETOKEN" not in out.out + out.err
+    if code == 0:
+        assert f"release someone/zab@{m2_debs.RELEASE} (with gh)" in out.out
+
+
+def test_the_pari_data_release_is_resolved_like_the_macaulay2_one(
+    monkeypatch, pubkey, capsys, deps
+):
+    """Review of #952, B1: no origin and no --pari-data-release (the Macaulay2 set given) stops the
+    build before AWS, naming the PARI flag; --pari-data-dir needs no release."""
+    monkeypatch.setattr(ba, "Ec2", lambda *a: pytest.fail("no AWS call"))
+
+    def no_origin(run=None, flag="--deps-release"):
+        raise m2_debs.DepsError(f"no GitHub origin …; pass {flag} OWNER/REPO@TAG")
+
+    monkeypatch.setattr(ba.m2_debs, "origin_repo", no_origin)
+    argv = ["--account-id", "123456789012", "--zab-tag", "v0.0.2", "--ssh-public-key", pubkey]
+    argv += ["--dry-run", "--deps-release", "o/r@deps/x"]
+    assert with_build(ba.main, argv) == 2
+    assert "pass --pari-data-release" in capsys.readouterr().err
+    assert with_build(ba.main, [*argv, "--pari-data-dir", "/copy"]) == 0
+    assert "PARI's data packages from /copy" in capsys.readouterr().out
+
+
+def test_the_pari_sets_refusal_never_shows_the_origins_token(monkeypatch, pubkey, capsys):
+    """Review round 2 on #950, on #952's path: the Macaulay2 release given, the PARI set's comes
+    from an origin that carries a token and isn't GitHub's; the refusal names --pari-data-release
+    and never the token."""
+    monkeypatch.setattr(ba.m2_debs, "origin_repo", ORIGIN_REPO)  # the real one, with a fake git
+    url = "https://x-access-token:ghp_FAKETOKEN0123@gitlab.com/someone/zab.git"
+
+    def git(argv, **kw):
+        return subprocess.CompletedProcess(argv, 0, url + "\n", "")
+
+    monkeypatch.setattr(ba.m2_debs.subprocess, "run", git)
+    argv = ["--account-id", "123456789012", "--zab-tag", "v0.0.2", "--ssh-public-key", pubkey]
+    assert with_build(ba.main, [*argv, "--dry-run", "--deps-release", "o/r@deps/x"]) == 2
+    out = capsys.readouterr()
+    assert "pass --pari-data-release" in out.err and "FAKETOKEN" not in out.out + out.err

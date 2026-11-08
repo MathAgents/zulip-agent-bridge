@@ -5,11 +5,12 @@
 
 1. Finds the test VM by its tags (`zab-role=test`, the scope, `participant=<slug>`), takes its
    lock (`<report dir>/<instance>.lock`: one run per VM), starts it if it is stopped
-   (`harness/aws.py`: test infrastructure only), and checks that the roster's address is this
-   VM's.
+   (`harness/aws.py`: test infrastructure only), waits until SSH answers steadily (#690), and
+   checks that the roster's address is this VM's. The report's *Start-up* lists each step.
 2. Builds the wheel from the commit under test, in a temporary `git worktree`, and deploys it
    with that commit's `push_config.py --wheel … --only <slug> --claude-steer` (the rig's roster,
-   out dir, known_hosts and key), then records `<commit> <wheel>` on the VM. `--no-deploy`
+   out dir, known_hosts and key), run again when it could not connect (#690), then records
+   `<commit> <wheel>` on the VM. `--no-deploy`
    tests what is installed and reports that recorded build; it refuses a `--commit` the VM
    doesn't have, and a VM without a record fails the report (unknown provenance).
 3. Runs the selected scenarios of THIS checkout's `tests/e2e/` (the reference suite), with
@@ -29,7 +30,8 @@ The exit code follows the report's verdict, a merge gate: 0 for PASS (every sele
 passed); 1 for FAIL (a scenario failed, a `--require`d one did not pass, or the run had a
 problem); 3 for NO-RESULT (nothing failed, but nothing passed or a scenario was skipped); 2 when
 the run could not start. A release candidate runs with `--require rc`: every scenario must
-pass. The rig's inputs: `harness/config.py`.
+pass, and the scenarios get `ZAB_E2E_RC=1` (the model's own cadence is then a target). The
+rig's inputs: `harness/config.py`.
 """
 
 from __future__ import annotations
@@ -48,17 +50,18 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # `e2e.harness` as a script too
 
 from e2e.harness import config, report
-from e2e.harness.admin import failure
+from e2e.harness.admin import connect_failed, failure
 from e2e.harness.cleanup import ATTEMPTS, PAUSE_S, UNBLOCK
 from e2e.harness.secret_files import described
-from e2e.harness.vm import Result
+from e2e.harness.startup import DEPLOY_PAUSES_S, Timeline, steady_ssh
+from e2e.harness.vm import Result, say
 
 HERE = Path(__file__).resolve().parent
 Command = Callable[..., Result]
@@ -182,6 +185,17 @@ class Run:
     run: Command = command
     vm_factory: Callable[[str], Any] | None = None
     sleep: Callable[[float], None] = time.sleep
+    clock: Callable[[], float] = time.monotonic
+    wall: Callable[[], float] = time.time  # the timeline's UTC times
+    log: Callable[[str], None] = say
+    #: A release candidate's run (`--require rc`): the scenarios get `ZAB_E2E_RC=1`, which
+    #: makes the model's own cadence a target, never a failure (scenario 17's part 7, #668)
+    rc: bool = False
+    #: The start-up's timeline (`note`), for the report
+    start_up: Timeline = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.start_up = Timeline(self.clock, self.wall, self.log)
 
     def git(self, *args: str) -> str:
         res = self.run(["git", "-C", str(config.CHECKOUT), *args], timeout=300)
@@ -189,26 +203,45 @@ class Run:
             raise RuntimeError(f"git {args[0]}: {res.stderr.strip()[:300]}")
         return res.stdout.strip()
 
+    def mark(self) -> tuple[float, float]:
+        """Now, on the clock and in UTC: when a step of the timeline began."""
+        return self.start_up.mark()
+
+    def note(self, event: str, began: tuple[float, float] | None = None) -> None:
+        """One line of the start-up's timeline (`startup.Timeline.note`), printed and kept for
+        the report (#690)."""
+        self.start_up.note(event, began)
+
+    @property
+    def timeline(self) -> list[str]:
+        """The start-up's lines, for the report."""
+        return self.start_up.lines
+
     def ensure_running(self, instance_id: str) -> str:
-        """Start the VM if needed; its address once SSH answers. A VM `stopping` (the run
-        before stopped it) is waited for until it leaves that state, for `stopped`, `pending` or
-        `running`: the test waker may start it again for that run's last messages (SPEC §13.4),
-        and the polls can miss the moment it was stopped (#305). Only a VM read `stopped` is
-        started; insisting on `stopped` is for whoever stops the VM."""
+        """Start the VM if needed; its address once SSH answers steadily (`steady_ssh`). A VM
+        `stopping` (the run before stopped it) is waited for until it leaves that state, for
+        `stopped`, `pending` or `running`: the test waker may start it again for that run's last
+        messages (SPEC §13.4), and the polls can miss the moment it was stopped (#305). Only a
+        VM read `stopped` is started; insisting on `stopped` is for whoever stops the VM."""
         state = self.ec2.state(instance_id)
+        self.note(f"EC2 {state}")
         if state == "stopping":
             state = self.ec2.wait_while(instance_id, "stopping", timeout=600)
+            self.note(f"EC2 {state}")
         if state == "stopped":
             self.ec2.start(instance_id)
+            self.note("EC2 start sent")
         if state != "running":
             self.ec2.wait_state(instance_id, "running", timeout=600)
+            self.note("EC2 running")
         ip = self.ec2.public_ip(instance_id)
-        vm = self.vm_factory(ip) if self.vm_factory else None
-        for _ in range(60):
-            if vm is None or vm.reachable():
-                return ip
-            self.sleep(10)
-        raise TimeoutError(f"{ip}: no SSH 10 minutes after the start")
+        if self.vm_factory is not None:
+            self.steady_ssh(self.vm_factory(ip), ip)
+        return ip
+
+    def steady_ssh(self, vm: Any, ip: str) -> None:
+        """`startup.steady_ssh` on this run's timeline and pauses (#690)."""
+        steady_ssh(vm, ip, self.start_up, self.sleep)
 
     def vm(self, ip: str) -> Any:
         if self.vm_factory is None:
@@ -245,10 +278,22 @@ class Run:
         wheels = sorted(dist.glob("*.whl")) if built.ok else []
         if len(wheels) != 1:
             raise RuntimeError(f"wheel build failed: {built.stderr.strip()[-300:]}")
-        deployed = self.push_config(tree, "--wheel", str(wheels[0]), "--claude-steer")
+        for pause in (*DEPLOY_PAUSES_S, None):
+            began = self.mark()
+            deployed = self.push_config(tree, "--wheel", str(wheels[0]), "--claude-steer")
+            cause = connect_failed(deployed, self.cfg.slug, ip) if ip else ""
+            if not cause:
+                break
+            # #690: push_config never retries a connect; a rollout is idempotent: run it again
+            then = f"push_config again in {pause:g} s" if pause else "no tries left"
+            took = self.clock() - began[0]
+            self.note(f"deploy failed after {took:.1f} s: {cause}; {then}", began)
+            if pause is None:
+                break
+            self.sleep(pause)
         last = (deployed.stdout.strip().splitlines() or [""])[-1][:200]
         if not deployed.ok:
-            raise RuntimeError(f"push_config failed (exit {deployed.returncode}): {last}")
+            raise RuntimeError(f"push_config failed: {failure(deployed, self.cfg.slug)}")
         if vm:
             vm.run(["sudo", "install", "-d", "-m", "0755", str(Path(BUILD_FILE).parent)])
             vm.script('printf "%s %s\\n" "$1" "$2" > "$3"', sha, wheels[0].name, BUILD_FILE,
@@ -326,6 +371,9 @@ class Run:
         whole output goes to `log`."""
         env = {**os.environ, "ZAB_LIVE": "e2e", "ZAB_E2E_SCENARIOS": spec}
         env["ZAB_E2E_REPORT_JSON"] = str(json_path)
+        env.pop("ZAB_E2E_RC", None)  # only a release candidate's run sets it (#922, N7)
+        if self.rc:
+            env["ZAB_E2E_RC"] = "1"
         # pytest runs in the checkout and loads the rig again: give it this run's absolute
         # paths, not relative ones from where run.py started (codex on #283)
         cfg = self.cfg
@@ -396,6 +444,7 @@ def main(
         print(f"e2e: --merge-into {args.merge_into}: no such report", file=sys.stderr)
         return 2
     runner = make(cfg) if make else _default_run(cfg)
+    runner.rc = args.require.strip() == "rc"
     try:
         sha = runner.git("rev-parse", "--verify", f"{args.commit or 'HEAD'}^{{commit}}")
         instance_id = str(runner.ec2.find({"participant": cfg.slug})["InstanceId"])
@@ -507,6 +556,7 @@ def _run(
             finally:
                 for s, handler in held.items():
                     signal.signal(s, handler)
+                result.boot = list(runner.timeline)  # the clean-up's start too, if it made one
             result.finished = f"{dt.datetime.now(dt.UTC):%Y-%m-%d %H:%M:%S}Z"
     return result
 

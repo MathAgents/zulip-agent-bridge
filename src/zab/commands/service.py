@@ -23,6 +23,20 @@ MARKER = "# Managed by zab service install\n"
 #: `zab sentinel`'s unit (#204; SPEC §13.3): `!vm` and `!restart` in a DM, also while the bridge
 #: is down. No tie to `zab.service`, so that it keeps running while the bridge doesn't.
 SENTINEL = "zab-sentinel.service"
+#: The bridge's restarts back off (#806; SPEC §13.3): `RestartSteps` and `RestartMaxDelaySec`.
+#: A bridge that dies at every start, as one killed while delivering an answer, started again
+#: every 5 s (`RestartSec`), each start with its Zulip requests. Now the delay grows from 5 s to
+#: 120 s in 5 steps (5, 9.4, 18, 34, 64, then 120 s), and stays there. systemd never gives up,
+#: so a bridge that failed to start in a Zulip outage starts again once it ends, at most 2
+#: minutes later; a start limit would stop it until `!restart` (review round 1 of #813). One
+#: exception is systemd's own: a blocking `systemctl --user start` typed while the unit waits
+#: trips its default start limit and leaves it `failed`; `restart` and `!restart` don't. Only
+#: a manual start or restart of a bridge running or stopped, the sentinel's `!restart` (its
+#: `reset-failed`, even mid-wait) or a boot sets the delay back to 5 s, not a run that lasted,
+#: nor a `restart` during the wait (systemd 255, DECISIONS' verification log). So 2 minutes is
+#: also the most a later automatic restart in the same boot, the watchdog's say, waits beyond
+#: `RestartSec`.
+RESTART_BACKOFF = (5, 120)  # RestartSteps, RestartMaxDelaySec
 #: The Codex app-server's open files (#664). Each Codex thread it has loaded keeps a
 #: `lean-lsp-mcp` child (#632) and its pipes: on the test VM, 109 of them held 967 of the default
 #: soft limit, 1024, a minute after boot, and a shell there failed with "No file descriptors
@@ -174,7 +188,9 @@ def units(config: Config, *, nofile: int = CODEX_NOFILE) -> dict[str, str]:
         )
         + "\n"
         + bridge_environment
-        + "Restart=on-failure\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=30\n"
+        + "Restart=on-failure\nRestartSec=5\n"
+        + "RestartSteps={}\nRestartMaxDelaySec={}\n".format(*RESTART_BACKOFF)
+        + "KillMode=mixed\nTimeoutStopSec=30\n"
         + "[Install]\nWantedBy=default.target\n"
     )
     result[SENTINEL] = (

@@ -2,7 +2,7 @@
 """Start or stop workshop VMs and spares (docs/ADMIN.md §3, action 6; README.md, "power.py").
 
     uv run --with boto3 python workshop/aws/power.py --roster roster.csv (--start | --stop) \\
-        (--all [--spares] | --spares | --only SLUG …) [--tag KEY=VALUE …] [--region R] \\
+        (--all [--spares] | --spares | --only SLUG …) --tag KEY=VALUE [--tag …] --region R \\
         [--spares-file FILE] [--wait] [--dry-run]
 
 Replaces the raw `aws ec2 start-instances` / `stop-instances` (README.md, "power.py", by hand),
@@ -25,8 +25,9 @@ and backs the admin bot's `!start` and `!stop`.
   candidates (docs/ADMIN.md §3.2): the admin server is never started or stopped, even if the
   roster names its address. An instance tagged as another participant (a typo in `ip`) is
   refused too.
-- **One region.** `--region`, or else the region of every roster row with an `ip` (the `region`
-  column; empty means us-west-2, as `status.py` reads it), which must then be a single one.
+- **One region,** `--region`, required (#808): a row whose `region` column names another is
+  refused or skipped. A row with a VM and an empty `region` is one launched before launch.py
+  recorded it, in us-west-2, as `status.py` reads it (`UNRECORDED_REGION`).
 - **Idempotent.** A VM already in the wanted state, or on its way there, is left alone. One
   that is on its way to the other state (`stopping` for `--start`, `pending` for `--stop`) is a
   failure: rerun in a minute. A failure on one VM is reported and the others still run; the exit
@@ -84,8 +85,11 @@ from aws_common import (
 from launch import SPARES_FILE
 
 LIVE_STATES = ("pending", "running", "stopping", "stopped")
-#: The region of a row without one: launch.py's default (as `status.py` reads it).
-DEFAULT_REGION = "us-west-2"
+#: The region of a row with a VM but no region recorded: one launched before launch.py
+#: recorded it, which the first fleet's were, in us-west-2. launch.py records it for every
+#: VM it makes (#808: no script takes it as the workshop's region any more). As the admin
+#: bot reads such a row (`zab.admin.actions`).
+UNRECORDED_REGION = "us-west-2"
 #: Keyed by `start`: the states in which a VM needs no call (already there, or on its way), and
 #: the one it is started or stopped from. The fourth live state is on its way to the other.
 DONE = {True: ("running", "pending"), False: ("stopped", "stopping")}
@@ -125,16 +129,7 @@ class Selection:
 
 
 def region_of(row: dict[str, str]) -> str:
-    return (row.get("region") or "").strip() or DEFAULT_REGION
-
-
-def workshop_region(rows: list[dict[str, str]]) -> str:
-    """The one region of every roster row with a VM; refuses none or several."""
-    regions = sorted({region_of(r) for r in participants(rows) if r.get("ip")})
-    if len(regions) != 1:
-        found = ", ".join(regions) or "none (no row has an ip)"
-        raise SelectionError(f"give --region: the roster's VMs are in {found}")
-    return regions[0]
+    return (row.get("region") or "").strip() or UNRECORDED_REGION
 
 
 def load_spares(path: pathlib.Path, *, given: bool = False) -> dict[str, Any]:
@@ -419,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--only", action="append", default=[], metavar="SLUG", help="a participant or a spare"
     )
-    parser.add_argument("--region", help="default: the roster's one region")
+    parser.add_argument("--region", required=True, help="the workshop's region")
     parser.add_argument("--spares-file", metavar="FILE", help=f"default {SPARES_FILE}")
     add_tag_argument(parser)
     parser.add_argument("--wait", action="store_true", help="until stopped, or SSH answers")
@@ -432,7 +427,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         scope = parse_tags(opts.tag)
         rows = read_roster(opts.roster)
-        region = opts.region or workshop_region(rows)
+        region = opts.region
         path = pathlib.Path(opts.spares_file) if opts.spares_file else SPARES_FILE
         wants_spares = opts.spares or any(is_spare_name(name) for name in only_slugs(opts.only))
         spares = load_spares(path, given=bool(opts.spares_file) and wants_spares)

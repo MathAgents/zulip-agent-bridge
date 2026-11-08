@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import time
+import tracemalloc
 from dataclasses import dataclass, field
 
 import pytest
@@ -482,6 +483,28 @@ def test_split_reserves_the_closer_of_a_nested_opener() -> None:
     assert len(bodies) == 2
     assert bodies[0] == "```spoiler\n" + "x" * 9500 + "\n```"
     assert bodies[1] == "```spoiler\n" + fence + "python\ny\n" + fence + "\n```\n" + "z" * 100
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "$a" + "b" * 1_000_000,  # never closed
+        "$a" + "b " * 500_000 + "c$ d",  # closed at the end
+        "$a" + "\\b" * 500_000,  # escapes
+    ],
+    ids=["open", "closed", "escapes"],
+)
+def test_convert_math_costs_bounded_memory(text: str) -> None:
+    """#833: `_DOLLAR_MATH`'s lazy repeat of a group kept a frame of `re` per character of the
+    run after a `$`, 147 MB on this megabyte, on every answer. It is possessive now."""
+    tracemalloc.start()
+    try:
+        base = tracemalloc.get_traced_memory()[0]
+        convert_math(text)
+        peak = tracemalloc.get_traced_memory()[1] - base
+    finally:
+        tracemalloc.stop()
+    assert peak < 16_000_000, f"{peak / 1e6:.0f} MB"
 
 
 #: The bounds on time here are on CPU time (`process_time`), not the wall clock, which

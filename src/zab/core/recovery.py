@@ -32,6 +32,7 @@ def session_spec(actor: SessionActor) -> t.SessionSpec:
         settings=settings,
         git_identity=getattr(actor, "git_identity", None),
         bot=actor.row["bot"],  # ZAB_BOT, for `zab history` (issue #248)
+        session=actor.row["id"],  # ZAB_SESSION, for `zab job` (issue #655)
         context_prompt=context_prompt(getattr(actor, "multi_party_enabled", False)),
     )
 

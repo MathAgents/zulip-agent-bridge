@@ -82,6 +82,13 @@ nothing left to run, exits. After the last record the fake waits for EOF, like t
 fixture without `stdin` records gets an echo of the prompt before its first `assistant` record
 under `--replay-user-messages`. `ZAB_FAKE_CLAUDE_LOG` then also gets `{"steer": <line>}` for
 each later line.
+
+Two record shapes serve a background sub-agent, which outlives the `result` of the loop that
+started it (#660): the real CLI waits for it, with stdin open or not, and its notification
+starts a further loop. A `stdin` record with `"optional": true` doesn't end the replay at EOF:
+the records whose `for` is its uuid (the loop that line would have started) are skipped and the
+replay goes on, as the real CLI runs what it has. A `{"kind": "hang"}` record waits there, stdin
+open or not, for a signal, handled as with `ZAB_FAKE_CLAUDE_HANG` (a sub-agent that never ends).
 """
 
 from __future__ import annotations
@@ -94,7 +101,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, NoReturn
 
 PINNED_VERSION = "2.1.283"
 
@@ -301,6 +308,26 @@ def _put(stream: Any, text: str) -> None:
         signal.pthread_sigmask(signal.SIG_SETMASK, held)
 
 
+#: A wait that a signal may end is slept in slices this short, never in one long sleep or
+#: `signal.pause()`. A Python handler runs only when the eval loop checks for signals, and
+#: neither makes a check before its syscall: a signal that lands just before one only sets the
+#: handler's flag, and the handler runs when the syscall ends, if ever (#890, #910).
+NAP_S = 0.01
+
+
+def _sleep(seconds: float) -> None:
+    """`time.sleep(seconds)` in `NAP_S` slices, so that a signal's handler runs within one."""
+    end = time.monotonic() + seconds
+    while (left := end - time.monotonic()) > 0:
+        time.sleep(min(left, NAP_S))
+
+
+def _wait_for_a_signal() -> NoReturn:
+    """Wait until a signal ends the process: its handler raises, or its default action."""
+    while True:
+        time.sleep(NAP_S)
+
+
 def load_fixture(path: str) -> list[dict[str, Any]]:
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
@@ -352,7 +379,7 @@ def _auth_login(args: list[str]) -> int:
     out.write("Opening browser to sign in\u2026\r\n")
     if mode == "nourl":
         out.flush()
-        signal.pause()
+        _wait_for_a_signal()
     text = (
         "If the browser didn't open, visit: "
         f"\x1b]8;;{LOGIN_URL}\x07\x1b[94m{LOGIN_URL}\x1b[39m\x1b]8;;\x07\r\n"
@@ -367,7 +394,7 @@ def _auth_login(args: list[str]) -> int:
     out.write(text)
     out.flush()
     if mode == "hang":
-        signal.pause()
+        _wait_for_a_signal()
     code = sys.stdin.readline().strip()
     if code == os.environ.get("ZAB_FAKE_CLAUDE_LOGIN_CODE", "fake-code#fake-state"):
         with open(_login_marker(), "w", encoding="utf-8") as f:
@@ -467,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
                                     "GIT_COMMITTER_NAME",
                                     "GIT_COMMITTER_EMAIL",
                                     "ZAB_BOT",
+                                    "ZAB_SESSION",
                                 )
                             },
                         },
@@ -527,30 +555,38 @@ def main(argv: list[str] | None = None) -> int:
     last_t = 0.0
     exit_code = 0
     result_text: str | None = None
+    missed: set[str] = set()  # the optional lines stdin closed before (their loops are skipped)
     for rec in records:
         kind = rec.get("kind")
         if kind == "meta" or (kind == "stdin" and inputs and rec is inputs[0]):
+            continue
+        if rec.get("for") is not None and str(rec.get("for")) in missed:
             continue
         if kind == "stdin":
             if not stream:
                 continue
             line = steer_line()  # where the recording wrote its next line
+            if line is None and rec.get("optional"):
+                missed.add(str(rec.get("uuid")))  # a background sub-agent's loop still comes
+                continue
             if line is None:  # stdin closed: with nothing left to run, the CLI exits
                 exit_code = 0
                 break
             uuids[str(rec.get("uuid"))] = str(line.get("uuid") or "")
             continue
+        if kind == "hang":  # a background sub-agent that never ends: until a signal
+            sys.stdout.flush()
+            _wait_for_a_signal()
         if realtime:
             t = float(rec.get("t") or 0.0)
             gap = min(max(t - last_t, 0.0), 2.0)
             if gap:
-                time.sleep(gap)
+                _sleep(gap)
             last_t = t
         if kind == "stdout":
             data = rec.get("data")
             if hang and isinstance(data, dict) and data.get("type") == "result":
-                while True:  # until SIGINT/SIGTERM (handled above) or SIGKILL
-                    time.sleep(3600)
+                _wait_for_a_signal()  # SIGINT/SIGTERM (handled above) or SIGKILL
             if isinstance(data, dict) and data.get("type") == "result":
                 result_text = data.get("result")
             data = _rewrite(data, session_id, uuids)
@@ -568,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
         _write_transcript(session_id, prompt, result_text, fork_from=_fork_source(args))
     linger = float(os.environ.get("ZAB_FAKE_CLAUDE_LINGER") or 0)
     if linger > 0:
-        time.sleep(linger)
+        _sleep(linger)
     return exit_code
 
 

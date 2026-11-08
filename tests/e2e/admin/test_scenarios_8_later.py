@@ -1,6 +1,6 @@
-"""The later stages' scenarios (docs/ADMIN.md §7, "Later stages"; issue #356): A16, and hooks.
+"""The later stages' scenarios (docs/ADMIN.md §7, "Later stages"; issue #356): A16.
 
-Each is selectable (`--scenarios A9`, or `all`). A stage that hasn't landed has a hook here that
+Each is selectable (`--scenarios A16`, or `all`). A stage that hasn't landed gets a hook here that
 reports a skip naming the stage and the PRs it waits for, never a silent gap; the go criteria
 (`go`, §8.2) don't include them. When a stage lands, its scenario replaces its hook, to its pass
 criteria in §7, with the harness of the other files: `Talk.request` and `Talk.approve` for plans
@@ -9,11 +9,12 @@ AWS just after a bot changed it goes through `settle.until`: EC2 may show the ch
 seconds later. A9 has its own file, `test_scenarios_8_the_end.py`.
 
 **A16** (stage 7, #418) makes a throwaway workshop through the global admin bot and takes it
-apart again: its name is new each run (`THROWAWAY`), since Zulip reactivates no bot and an
-archived channel keeps its name. The bot is deactivated and the channels archived (as
-`zab-tester`, the rig's provisioner and global admin), and the entry, the key file and the
-workshop's directory removed, in the scenario's `finally`; the key pair goes with the run's
-teardown (`AwsRig.drop_throwaway_key_pairs`), the scenario's AWS view being read-only.
+apart again: its name is new each run (`THROWAWAY`), since `!new-workshop` makes a new bot and
+never reactivates one, and an archived channel keeps its name. The bot is deactivated and the
+channels archived (as `zab-tester`, the rig's provisioner and global admin), and the entry, the
+key file and the workshop's directory removed, in the scenario's `finally`; the key pair goes
+with the run's teardown (`AwsRig.drop_throwaway_key_pairs`), the scenario's AWS view being
+read-only.
 """
 
 from __future__ import annotations
@@ -30,11 +31,6 @@ from e2e.admin.harness.rig import E2E, FLEET_GROUP, GLOBAL_BOT, THROWAWAY
 from e2e.admin.test_scenarios_2_bot import PROVISIONER_Q9, records, restart, talk
 from e2e.harness.zulip_user import dm_narrow
 
-#: label → (stage of ADMIN §8.1, what it waits for).
-LATER = {
-    "A10b": (6, "the in-band !upgrade-server, PR 20"),
-    "A17": (8, "the automated month-end, PR 24"),
-}
 #: As root: what A16's workshop left on the server, by name (`THROWAWAY-<hex>` only).
 FORGET = r"""set -eu
 case $1 in zab-dev-e3-[0-9a-f]*) ;; *) echo "refused: $1" >&2; exit 2 ;; esac
@@ -43,15 +39,6 @@ rm -f -- "/etc/zab-admin/secrets/bots/$1.zuliprc"
 """
 #: A region the rig never sets up, not in its `[global] regions`: refused before any script.
 NOT_SET_UP = "eu-north-1"
-
-
-@pytest.mark.admin_e2e
-@pytest.mark.parametrize(
-    "label", [pytest.param(label, marks=pytest.mark.admin_scenario(label)) for label in LATER]
-)
-def test_later_stage(scenario, label):
-    stage, what = LATER[label]
-    pytest.skip(f"stage {stage} is not built yet: {what}")
 
 
 async def _version_lists(admins: Talk, name: str) -> None:

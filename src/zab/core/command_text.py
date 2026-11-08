@@ -12,8 +12,10 @@ from zab.core.addressing import unaddressed
 #: the rendered "Start here" gives back. Any run of backticks, closed by the same run, with the
 #: spaces inside it, as CommonMark has code spans; on one line, so that a fenced block
 #: ("```\n!pip install sympy\n```") is never a command. Its words and the spaces between them
-#: are classes that share no character, so a long run of either is matched in linear time.
-_CODE_SPAN = re.compile(r"(`+)[^\S\n]*(![^`\s]*(?:[^\S\n]+[^`\s]+)*)[^\S\n]*\1")
+#: are classes that share no character, so a long run of either is matched in linear time; the
+#: repeat of a space and a word is possessive, as giving one back never lets the closing
+#: backticks match, and a greedy one keeps a frame of `re` per pass, 145 MB on 1 MB (#833).
+_CODE_SPAN = re.compile(r"(`+)[^\S\n]*(![^`\s]*(?:[^\S\n]+[^`\s]+)*+)[^\S\n]*\1")
 _VERB = re.compile(r"!\S+")
 
 

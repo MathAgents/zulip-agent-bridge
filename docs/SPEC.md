@@ -1,6 +1,6 @@
 # zab — Zulip Agent Bridge: specification
 
-Status: describes v0.2.15.
+Status: describes v0.2.19.
 
 This document is the source of truth for the bridge. Section numbers are stable: cite them in commits and pull requests ("SPEC §7.4"). `#NNN` is an issue or pull request of the private repository where zab is developed (CONTRIBUTING.md; D37). The words *must*, *should* and *may* are used in the RFC 2119 sense. *Phase 1* is the bridge as first built, for a workshop in October 2026, with the amendments since folded in; §18 lists what is deferred, and §16 the history.
 
@@ -68,7 +68,7 @@ The MathAgents workshops, for example, run all of these. Personal use needs none
 - **G3 Durability.** Sessions survive bridge restarts, topic renames and moves, and loss of the Zulip event queue.
 - **G4 Safe defaults.** Only a bot's owner can drive it; sessions run only in private channels; agent output cannot ping everyone and has known secret formats redacted.
 - **G5 Replicable.** One Python package, one config file, `zab init` and `zab doctor`; installable on a fresh Ubuntu VM in under ten minutes; runs in the foreground on macOS.
-- **G6 Codex co-presence.** A Codex thread can be driven from Zulip and from `codex` in a terminal at the same time.
+- **G6 Codex co-presence.** A Codex thread can be driven from Zulip and from `codex` in a terminal at the same time, once the bridge has loaded it: after a boot or a wake, by its topic's first message. A thread a terminal loads first can't be driven from Zulip until the terminal lets it go (§8.6, #632).
 
 ### 1.2 Non-goals for Phase 1
 
@@ -203,7 +203,7 @@ The organization is a single Zulip Cloud org on the Standard plan (academic spon
 ### 4.4 Topics and sessions
 
 - A session is bound to its **card message id**. The session's current channel and topic are the card's current location.
-- The store caches that location and updates it from `update_message` events (§4.10). After any event-queue loss, the bridge must refresh the location of each active session's card with `GET /messages/{card_id}` before its catch-up. On startup it confirms a card before anything depends on its location (issue #443):
+- The store caches that location and updates it from `update_message` events (§4.10). An event-queue loss loses the card moves of the gap with it: no location is confirmed any more, as at startup. On startup, and after an event-queue loss (§7.8.2), it confirms a card with `GET /messages/{card_id}` before anything depends on its location (issue #443):
   - before the catch-up replay, the cards of sessions that can post before a message reaches them (a turn to recover, held or pending input, a pending approval);
   - before routing a message in a topic, the cards of the sessions stored at that topic; if none is left there, it searches the topic, once, for this bot's messages (`GET /messages`, narrow of channel, topic and sender), and confirms any card found, moved there while the bridge was down;
   - before a session posts in its topic, its own card (a turn the backend reports for a session nothing else has reached, say);
@@ -224,18 +224,18 @@ For each `message` event received by bot **B** with sender **S**, channel **C**,
 1. **Ignore** the message if S is B, if S is any bot, or if S is not in B's allowlist (§5.2).
 2. **Direct message** to B: handle DM control commands only (§4.6), then stop.
 3. **Public channel** with `allow_public_channels = false`: if B was mentioned, reply once per topic with the refusal (§4.3), then stop.
-4. Normalize: let **M′** be M with its leading list of bot mentions, completed or typed ("Mention detection", below), and the whitespace after them removed. M′ is a **command** if it starts with `!`, and an **aside** if it starts with `//`. Nothing about a topic's earlier messages decides who gets M (#713): before it, each bot kept the topic's last addressees (`topic_addressing:<bot>:<stream>:<topic>`, which nothing reads now).
+4. Normalize: let **M′** be M with its leading list of bot mentions, completed or typed ("Mention detection", below), and the whitespace after them removed. M′ is a **command** if it starts with `!`, and an **aside** if it starts with `//`. Under the VM's rule `all`, the default, nothing about a topic's earlier messages decides who gets M (#713); under `last`, the topic's addressee record decides who gets a message without a mention (#878, "The rule `last`", below). Before #713, each bot kept the topic's last addressees (`topic_addressing:<bot>:<stream>:<topic>`, which nothing reads or writes now).
 5. Look up B's session **X** whose card is currently in (C, T). Detached sessions are excluded.
 6. If X exists:
    1. An aside is ignored; it stays in the transcript for humans.
-   2. If M mentions no bot, it goes to each of the VM's bots, whatever earlier messages in T addressed ("A message without a mention", below): deliver it to X. This also applies to commands such as `!stop`. In a multi-party channel, it goes to none.
+   2. If M mentions no bot, it goes to each of the VM's bots, whatever earlier messages in T addressed ("A message without a mention", below), or under the rule `last` to the ones T's last mention named (#878): where it goes to B, deliver it to X. This also applies to commands such as `!stop`. In a multi-party channel, it goes to none.
    3. If M mentions another bot and does not mention B, ignore M.
    4. A command is a topic command for X (§4.6).
    5. Otherwise deliver M′ to X (§7.3).
 7. If no session exists and B is mentioned, or M mentions no bot and goes to B ("A message without a mention", below):
    1. If T is the empty topic (*general chat*), reply once asking for a named topic, and stop.
-   2. If M′ is `!help`, `!attach` with or without an ID, `!vm` or `!tools`, handle it without creating a session (§4.6, §13.5). `!fork` gets the answer that a mention with a prompt starts a session (§7.11).
-   3. Any other command is refused, "No session here: write a prompt to start one; !help lists the commands.", except `!new`. Without a mention, only where no other bot of the VM has a session in T, and from one bot (§4.6).
+   2. If M′ is `!help`, `!attach` with or without an ID, `!vm` or `!tools`, handle it without creating a session (§4.6, §13.5). `!fork` and `!btw` each get their own answer, that a prompt starts a session to fork or to ask about (§7.11, §7.13).
+   3. Any other command is refused, "No session here: write a prompt to start one; !help lists the commands.", except `!new`, `!fork` and `!btw` (rule 7.2). Without a mention, only where no other bot of the VM has a session in T, and from one bot (§4.6).
    4. For `!new [opts] <prompt>` or a plain prompt: resolve the project for C (§5.4) and create a session (§7.2). If no project resolves, reply with the fix ("add this channel to `[[projects]]` in your zab config") and stop.
 8. Otherwise ignore M.
 
@@ -259,8 +259,9 @@ Mention detection:
 - Bot names should be unique in the org; the workshop names them by the participant's slug (`workshop/admin/README.md` §1).
 - Before forwarding M′ to the agent, remove any remaining completed mention of B from it, except in a quote, which arrives as it was, together with a leading `!new …` options line (§4.6).
 
-**A message without a mention (#687, #713).** In a single-human channel (below), an allowed
-user's message that mentions no bot, completed or typed, goes to each of the VM's bots (the
+**A message without a mention (#687, #713).** Under the VM's rule `all`, the default (`last`:
+"The rule `last`", below), in a single-human channel (below), an allowed user's message that
+mentions no bot, completed or typed, goes to each of the VM's bots (the
 bridges of B's process) that is subscribed to the channel (the membership read for the
 multi-party rule, below) and whose allowlist has the sender, whatever earlier messages in the
 topic addressed: each takes it as if M mentioned them all, B's peers being the others. So a mention
@@ -274,7 +275,8 @@ into or out of, one where another bot attached a session. After `!detach` in the
 bot waits for a mention there (§4.6); the others don't. A bot without a session in the topic
 whose agent is known to be signed out stays out, silently, and the others leave it out of
 their peers, unless none of the VM's bots that M goes to is signed in: then each answers, with
-its sign-in hint. A bot with a session there is not asked: its turn says what it needs. Known
+its sign-in hint. (`!help`, `!vm` and `!tools`, which a bot's bridge answers for the VM, are
+the exception: §4.6.) A bot with a session there is not asked: its turn says what it needs. Known
 means the backend's answer (`signed_in`): Codex asks its daemon (`account/read`, no token
 refresh), waiting for its own daemon to connect within 15 seconds of the bridge's start (a
 wake, a restart) until a check ends unknown, and otherwise, as for another bot's, 1 second;
@@ -291,7 +293,108 @@ needs a mention. The channel's membership is read for that too (`channel_members
 of the multi-party rule below), switch or not, and read again after Zulip drops the event
 queue, whose subscription events went with it.
 
-Shared topics: the `shared` flag may remain for display, but never gates routing. A mention of both bots addresses both, and so does a message without a mention; a mention of one addresses that one alone, and the next message without a mention both again. Session creation order does not change this rule. Before delivering a co-addressed prompt, prepend a short note naming the other agents and telling this agent to answer it itself. Keep topic commands and `!new` options intact. Bot messages never select recipients or start turns.
+**The rule `last` (#878).** Who gets a message without a mention is the VM's rule, one for
+all its bots (the bridges of one process, which share one store) in every channel: `all`, the
+paragraph above and the default, or `last`. `bridge.unmentioned` (§5.2) gives the default, and a
+DM `!unmentioned all` or `!unmentioned last` to either bot sets it for all of them (§4.6), in the
+store (`kv` key `unmentioned`), so that it holds across a restart, a stop and a wake.
+- **The record.** Each topic has one addressee record for the VM's bots (`kv` key
+  `topic_addressees:<stream>:<topic>`, in `zab.core.unmentioned`), kept under both rules, so
+  that a switch to `last` starts from the topic's last mention. Each allowed prompt there (a
+  message that is neither a command nor an aside, `!new <prompt>` included) that mentions one or
+  more of the VM's bots, completed or typed (a typed one names the bots of its kind that allow
+  the sender, a corrected foreign mention its local bot), records them under its message id,
+  written by each bot that reads it, which finds the same ones. A command records nothing: the
+  record is whom the participant talks to, not whom they send a command, so `@codex !usage` in
+  a topic where they talk to Claude leaves the follow-ups with Claude. One command amends the
+  record, and only by removal: each bot that reads a `!detach` records, under the command's id,
+  the newest entry before it without the bots it detaches, an empty entry being no record.
+  Those are the bots the `!detach` reaches (those it names, in a multi-party channel too;
+  without a mention, in a single-human channel, the recorded ones, or else all) for which its
+  text, the bot's own completed mentions taken off, is exactly `!detach`, as the bot's actor
+  reads it, or would, a bot without a session here included (`Router.actor_text`, #891):
+  `@claude !detach now` detaches nothing, and amends nothing. (The record takes off a completed
+  mention of the bot's name with any user ID, its actor only its own: a mention of another user
+  who shares the bot's name, which Zulip writes with an ID, is the bot's for the record alone.)
+  Before a `!detach` amends the record, under either rule, the bot has the VM's other bots
+  confirm their cards in the topic (`confirm_others`, below), so that every bot reads the same
+  entry before it. So after `@codex !detach` no record names a bot that waits for a mention,
+  and every bot reads the same after it, in whatever order the bots read the two messages. The
+  record is written from the message's text and position alone, in a public channel too, whose routing reads none, and from an expired message (§7.8.1) too: so an
+  expired `!detach`, which detaches nothing, still amends it, as each bot finds the same. A
+  message that mentions only another participant's bot or an integration records nothing. An
+  entry
+  stays until the entry after it was first recorded a day ago (`RETAIN_S`): the messages it
+  decides come before that one in every bot's queue, which a bot that is behind reads within a
+  catch-up's replay. A `!fork` records, in the fork's topic and under the `!fork` message's id,
+  each bot that forked on it: one, or both into one topic (§7.11).
+- **Under `last`,** M goes to the bots that the newest prompt with a mention *before M* named,
+  of the VM's bots by their current names, and only to those. Before M, and not the record's
+  newest: the VM's bots read their queues each at its own pace (a catch-up replays one bot's,
+  then the other's), and a bot that reads M later still finds what M followed, so the bots agree
+  on who gets it ("Agreement", below). A bot that gets M takes it as above, as if M mentioned the recorded bots, its
+  peers being the others of them (so the co-addressed note and peer context, R3, when the record
+  names both), and a command as when they are named: an unmentioned `!stop` stops their turns
+  only, and where the record names one bot, that bot answers alone (`Route.quiet` off, §4.6). A
+  bot the record leaves out ignores M, and records M's audience as a message to the recorded
+  bots, for its peer context. With no record in the topic (no prompt has named a bot of the VM
+  there yet), or one whose bots can't take M (none of the VM's bots by their current names, or
+  each out of the channel, not allowing the sender, or detached in the topic by a check that
+  found its card gone), M goes to all of them, as under `all`, a new topic's first message
+  included (#687). The rest is as under `all`, among the recorded bots: the sign-in rule (a
+  signed-out bot without a session stays out, unless none of the recorded bots is signed in),
+  `!detach`, the channel's membership.
+  Under both rules, a multi-party channel needs a mention, and `bridge.multi_party=false` keeps
+  its own rule (above), which reads no record; so do public channels and read-only sessions.
+- **Moves.** The record follows a session card: on a move of messages that takes a card of any
+  of the VM's bots, each bot adds the move's source topic's newest entry to the destination's
+  record (`Router.follow_cards`, from Zulip's `stream_id` and `orig_subject`, as the card's own
+  bot may have moved its row first), and so does the card's own bot when a check of the card
+  finds a move made while the bridge was down (`Router.move_card`, §4.4). Before it routes a
+  message without a mention under `last`, and, under either rule, before a `!detach`, a bot has
+  the VM's other bots confirm their cards in the topic, as each confirms its own
+  (`BotBridge.confirm_others`, `ensure_location`), so that a card moved there unseen has brought
+  its record: every bridge's cards count as unconfirmed from the process's start. Where another
+  bot's side fails, other than transiently, the bot logs it and routes M as with no record, to
+  all, rather than dropping it, and a `!detach` as it is, amending from the entry it finds; a
+  transient failure retries M, as for its own cards. Into a topic with a record of its own, the newer message wins,
+  as before #713. The source keeps its record.
+- **Agreement.** Each bot routes M from what M's place in its queue fixes: the record's entries
+  before M, each written from a message's text and position (a prompt's names, a `!detach`'s
+  removal, a `!fork`'s forking bots). A `!detach` takes its bots out of the record from its
+  own position on, and a bot it detached still counts as one that can take a message before it,
+  as it could when that message came. The bots can disagree on M only where state that no
+  message orders changes between their two reads of M:
+  - a live move that brings a card's record into the topic, since the move's event doesn't say
+    where it falls among the message ids, or one a bot handles late, which copies the source's
+    newest entry as it is then;
+  - which recorded bots can take M, from each bridge's current view: the channel's members, the
+    bots' names and allowlists, and a session that a check of its card detached, its card gone
+    (`card_gone:<session id>`, a detach that no message records);
+  - the rule itself, set by a DM between the reads; and, as under `all`, whether the channel
+    is multi-party, from each bridge's view of its members, and the agents' sign-ins;
+  - another bot's side refusing a confirmation (`confirm_others`) for one bridge only, which
+    then routes M as with no record, or amends the record for a `!detach` from the entry it
+    finds;
+  - as under `all` since #713, each bridge's view of which of the other bots are detached in
+    the topic, which `siblings` leaves out (#891). This changes a bot's peers, and with them
+    `Route.quiet` and the lead for a command whose answer depends on the topic's sessions: the
+    co-addressed note; which bot answers an unmentioned command that no session acts on
+    (`!stop` with no turn running, `Delivery.first`) or says "No session here", which can then
+    come from both bots, when one reads it after a later `!detach` of the other has run, or
+    from neither, when one reads it before an earlier `!detach` of the other has; and the
+    exception for none signed in (one sign-in hint more or less). A command whose answer is the
+    VM's (`!help`, `!vm`, `!tools`, a topic's `!unmentioned`) reads none of it (§4.6, #899),
+    except with `bridge.multi_party` off;
+  - a fork's record, which gains a bot when that bot forks: a bot that reads a follow-up in the
+    fork's topic before the other forks finds it without the other, as after a `!fork` that
+    waited for its session's reopen (`pending_forks`, §7.11).
+- **Visibility.** A topic's `!session` says where a message without a mention goes there, and a
+  DM `!status` shows the rule. When an unmentioned message reaches only some of the VM's bots,
+  nothing more is posted: no notice per message (Zulip's edit limits, #754); the answering bot's
+  status line shows who answers.
+
+Shared topics: the `shared` flag may remain for display, but never gates routing. A mention of both bots addresses both, and so does a message without a mention; a mention of one addresses that one alone, and the next message without a mention both again, or under the rule `last`, after a prompt that mentions one, that one again (#878). Session creation order does not change this rule. Before delivering a co-addressed prompt, prepend a short note naming the other agents and telling this agent to answer it itself. Keep topic commands and `!new` options intact. Bot messages never select recipients or start turns.
 
 Idempotency: every message id a bot processes is recorded in the store for that bot (§6.2), and a bot never processes a message id twice.
 
@@ -326,7 +429,8 @@ never trigger turns. Asides remain ignored. Cache `GET /streams/{id}/members`
 subscriber IDs with the users list, refresh on subscription peer_add/peer_remove,
 and expire after three minutes. Unknown membership requires mentions as a
 conservative fallback. Single-human channels retain R3, and a message without a mention goes to
-all of the VM's bots (above); `multi_party=false` restores the preceding session prompt and
+all of the VM's bots under the rule `all`, or under `last` to those the topic's record names
+(above); `multi_party=false` restores the preceding session prompt and
 context, and a message without a mention goes only to the bots with a session in the topic.
 
 In multi-party channels, every owner prompt or steer uses the R3 fetch, window,
@@ -360,7 +464,7 @@ Topic commands (in a session topic, or on the first message of a new one):
 | `!new [opts]` | Only on the mention that creates a session. Options: `--model M`, `--effort E`, `--approval P`, `--account A` (Claude), `--worktree` or `--shared`, `--subdir PATH` (project-relative working directory). |
 | `!session` | Show backend/machine, native id, workspace/branch, resolved settings, state, turns/tokens and the SSH resume command. |
 | `!status` | Reply with the current state: idle, running and elapsed time, or pending approval. A session in `error`, or waiting for its backend, is reopened first (§7.8.1). |
-| `!stop` | Interrupt the running turn (§7.7). Queued messages are kept. |
+| `!stop` | Interrupt the running turn (§7.7). Queued messages are kept. With no turn running, stop the sub-agents an ended Codex turn left running, or answer "No turn is running". |
 | `!model [M]`, `!effort [E]` | Show the resolved value (label agent defaults), or validate and set it for subsequent turns (§7.9). |
 | `!approve`, `!approve-session`, `!deny` | Answer the oldest pending approval (§7.6). |
 | `!diff` | Post the workspace diff since the session started (§10.5). |
@@ -374,16 +478,31 @@ Topic commands (in a session topic, or on the first message of a new one):
 | `!tools` | Post the VM's software from its list `/etc/zab/tools.json` (schema 1, #475): the tools grouped by `area`, each with its version and `call`, in one message (summaries dropped first, then the last tools, with a line saying how many and where the list is). Answered by the bridge, never an agent turn, in a topic with or without a session and in a DM. A missing or unreadable list is one plain sentence. |
 
 **Commands without a mention (#713).** In a single-human channel a topic command that names
-no bot goes to each of the VM's bots (§4.5), and each does what it does when named, with these
-exceptions, so that a bot the command doesn't concern stays quiet (`Route.quiet`,
+no bot goes to each of the VM's bots (§4.5), or under the rule `last` to those the topic's last
+mention named (#878), and each does what it does when named, with these exceptions where it
+reaches more than one, so that a bot the command doesn't concern stays quiet (`Route.quiet`,
 `Delivery.quiet`):
 - `!help`, `!vm` and `!tools`, whose answer is the VM's, are answered by one bot, the first by
-  full name among those the command reaches (Claude's on the workshop VMs).
+  full name among the VM's bots that the channel and their allowlists let the command reach
+  (under `last`, of those that the record's newest entry before it names, as written, or all
+  where it names none of them), whatever their sessions in the topic, a `!detach` there, a
+  card found gone or their agents' sign-ins (`BotBridge.answerers`, #899): each bot finds the
+  same one in whichever order the bots read the command and a `!detach`, and a bot that waits
+  for a mention after `!detach` still answers them (Claude's on the workshop VMs). A topic's
+  `!unmentioned` too. In a topic without a name, and with `bridge.multi_party` off, whose rule
+  reaches the bots with a session in the topic, the first by name of the bots it reaches
+  answers, as before, and an expired one gets the expired note as before (§7.8.1).
 - A bot without a session in the topic gives rule 7's refusal ("No session here", or
-  `!fork`'s answer) only where no other bot of the VM has a session there, and then only the
+  `!fork`'s or `!btw`'s answer) only where no other bot of the VM has a session there, and then only the
   first by name; `!attach` and `!new` are its own, and `!login`'s pointer to a DM comes from
   each.
-- `!stop` stops each running turn; an idle bot says nothing.
+- `!stop` stops each running turn. An idle bot stops what its ended turns left running (§7.7)
+  and says so, as it says that one may still run when it couldn't stop or check them all, and
+  that a turn started outside Zulip is running on its session, which it leaves alone. One
+  that stopped nothing says nothing, except that where no turn of the topic runs, one bot with
+  a session there answers for the topic: one whose backend stops sub-agents (Codex) before one
+  whose doesn't, since only it knows what it found, then the first by name. So the topic gets
+  one line (#847).
 - `!model M` and `!effort E` set the value on each bot whose backend accepts it; one that
   refuses it says nothing, since the value is the other agent's. So does one whose backend
   can't verify the value, which a named command accepts (Codex without its model list,
@@ -431,7 +550,7 @@ A window whose reset time is at or before now has reset since it was reported,
 so its row shows no bar and no percentage: "unknown until the next Claude turn"
 (Codex: "unknown; try !usage again"), and "reset at <time>" (issue #647).
 
-Direct-message commands to a bot: `!help` (command list), `!status` (bridge and backend health), `!vm` and `!tools` (as in a topic), `!login [account]` (subscription sign-in, described below), and `!restart`, `!restart codex`. Where `zab-sentinel.service` runs (§13.3), `zab sentinel` answers `!vm` and `!restart` in a one-to-one DM, also while the bridge is down or deaf, and the bridge stays silent on them (issue #204; §13.5). A DM command may follow a leading mention of the bot, typed or completed. The bridge's DM route, its sign-in (`!login`, and `!login cancel` during one) and `zab sentinel` drop a typed mention of the bot's own kind first (`zab.core.addressing.without_typed_address`, #713), then read the rest as people type commands (`as_command`, above), after a completed mention of the bot (`@**Bot name**`, #709). The bridge and the sentinel read a DM with the same kind and mention, the router's, so that both agree on which of them answers. `@claude !login` to Claude's bot is `!login`, and so are `@**Claude · alice** !Login`, ``@claude `!login` `` and `@claude @**Claude · alice** !login`; `@codex !login` to it is no command, and neither is a completed mention followed by a typed one, `@**Claude · alice** @claude !vm`: the typed mention is dropped only first. `zab sentinel`'s `!restart` reads its one word in any case too: `!Restart Codex` is `!restart codex`. A pasted code during a sign-in comes without a leading typed mention: `@claude CODE` passes on `CODE`.
+Direct-message commands to a bot: `!help` (command list), `!status` (bridge and backend health, and the rule for a message without a mention), `!vm` and `!tools` (as in a topic), `!login [account]` (subscription sign-in, described below), `!unmentioned [all|last]`, and `!restart`, `!restart codex`. `!unmentioned` (#878) sets the VM's rule for a message without a mention (§4.5, "The rule `last`"), for all of its bots, from a sender on the bot's allowlist, and answers in one line what the rule now does; alone, it says which rule is in force and what it does; any other word gets its usage. With `bridge.multi_party` off, whose own rule then applies, each answer says that the setting has no effect, the value being kept for when the switch is on again. In a topic, `!unmentioned` gets a pointer to a DM, from one bot (the first by name, as `!help`). Where `zab-sentinel.service` runs (§13.3), `zab sentinel` answers `!vm` and `!restart` in a one-to-one DM, also while the bridge is down or deaf, and the bridge stays silent on them (issue #204; §13.5). A DM command may follow a leading mention of the bot, typed or completed. The bridge's DM route, its sign-in (`!login`, and `!login cancel` during one) and `zab sentinel` drop a typed mention of the bot's own kind first (`zab.core.addressing.without_typed_address`, #713), then read the rest as people type commands (`as_command`, above), after a completed mention of the bot (`@**Bot name**`, #709). The bridge and the sentinel read a DM with the same kind and mention, the router's, so that both agree on which of them answers. `@claude !login` to Claude's bot is `!login`, and so are `@**Claude · alice** !Login`, ``@claude `!login` `` and `@claude @**Claude · alice** !login`; `@codex !login` to it is no command, and neither is a completed mention followed by a typed one, `@**Claude · alice** @claude !vm`: the typed mention is dropped only first. `zab sentinel`'s `!restart` reads its one word in any case too: `!Restart Codex` is `!restart codex`. A pasted code during a sign-in comes without a leading typed mention: `@claude CODE` passes on `CODE`.
 
 `!login [account]` in a one-to-one DM starts the CLI's own login flow for an
 allowlisted user (D24); `account` is an optional Claude account alias. One login
@@ -501,11 +620,11 @@ Exact templates for the card, status, approval and final messages are in Appendi
 - **Card.** One friendly anchor line, posted once and never edited. Preserve the `**zab session**` marker (D7). `!session` posts current session details separately.
 - **Status message.** Posted when a turn starts. While running, it shows the state, when the turn started (a Zulip time, `<time:…>`), the last eight actions, plan progress and the agent's last three notes (its interim texts), newest last, in one quote, a paragraph each. Nothing in it changes only because time passes: no elapsed time, and no running step's time (issue #754). Each note is redacted (§11.6), then put on one line and cut after a word to at most 500 characters, with `…` (issue #654), never inside such a Zulip time as §11.1 defines (issue #673). When the turn ends, it becomes a one-line summary with the turn's duration, followed by the action log in a spoiler. The log is capped at the last 50 actions and truncated so that the whole message fits in `max_message_length − 200`.
 - **Status edits (issue #754; D41).** Zulip keeps every earlier version of an edited message, and Zulip Cloud's guidance is to edit a message only when something changes in an important way, about once a minute at most. The status message is edited when the turn's model becomes known, when an approval is requested or answered, when the turn is stopping, when the backend is reconnecting or recovers, and with the summary when the turn ends. Its action list, plan and notes are refreshed only when they changed. From one edit gap (60 s) after the turn starts, the bridge looks every 30 s, and the first look that finds them changed edits the message once, the early view: most turns end within five minutes, and one early view of what the agent does costs one edit, even when the agent is slow to report its first action. An edit of the model, effort or state alone is not the early view. After it, a refresh comes at the first look that finds a change at least `status_edit_interval_s` after the last (default 300, at least 60: a lower value is a configuration error). Every edit of a message, whatever its path, goes through one place (`ZulipClient.edit`), which bounds each message:
-  - two edits of a message are at least 60 s apart. A final edit may come sooner: the turn's summary (or the restart notice in its place, §7.8.1), and the answer on an approval request. Each is its message's last edit, so it adds one edit at most when it lands, and holding a summary back would show a finished turn as running. A summary that fails is tried again at a look at most once a gap (`redeliver`, `!status` and a reconnect retry it too), each try counted, since it may have landed;
-  - a message gets at most 20 edits, a final one included. The others stop at 19, so that the final edit always has its slot; the 19th says that updates are paused, that `!status` shows the turn's progress, and that the summary comes when the turn ends. A summary whose edit can't be made, its slot spent by a failed one that may have landed, is posted as a new status message;
-  - an edit that comes within its gap is held, one per message, merged with any later one (the newest content wins), and sent when the gap has passed, unless a final edit comes first; one past the cap is dropped. Nothing queues edits without limit.
+  - two edits of a message are at least 60 s apart. A final edit may come sooner, the first for its message: the turn's summary (or the restart notice in its place, §7.8.1), and the answer on an approval request. Each is meant as its message's last edit, and holding a summary back would show a finished turn as running. Once a final edit went out, a repeat waits for its gap like any other edit (issue #806). The message shows it already, unless the first never landed. A repeat is a summary sent again at the next start of a bridge that died delivering the turn's answer, as at each start of such a crash loop, or one tried again after a failure: at a look at most once a gap, and by `redeliver`, `!status` and a reconnect, each try counted, since it may have landed. The store records that a message's final edit went out (`message_finals`, §6.2). A repeat held back is kept there too until it is sent, since the earlier one may have been counted without landing (#806): the answer and the end of the turn don't wait for it, a failure tries it again a gap later, and a start sends what an earlier run held, once its gap has passed. Only Zulip refusing it (a 4xx: it never lands) or the cap drops it;
+  - a message gets at most 20 edits, a final one included. The others stop at 19, so that the final edit always has its slot; the 19th says that updates are paused, that `!status` shows the turn's progress, and that the summary comes when the turn ends. A summary whose edit can't be made, its slot spent by a failed one that may have landed, is posted as a new status message, and the post counts as that message's final edit: its repeat waits for the gap after it;
+  - an edit that comes within its gap is held, one per message, merged with any later one (the newest content wins), and sent when the gap has passed, unless a final edit comes first; a held final edit is never replaced by one that isn't. One past the cap is dropped. Nothing queues edits without limit.
 
-  The counts are kept in memory, for the 4096 messages edited last: a restart begins them again. So a bridge that restarts in a loop (systemd restarts it 5 s after a failure) may edit a surviving turn's status message once per restart, as recovery refreshes it; persisting the counts is a follow-up.
+  The counts survive a restart (issue #757). A bridge that restarts in a loop (systemd restarts it 5 s after a failure) refreshes a surviving turn's status message at each start, as recovery does, and the bounds hold across the loop: at most 20 edits, at least 60 s apart but for the summary. Each bot's counts are kept in memory and in the store's `message_edits` (§6.2), for the 4096 messages it edited last, and taken up again at start. The store is written once per edit sent (once more for one Zulip refused, which doesn't count), never for an edit the bounds hold back or refuse. A last edit's time is kept on the wall clock, since a reboot starts the monotonic one again; one later than now, after the clock was set back, counts as now. The store forgets a message that won't be edited again, the status message of a turn whose end the backend confirmed and whose answer was delivered, and, as memory does, any message past the 4096 edited last. A stop that timed out (§7.7) is not confirmed: recovery may take its turn up again with that status message, so its count stays. A store write that fails can leave a row that memory no longer has (a message trimmed from memory, or one Zulip refused whose row couldn't be removed): within a process, a bot's rows are at most 4096 plus one per failed write, and each start trims them to 4096. The admin bot's counts stay in memory.
 - **Approval message.** What is being requested (the command and working directory, or the files and a diff in a spoiler), the reason, and the reaction legend. When answered, it is edited to show who decided what; if answered elsewhere, it shows "resolved elsewhere".
 - **Final answer.** The rendered agent text (§11), in one or more parts.
 - **Diff message.** If the turn changed files, one more message follows the final answer: one visible summary line (with the diff attached when it is too large to inline) and one spoiler with the file list and, when it fits, the patch (§11.8). It is always a separate message, never appended to the answer.
@@ -576,6 +695,7 @@ default_project = ""             # path used for channels without a [[projects]]
 auto_clone = false               # clone `repo:` from the channel description (§5.4)
 allow_public_channels = false
 multi_party = true                 # owner-only mentions and shared context in multi-human channels
+unmentioned = "all"              # "all" | "last": who gets a message without a mention (§4.5, #878)
 mention_after_s = 120            # §4.8
 status_edit_interval_s = 300     # §4.9: at least 60
 max_concurrent_turns = 3         # per backend; extra turns wait with ⏳ (§7.10)
@@ -676,7 +796,7 @@ profile's name is not written to the config, so a config written under either na
 
 - **personal**: shared workspaces by default and worktree mode per project. Codex runs in daemon mode with `approval = "never"` and the `workspace-write` sandbox. Claude uses `bypassPermissions` and one account, `main`, which is the CLI's default directory `~/.claude` (§9.2). `zab init` asks for no account: it writes that `[backends.claude]` table when it adds a Claude bot (`--backend claude`) and the config has no such table yet, and otherwise leaves that table as it is, accounts, `default_account`, `binary` and `defaults` included. Other accounts are added to `accounts` by editing the config (§5.2).
 - **workshop**: the shared workspace; `default_project` set to the participant's repo; Codex with `approval = "never"` and `sandbox = "danger-full-access"` (the VM is disposable, and agents need `sudo`); Claude with `bypassPermissions`; `max_concurrent_turns = 2`; `allow_user_ids` set to the participant.
-  The workshop VMs themselves get their config from `workshop/admin/push_config.py`, which differs: `default_workspace = "worktree"`, a worktree per topic (issue #36: in one shared checkout the agents overwrote each other's files and the turn diff mixed topics; `!new --shared` opts out); `max_concurrent_turns = 4`; `mention_after_s`, the workshop's (`--mention-after-s`, from `admin.toml`; #711); `allow_public_channels = true`, since participants may make their sandboxes public; `service_path_prepend` and `service_env` with the agent's venv and elan; `worktree_post_create` running `lean-project --repair-all` (which `--lean-shared` installs) to link committed Lean projects to the shared Mathlib; `effort = "high"` for both agents; Claude's `steer` and `bridge.multi_party`, written out (`--no-claude-steer`, `--no-multi-party`); and the `[render] refserve_url` of the deployment's file server, with `refserve_owner`, the workshop's `github_org` (`--refserve-owner`; #693).
+  The workshop VMs themselves get their config from `workshop/admin/push_config.py`, which differs: `default_workspace = "worktree"`, a worktree per topic (issue #36: in one shared checkout the agents overwrote each other's files and the turn diff mixed topics; `!new --shared` opts out); `max_concurrent_turns = 10` (§7.10); `mention_after_s`, the workshop's (`--mention-after-s`, from `admin.toml`; #711); `allow_public_channels = true`, since participants may make their sandboxes public; `service_path_prepend` and `service_env` with the agent's venv and elan; `worktree_post_create` running `lean-project --repair-all` (which `--lean-shared` installs) to link committed Lean projects to the shared Mathlib; `effort = "high"` for both agents; Claude's `steer` and `bridge.multi_party`, written out (`--no-claude-steer`, `--no-multi-party`); and the `[render] refserve_url` of the deployment's file server, with `refserve_owner`, the workshop's `github_org` (`--refserve-owner`; #693).
 
 ### 5.4 Resolving a channel to a project
 
@@ -804,9 +924,22 @@ CREATE TABLE held (
   PRIMARY KEY (message_id, session_id)
 );
 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);  -- last_event_id:<bot>, upload cache, …
+CREATE TABLE message_edits (             -- each message's edit bounds (§4.9, #757)
+  bot         TEXT NOT NULL,
+  message_id  INTEGER NOT NULL,
+  edits       INTEGER NOT NULL,          -- the edits sent, Zulip's 4xx refusals excepted
+  edited_at   REAL NOT NULL,             -- when the last went out, on the wall clock
+  PRIMARY KEY (bot, message_id)
+);
+CREATE TABLE message_finals (            -- those whose final edit went out (§4.9, #806)
+  bot         TEXT NOT NULL,
+  message_id  INTEGER NOT NULL,
+  pending     TEXT,                      -- a repeat of it held back, until it is sent
+  PRIMARY KEY (bot, message_id)
+);
 ```
 
-`parent_session_id` came after the first release (#202). A store that opens a database without it adds it (`ALTER TABLE … ADD COLUMN`, under `BEGIN IMMEDIATE`) and keeps `user_version` 1: a VM keeps its database across a rollout, and an older zab, after a rollback, still opens it, reading and writing rows by column name.
+`parent_session_id` came after the first release (#202). A store that opens a database without it adds it (`ALTER TABLE … ADD COLUMN`, under `BEGIN IMMEDIATE`) and keeps `user_version` 1: a VM keeps its database across a rollout, and an older zab, after a rollback, still opens it, reading and writing rows by column name. `message_edits` came later still (#757), and is created the same way (`CREATE TABLE IF NOT EXISTS`): an older zab never reads it. `message_finals` came after it (#806), created the same way. It is a table of its own and not a column of `message_edits`, because #757's zab writes `message_edits` rows by position: with a fifth column, a rollback to it would fail every edit-count write, and so every edit. A row of `message_finals` without its `message_edits` row, which #757's zab leaves when it forgets a message after a rollback, is deleted at each start. Columns are named in every write since #806, so that a later column breaks no rollback to it. The rows of `message_edits` are bounded: a bot keeps one for each of the 4096 messages it edited last, and deletes a turn's status message's row once the turn's end is confirmed and its answer delivered. A store write that fails can leave one row more: the 4096 holds at each start, when the bot trims its rows, and within a process a bot may hold 4096 plus one row per failed write (§4.9).
 
 ### 6.3 Invariants
 
@@ -834,7 +967,7 @@ turn/state/settings updates never edit or replace the anchor (Appendix B.1).
    4. Register an event queue.
    5. Catch up (§7.8.1): create an actor for every session without a request, confirm the cards of sessions with work in flight (§4.4), recover pending creations, and replay the combined feed.
    6. Start the listener.
-   7. Housekeeping, in the background (issue #443): confirm the cards of recent sessions (§4.4), then reconcile their topics (§7.8.2), through the budget's housekeeping lane (§4.10).
+   7. Housekeeping, in the background (issue #443): confirm the cards of recent sessions (§4.4), then reconcile their topics (§7.8.2), through the budget's housekeeping lane (§4.10). The recovery from an event-queue loss ends the same way (§7.8.2).
 
 The message that woke the VM is answered in step 5, without waiting on step 7, whose cost
 grows with the number of sessions: on the participant test VM (Oct 18) the claude bot's 86
@@ -869,7 +1002,7 @@ What happens depends on the session state:
 | `running`, and the backend cannot steer | Hold the message (§7.5). React ⏳. |
 | `awaiting_approval` | Hold the message, and reply once with a reminder that an approval is pending. |
 | `readonly` or `detached` | Ignore it. |
-| `error` | Hold the message. Reply once that the session needs recovery and that `!status` retries it. A ⏳ notice already under held messages, such as one caught up at startup before the reopen failed, is edited to say so. |
+| `error` | Hold the message. Reply once that the session needs recovery and that `!status` retries it, also while its turn's row is still running (a reopen refused while the turn ran, #830). A ⏳ notice already under held messages, such as one caught up at startup before the reopen failed, is edited to say so. |
 
 ### 7.4 Turn lifecycle
 
@@ -922,6 +1055,7 @@ Approvals come only from backends that declare `capabilities.approvals` (Codex i
 - `!stop`, or 🛑 on the status message, calls `backend.interrupt(session)`.
 - The status message immediately shows "⏹ stopping…".
 - If no `TurnCompleted` arrives within 30 s, the bridge marks the turn `interrupted` itself, posts a warning, and sets the session state to `error`. A later `!status` probes the backend and clears the error once the backend reports the session idle.
+- **With no turn of the session running** (#847), `!stop` calls `backend.stop_subagents(session)` when `capabilities.stop_subagents` is on (Codex, §8.4): a turn can end while a sub-agent it spawned runs on (§8.5), and its answer would never be posted. The backend stops those sub-agents without loading or resuming the session, and the bot says how many it stopped. Codex finds them among the daemon's loaded threads (§8.4), which hold every running sub-agent, one started before the bridge's last restart included (#858). A backend that can't rule one out, because it can't see them all or a look failed in part after it stopped some, reports `unseen`, and the bot adds that not every one could be checked; with none stopped it then says that no sub-agent the bridge saw start is running, never that none was, and unmentioned that zero is gated like any other (§4.6). Codex reports `unseen` only for a look that failed in part (Codex round 2 on #861). When it stopped none of a thread it started, the bot answers "No turn is running, and no sub-agent was"; a backend that couldn't stop or check every one, and stopped none, raises, and the bot says that one may still run. A turn the core doesn't drive, such as a terminal client's on a thread it loaded (§8.6), may run on the session: its sub-agents are that turn's, so the backend stops nothing and raises `TurnElsewhere`, and the bot says that a turn started outside Zulip is running there. Claude has no such hook: a background sub-agent belongs to its turn's process, which runs until the sub-agent ends or the CLI stops it (§9.7), so it is stopped as a running turn, and with no turn running `!stop` answers "No turn is running". Never "Unknown command". Unmentioned, §4.6 says which bot answers.
 
 ### 7.8 Recovery
 
@@ -939,7 +1073,7 @@ Approvals come only from backends that declare `capabilities.approvals` (Codex i
      - Then mark the turn `interrupted`, and edit its status message to "⏹ interrupted by bridge restart; send a message to continue".
 
 On startup, capture the bot's highest handled message ID before the replay (after an
-event-queue loss, before topic reconciliation, which then precedes the replay).
+event-queue loss, when the listener finds the queue gone).
 With no inbound history or saved cursor, initialize at the newest message and skip
 replay. Expiry notices obey normal addressing: only input for this bot receives one.
 Page through its combined feed after that ID (100 messages
@@ -953,8 +1087,8 @@ DMs whose contents must never be persisted. With no prior inbound ID or cursor, 
 from the beginning using the same age limit. Event-queue recovery (§7.8.2) runs the
 same topic reconciliation and catch-up.
 
-At startup, topic reconciliation (§7.8.2 steps 3 and 4) is housekeeping: it runs after
-the replay and the start of the listener (§7.1), from the boundary captured before the
+Topic reconciliation (§7.8.2 step 5) is housekeeping, at startup as after an event-queue
+loss: it runs after the replay and the start of the listener (§7.1), from the boundary captured before the
 replay, the catch-up cursor and each session's newest inbound message. What it finds is
 measured against that cursor, not the one the replay advanced, and claims keep it from
 handling a message twice. It handles nothing newer than the last message the replay read:
@@ -962,8 +1096,12 @@ those are the listener's, and a claim ahead of the listener would raise the next
 anchor (the newest claim) past DMs and new topics not yet read (e2e scenario 4 on #447:
 an event queue lost during the housekeeping). The boundary stays in the store (`catchup_reconcile:<bot>`)
 until reconciliation finishes, so a restart in between reconciles from it again. After
-an event-queue loss, recovery stops the startup housekeeping if it is still running and
-reconciles inline, before its replay, from the older of the two boundaries.
+an event-queue loss, recovery stops the housekeeping if it is still running, and starts it
+again after its own replay, from the older of the two boundaries. Recovery used to
+reconcile inline, before its replay: a request or two per session, before the answers
+Zulip had refused and the gap's messages. E2e scenario 4's answer after the block grew with
+the test VM's sessions, from 3 s on Oct 19 to 547 s on Nov 6, and missed its 600 s bound
+at v0.2.19's candidate (#964).
 
 Backend events queued while the bridge was starting can arrive after the reopened
 session's summary has already settled their turn. A late event of a settled turn is
@@ -982,7 +1120,7 @@ The sessions of all the bots of one backend reopen in one round, one `open_sessi
 a time. On `BackendUnavailable` the round stops, and the rest wait for the next
 `BackendStatus(up=True)` as backend-down, not in `error`. A backend that is up but
 refuses one session raises `SessionRefused` (Codex: a thread its app-server had
-already loaded, with an unverified commit identity, §5.5): only that session goes to
+already loaded, with an unverified commit identity, §5.5, §8.6): only that session goes to
 `error`, and the round continues. `!status` reopens a session in `error`, or a
 backend-down one if its backend answers, and shows a refusal's reason (issue #306).
 
@@ -996,18 +1134,19 @@ terminal turn is not adopted into a detached binding.
 
 **7.8.2 Event-queue loss or reconnect.** After re-registering:
 
-1. Refresh the card locations of active sessions (§4.4), so that topics renamed or moved during the gap are queried under their new names.
+1. Forget every confirmed card location: the card moves of the gap were lost with the queue. Confirm the cards of the sessions with work in flight, as at startup (§4.4, §7.1 step 5). Every other card is confirmed when something depends on it (§4.4).
 2. Recover the pending creations (§7.2): create the sessions whose first prompt is still pending, before any later message is handled. If Zulip interrupts one again, this step is retried after the backoff below, without step 1 again.
-3. For each active session within the reconciliation window (§2), fetch the messages in its topic after the highest `inbound.message_id` seen for that session (`GET /messages` with anchor, `num_after = 100`, and a narrow of channel and topic). These fetches go through the poster's rate limiter.
-4. Process messages that are not yet in `inbound`, in order.
-5. Fetch the reactions on pending approval messages and on the status messages of running turns, and apply any decisions not yet applied.
+3. Catch up the combined feed, as at startup (§7.8.1), with the same two-hour limit and notices.
+4. Fetch the reactions on pending approval messages and on the status messages of running turns, and apply any decisions not yet applied.
+5. Start the housekeeping in the background, as at startup (§7.1 step 7), and resume polling. The first poll does not block, and the answers Zulip refused are retried then (below), ahead of the housekeeping's requests (§4.10). The housekeeping confirms the cards of recent sessions and reconciles their topics. For each active session within the reconciliation window (§2), it fetches the messages in the topic after the highest `inbound.message_id` seen for that session (`GET /messages` with anchor, `num_after = 100`, and a narrow of channel and topic), through the poster's housekeeping lane (§4.10). It processes, in order, those not yet in `inbound` and no newer than the last message step 3 read (§7.8.1).
 
-Steps 3 and 4, and a catch-up of the combined feed after it, work as at startup (§7.8.1),
-with the same two-hour limit and notices. The catch-up starts after the newest message
-the listener handled, so a new topic or DM sent while the queue was gone is answered,
-and nothing handled live (an owner's login DMs, which are never claimed) is handled
-twice. Zulip drops a queue nobody polled for about ten minutes, so a longer outage
-always ends here (end-to-end scenario 4).
+The catch-up starts after the newest message the listener handled, so a new topic or DM
+sent while the queue was gone is answered, and nothing handled live (an owner's login
+DMs, which are never claimed) is handled twice. A message in a topic moved during the gap
+reaches its session through routing, which confirms the topic's cards first (§4.4). Zulip
+drops a queue nobody polled for about ten minutes, so a longer outage always ends here
+(end-to-end scenario 4). None of steps 1 to 4 costs a request for each session, so the
+answers and the gap's messages do not wait on the number of sessions.
 
 **Zulip unreachable.** On a transport error or a 5xx, the listener retries every second.
 After a failure, its next poll does not block (`dont_block`), so it notices at once when
@@ -1074,6 +1213,35 @@ not block commands. Hidden models remain valid when named explicitly.
 - At most `max_concurrent_turns` turns run at once per backend.
 - An extra turn is held with ⏳, and its status message reads "waiting for a free slot".
 - A per-session lock ensures a session never runs two turns at once.
+- **The workshop VMs allow 10 per backend** (#919; 4 from Oct 9, 2 before), so 20 turns on an
+  m7a.2xlarge: 8 vCPUs and 32 GiB (D23), with an 8 GiB swap file (`workshop/ami/README.md`).
+  At 4, an agent's fifth turn waited, and participants were held by ⏳. The other defaults stay:
+  3 in the schema, for a personal machine that does other work, and 2 from `zab init --profile
+  workshop`, which doesn't know the machine's size (§5.3). Why 10 fits the fleet's VMs:
+  - **What a turn costs.** A Claude turn is one `claude` process with its MCP servers, started
+    for the turn and ended with it (§9.1). A Codex turn is a share of the one Codex daemon
+    (§8.1); each thread it has loaded keeps a `lean-lsp-mcp` child, about 54 MB of anonymous
+    memory, whether a turn runs or not (DECISIONS, 2026-10-25), so the limit doesn't change
+    Codex's standing memory. A turn that waits on the model, the common case, uses almost no
+    CPU: the inference runs on the provider's servers. One `claude` process's resident memory
+    during a turn on the fleet's image is not recorded yet.
+  - **What the limit doesn't bound:** a turn's own commands. One turn can keep all 8 vCPUs busy
+    at any limit. Heavy computation belongs in background jobs (#655, designed, not yet built),
+    which are to have a per-VM limit and a memory cap of their own.
+  - **The margin is memory.** A turn that uses Lean through `lean-lsp-mcp` starts a Lean
+    server (§7.12). The one measured, idle after a turn checked one small file against Mathlib,
+    held about 1.3 GB of anonymous memory, nearly all of it in `lean --server` (1.16 GB); its
+    one `lean --worker` held 46 MB (DECISIONS, 2026-10-25). A server runs one worker per open
+    file, so a turn with more files open, or a larger one, holds more. Claude's servers end
+    with their turn, so the limit bounds how many there are; Codex's stay with their thread
+    whatever the limit, until the reaper stops them idle (§7.12). At the measured size only,
+    10 Claude turns all in Lean hold about 13 GB, against 5.2 GB at 4, and 20 turns of both
+    agents about 26 GB. The Codex threads' `lean-lsp-mcp` children come on top, one per loaded
+    thread (3.6 GB after a boot in that measurement: 68 of about 54 MB). Together that is
+    already about the VM's usable memory, 30.65 GiB (`MemTotal`), before the `claude`
+    processes, so such a peak runs into the swap. It needs every turn in Lean at once; 10 was
+    chosen for the common case, turns that wait on the model (#919). `!status` shows the
+    memory, and a VM under strain (ORGANIZERS §3.6).
 
 ### 7.11 Forking a session (`!fork`, issue #202)
 
@@ -1092,7 +1260,7 @@ not block commands. Hidden models remain valid when named explicitly.
 
   A failure before step 5 removes the new worktree and posts one ⚠️ line in the parent topic; the `!fork` message is not retried, so the user sends it again.
 - **One message, one fork topic (#712).** The bots of one bridge process create their forks one at a time (the channel's fork lock). The first to fork a `!fork` message makes its topic and worktree as above, and step 5's transaction also records its session as that message's fork (`fork_of_message:<message id>`). Each later bot that forks that message joins it, while that session is live (not detached or read-only) in the channel, its worktree still exists, and the joining bot has no session in its topic: holding that topic's creation lock, and its own as above, it forks its own session into that topic, in that worktree (`topic_worktree`, §10.1, with its own parent's subdirectory), the way a session another bot starts in a fork topic joins it. It takes no `fork_base` and prepares nothing, and a failure leaves the worktree, which is the first's. With `--name` it joins the named topic too. Its card says that it works in the files and on the branch of the topic's other agent; the parent topic gets one `⑂ forked to` line, the first's. Each fork's row has its own bot's session as its parent, so each fork's first answer is reported to its own parent (Report back): two lines when both agents answer. Otherwise the later bot makes a topic of its own, as above, and a `--name` taken by another message's fork, or by any other session, is refused. A bot that can't fork (no completed turn, a session in `error`, no `capabilities.fork`) posts its one ⚠️ line and the other forks alone; when the first fails before its row exists, the next one makes the topic. A mention forks only the bots it names. Bots of different bridge processes share no store, and each forks alone.
-- **Afterwards** the fork topic is an ordinary topic: follow-ups, `!stop`, `!diff` (since the fork started; for a fork that joined another bot's, since it joined, its start snapshot, so a joiner that waited leaves out the other agent's first turn), `!model` and `!effort` (for the fork only), `!handover`. The other bot, mentioned there, works in the fork's worktree (§10.1), even where new topics default to `shared`. So does it after a follow-up without a mention in a single-human channel, which goes to both bots there as everywhere (§4.5, #713): after a fork of one agent, that follow-up brings the other agent into the fork topic, in a new session, without the parent conversation (it gets the topic's context since the fork, as peer context). An unmentioned `!fork` in a topic with both bots' sessions forks both, into one topic (above). The fork's work comes back by merging its branch into the parent's.
+- **Afterwards** the fork topic is an ordinary topic: follow-ups, `!stop`, `!diff` (since the fork started; for a fork that joined another bot's, since it joined, its start snapshot, so a joiner that waited leaves out the other agent's first turn), `!model` and `!effort` (for the fork only), `!handover`. The other bot, mentioned there, works in the fork's worktree (§10.1), even where new topics default to `shared`. So does it after a follow-up without a mention in a single-human channel, which under the rule `all` goes to both bots there as everywhere (§4.5, #713): after a fork of one agent, that follow-up brings the other agent into the fork topic, in a new session, without the parent conversation (it gets the topic's context since the fork, as peer context). Under `last` (#878), the fork topic's record starts with the bots that forked, so that follow-up stays with the forked agent. An unmentioned `!fork` in a topic with both bots' sessions forks both, into one topic (above). The fork's work comes back by merging its branch into the parent's.
 - **Report back.** When the fork's first turn has ended and its answer is posted, once per fork:
   - if a bridge restart ends a Claude fork's first turn, no answer is posted, so the fork's next turn is the one reported; a Codex turn usually survives the restart and is reported when it ends, with its answer if it ended meanwhile, and one the app-server lost is reported as interrupted, with zab's warning "stored turn no longer active" as its answer;
   - the parent topic gets one line: ⑂, the fork topic as code, "answered" (or the turn's status), and a link to the answer, posted at a confirmed card location (§4.4);
@@ -1220,7 +1388,7 @@ The reference is the app-server README for the pinned Codex version, together wi
 - A `codex` TUI started on the same machine attaches to a running daemon on the default socket; `codex --remote unix://` forces that.
 - Two benefits:
   1. Threads and running turns survive bridge restarts.
-  2. The same thread can be driven from Zulip and from a terminal (G6).
+  2. The same thread can be driven from Zulip and from a terminal (G6), once the bridge has loaded it (§8.6).
 - If the daemon is not running at startup, the backend is marked down (§7.1). The bridge must not start its own daemon; the service manager owns it.
 
 **`connect = "spawn"`.**
@@ -1277,11 +1445,12 @@ The opt-out list keeps traffic small. The bridge does not stream text, and the f
 | Contract method (§ types.py) | App-server calls |
 |---|---|
 | `create_session(spec)` | `thread/start` with `cwd`, `config` (the identity policy of §5.5), `serviceName: "zab"` and `developerInstructions`, the context prompt (Appendix A.1; the field is in the 0.157.1 schema: DECISIONS, 2026-09-27), plus non-empty `model`, `approvalPolicy`, `sandbox` (the legacy shorthand; switch to the experimental `permissions` profile only after verifying it). Then `thread/name/set` with `{threadId, name}`. |
-| `open_session(id, spec)` | `thread/resume` with `{threadId, excludeTurns: true}` and non-empty `developerInstructions` from the spec. Codex 0.157.1 does not reliably apply new resume instructions to existing history: also prefix the first accepted start/steer input after opening with `<zab-context>…</zab-context>` (§A.1), retaining the prefix across rejected submissions. Then `thread/turns/list` with `{threadId, limit: 2, sortDirection: "desc", itemsView: "summary"}`. From these, fill `SessionInfo.active_turn_id` (a turn still in progress) and `SessionInfo.last_turn` (the latest completed turn: id, status, final text, error) for reconciliation (§7.8.1). The event stream runs meanwhile: a `turn/completed` it handled during the call, for a turn the list shows running or not at all, is taken as newer than the list, and that turn is the `last_turn`, with its answer (issue #306). A completion handled before the call never overrides the list. A turn missing from the list because another client ran two newer ones within the same call is not told apart; reconciliation matches turns by id, so no answer goes to another turn. |
+| `open_session(id, spec)` | `thread/resume` with `{threadId, excludeTurns: true}` and non-empty `developerInstructions` from the spec. Codex 0.157.1 does not reliably apply new resume instructions to existing history: also prefix the first accepted start/steer input after opening with `<zab-context>…</zab-context>` (§A.1), retaining the prefix across rejected submissions. Then `thread/turns/list` with `{threadId, limit: 2, sortDirection: "desc", itemsView: "summary"}`. From these, fill `SessionInfo.active_turn_id` (a turn still in progress) and `SessionInfo.last_turn` (the latest completed turn: id, status, final text, error) for reconciliation (§7.8.1). The event stream runs meanwhile: a `turn/completed` it handled during the call, for a turn the list shows running or not at all, is taken as newer than the list, and that turn is the `last_turn`, with its answer (issue #306). A completion handled before the call never overrides the list. A turn missing from the list because another client ran two newer ones within the same call is not told apart; reconciliation matches turns by id, so no answer goes to another turn. **A thread the app-server doesn't hold loaded** is not resumed (#632): `thread/read` (`includeTurns: false`) reports its `status` `notLoaded`, as for every thread after a boot or a wake, and `thread/turns/list` reads the same snapshot from the rollout, a turn the app-server lost listed `interrupted`. Its next turn, `!fork` or `!btw` resumes it first (§8.6), and so does its first `!model` or `!effort`: the defaults a change and a reset are resolved against are the ones a resume reports, while `thread/read` gives the persisted model and effort, or null when unavailable, which are only shown meanwhile. Each loaded thread runs its own MCP servers (on the VMs, a `lean-lsp-mcp`), so the threads loaded after a boot are the sessions used since, not every session of the store. A read that fails, or a turn listed in progress, resumes the thread at once. |
 | `list_sessions(cwd)` | `thread/list` with `{cwd, limit, sortKey: "updated_at", sourceKinds: <all kinds>}`. Without `sourceKinds` the server returns only interactive sessions. The kinds are the 0.157.1 schema's: `cli`, `vscode`, `exec`, `appServer`, the `subAgent…` kinds and `unknown` (DECISIONS, 2026-09-27). |
 | `start_turn(id, input)` | `turn/start` with `{threadId, clientUserMessageId: input.client_id, input: [{type: "text", text}, …{type: "localImage", path} for image attachments]}`, plus any pending setting overrides (`model`, `effort`). Returns `turn.id`. |
 | `steer(id, turn, input)` | `turn/steer` with `{threadId, expectedTurnId: turn, clientUserMessageId, input}`. The server rejects this when no turn is active or the turn cannot be steered; return that as an error. |
-| `interrupt(id)` | `turn/interrupt` with `{threadId, turnId}` for the active turn. The turn then ends with `turn/completed`, status `interrupted`. |
+| `interrupt(id)` | `turn/interrupt` with `{threadId, turnId}` for the active turn. The turn then ends with `turn/completed`, status `interrupted`. It doesn't reach the thread's sub-agents (DECISIONS, 2026-11-05), so their running turns are interrupted too (#660). The stop walks every spawn the events reported (§8.5: an interrupt or a message from another thread makes no sub-agent of it), whatever each sub-agent's state, since a running grandchild can sit under an idle child: breadth first, each thread once, at most 8 levels down. It interrupts a sub-agent only if its turn runs: first the ones the events told of, whose turn ids the daemon sent, so that the thread's answer doesn't call them running; then the thread's own turn; then, walking also the edges of the daemon's loaded threads, any that is `active`, whose turn in progress `thread/turns/list` gives. A running sub-agent's turn keeps its thread loaded, so `thread/loaded/list` (every page) holds it, and its `thread/read` (`includeTurns: false`, which loads nothing) gives its `parentThreadId`, set only on a sub-agent; an unloaded idle sub-agent between it and the thread is read for the next edge up, a level at a time, 8 levels at most. Every loaded thread but a topic's own session is read, 8 reads at a time. Only `parentThreadId` makes an edge: a thread's `sessionId` is its whole tree's, beyond the topic's thread when that is itself an attached sub-agent, and a thread without a parent is none (Codex round 1 on #861). A tree deeper than 8 levels, in the walk or up from a loaded thread, leaves the pass incomplete. `thread/list` lists no sub-agent thread on 0.157.1, whatever it is asked, and isn't asked (DECISIONS, 2026-11-05, #858). That last pass runs also when the thread's turn ended meanwhile, or its interrupt was refused, which is reported after it. A sub-agent thread that is itself an open session, attached in another topic (`!attach` lists sub-agent threads), is left to that topic's `!stop`, with all below it. The last pass stops again a sub-agent the first one stopped if the thread, still running then, resumed it with a new turn: it skips only the very turns already interrupted. Each sub-agent step has 10 s, and its failure never holds back the thread's stop. Their exec sessions run on: Codex ends them only when a thread shuts down. |
+| `stop_subagents(id)` | `!stop` with no turn running (§7.7, #847): `interrupt`'s last pass alone, the walk of the thread's sub-agents with the edges of the daemon's loaded threads, which needs neither a turn nor the thread loaded, and loads nothing: a thread reopened unloaded (§7.8.1) stays so. First `thread/read` with `includeTurns: false`, which loads nothing: a thread `active` runs a turn the core doesn't drive (§8.6), so nothing is stopped (`TurnElsewhere`). The bridge logs how many loaded threads it read, how many were sub-agents, and in how many seconds (`subagent_loaded`). Returns `SubagentStop(stopped)`: how many sub-agent turns it interrupted. The loaded threads, all read, hold every running sub-agent, one no event of this connection told of included (after a bridge restart), so it reports `unseen` only when not all could be read (DECISIONS, 2026-11-05, #858). Each read's edge counts as soon as the read completes, so a read past the budget keeps those found before it (Codex round 2 on #861). Any step that fails, or a tree deeper than the cap, makes the result `unseen` with what it stopped, or raises `BackendUnavailable` if it stopped none: the loaded threads' list or a read, a sub-agent's lookup (`thread/turns/list`), or its `turn/interrupt` refused while its newest turn is still in progress (a refusal after that turn ended is a turn that just ended). On `interrupt`'s path such a failure is logged, and a sub-agent the events track that still runs is in the turn's answer (§8.5's note). |
 | `respond(request_id, decision)` | A JSON-RPC response to the server request: `{"id": <request id>, "result": {"decision": "accept" \| "acceptForSession" \| "decline" \| "cancel"}}`. |
 | `update_settings(id, s)` | Keep the settings and send them as overrides on the next `turn/start`, where they persist for later turns. `thread/settings/update` (experimental) may be used instead once verified. |
 | `rename(id, name)` | `thread/name/set`. |
@@ -1299,7 +1468,7 @@ The opt-out list keeps traffic small. The bridge does not stream text, and the f
 | `turn/plan/updated` | `PlanUpdated(steps)` |
 | `thread/tokenUsage/updated` | `UsageUpdated`, carrying the thread's cumulative total. The per-turn figure for `TurnCompleted.usage` is the difference between the totals at the turn's end and at its start. |
 | `turn/diff/updated` | Keep the latest diff per turn; attach it to `TurnCompleted.native_diff` |
-| `turn/completed` | `TurnCompleted`: `status` from `turn.status`; `error` from `turn.error` (below); `final_text` = text of the last `agentMessage` item completed in this turn. Do not read `turn.items`: the README says it is currently always empty, so track items yourself. |
+| `turn/completed` | `TurnCompleted`: `status` from `turn.status`; `error` from `turn.error` (below); `final_text` = text of the last `agentMessage` item completed in this turn. Do not read `turn.items`: the README says it is currently always empty, so track items yourself. If sub-agents of the thread still run (below), a ⚠️ bridge note follows the text (#660): Codex starts no turn when such a sub-agent finishes, so its answer won't reach Zulip (DECISIONS, 2026-10-25, B2). The note says to ask Codex about it in a new message, or to send `!stop`, which stops it with no turn running (§7.7). |
 | `error` | Remember it for the turn's `TurnCompleted`. If the error is not tied to a turn, emit an `error` `Notice` that says Codex reported it (Appendix B.4). |
 | `item/commandExecution/requestApproval` (server request) | `ApprovalRequested(kind="command", summary=command, detail=cwd + reason, decisions from availableDecisions)` |
 | `item/fileChange/requestApproval` (server request) | `ApprovalRequested(kind="file_change", detail=` the diffs of the pending `fileChange` item from its `item/started``)` |
@@ -1318,11 +1487,14 @@ The opt-out list keeps traffic small. The bridge does not stream text, and the f
 | `commandExecution` | `COMMAND`; `title` = the command, shortened to 120 characters; `exit_code`; `duration_ms`; `status` (`declined` maps to `DECLINED`) |
 | `fileChange` | `FILE_CHANGE`; `title` = the changed paths; `detail` = the concatenated diffs |
 | `mcpToolCall` | `TOOL_CALL`; `title` = `server.tool` |
-| `collabToolCall` | `SUBAGENT` |
+| `collabAgentToolCall`, `collabToolCall` | `SUBAGENT` |
+| `subAgentActivity` | `SUBAGENT`; `title` = `sub-agent <agentPath> <kind>` |
 | `webSearch` | `WEB_SEARCH`; `title` = the query |
 | `contextCompaction` | `COMPACTION` |
 | `plan` | `PLAN` |
 | anything else | `OTHER`, with the type name as `title` |
+
+**A thread's sub-agents** (#660) are tracked from what the daemon sends (codex-rs 0.157.1; DECISIONS, 2026-11-05). Under multi-agent v2, the VM's model's, the parent's `subAgentActivity` items say when one is spawned (`started`), stopped by the model (`interrupted`) or done (`completed`, sent under the spawning turn's id even after that turn ended). A message to one (`interacted`) changes nothing: `send_message` only queues it for an idle sub-agent, and a `followup_task` that starts it again shows as the sub-agent's own `turn/started`. Under v1, a `spawnAgent` `collabAgentToolCall`'s `receiverThreadIds` are new ones, and any call's `agentsStates` give their last known status. The daemon subscribes every connection to a new thread, so a sub-agent's own `turn/started` and `turn/completed` arrive too: a failed or stopped one sends no activity item. `pendingInit` and `running` mean still running. A thread's sub-agents are kept with their last state, never dropped: one that ended can be started again, and its own `turn/started` can come before the parent's `interacted`. Its own turns can come before the parent's item that names it, too: when that item comes, a turn of its that runs, or how its last one ended, gives its state, over any snapshot of it in a v1 item's `agentsStates` (its spawn, a `wait`, a `close_agent`): its own turns, once seen, are newer. An end the parent's items report while the sub-agent's own newer turn runs (a late `completed`) is ignored: its own `turn/completed` ends that turn. Only the thread's own sub-agents are counted, not theirs: a grandchild's answer goes to the sub-agent that spawned it. Only a spawn (v2's `started`, v1's `spawnAgent`) makes a sub-agent of the thread. Its other items (`interacted`, `interrupted`, `agentsStates`) update only a sub-agent it spawned, since a message, an interrupt or a wait can target any thread of the daemon, another thread's sub-agent included; `!stop` walks these relations (§8.4). The tracking is in memory, and a new connection to the daemon forgets the states and the old sub-agents' turn ids, since their events stop coming, and on v1 a `wait` makes one running again only once its own `turn/started` has come: after a bridge restart or a reconnection there is no note for a sub-agent that was running.
 
 `codexErrorInfo` → `ErrorKind`:
 
@@ -1340,11 +1512,12 @@ The values are the 0.157.1 schema's, in camelCase; an object variant is read by 
 ### 8.6 Co-presence with the Codex TUI
 
 - A `userMessage` item whose `clientId` is missing or unknown did not come from zab. Emit it as an `ItemCompleted(USER_MESSAGE)` with no `client_id`; the core mirrors it into the topic as `💻 *via terminal:*` followed by the quoted text.
-- A turn started from the TUI still emits `turn/started` to zab, because zab is subscribed to the thread. zab handles it like its own turns: status message, then final answer.
+- A turn started from the TUI still emits `turn/started` to zab when zab is subscribed to the thread: when zab has loaded or resumed it since its start, which after a boot or a wake is at the topic's first message (§8.4). zab handles it like its own turns: status message, then final answer.
 - Both the TUI and zab, subscribed to one thread, received its approval request on 0.157.1 (DECISIONS, "M1 live verification", 2026-09-27). The rules:
   - zab answers only requests for turns it started, unless `answer_external_approvals = true`.
   - If the TUI answers first, `serverRequest/resolved` arrives and the approval message is edited to "resolved elsewhere".
-- If `thread/closed` arrives for a thread with no active turn, the next delivery calls `open_session` again first.
+- If `thread/closed` arrives for a thread with no active turn, or `open_session` left it unloaded (§8.4), its next turn, fork, side question, `!model` or `!effort` resumes it first, one at a time. Another client may have loaded it meanwhile, in its own environment: it is checked as a thread with an unknown commit identity (§5.5), and refused if it is loaded. The refusal says what lets it go: quit that client, if any, and wait about a minute after any turn there ends, the app-server unloading a thread no client holds, then `!status` (or `!attach` again); or restart the app-server when its turns are idle. The loader may also be the bridge before a restart, which the check can't tell apart, and the refusal says so. An unmentioned `!model` or `!effort` is refused quietly instead (§4.5). The identity the bridge loads a thread with is recorded (`applied_git_identity`) only once it has loaded it, never at an unloaded open, so a restart of the bridge alone checks a thread another client loaded first rather than trusting it. The record names the run of the app-server that load was made in (`applied_instance`: the boot's id, and the app-server process's id and start time; #830), and vouches for a thread only in that run: after a boot, or a restart of the daemon alone, every earlier load is gone, so a thread another client loaded before the bridge reopened it is checked too. A record without its run (from before #830, or where the run can't be read) vouches for nothing. A thread the bridge's connection started, forked or resumed is its own load, for the identity it applied. A resume the bridge sent counts as its own load if what followed failed or was cancelled, and the next use resumes again.
+- **Until zab has loaded a thread, a terminal client's turn on it is out of zab's reach:** it reaches no topic, `!stop` and 🛑 can't stop it (`!stop` says that a turn started outside Zulip is running, and stops none of its sub-agents, §7.7), and `answer_external_approvals` can't answer its approvals, since zab isn't subscribed to the thread.
 
 ### 8.7 Attaching existing threads
 
@@ -1355,6 +1528,7 @@ The values are the 0.157.1 schema's, in camelCase; an object variant is read by 
   3. post a recap: the thread's last user message and last final answer, from `thread/turns/list` with `itemsView: "summary"`;
   4. set the session state to `idle`, or to `running` if a turn is active.
 - In daemon mode this lets a session begun at the terminal continue from Zulip, and vice versa.
+- The detached binding's identity record (§8.6) doesn't come along: whatever loaded the thread since the detach, perhaps a terminal's client, is checked as an unknown identity (§5.5), and the attach is refused while another client holds the thread loaded. A thread the bridge's connection still holds from its own load is resumed (#830).
 
 ### 8.8 Session fork contract (issue #202)
 
@@ -1573,11 +1747,15 @@ The event shapes were checked against fixtures recorded with the pinned version 
 
 The transcript up to that point stays in the session file, and the next turn resumes from it. On bridge shutdown, the running Claude process groups are terminated the same way.
 
+A background sub-agent runs in the turn's process group, and the turn runs until the sub-agent ends (§9.7): `!stop` stops it with the turn. The backend has no `stop_subagents` (`capabilities.stop_subagents` is off): with no turn running, nothing of a Claude session is left to stop, and `!stop` answers "No turn is running" (§7.7, #847).
+
 The process group id of a running turn is reported to the core, which stores it in `turns.pgid`. After a crash, the core uses it to kill orphaned groups (§7.8.1). The backend reports it through `TurnStarted.pgid`.
 
 ### 9.7 Follow-up messages
 
-With `[backends.claude] steer = true`, the default (D25; the key was added off by default in the amendment of Fri Oct 9, issue #36), a turn takes its prompt as `--input-format stream-json` and keeps stdin open, `capabilities.steer` is true, and a message that arrives during the turn is written to stdin (↪️). stdin closes once the CLI has taken in every message written (`--replay-user-messages`); later messages are held (§7.5). The texts of all the turn's results are posted in order (DECISIONS, 2026-10-09).
+With `[backends.claude] steer = true`, the default (D25; the key was added off by default in the amendment of Fri Oct 9, issue #36), a turn takes its prompt as `--input-format stream-json` and keeps stdin open, `capabilities.steer` is true, and a message that arrives during the turn is written to stdin (↪️). stdin closes once the CLI has taken in every message written (`--replay-user-messages`) and no background sub-agent runs; later messages are held (§7.5). The texts of all the turn's results are posted in order (DECISIONS, 2026-10-09).
+
+**A background sub-agent** (the Agent tool with `run_in_background`; `background_tasks_changed` lists it as a `local_agent` task) outlives the `result` of the loop that started it: the CLI waits for it, and its notification starts a further loop with its own `result` (DECISIONS, 2026-10-25). Until then stdin stays open (#660), so a message sent meanwhile gets a loop of its own and is answered before the sub-agent ends. While only a sub-agent keeps the turn going, stdin closes 10 minutes after the last `result`, and then the CLI's own wait applies: 2.1.283 waits another 10 minutes at most, then stops the sub-agent (DECISIONS, 2026-11-05). A background command (`local_bash`) keeps nothing open: `-p` stops it at the end. `!stop` signals the turn's process group, which holds its sub-agents too, and a turn stopped after one of its `result`s is `INTERRUPTED` (§9.6).
 
 With `steer = false`, `capabilities.steer = false` and a turn runs as it did before steering: the core holds messages that arrive during a turn and coalesces them (§7.5).
 
@@ -1875,7 +2053,9 @@ Replace matches with `[redacted <kind>]`:
 | PGP private key | `-----BEGIN PGP PRIVATE KEY BLOCK-----` through the `END` line |
 | Zulip API key | a line `key = [A-Za-z0-9]{32}` (blanks around `=` optional, one leading diff or list prefix character kept; a line ends wherever `str.splitlines` ends one, a lone `\r` included), the value of `ZULIP_API_KEY=…` (quoted or not), and the key in `curl -u user:key` / `--user user:key` |
 
-A key prefix (`sk-`, `sk-ant-`, `gh…_`, `AKIA`/`ASIA`) matches only at the start of a token, never inside a longer hyphenated or alphanumeric one: a URL slug such as `…-the-unit-disk-to-…` or `…/task-scheduling-…` is not a key. Redaction is a safety net, not a guarantee. It also applies to status-message titles.
+A key prefix (`sk-`, `sk-ant-`, `gh…_`, `AKIA`/`ASIA`) matches only at the start of a token, never inside a longer hyphenated or alphanumeric one: a URL slug such as `…-the-unit-disk-to-…` or `…/task-scheduling-…` is not a key. A match runs to the end of its token (`[A-Za-z0-9_-]`): what follows a key in the same token is redacted with it, so `AKIA…ghp_…` is one placeholder. The exception is a glued `ZULIP_API_KEY=`, `-u ` or `--user `: the Zulip rules for those have no token guard and run first, so their key is redacted wherever it stands. A JWT glued behind a key, whose header is then the end of that token, goes with the key. Its payload and signature, with a header that is nearly always one of a few, are the bearer token. Every segment dot-joined after them goes too, empty ones included, because where a further JWT would start in that run isn't known (#821). The limits: a JWT glued behind a word that is no key starts no token and is shown, like any key inside a word. One glued behind another JWT shows its payload and signature, because the first JWT's last segment takes its header. One pass leaves nothing that a second pass would redact (#666). Redaction is a safety net, not a guarantee. It also applies to status-message titles.
+
+Cost: a text that ends a line where a regular expression's `^` and `$` don't see one (a `\r` that no `\n` follows, or another `str.splitlines` line end) gets a second pass for the Zulip key line, about 25% more time, file uploads included. A text whose line ends are `\n` or CRLF doesn't (#666).
 
 ### 11.7 Splitting
 
@@ -2035,6 +2215,8 @@ ExecStart=%h/.local/bin/zab run
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=120
 KillMode=mixed
 TimeoutStopSec=30
 [Install]
@@ -2061,6 +2243,39 @@ WantedBy=default.target
   bound, and a 12-minute Zulip block during a Claude turn causes no restart. That one hung
   listener stops the pings while the others stay live is tested offline
   (`tests/core/test_watchdog.py`).
+- **The restarts back off** (issue #806): `RestartSteps=5` and `RestartMaxDelaySec=120` (systemd
+  254 or later; the AMI has 255).
+  - **Why.** A bridge that dies at every start, as one killed while delivering an answer,
+    started again every 5 s, each start with its Zulip requests (its event queues, its catch-up,
+    recovery's edits). Now each automatic restart waits longer: 5, 9.4, 18, 34, 64 s, then
+    120 s for every one after (systemd 255's `RestartUSecNext`). From the 6th, a loop starts
+    the bridge at most once every 2 minutes. A loop that dies delivering an answer then edits
+    the status message about once every 2 minutes, and so posts a new one, past the 20-edit
+    cap, about every 45 minutes while it lasts.
+  - **Never failed.** systemd keeps restarting it. Its default start limit (5 starts in 10 s)
+    can't trip at these delays, so a bridge that fails its start while Zulip is down (its
+    registration, §7.1) starts again by itself once Zulip answers, at most 2 minutes later, with
+    no `!restart`. A start limit would leave it `failed` until a `!restart`, a boot or a start
+    10 minutes later, and was taken out for that (DECISIONS, verification log, 2026-11-05). One
+    exception is systemd's own: a blocking `systemctl --user start zab.service`, typed by hand
+    while the unit waits for its restart, trips that default limit and leaves the unit `failed`.
+    `start --no-block`, which `zab service install` runs, `restart` and `!restart` don't. So use
+    `restart` or `!restart`. No zab code path or runbook starts the bridge that way.
+  - **What sets it back.** Only three things set the delay back to 5 s: a manual start or
+    restart of a bridge that is running or stopped, the sentinel's `!restart` (its
+    `reset-failed` sets the delay back even while the unit waits, then its `restart` starts the
+    bridge at once), and a boot (a woken VM included). A plain `restart` while the unit waits
+    starts the bridge at once, but if it fails again the next delay is still the one it had: a
+    rollout during a crash loop starts the new code at once all the same. A run that lasted
+    doesn't set the delay back. So 2 minutes is also the most that any later automatic restart
+    in the same boot, the watchdog's included, waits beyond `RestartSec`. End-to-end scenario 3
+    reads that delay as `RestartUSecNext`.
+  - **While it waits**, the unit is `activating`, and the sentinel's `!vm` says "bridge
+    starting".
+  - **A rollout** restarts the bridge with `systemctl --user restart`, which a backoff never
+    refuses.
+  - **Verified** on systemd 255, the AMI's major version (DECISIONS, verification log,
+    2026-11-05). `tests/cli/test_service.py` checks it on a user manager where there is one.
 - `zab doctor --service-env` reports systemd's `NRestarts` as `service:restarts`, warning
   on a nonzero count or unavailable manager; it never resets that counter. The journal
   retains the reasons for individual restarts.
@@ -2143,7 +2358,10 @@ bot's bridge adds its 👀, in configured order, if that bot allows its sender:
 - a message without a mention: each of the VM's bots, as the bridge sends it to
   each (§4.5, "A message without a mention", #713), whatever its topic's earlier
   messages addressed. The waker reads no topic history: #683's lookup went with
-  the rule it served. In a multi-party channel too, where the bridge needs a
+  the rule it served. Nor does it see the VM's rule or the topic's record (`last`,
+  #878): under `last` too, a stopped VM's bots both react ⏰, and the woken bridge
+  routes the message by its record, so a bot it leaves out reacts ⏰ and doesn't
+  answer. In a multi-party channel too, where the bridge needs a
   mention: the ⏰ says that the VM is starting, even where no bot will answer;
   likewise for a bot whose agent is not signed in, which stays
   out, and for one whose session in the topic was detached: the waker sees none
@@ -2394,7 +2612,7 @@ Live acceptance tests need human senders, several bots and several channels. The
 |---|---|
 | Two human test users, `zab-tester` and `zab-tester2` | Ordinary member accounts, not a real person's. `zab-tester` is in the `allow_user_ids` of every dev bot; `zab-tester2` is not (AT-7). Each development machine gets `zab-tester`'s API key in `~/.config/zab/tester.zuliprc`, and `zab-tester2`'s in `tester2.zuliprc`. A test driver in `tests/live/` uses these accounts to post and react like a person. |
 | Dev bots | Per development machine: one for its backend (`Codex · dev-<machine>`, `Claude · dev-<machine>`), one spare for AT-7's "another bot", and 5 soak bots on one machine for AT-23 (fake backends). Their allowlists are set explicitly. |
-| Channels | `#zab-dev` (private; testers and dev bots); `#zab-dev-2` (private; same members, for AT-9's move); `#zab-dev-public` (public, for AT-8). |
+| Channels | `#zab-dev` (private; testers and dev bots); `#zab-dev-2` (private; same members, for AT-9's move). `#zab-dev-public` (public, for AT-8) was archived on Oct 26, 2026, since a public channel is visible to every member of the organization; the live tests skip AT-8 (§17), and none of them unarchives it or creates a public channel. |
 | A test VM | A workshop VM of a test participant, with its own bots, channels and repository, launched from the workshop image and tagged as test infrastructure. The end-to-end suite deploys the wheel under test to it and posts as the test users. AT-21 needs a fresh Ubuntu 24.04 VM with both CLIs signed in. |
 
 Credential files for test users and dev bots live only on the development machines and the test VMs, never in git.
@@ -2432,7 +2650,7 @@ Unless stated otherwise, run them in a private channel mapped to a scratch repo,
 | **AT-5** | Stop: `!stop`, or 🛑 on the status message. | The turn ends within 15 s; the status message shows ⏹. |
 | **AT-6** | Approvals (Codex, approval policy `on-request`): trigger a command approval. | Approval message mentions the owner. 👍 runs the command; 👎 declines it. Answering in the TUI edits the message to "resolved elsewhere". |
 | **AT-7** | Non-owners: messages from another human and from another bot in the topic. | Ignored: no reaction, no delivery. |
-| **AT-8** | Public channel: mention the bot in a public channel. | One refusal message; no session created. |
+| **AT-8** | Public channel: mention the bot in a public channel. Covered offline, with a fake public channel (`tests/core/test_bridge.py`, `tests/core/test_router.py`); the live tests skip it, since the dev organization's public channel is archived (§15.3). | One refusal message; no session created. |
 | **AT-9** | Rename and move: rename the topic, resolve it, move it to another private channel, then post there. | The session continues; the Codex thread name follows the rename. |
 | **AT-10** | Restart (Codex): kill `zab` during a turn and restart it. | The final answer is posted exactly once; the status message is finalized. |
 | **AT-11** | Restart (Claude): kill `zab` during a turn and restart it. | The status message reads "interrupted by bridge restart". The next message resumes the same session id. |

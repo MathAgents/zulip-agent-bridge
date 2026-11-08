@@ -337,7 +337,7 @@ def test_required_skips_fail_and_other_skips_are_no_result():
     assert text.startswith("## End-to-end: FAIL") and "not passed: 9" in text
     assert "- **9. File server**: no #256 rendering" in text
     assert report.Report(results=[passed], required=[1, 2]).missed() == [2]  # no row at all
-    assert run.required("rc") == list(range(1, 17)) and run.required("") == []
+    assert run.required("rc") == list(range(1, 18)) and run.required("") == []
     assert run.required("1,9") == [1, 9]
 
 

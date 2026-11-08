@@ -1265,6 +1265,29 @@ async def test_a_turn_carries_zab_bot_from_the_spec(home, monkeypatch):
     assert calls(home)[-1]["env"]["ZAB_BOT"] is None
 
 
+async def test_a_turn_carries_zab_session_from_the_spec(home, monkeypatch):
+    """Issue #655: every turn names its zab session in ZAB_SESSION, the one the spec gives at
+    create and open (§5.6); the bridge's own never leaks into a turn."""
+    monkeypatch.setenv("ZAB_SESSION", "the-bridge-itself")
+    backend = make_backend(home)
+    await backend.start()
+    await backend._events.get()
+    work = str(home["work"])
+    spec = SessionSpec(cwd=work, name="t", bot="claude-alice", session="first")
+    info = await backend.create_session(spec)
+    await backend.start_turn(info.native_id, UserInput(text="hi", client_id="z1"))
+    await drain(backend)
+    assert calls(home)[-1]["env"]["ZAB_SESSION"] == "first"
+    await backend.open_session(info.native_id, SessionSpec(cwd=work, name="t", session="second"))
+    await backend.start_turn(info.native_id, UserInput(text="again", client_id="z2"))
+    await drain(backend)
+    assert calls(home)[-1]["env"]["ZAB_SESSION"] == "second"
+    await backend.open_session(info.native_id, SessionSpec(cwd=work, name="t"))
+    await backend.start_turn(info.native_id, UserInput(text="more", client_id="z3"))
+    await drain(backend)
+    assert calls(home)[-1]["env"]["ZAB_SESSION"] is None
+
+
 # ----------------------------------- the opt-in raw-stream log (PM on issue #36, Wed 14:45)
 
 
@@ -1329,11 +1352,14 @@ def test_a_raw_log_that_cannot_be_written_never_fails_the_turn(tmp_path, caplog)
     [
         ("e" * 190 + "\nkey=" + "Q7xK" + "a1B2" * 7 + "\n", "Q7xK"),  # crosses 200
         ("e" * 190 + " ghp_" + "Z9y8X7w6" * 4 + "V5u4\n", "ghp_"),
+        ("boom\nkey=" + "Q7xK" + "a1B2" * 7 + "\u3000", "Q7xK"),  # whole once stripped (#666)
     ],
 )
 async def test_a_failed_commands_stderr_is_redacted_before_it_is_cut(stderr, hidden):
     """#661: `_run_capture`'s error keeps 200 characters of stderr; a secret crossing the cut
-    would keep too little for its rule (SPEC §11.6), so it is redacted first."""
+    would keep too little for its rule (SPEC §11.6), so it is redacted first. It is stripped
+    before that: `.strip()` takes U+3000, which ends no line, and then `key=<32>` is a whole
+    zuliprc line (#666)."""
     script = "import os, sys; sys.stderr.write(os.environ['DECOY']); sys.exit(3)"  # argv is shown
     with pytest.raises(OSError, match="exited 3") as caught:
         await cb._run_capture(

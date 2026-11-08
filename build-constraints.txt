@@ -3,7 +3,7 @@
 #   uv build --wheel --build-constraints build-constraints.txt --require-hashes
 # which refuses a backend, or a dependency of it, that is missing here or fails its hash. To move
 # hatchling, review the new release, then regenerate the lines below and keep this comment:
-#   echo 'hatchling==X.Y.Z' | uv pip compile --universal --generate-hashes --python-version 3.11 \
+#   echo 'hatchling==X.Y.Z' | uv pip compile --universal --generate-hashes --python-version 3.12 \
 #     --no-header - -o -
 hatchling==1.32.4 \
     --hash=sha256:08ecf7548fb48205e7f213d70c71e67b8271b7242093dc3f1da578b42c734a2c \

@@ -8,7 +8,10 @@ requester, the approvers, the sender of an approval or a refusal; an approver th
 wrote as a bare user ID is named after the records that named it) and outcome (`outcome` or
 `code`, `exit`, a short `reason`), and nothing else: no argument list (`args`, `argv`), no
 hash, no output. The last `KEEP` of each workshop's, and of the server's own (no workshop), are
-kept. The collector scrubs them again (§2.7); the log's records are scrubbed already.
+kept. The collector scrubs them again (§2.7); the log's records are scrubbed already. A
+`!retire`'s `retire_step` records (#837), one per row and step, are left out, so that a
+retire of many rows doesn't push every other record out of the view: its `apply_start` and
+`apply_end` stand for it.
 
 **Open plans** are read from the same records: a `plan` record opens one, with its `request`'s
 requester; its approvals are counted; the approval that completes them (`code` "approved")
@@ -34,6 +37,8 @@ from pathlib import Path
 from typing import Any
 
 KEEP = 200
+#: The records the view leaves out (module doc).
+QUIET = frozenset({"retire_step"})
 #: How long an applying plan is shown without its end: longer than any apply's timeout (§2.4).
 APPLYING_MAX = 6 * 3600.0
 CLOSING = frozenset({"apply_end", "reject", "expired", "stale", "interrupted", "unchanged"})
@@ -154,6 +159,8 @@ class View:
                 self.names[person["id"]] = person["name"]
             else:
                 person["name"] = self.names.get(person["id"], "")
+        if shown["event"] in QUIET:
+            return
         kept = self.kept.setdefault(shown["workshop"], deque(maxlen=KEEP))
         kept.append(shown)
         plan, event = shown.get("plan"), shown["event"]

@@ -79,6 +79,11 @@ class Runtime:
                 bridge.client.limits["max_file_upload_size_mib"] * 1024**2,
             )
         for bridge in self.bridges:
+            # Each bridge's cards unconfirmed before the first replay, as its own start has them:
+            # another bridge's message without a mention, under `last`, may have them confirmed
+            # first (`BotBridge.confirm_others`, #878).
+            bridge.unverify()
+        for bridge in self.bridges:
             await bridge.start()
         for name, backend in self.backends.items():
             self.pumps.append(asyncio.create_task(self.pump(name, backend)))

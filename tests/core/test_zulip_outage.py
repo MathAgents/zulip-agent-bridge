@@ -19,7 +19,8 @@ from test_bridge import user_message
 
 from zab.core import types as t
 from zab.core.session import StopTimeout
-from zab.zulip.client import ZulipError
+from zab.testing.fake_clock import FrozenClock
+from zab.zulip.client import GAP, ZulipError
 
 pytestmark = pytest.mark.integration
 
@@ -634,8 +635,10 @@ async def test_an_unconfirmed_stop_still_waits_for_status(live, caplog):
 
 async def test_a_pending_answer_status_shows_how_the_turn_ended(bridge):
     """Scenario 4 on 0bca627: right after the reconnect, a tick rendered the finished turn under
-    the session's state, a raw "error · 12m 20s" heading, before the answer's retry posted it."""
+    the session's state, a raw "error · 12m 20s" heading, before the answer's retry posted it.
+    The failed summary may have landed: its retry waits for the message's gap (#806)."""
     b, fake, _backend = bridge  # no listener: nothing retries the answer here
+    b.client.budget.clock = clock = FrozenClock(time.time())
     await user_message(b, fake, "@**Test Bot** sleep, then answer")
     actor = b.actors["native"]
     fake.offline = True
@@ -649,6 +652,7 @@ async def test_a_pending_answer_status_shows_how_the_turn_ended(bridge):
     fake.offline = False
     actor.last_status = ""
     actor.retried = None  # a look a gap after the failed try (review round 2 of #755)
+    clock.advance(GAP)
     actor.put("tick")
     await actor.inbox.join()
     assert fake.messages[actor.turn["status_message_id"]]["content"].startswith("✅ **Done** · ")

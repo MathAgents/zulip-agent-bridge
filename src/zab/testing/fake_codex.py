@@ -9,6 +9,17 @@ unix-socket websocket, so the real `CodexBackend` runs against it. Its shapes fo
 the `cwd` it was given, and it inherits none of the parent's model, effort or sandbox. An
 `ephemeral` fork (a side question, #716) is gone at its `thread/unsubscribe`; whether the real
 one leaves any trace is the test VM's VERIFY (DECISIONS).
+
+It also models which threads the app-server holds loaded (#632), as 0.157.1's source does
+(DECISIONS, 2026-11-05): `thread/start`, `thread/resume` and `thread/fork` load one, which on a
+VM starts its own stdio MCP servers; `thread/read` reports `notLoaded` for the others and
+`thread/turns/list` reads them from the rollout; `turn/start`, `turn/steer` and
+`turn/interrupt` need the thread loaded, while `thread/fork` reads the parent from the store.
+`restart()` is the daemon's restart at a boot or wake: nothing stays loaded, and a turn it was
+running reads `interrupted`. It unloads a thread its last client left only when a test calls
+`unload()`. Each run has its own `instance`, which the bridge reads from the process on the other
+end of the socket (`codex_rpc.app_server_instance`, #830): the fake runs in the test's process,
+so a test that restarts it points that lookup at `instance_of`.
 """
 
 from __future__ import annotations
@@ -77,6 +88,12 @@ class FakeAppServer:
     def __init__(self, home: str) -> None:
         self.home = home
         self.threads: dict[str, dict[str, Any]] = {}
+        # The threads held loaded (#632), and each load from the rollout, in order: on a VM,
+        # each starts the thread's own `lean-lsp-mcp`
+        self.loaded: set[str] = set()
+        self.loads: list[str] = []
+        self.runs = itertools.count(1)
+        self.instance = f"fake-run/{next(self.runs)}"  # `instance_of`, a new one each `restart()`
         self.calls: list[dict[str, Any]] = []
         self.wire: list[tuple[str, dict[str, Any]]] = []
         self.hold = False
@@ -99,6 +116,12 @@ class FakeAppServer:
         # thread, `disabled` where its `config` turned it off; `mcp_states` forces a state
         # (`None`: unknown), and lists a server that `config/read` leaves out
         self.mcp_states: dict[str, str | None] = {}
+        # whether `thread/list` lists a spawned sub-agent's thread: 0.157.1 lists none,
+        # whatever it is asked, though `thread/loaded/list` and `thread/read` show it (both
+        # 2026-11-05 rows of DECISIONS, #858); a test may list them as the fake once did
+        self.lists_subagents = False
+        # threads whose `turn/interrupt` is refused, as the real one refuses a turn that ended
+        self.refuse_interrupt: set[str] = set()
 
     @contextlib.asynccontextmanager
     async def serve(self, path: str) -> AsyncIterator[FakeAppServer]:
@@ -111,14 +134,116 @@ class FakeAppServer:
         """The params of every `method` request, oldest first."""
         return [call["params"] for call in self.calls if call["method"] == method]
 
+    async def spawn(self, parent_id: str) -> str:
+        """The model's `spawn_agent` in the parent's turn in progress (#660), as codex-rs
+        0.157.1 runs it under multi-agent v2, the VM's model's (DECISIONS, 2026-11-05): a child
+        thread (source `subAgent.thread_spawn`) whose turn runs until `finish` or
+        `turn/interrupt`; the parent's `subAgentActivity` `started` item (v2 sends no
+        `collabAgentToolCall` for a spawn); and the child's own `turn/started`, since the daemon
+        subscribes every connection to a new thread. The child's id."""
+        parent = self.threads[parent_id]
+        turn = next(t for t in parent["turns"] if t["status"] == "inProgress")
+        source = {"subAgent": {"thread_spawn": {"parent_thread_id": parent_id, "depth": 1}}}
+        child = self._new_thread(
+            {},
+            parent["cwd"],
+            parent=parent_id,
+            source=source,
+            spawned_in=turn["id"],
+            session=parent.get("session", parent_id),  # the tree shares one `sessionId`
+        )
+        child_turn = {
+            "id": f"turn-{next(self.ids)}",
+            "status": "inProgress",
+            "items": [],
+            "started": int(time.time()),
+        }
+        child["turns"].append(child_turn)
+        await self._activity(parent, turn["id"], child["id"], "started")
+        await self._send(
+            self._note(
+                "turn/started", threadId=child["id"], turn=self._turn_json(child_turn, "notLoaded")
+            )
+        )
+        return child["id"]
+
+    async def message(self, child_id: str, *, follow_up: bool = False) -> None:
+        """The parent's `send_message` to a sub-agent (`follow_up`: `followup_task`), in the
+        parent's turn in progress: its `subAgentActivity` `interacted` item. Only a follow-up
+        starts an idle sub-agent again, with a turn of its own (codex-rs 0.157.1)."""
+        child = self.threads[child_id]
+        parent = self.threads[child["parent"]]
+        turn = next(t for t in parent["turns"] if t["status"] == "inProgress")
+        await self._activity(parent, turn["id"], child_id, "interacted")
+        if follow_up and all(t["status"] != "inProgress" for t in child["turns"]):
+            again = {"id": f"turn-{next(self.ids)}", "status": "inProgress", "items": []}
+            child["turns"].append(again | {"started": int(time.time())})
+            child["spawned_in"] = turn["id"]  # its completion goes to this turn now
+            note = self._turn_json(child["turns"][-1], "notLoaded")
+            await self._send(self._note("turn/started", threadId=child_id, turn=note))
+
+    async def _activity(self, parent: dict, turn_id: str, child_id: str, kind: str) -> None:
+        """The parent's `subAgentActivity` item, under the given turn: the spawn's own for a
+        `completed` one, even when that turn has ended (codex-rs 0.157.1)."""
+        item = {
+            "type": "subAgentActivity",
+            "id": f"item-{next(self.ids)}",
+            "agentThreadId": child_id,
+            "agentPath": f"/root/{child_id}",
+            "kind": kind,
+        }
+        turn = next(t for t in parent["turns"] if t["id"] == turn_id)
+        turn["items"].append(item)
+        for method, stamp in (("item/started", "startedAtMs"), ("item/completed", "completedAtMs")):
+            note = {"threadId": parent["id"], "turnId": turn_id, "item": item, stamp: _ms()}
+            await self._send(self._note(method, **note))
+
     async def finish(self, thread_id: str, text: str | None = None) -> None:
         """Complete the thread's turn in progress (one that `hold` kept running). A test calls it
-        once that turn exists: a thread can be there before its `turn/start` (#748)."""
+        once that turn exists: a thread can be there before its `turn/start` (#748). A
+        sub-agent's completion also gives its parent a `subAgentActivity` `completed` item."""
         thread = self.threads[thread_id]
         turn = next((t for t in thread["turns"] if t["status"] == "inProgress"), None)
         if turn is None:  # not a bare StopIteration, which a coroutine turns into a RuntimeError
             raise AssertionError(f"no turn in progress on {thread_id}")
         await self._complete(thread, turn, "completed", text)
+        if thread.get("parent"):
+            parent = self.threads[thread["parent"]]
+            await self._activity(parent, thread["spawned_in"], thread_id, "completed")
+
+    def restart(self) -> None:
+        """The daemon restarts (a VM's boot or wake, `!restart codex`): no thread stays loaded,
+        and a turn it was running is gone, which 0.157.1 then lists as `interrupted`
+        (`normalize_thread_turns_status`). Connections are the test's to close."""
+        self.loaded.clear()
+        self.instance = f"fake-run/{next(self.runs)}"
+        for thread in self.threads.values():
+            for turn in thread["turns"]:
+                if turn["status"] == "inProgress":
+                    turn["status"] = "interrupted"
+
+    def instance_of(self, pid: int | None) -> str:
+        """`codex_rpc.app_server_instance` for this fake: its current run, whatever the pid
+        (the test's own process, the same across `restart()`)."""
+        return self.instance
+
+    def unload(self, thread_id: str) -> None:
+        """The daemon unloads a thread with no subscribed connection and no running turn,
+        `thread_unload_delay_secs` (60 s) after its last client left (0.157.1,
+        `unload_thread_without_subscribers`; DECISIONS, 2026-11-05). A test calls it between
+        connections, so no `thread/closed` goes out. A sub-agent the thread spawned runs on, as
+        in 0.157.1 (source read, not run; DECISIONS, 2026-11-05): an unload shuts down only the
+        thread's own session runtime (its tasks, exec processes and MCP servers), and only
+        `close_agent` and `thread/archive` walk the sub-agent tree. So a `!stop` has to reach it
+        with no turn running (#660, #847)."""
+        thread = self.threads[thread_id]
+        assert all(t["status"] != "inProgress" for t in thread["turns"]), "a running turn holds it"
+        self.loaded.discard(thread_id)
+
+    def _load(self, thread: dict[str, Any]) -> None:
+        if thread["id"] not in self.loaded:
+            self.loaded.add(thread["id"])
+            self.loads.append(thread["id"])
 
     # ------------------------------------------------------------------------------ transport
 
@@ -156,9 +281,12 @@ class FakeAppServer:
     def _thread_json(self, thread: dict[str, Any]) -> dict[str, Any]:
         now = int(time.time())
         busy = any(t["status"] == "inProgress" for t in thread["turns"])
+        status: dict[str, Any] = {"type": "active", "activeFlags": []} if busy else {"type": "idle"}
+        if thread["id"] not in self.loaded:
+            status = {"type": "notLoaded"}
         return {
             "id": thread["id"],
-            "sessionId": thread["id"],
+            "sessionId": thread.get("session", thread["id"]),  # its session tree's
             "cwd": thread["cwd"],
             "cliVersion": "0.157.1",
             "createdAt": thread["created"],
@@ -171,8 +299,9 @@ class FakeAppServer:
             "name": thread["name"],
             "preview": thread["preview"],
             "projectId": None,
-            "source": "appServer",
-            "status": {"type": "active", "activeFlags": []} if busy else {"type": "idle"},
+            "source": thread.get("source", "appServer"),
+            "parentThreadId": thread.get("parent"),
+            "status": status,
             "turns": [],
         }
 
@@ -205,12 +334,20 @@ class FakeAppServer:
             "config": params.get("config"),
         } | extra
         self.threads[thread["id"]] = thread
+        self._load(thread)  # a new thread or fork is loaded: its MCP servers start
         return thread
 
     def _thread(self, params: dict[str, Any]) -> dict[str, Any]:
         thread = self.threads.get(params.get("threadId", ""))
         if thread is None:
             raise RpcFailure(-32600, f"invalid thread id: {params.get('threadId')}")
+        return thread
+
+    def _live(self, params: dict[str, Any]) -> dict[str, Any]:
+        """A thread a turn needs loaded: 0.157.1 refuses the others as not found (#632)."""
+        thread = self._thread(params)
+        if thread["id"] not in self.loaded:
+            raise RpcFailure(-32600, f"thread not found: {thread['id']}")
         return thread
 
     @staticmethod
@@ -286,13 +423,37 @@ class FakeAppServer:
         return self._settings_json(thread), []
 
     async def _thread_resume(self, params: dict[str, Any]) -> tuple[dict[str, Any], list]:
-        return self._settings_json(self._thread(params)), []
+        thread = self._thread(params)
+        self._load(thread)
+        return self._settings_json(thread), []
 
     async def _thread_read(self, params: dict[str, Any]) -> tuple[dict[str, Any], list]:
         return {"thread": self._thread_json(self._thread(params))}, []
 
+    async def _thread_list(self, params: dict[str, Any]) -> tuple[dict[str, Any], list]:
+        """Newest first; `sourceKinds` as 0.157.1 reads them (interactive sources by default):
+        a spawned sub-agent's thread is `subAgentThreadSpawn`, every other one `appServer`.
+        Pages of `limit`, the next one's `cursor` in `nextCursor` (here, its offset)."""
+        kinds = params.get("sourceKinds") or ["cli", "vscode", "exec", "appServer"]
+        threads = [
+            thread
+            for thread in reversed(self.threads.values())
+            if ("subAgentThreadSpawn" if thread.get("parent") else "appServer") in kinds
+            and params.get("cwd") in (None, thread["cwd"])
+            and (self.lists_subagents or not thread.get("parent"))
+        ]
+        start = int(params.get("cursor") or 0)
+        end = start + params["limit"] if params.get("limit") is not None else len(threads)
+        more = str(end) if end < len(threads) else None
+        data = [self._thread_json(t) for t in threads[start:end]]
+        return {"data": data, "nextCursor": more}, []
+
     async def _thread_loaded_list(self, params: dict[str, Any]) -> tuple[dict[str, Any], list]:
-        return {"data": list(self.threads), "nextCursor": None}, []
+        """Pages of `limit`, the next one's `cursor` in `nextCursor` (here, its offset)."""
+        ids = [sid for sid in self.threads if sid in self.loaded]
+        start = int(params.get("cursor") or 0)
+        end = start + params["limit"] if params.get("limit") is not None else len(ids)
+        return {"data": ids[start:end], "nextCursor": str(end) if end < len(ids) else None}, []
 
     async def _thread_name_set(self, params: dict[str, Any]) -> tuple[dict[str, Any], list]:
         self._thread(params)["name"] = params["name"]
@@ -339,6 +500,7 @@ class FakeAppServer:
         if not thread.get("ephemeral"):
             return {"status": "unsubscribed"}, []
         del self.threads[thread["id"]]
+        self.loaded.discard(thread["id"])
         return {"status": "unsubscribed"}, [self._note("thread/closed", threadId=thread["id"])]
 
     async def _thread_items_list(self, params: dict[str, Any]) -> tuple[dict[str, Any], list]:
@@ -356,7 +518,7 @@ class FakeAppServer:
         return {"data": items, "nextCursor": None, "backwardsCursor": None}, []
 
     async def _turn_start(self, params: dict[str, Any]) -> tuple[dict[str, Any], list]:
-        thread = self._thread(params)
+        thread = self._live(params)
         if any(t["status"] == "inProgress" for t in thread["turns"]):
             raise RpcFailure(-32600, "a turn is already in progress")
         for key, field in (
@@ -422,7 +584,7 @@ class FakeAppServer:
         return {"turn": self._turn_json(turn, "notLoaded")}, after
 
     async def _turn_steer(self, params: dict[str, Any]) -> tuple[dict[str, Any], list]:
-        thread = self._thread(params)
+        thread = self._live(params)
         turn = thread["turns"][-1] if thread["turns"] else None
         if turn is None or turn["status"] != "inProgress" or turn["id"] != params["expectedTurnId"]:
             raise RpcFailure(-32600, "no active turn to steer")
@@ -446,7 +608,9 @@ class FakeAppServer:
         ]
 
     async def _turn_interrupt(self, params: dict[str, Any]) -> tuple[dict[str, Any], list]:
-        thread = self._thread(params)
+        thread = self._live(params)
+        if thread["id"] in self.refuse_interrupt:  # as for a turn that just ended (0.157.1)
+            raise RpcFailure(-32600, "no active turn to interrupt")
         turn = next((t for t in thread["turns"] if t["id"] == params.get("turnId")), None)
         if turn is None or turn["status"] != "inProgress":
             return {}, []

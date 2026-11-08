@@ -6,6 +6,7 @@ script's default, and the hash is stable on identical inputs and ignores what it
 """
 
 import base64
+import calendar
 import dataclasses
 import hashlib
 import re
@@ -98,8 +99,18 @@ ROWS = (
     Row("dave", "198.51.100.4", "us-west-2"),
 )
 SPARES = ("zab-spare-1", "zab-spare-2")
+#: When the bot read the fleet: `!keep-until`'s ends are after it (#570).
+READ_AT = float(calendar.timegm((2026, 11, 5, 12, 0, 0)))
 FLEET = Fleet(
-    HARVARD, ROWS, SPARES, PRODUCTION, release="v0.2.2", held=False, others=(TEST,), settings=()
+    HARVARD,
+    ROWS,
+    SPARES,
+    PRODUCTION,
+    release="v0.2.2",
+    held=False,
+    others=(TEST,),
+    settings=(),
+    read_at=READ_AT,
 )
 #: The other workshop on the same server, with its own rows: none of them is harvard's.
 ERIN = (Row("erin", "203.0.113.5", "us-east-1"),)
@@ -114,6 +125,7 @@ PROV = "--zuliprc /etc/zab-admin/secrets/provisioner.zuliprc"
 TAG = "--tag workshop=harvard-2026 --tag zab-scope=mathagents"  # #422: the fleet's too
 WHL = "--wheel {W}/zulip_agent_bridge-0.2.2-py3-none-any.whl"
 EVERYONE = "--only alice --only bob --only carol --only dave"
+CLEAR_ALL = "--set alice=none --set bob=none --set carol=none --set dave=none"
 STATUS = f"{PY}/admin/status.py {R} {KH} {TAG} --json"
 PUSH = f"{PY}/admin/push_config.py {R} {{release}} --out-dir {OUT} {KH} "
 PUSH += "--refserve-url https://files.mathagents.org"
@@ -295,6 +307,15 @@ EXACT = [
             )
         ],
     ),
+    # #570: a kept VM's end, one --set per row; `none` clears it
+    (
+        "!keep-until 2026-11-30 bob dave",
+        [(f"{PY}/admin/keep_until.py {R} --set bob=2026-11-30 --set dave=2026-11-30", DRY, ())],
+    ),
+    (
+        "!keep-until none all",
+        [(f"{PY}/admin/keep_until.py {R} {CLEAR_ALL}", DRY, ())],
+    ),
     # push_waker.py looks VMs up by IP: `all` is the rows that have one
     (
         "!waker on all",
@@ -441,10 +462,13 @@ def test_every_verb_maps_to_exact_argument_lists(message, steps, layout):
 
 def test_the_table_covers_every_mapped_verb():
     covered = {command(message).verb for message, _ in EXACT}
-    # !new-workshop is the [global] bot's, built by zab.admin.newworkshop; !retire's steps
-    # carry their rows (#559); !roster sync and restore need another fleet (#627): each has
-    # its own tests
-    assert covered == set(VERBS) - {"new-workshop", "retire", "roster sync", "roster restore"}
+    # !new-workshop and !upgrade-server are the [global] bot's, built by zab.admin.newworkshop
+    # and zab.admin.upgradeserver (#569); !retire's steps
+    # carry their rows (#559); !roster sync and restore need another fleet (#627), and
+    # !month-end schedule rows with an end (#570): each has its own tests
+    left = {"new-workshop", "upgrade-server", "retire", "roster sync", "roster restore"}
+    left.add("month-end schedule")
+    assert covered == set(VERBS) - left
 
 
 def test_every_verb_is_mapped_or_answered_by_the_bot():
@@ -454,7 +478,7 @@ def test_every_verb_is_mapped_or_answered_by_the_bot():
 
 
 def test_every_keyword_and_setting_has_a_fixed_flag():
-    for verb in set(VERBS) - {"new-workshop"}:  # whose settings go to zab.admin.newworkshop
+    for verb in set(VERBS) - {"new-workshop", "upgrade-server"}:  # their modules' own flags
         spec = SPECS[verb]
         assert set(spec.keywords) == set(KEYWORD_FLAGS.get(verb, {})), verb
         assert set(spec.settings) <= set(SETTING_FLAGS), verb
@@ -505,6 +529,7 @@ def minimal(verb: str, selection: Selection) -> Command:
         "idle-stop": {"idle_stop": 15},
         "teardown": {"keywords": frozenset({"unsynced"})},
         "retire": {"keywords": frozenset({"unsynced"})},
+        "keep-until": {"until": "2026-11-30"},
     }.get(verb, {})
     return Command(verb, selection=selection, **fields)
 
@@ -656,8 +681,9 @@ def test_power_does_not_mix_keywords_and_names(layout):
 
 def test_unmapped_verbs_keywords_and_settings_are_refused(layout, monkeypatch):
     for verb in BOT_VERBS:
+        selection = ALL if SPECS[verb].selection else None  # `!month-end cancel SEL` (#570)
         with pytest.raises(ActionError, match="no script is mapped"):
-            build(Command(verb), FLEET, layout=layout)
+            build(Command(verb, selection=selection), FLEET, layout=layout)
     with pytest.raises(ValueError, match="not a verb"):
         Command("rebind")
     for verb in ("rebind", ["status"]):

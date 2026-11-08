@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
+from at8 import AT8_SKIP, PUBLIC
 
 from zab.commands.run import Runtime
 from zab.config import BackendConfig, BotConfig, BridgeConfig, Config, RenderConfig
@@ -142,11 +143,7 @@ async def live(tmp_path):
         await asyncio.wait_for(runtime.backends["codex"].ready.wait(), 20)
         identity = runtime.backends["codex"].rpc.identity
         assert identity["userAgent"].startswith("zab/0.157.1 "), identity["userAgent"]
-        for sid, name, private in [
-            (639106, "zab-dev", True),
-            (639107, "zab-dev-2", True),
-            (639108, "zab-dev-public", False),
-        ]:
+        for sid, name, private in [(639106, "zab-dev", True), (639107, "zab-dev-2", True)]:
             channel = await runtime.bridges[0].channel(sid)
             assert channel["name"] == name and runtime.bridges[0].private(channel) == private
         yield Live(runtime, tester)
@@ -238,8 +235,11 @@ async def test_steer_and_stop(live):
     print("AT3/5 stop seconds", time.monotonic() - start, "topic", live.topic)
 
 
+@pytest.mark.skip(reason=AT8_SKIP)
 async def test_public_refusal(live):
-    live.stream = 639108
+    """AT-8, skipped (`AT8_SKIP`): it needs a public channel, and the dev organization's is
+    archived."""
+    live.stream = PUBLIC
     await live.send("@**codex dev-gpt** Test the public-channel refusal.")
     await live.send("@**codex dev-gpt** Repeat the public-channel refusal.")
 

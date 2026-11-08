@@ -14,7 +14,9 @@ from zab.render.markdown import normalize, redact_secrets
 
 
 def code(text: str) -> str:
-    text = redact_secrets(text).replace("\n", " ")
+    # Redacted, and again once on one line, which can make a key's context whole: `curl -u`
+    # and a newline before the user, `ZULIP_API_KEY` and one before the `=` (SPEC §11.6, #666).
+    text = redact_secrets(redact_secrets(text).replace("\n", " "))
     width = max((len(x) for x in re.findall(r"`+", text)), default=0) + 1
     fence = "`" * width
     return f"{fence} {text} {fence}"

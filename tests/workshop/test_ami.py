@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import pathlib
 import re
@@ -70,9 +71,8 @@ def test_pari_is_built_from_source_with_pinned_checksums():
     assert "./Configure --prefix=/usr/local --with-gmp --with-readline" in text
     assert "sudo make install" in text
     assert 'fetch_checked "$PARI_SHA256" "$src/pari-$PARI_VERSION.tar.gz"' in text
-    assert (
-        '"$PARI_URL/unix/OLD/${PARI_VERSION%.*}/pari-$PARI_VERSION.tar.gz"' in text
-    )  # next release
+    assert '"$PARI_URL/OLD/${PARI_VERSION%.*}/pari-$PARI_VERSION.tar.gz"' in text  # next release
+    assert "$PARI_URL/unix/OLD" not in text  # PARI has no such directory (#945)
     assert (
         'fetch_checked "${PARI_DATA_SHA256[$name]}" "/tmp/$name.tgz" "$PARI_URL/packages/$name.tgz"'
         in text
@@ -299,6 +299,32 @@ def test_pins_and_mcp_mirror_the_first_boot():
     assert 'jq "del(.machineID, .userID)"' in text
     assert "claude doctor </dev/null 2>&1 | grep -q 'Auto-updates: disabled'" in text
     assert "mcp get lmfdb 2>/dev/null | grep -q '$LMFDB_MCP_URL'" in text
+
+
+def test_smoke_checks_claude_codes_ca_list_and_the_store_agent_reads():
+    """#882, criterion 1: both smoke tests check that the managed settings set
+    CLAUDE_CODE_CERT_STORE=system, and that agent reads a certificate from the system store,
+    without which Claude Code falls back to its bundled roots."""
+    import build_ami
+
+    text = BUILD_SH.read_text()
+    smoke = text[text.index("# --- 13. smoke test") : text.index("# --- 14. housekeeping")]
+    managed = "/etc/claude-code/managed-settings.json"
+    assert (
+        f"""check bash -c 'jq -e ".env.CLAUDE_CODE_CERT_STORE == \\"system\\"" {managed}'"""
+        in smoke
+    )
+    assert 'check as_agent bash -c "$SYSTEM_STORE"' in smoke
+    instance = build_ami.SMOKE_SCRIPT
+    assert f"managed={managed}\n" in instance
+    assert (
+        """check bash -c "jq -e '.env.CLAUDE_CODE_CERT_STORE == \\"system\\"' $managed\""""
+        in instance
+    )
+    assert 'check as_agent bash -c "$store"' in instance
+    for script in (smoke, instance):  # the store's checks come before the result
+        end = 'if [ "$fail" -ne 0 ]' if script is smoke else 'echo "SMOKE-RESULT $fail"'
+        assert script.index("CLAUDE_CODE_CERT_STORE") < script.index(end)
 
 
 def test_build_script_is_strict_and_non_interactive():
@@ -568,3 +594,89 @@ def test_agent_instructions_use_the_shared_mathlib():
     ):
         assert needle in doc, needle
     assert "unpacks its own copy" not in doc  # the per-project Mathlib advice of #224 is gone
+
+
+def run_pari_data_step(
+    tmp_path: pathlib.Path, *, copy: str = "dir", tamper: str = "", site: bool = False
+):
+    """Step 3's data packages under bash: build.sh's fetch_checked, with curl failing (PARI's site
+    out of reach) or, with `site`, serving the pinned files, and `sudo` recorded; two small
+    packages pinned by their sha256, the release's copy as a directory, an empty directory, a
+    tarball or none. (exit code, stderr, sudo lines, curl lines)."""
+    text = BUILD_SH.read_text()
+    fetch = text[
+        text.index("fetch_checked() {") : text.index("\n}\n", text.index("fetch_checked() {")) + 3
+    ]
+    step = text[text.index("sudo install -d -m 0755 /usr/local/share/pari") :]
+    end = '[ -z "$pari_data" ] || [ "$pari_data" = "$PARI_DATA" ] || rm -rf "$pari_data"'
+    step = step[: step.index(end) + len(end)] + "\n"
+    step = step.replace("/tmp/", f"{tmp_path}/")  # noqa: S108 - not used, rewritten
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    data, calls, curls = tmp_path / "data", tmp_path / "sudo", tmp_path / "curl"
+    data.mkdir()
+    packages = {f"zab945{n}": f"package {n}".encode() for n in ("a", "b")}
+    for name, body in packages.items():
+        (data / f"{name}.tgz").write_bytes(body)
+    pins = " ".join(f"[{n}]={hashlib.sha256(b).hexdigest()}" for n, b in packages.items())
+    if tamper:
+        (data / f"{tamper}.tgz").write_bytes(b"another")
+    if copy == "empty":
+        for name in packages:
+            (data / f"{name}.tgz").unlink()
+    source = {"dir": str(data), "empty": str(data), "none": ""}.get(
+        copy, str(tmp_path / "pari-data.tar")
+    )
+    if copy == "tar":
+        tar = ["tar", "-cf", source, "-C", str(data), *(f"{n}.tgz" for n in packages)]
+        subprocess.run(tar, check=True)  # noqa: S603 - an argument list
+    stubs = (
+        "set -euo pipefail\n"
+        f'sudo() {{ printf "%s\\n" "$*" >> {calls}; }}\n'
+        f'curl() {{ printf "%s\\n" "$*" >> {curls}; [ -n "{"1" if site else ""}" ] || return 22\n'
+        "  local url=${*: -3:1} dest=${*: -1}\n"  # `… "$url" -o "$dest"`
+        "  case $url in\n"
+        + "".join(
+            f"    */{n}.tgz) printf '%s' '{b.decode()}' > \"$dest\" ;;\n"
+            for n, b in packages.items()
+        )
+        + "  esac\n}\n"
+        f"declare -A PARI_DATA_SHA256=({pins})\nPARI_URL=https://pari.invalid\nPARI_DATA={source}\n"
+    )
+    run = subprocess.run(  # noqa: S603 - build.sh's own step
+        ["bash", "-c", stubs + fetch + step],  # noqa: S607
+        env={"PATH": "/usr/bin:/bin", "TMPDIR": str(tmp_path)},
+        capture_output=True,
+        text=True,
+    )
+    lines = lambda p: p.read_text().splitlines() if p.exists() else []  # noqa: E731
+    return run.returncode, run.stderr, lines(calls), lines(curls)
+
+
+@pytest.mark.parametrize("copy", ["dir", "tar"])
+def test_the_releases_copy_of_the_pari_data_needs_no_download(tmp_path, copy):
+    """#945: the release's copy of each data package (PARI_DATA) is where fetch_checked looks
+    first; matching its pin, nothing is downloaded from PARI's site."""
+    code, err, sudo, curl = run_pari_data_step(tmp_path / copy, copy=copy)
+    assert code == 0, err
+    assert curl == []
+    assert len([s for s in sudo if s.startswith("tar -xzf ")]) == 2
+
+
+def test_a_pari_data_copy_that_isnt_pinned_falls_back_to_paris_site(tmp_path):
+    code, err, _sudo, curl = run_pari_data_step(tmp_path / "t", tamper="zab945b")
+    assert code == 1 and "checksum mismatch or download failed" in err
+    assert [c for c in curl if "zab945b.tgz" in c] and not [c for c in curl if "zab945a" in c]
+    code, err, _sudo, curl = run_pari_data_step(tmp_path / "n", copy="none")  # no copy at all
+    assert code == 1 and [c for c in curl if "zab945a.tgz" in c]
+
+
+def test_an_empty_pari_data_directory_falls_back_to_paris_site(tmp_path):
+    """Codex round 1 on #952: a PARI_DATA directory with no packages in it isn't an error; each
+    package comes from PARI's site, checked against its pin, and the directory is left as it was."""
+    code, err, sudo, curl = run_pari_data_step(tmp_path / "e", copy="empty", site=True)
+    assert code == 0, err
+    assert len([c for c in curl if ".tgz" in c]) == 2
+    assert len([s for s in sudo if s.startswith("tar -xzf ")]) == 2
+    assert (tmp_path / "e" / "data").is_dir()  # never removed: it isn't the step's own
+    code, err, _sudo, _curl = run_pari_data_step(tmp_path / "f", copy="empty")  # site down too
+    assert code == 1 and "checksum mismatch or download failed" in err and "cp:" not in err

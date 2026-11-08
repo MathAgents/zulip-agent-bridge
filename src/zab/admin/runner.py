@@ -59,6 +59,17 @@ log and scrubber (`AdminServer`).
   or the last backup failed; its failure is said in the topic and changes nothing here. A
   cancelled apply stays APPLYING: the next start marks it INTERRUPTED (`PlanStore.recover`)
   and says so, and it never runs again on its own.
+- **The roster lock** (#646). A slug is unique on the server (§2.1), and each roster verb's
+  plan hashes the other workshops' rosters and the retired slugs. An apply of a roster verb
+  (`!roster import`, `sync`, `remove`, `restore`, `rename`: the verbs that add, rename or
+  exclude rows) takes the server's one roster lock after its workshop's, always in that order, and
+  holds it from the recheck to its end. So the recheck, which reads the others' rosters again,
+  and the script's own check of the slugs at apply run while no other roster verb runs. The
+  other verbs write other columns of their own workshop's roster, never a slug, so two
+  workshops approving at once can't both take one free slug, and the second, whose inputs the
+  first changed, is STALE. A plan that waits for the lock says so in its topic, once
+  (`roster_wait`), and holds its workshop's lock meanwhile; one whose TTL passed while it
+  waited is EXPIRED before its recheck.
 - **Rows** (`!retire`, #559). A plan whose steps name their row (`Step.row`) runs them in
   order, but a failure stops its row alone (`Rows`): the row's later steps are `not run`, and
   the other rows go on. A tolerated step's failure stops nothing. A step that needs the row's
@@ -80,6 +91,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import dataclasses
 import hashlib
 import json
 import logging
@@ -88,30 +100,36 @@ import shutil
 import signal
 import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from zab.admin import actions as actions_mod
+from zab.admin import monthend
 from zab.admin.actions import (
     DRY_RUN,
     IDLE_STOP_DEFAULT,
+    MONTH_END,
     NOTHING,
     RETIRE,
     TARGETS,
     VERBS,
     Action,
+    ActionError,
     Argv,
     Ending,
     Fleet,
     Live,
     Step,
+    build_run,
     digests,
     target_material,
 )
-from zab.admin.fleet import ApplyEnd, RowEnd
+from zab.admin.fleet import ApplyEnd, FleetError, RowEnd, read_roster, roster_rows
+from zab.admin.grammar import Command, Selection
 from zab.admin.planning import NOTE_CHARS, Job, Prepared
-from zab.admin.plans import APPLYING, APPROVED, EXPIRED, STALE, Plan, fingerprint
+from zab.admin.plans import APPLYING, APPROVED, DONE, EXPIRED, FAILED, STALE, Plan, fingerprint
 from zab.admin.reads import footer, short
 from zab.admin.scrub import (
     ATTACHMENT_BYTES,
@@ -134,6 +152,7 @@ TIMEOUTS = {
     "final-sync": 1800.0,
     "export": 1800.0,
     "teardown": 1800.0,
+    "upgrade-server": 1800.0,  # #569: a review, or a build and its wheels; its helper stops at 1500
 }
 TIMEOUT = 900.0  # every other verb, `!status` included
 GRACE = 30.0  # at a timeout: SIGTERM, then SIGKILL this much later (§2.4)
@@ -203,6 +222,17 @@ def took(seconds: float) -> str:
     return f"{s // 60} min {s % 60} s" if s < 3600 else f"{s // 3600} h {s % 3600 // 60} min"
 
 
+def roster_wait(plan: Plan, ahead: list[Plan]) -> str:
+    """The line of a roster plan that waits for the roster lock (#646): the plan that holds it,
+    or takes it next, and how many more come before this one. They are other workshops'."""
+    first, more = ahead[0], f" and {len(ahead) - 1} more" * (len(ahead) > 1)
+    return (
+        f"⏳ {plan.name} waits for {first.name} of {first.workshop}{more}: slugs are unique on "
+        "the server, so roster plans apply one at a time. Meanwhile this workshop answers its "
+        "other approvals with `busy:`."
+    )
+
+
 class Capture:
     """Output as it arrives: its first `limit` characters, cut at a line, and a count of the
     rest. A cut between lines splits no secret in scope (§2.7 item 5), and nothing past it is
@@ -264,6 +294,8 @@ class Ran:
     killed: bool = False
     cut: bool = False
     row: str = ""  # the row it ran for (`Step.row`)
+    at: float = 0.0  # when it began, by the bot's clock: `apply_end` records it (#570)
+    took: float = 0.0  # its seconds
 
     @property
     def label(self) -> str:
@@ -312,6 +344,26 @@ class Rows:
         self.seconds: dict[str, float] = {}  # each row's steps' time, in seconds
         self.vms = vms
 
+    def resume(self, steps: Sequence[Step], finished: Mapping[str, Mapping[str, object]]) -> None:
+        """A month-end run's rows resumed (#570): the stages an earlier run of the same schedule
+        did (`finished`, as `monthend.done` has them), which this run skips, `ok` in their
+        place among the row's whole chain (`steps`, before `monthend.order`), unless they run
+        again (`start`). The result's table and `apply_end`'s cells then name them: this run's
+        `apply_start` made the ledger forget the row's uninstall and sync, and its `apply_end`
+        gives them back, whatever happens to the rest (Codex round 6 on #835)."""
+        for row, cells in self.cells.items():
+            done = finished.get(row, {})
+            if not done:
+                continue
+            for stage in done:
+                if stage not in self.order[row]:
+                    cells[stage] = "ok"
+            whole = [step.stage for step in steps if step.row == row]
+            self.order[row] = [s for s in whole if s in done or s in self.order[row]]
+        shown = {stage for order in self.order.values() for stage in order}
+        whole = dict.fromkeys(step.stage for step in steps if step.row)
+        self.stages = [stage for stage in whole if stage in shown]
+
     def skip(self, step: Step) -> bool:
         """Whether `step` doesn't run, its cell set: its row stopped, or no VM for it."""
         if not step.row:
@@ -326,6 +378,12 @@ class Rows:
                 self.stopped.add(step.row)
             return True
         return False
+
+    def stop(self, step: Step, cell: str) -> None:
+        """`step`'s row stops before it, with `cell` as its cell (a month-end run's row
+        cancelled while the run applies, #570)."""
+        self.cells[step.row][step.stage] = cell
+        self.stopped.add(step.row)
 
     def ran(self, step: Step, ran: Ran, seconds: float = 0.0) -> None:
         self.cells[step.row][step.stage] = ran.cell
@@ -418,9 +476,34 @@ def _fields(plan: Plan) -> dict[str, Any]:
 def _step_record(ran: Ran) -> dict[str, Any]:
     """A step as `apply_end` records it, with its row when it has one (review of #564)."""
     out: dict[str, Any] = {"script": ran.script, "exit": ran.code, "ended": ran.ended}
+    out |= {"at": round(ran.at, 1), "s": round(ran.took, 1)}  # A17 reads them (#570)
     return out | ({"row": ran.row} if ran.row else {})
 
 
+#: The cell of a month-end run's row cancelled during the run, before its step (#570).
+CANCELLED_CELL = "cancelled"
+#: The cell of a `!retire`'s step that ran but whose `retire_step` record couldn't be written,
+#: or may not have been (an error after it landed): not on record, so not done as the ledger
+#: has it (#837), though the step ran (`stopped_row`, `_put_back`).
+UNRECORDED = "failed: may not be on the audit log"
+#: The cells of a step that ran: `ok`, or one whose record may not be on the log.
+RAN = ("ok", UNRECORDED)
+
+
+def unrecorded(cell: str) -> str:
+    """The cell of a step whose `retire_step` record may not be on the log, keeping how the
+    step went (Codex round 1 on #860): `UNRECORDED` for one that exited 0, which ran (`RAN`);
+    else its own failure, or its skip, said failed, so that the row stops there, and the note:
+    neither counts as a step that ran."""
+    if cell == "ok":
+        return UNRECORDED
+    said = cell if cell.startswith("failed") else f"failed: {cell}"
+    return f"{said}, may not be on the audit log"
+
+
+#: The looks in a row at which a month-end run's reads at its start may fail (the roster, EC2)
+#: before its rows stop: until then each waits for the next look (review of #835, N8).
+READ_TRIES = 5
 #: Kept free in a result's message for its footer and the attachment's line (#559).
 RESULT_ROOM = 600
 #: A row's cell for a script's exit that says why by itself: final_sync.py's `GONE`, the row's
@@ -476,6 +559,12 @@ def vms_found(
             "other than those tagged participant=<slug>, which its teardown ends: tag the VM "
             "exactly (a spare handed over keeps participant=zab-spare-N), or end it by hand"
         )
+    elif none and action.verb != "retire":  # the schedule's (#570): no `unsynced` there
+        why = (
+            f"no VM found in {region} for {', '.join(none)}: `!retire {none[0]} unsynced` ends "
+            f"it, or `!keep-until none {none[0]}` leaves it out; or check the roster's ip and "
+            "region"
+        )
     elif none and not unsynced:
         why = (
             f"no VM found in {region} for {', '.join(none)}: add `unsynced` to retire "
@@ -485,33 +574,167 @@ def vms_found(
     return "\n".join(lines) + "\n", why
 
 
-def stopped_row(fleet: Fleet | None, row: str, cells: Mapping[str, str]) -> str:
+def _chains(action: Action) -> dict[str, Any]:
+    """What a `!retire`'s `apply_start` adds: each row's chain of stages, in order, which its
+    `retire_step` records then fill in (#837; `fleet.Ledger.chains`). Nothing for another
+    plan."""
+    if action.verb != "retire":
+        return {}
+    chains: dict[str, list[str]] = {}
+    for step in action.applied:
+        if step.row:
+            chains.setdefault(step.row, []).append(step.stage)
+    return {"chains": chains}
+
+
+def stopped_at(cells: Mapping[str, str]) -> str:
+    """The step that stopped a row: a month-end run's row stopped before a step (#570),
+    cancelled or by its guard (`RunHooks`), that step, which didn't run; otherwise its last
+    failed cell, its cells being in the order its steps ran. An earlier one is a failure that
+    `unsynced` tolerated (#820: an export that failed under `unsynced`, then a protection that
+    stopped the row)."""
+    halted = [stage for stage, cell in cells.items()
+              if cell == CANCELLED_CELL or cell.startswith("stopped: ")]  # fmt: skip
+    if halted:
+        return halted[0]
+    return [stage for stage, cell in cells.items() if cell.startswith("failed")][-1]
+
+
+def _outs(dropped: Mapping[str, str], halted: Mapping[str, str], redone: Sequence[str] = ()) -> str:
+    """The rows a month-end run left out, each with why (#570); and those whose work it saves
+    again (`monthend.unsaved`)."""
+    parts = []
+    if redone:
+        parts.append(
+            "uninstalled and synced again, the ledger no longer having their work saved (a plan "
+            f"since, such as a rollout, may have reinstalled the bridge): {', '.join(redone)}"
+        )
+    if dropped:
+        parts.append("dropped out of the schedule: " + "; ".join(f"{s} ({w})" for s, w in
+                                                                dropped.items()))  # fmt: skip
+    if halted:
+        parts.append("stopped before the run: " + "; ".join(f"{s} ({w})" for s, w in
+                                                           halted.items()))  # fmt: skip
+    return "; ".join(parts) + "."
+
+
+def month_end_stop(row: str, stage: str, cell: str) -> str:
+    """The line of a month-end run's row stopped before `stage` (#570), cancelled or by its
+    guard (`RunHooks`). Before its bots, its teardown is on record, in this run or one before
+    (`monthend.order` puts it first): its VM is gone, and the teardown cleared its `ip`
+    (#604), so only `!retire … unsynced` ends its bots (review of #835, B1)."""
+    reason = cell.removeprefix("stopped: ")
+    if stage == "bots":
+        why = (
+            "its month end was cancelled during the run" if cell == CANCELLED_CELL
+            else f"which didn't run: {reason}"
+        )  # fmt: skip
+        return (
+            f"- {row} stopped before bots{':' if cell == CANCELLED_CELL else ','} {why}. Its VM "
+            f"is gone, torn down already: `!retire {row} unsynced` deactivates its bots and "
+            "marks it retired."
+        )
+    if cell == CANCELLED_CELL:
+        return (
+            f"- {row} stopped before {stage}: its month end was cancelled during the run. Its VM "
+            f"is as the steps before left it: `!retire {row}` ends it, or the commands below the "
+            "steps it ran put it back in service."
+        )
+    return (
+        f"- {row} stopped before {stage}, which didn't run: {reason}. Check the row, then "
+        f"`!retire {row}`."
+    )
+
+
+#: On every way back into service: the participants sign their VM out before the `!retire`
+#: (ORGANIZERS §5.2, step 3), whether or not it then uninstalled the bridge (#820, #808)
+LOGIN = (
+    " A participant who signed the VM out of Codex and Claude (ORGANIZERS §5.2) then sends "
+    "`!login` to both bots"
+)
+
+
+def stopped_row(
+    fleet: Fleet | None, row: str, cells: Mapping[str, str], keywords: Collection[str] = ()
+) -> str:
     """A stopped row's line under the result's table (review of #564): what its VM is left
-    as, how to send it again, and how to put it back in service instead."""
-    stage = next(s for s, c in cells.items() if c.startswith("failed"))
-    if cells[stage] == f"failed: {GONE_CELL}":  # #714: final_sync.py's line names it too
+    as, how to send it again, and how to put it back in service instead. The `!retire` to send
+    again repeats the plan's `keywords` (#820), but `export` once the row's `export` cell is
+    `ok`, its archive collected. The cells end where the row stopped (a deadline leaves the
+    later ones unwritten), so whether the plan exports is read from `keywords`. One stopped at
+    its export is told how to end it without the archive, and how to put it back in service
+    first when its participant must change what the export refused (ORGANIZERS §5.6). Each
+    way back into service says that a participant who signed the VM out sends `!login` to both
+    bots (§5.2). A month-end run's row cancelled during it (#570) says so."""
+    stage = stopped_at(cells)
+    if cells[stage] == CANCELLED_CELL or cells[stage].startswith("stopped: "):
+        return month_end_stop(row, stage, cells[stage])
+    unsynced = "unsynced" in keywords
+    export = " export" * ("export" in keywords and cells.get("export") != "ok")
+    again = f"!retire {row}{export}" + " unsynced" * unsynced
+    tear = f"!retire {row}{export} unsynced"  # whatever its start, uninstall, sync or export do
+    if cells[stage].startswith(f"failed: {GONE_CELL}"):  # #714; the log's note too (#860, N4)
         org = fleet.workshop.github_org if fleet is not None else "the organization"
         return (
             f"- {row} stopped at {stage}: `{org}/{row}` no longer exists here: the participant "
-            f"deleted or transferred it, so its VM's work can't be pushed there. `!retire {row} "
-            "unsynced` tears it down all the same, and loses the work that is only on its VM: "
-            "what wasn't pushed before the repository went."
-        )
+            f"deleted or transferred it, so its VM's work can't be pushed there. `{tear}` tears "
+            "it down all the same, and loses the work that is only on its VM: what wasn't "
+            "pushed before the repository went" + ", unless its export takes it" * bool(export)
+            + "."
+        )  # fmt: skip
     if cells.get("teardown") == "ok" or stage in ("teardown", "bots") or "no VM" in cells[stage]:
-        return (f"- {row} stopped at {stage}: its VM may be gone. Send `!retire {row}` again; "
-                f"if its plan finds no VM, `!retire {row} unsynced`.")  # fmt: skip
+        if_gone = f"; if its plan finds no VM, `{tear}`" * (not unsynced)
+        return f"- {row} stopped at {stage}: its VM may be gone. Send `{again}` again{if_gone}."
     left = [what for stage_, what in (("idle-stop", "idle stop off"), ("waker", "the waker off"),
                                      ("uninstall", "its bridge uninstalled"))
-            if cells.get(stage_) == "ok"]  # fmt: skip
+            if cells.get(stage_) in RAN]  # fmt: skip
     state = f"its VM runs, with {', '.join(left)}" if left else "its VM is as it was"
+    back = _put_back(fleet, row, cells)
+    if stage == "export":  # its sync ran: its work is on GitHub, only the archive is missing
+        lines = [
+            f"- {row} stopped at export (`{cells[stage]}`): {state}. Fix the cause, then send "
+            f"`{again}` again, or `!retire {row}` to end it without the archive."
+        ]
+        if back:
+            lines.append(
+                f"  If its participant must change what the export refused (ORGANIZERS §5.6), "
+                f"put it back in service first: {back}.{LOGIN}, before an agent can change "
+                f"it. Then send `{again}` again."
+            )
+        return "\n".join(lines)
     lines = [
         f"- {row} stopped at {stage} (`{cells[stage]}`): {state}. Fix the cause, then send "
-        f"`!retire {row}` again, or `!retire {row} unsynced` to tear it down with its work."
+        f"`{again}` again" + f", or `{tear}` to tear it down with its work" * (not unsynced) + "."
     ]
-    back = _put_back(fleet, row, cells)
     if back:
-        lines.append(f"  To put it back in service instead: {back}.")
+        lines.append(f"  To put it back in service instead: {back}.{LOGIN}.")
     return "\n".join(lines)
+
+
+def left_row(
+    fleet: Fleet | None, row: str, cells: Mapping[str, str], order: Sequence[str],
+    words: Sequence[str],
+) -> str:  # fmt: skip
+    """The line of a row an apply left part way when it stopped before the row's next step
+    (another row's step record that couldn't be written, say: #860's review, B2 and N2):
+    where it was left, and what to do once the cause is fixed."""
+    stage = next(s for s in order if cells.get(s, "not run") == "not run")
+    again = " ".join([f"!retire {row}", *words])
+    said = f"- {row} left before {stage}, the run having stopped"
+    if cells.get("teardown") in RAN:
+        return f"{said}: its VM is gone. `!retire {row} unsynced` ends its bots."
+    if cells.get("protect") in RAN:
+        return (
+            f"{said}: its VM runs, synced, its termination protection off. Send `{again}` "
+            f"again, or `!protect on {row}` to keep the VM."
+        )
+    left = [what for stage_, what in (("idle-stop", "idle stop off"), ("waker", "the waker off"),
+                                     ("uninstall", "its bridge uninstalled"))
+            if cells.get(stage_) in RAN]  # fmt: skip
+    state = f"its VM runs, with {', '.join(left)}" if left else "its VM is as it was"
+    back = _put_back(fleet, row, cells)
+    out = f"{said}: {state}. Send `{again}` again"
+    return out + (f", or put it back in service: {back}.{LOGIN}." if back else ".")
 
 
 def _put_back(fleet: Fleet | None, row: str, cells: Mapping[str, str]) -> str:
@@ -527,17 +750,121 @@ def _put_back(fleet: Fleet | None, row: str, cells: Mapping[str, str]) -> str:
     minutes = known or str(IDLE_STOP_DEFAULT)
     release = fleet.release if fleet is not None and fleet.release else "<release>"
     out = []
-    if cells.get("waker") == "ok":
+    if cells.get("waker") in RAN:  # a step whose record may not be on the log ran (#855)
         whole = fleet is not None and fleet.waker
         out.append(f"`!waker on {row}`" + " (if it was opted in)" * (not whole))
-    idle = cells.get("idle-stop") == "ok" and minutes != "0"
-    if cells.get("uninstall") == "ok":
+    idle = cells.get("idle-stop") in RAN and minutes != "0"
+    if cells.get("uninstall") in RAN:
         words = [w for w in settings if not w.startswith("idle-stop=")]
         words += [f"idle-stop={minutes}"] * idle
         out.append(f"`!rollout {' '.join([release, row, *words])}`")
     elif idle:
         out.append(f"`!idle-stop {minutes} {row}`")
     return ", then ".join(out)
+
+
+#: The stages of a month-end run that destroy something, guarded at once before they run
+#: (`RunHooks.before`, Codex round 1 on #835): protection off, the teardown, the bots.
+GUARDED = ("protect", "teardown", "bots")
+
+
+async def _people(fleet: Fleet) -> dict[str, str]:
+    """Each row's Zulip ID, as the roster has it now."""
+    rows = await asyncio.to_thread(read_roster, fleet.workshop.roster)
+    return {row["slug"]: row.get("zulip_user_id", "") for row in rows}
+
+
+class RunHooks:
+    """A month-end run's hooks into `Runner._steps` (#570). Before each step of a row, the row
+    as `state.db` has it now: a step of a row that is no longer `running` under its own schedule
+    (cancelled, or anything else) doesn't run. Before a step that destroys something
+    (`GUARDED`), and after any wait for it, every check again, last of all, with no await
+    between the last one and the step's start but the runner's own (Codex rounds 1 and 2 on
+    #835): its VMs (for `protect` and `teardown`, those tagged with its slug) still the approved
+    ones, read afresh; the roster, read afresh, still as approved (`monthend.changed`: its
+    `keep_until`, in service, not excluded, its Zulip ID, its bots' keys); and the row still
+    `running`. Anything that can't be told (a read that fails) stops the row: it never
+    proceeds. Before a teardown, this schedule's final sync and protection off on record (the
+    order puts them first: the check is the data's own guard, review of #835, N5), and the
+    wait of `PROTECT_SETTLE` after the protection off. After each step, its record when it
+    exited 0. `sleep` is `asyncio.sleep`, which tests replace."""
+
+    sleep = staticmethod(asyncio.sleep)
+
+    def __init__(
+        self, runner: Runner, plan: Plan, entries: list[monthend.Entry], fleet: Fleet
+    ) -> None:
+        self.runner, self.plan, self.fleet = runner, plan, fleet
+        self.entries = {e.slug: e for e in entries}
+
+    async def before(self, step: Step, shown: Capture) -> str:
+        """ "" to run `step`, or the cell its row stops with (the class doc)."""
+        server = self.runner.server
+        assert server.store is not None
+        entry = self.entries[step.row]
+        if why := self._held(entry):
+            return why
+        if step.stage not in GUARDED:
+            return ""
+        if step.stage == "teardown":
+            done = monthend.done(server.store.db, entry)
+            if "final-sync" not in done:  # never: the order puts it first (review of #835, N5)
+                return "stopped: its final sync is not on record for this schedule"
+            protect = done.get("protect")
+            if protect is None:  # never: the order puts it first; unknown, so no teardown
+                return "stopped: its protection off is not on record"
+            until = protect[2] + actions_mod.PROTECT_SETTLE
+            if self.fleet.protection is not None:
+                until = max(until, self.fleet.protection.until)
+            wait = until - server.clock()
+            if wait > 0:  # §11.5: EC2 shows and enforces a lifted protection late (#378)
+                shown.feed(f"── {step.row}: {round(wait)} s more before its teardown, after "
+                           "its protection off (#378)\n")  # fmt: skip
+                await self.sleep(wait)
+        if step.stage in ("protect", "teardown"):
+            try:  # afresh: a VM replaced meanwhile is not the approved one
+                read = self.runner.tagged
+                if read is None:
+                    raise RunnerError("no VM lookup")
+                tagged = await asyncio.to_thread(read, self.fleet, (entry.slug,))
+            except Exception as exc:
+                LOG.warning("%s: %s's VMs can't be read (%s)", self.plan.name, entry.slug,
+                            type(exc).__name__)  # fmt: skip
+                return "stopped: its VMs can't be read"
+            if (found := tagged.get(entry.slug, "")) != entry.tagged:
+                return f"stopped: its VM changed ({entry.tagged or 'none'} → {found or 'none'})"
+        try:  # the roster afresh: its `keep_until`, Zulip ID and bots as approved (#835)
+            server_ = self.runner.server
+            fleet = await server_.read_fleet(self.fleet.workshop)
+            people = await _people(fleet)
+            why = await asyncio.to_thread(monthend.changed, entry, fleet, people)
+        except Exception as exc:
+            LOG.warning("%s: %s's roster can't be read (%s)", self.plan.name, entry.slug,
+                        type(exc).__name__)  # fmt: skip
+            return "stopped: its roster can't be read"
+        if why:
+            return f"stopped: {why}"
+        return self._held(entry)  # last, after every await: a cancel meanwhile stops it
+
+    def _held(self, entry: monthend.Entry) -> str:
+        """Why the row may not go on, as `state.db` has it now: "" while it is `running` under
+        its own schedule."""
+        store = self.runner.server.store
+        assert store is not None
+        now = monthend.current(store.db, entry)
+        if now is None:
+            return "stopped: no longer in the schedule"
+        if now.state == monthend.CANCELLED:
+            return CANCELLED_CELL
+        if now.state != monthend.RUNNING:
+            return f"stopped: {now.state}"
+        return ""
+
+    def after(self, step: Step, ran: Ran) -> None:
+        store = self.runner.server.store
+        if ran.ok and store is not None:
+            entry = self.entries[step.row]
+            monthend.record(store.db, entry, step.stage, self.plan.id, ran.at, ran.at + ran.took)
 
 
 class Runner:
@@ -554,6 +881,10 @@ class Runner:
         self.server, self.vms, self.tagged = server, vms, tagged
         self.addressed = addressed
         self.applying: dict[str, Plan] = {}  # the apply lock: workshop → its plan applying
+        self.rosters = asyncio.Lock()  # the server's roster lock (module doc, #646)
+        self.queued: list[Plan] = []  # the plans that hold it or wait for it, in order
+        self._hashed: dict[int, dict[str, str]] = {}  # an apply's input digests, as rechecked
+        self.unread: dict[str, int] = {}  # a workshop's month-end runs whose reads failed
 
     # -------------------------------------------------------------------------- processes
 
@@ -881,9 +1212,37 @@ class Runner:
             return
         self.applying[plan.workshop] = plan
         try:
-            await self._apply(job)
+            if job.action.verb.startswith("roster "):
+                await self._roster(job)
+            else:
+                await self._apply(job)
         finally:
             del self.applying[plan.workshop]
+
+    async def _roster(self, job: Job) -> None:
+        """A roster verb's apply, under the server's roster lock, taken after the workshop's
+        (module doc, #646). A wait for it is said once: the plans that hold it or wait for it
+        are `queued`, in the order they came, each until its apply has released it, so that a
+        plan that comes as the lock passes on sees the one it waits for. The lock may take them
+        in another order: each posts its wait before it joins the lock's queue (#799). A plan
+        whose TTL passed while it waited expires before its recheck, which would run under the
+        lock."""
+        store = self.server.store
+        assert store is not None
+        ahead = list(self.queued)
+        self.queued.append(job.plan)
+        try:
+            if ahead:
+                await self._say(job, roster_wait(job.plan, ahead), None)
+            async with self.rosters:
+                if (late := store.late(job.plan.id)) is not None:
+                    head = await self.server.audit("expired", **_fields(late), reason=late.note)
+                    text = f"❌ {late.name} is expired ({late.note}): nothing was done."
+                    await self._say(job, f"{text} Request again.", head)
+                    return
+                await self._apply(job)
+        finally:
+            self.queued.remove(job.plan)
 
     # ------------------------------------------------------------------------- the apply
 
@@ -922,17 +1281,222 @@ class Runner:
                 approvers=list(server.approvals.approved_by(plan.id)),
                 server=server.release,
                 **ApplyEnd.start_fields(action.targets),  # the ledger forgets their syncs here
+                **_chains(action),  # a `!retire`'s rows' chains, for its steps' records (#837)
             )
         except Exception as exc:  # nothing has run, and nothing will
             LOG.warning("%s: apply_start not recorded (%s)", plan.name, type(exc).__name__)
             store.finish(plan.id, False)
             await self._say(job, f"❌ {plan.name} failed: the audit log can't be written.", None)
             return
-        await self._steps(job, plan, Rows(action, live.vms))
+        self._hashed[plan.id] = now["inputs"]  # what `_schedule` stores (review of #824, N7)
+        try:
+            await self._steps(job, plan, Rows(action, live.vms), live)
+        finally:
+            self._hashed.pop(plan.id, None)
 
-    async def _steps(self, job: Job, plan: Plan, rows: Rows) -> None:
+    async def month_end(
+        self, plan: Plan, bot: AdminBot, where: tuple[int, str], fleet: Fleet, schedule: Plan,
+        due: list[monthend.Entry],
+    ) -> None:  # fmt: skip
+        """A month-end run (`_month_end`), the workshop's apply lock held from its start to its
+        end, however it ends (Codex round 5 on #835): an error that escapes it never leaves the
+        workshop busy in this process; its caller fails the plan if it is still APPLYING
+        (`Planning._abandoned`)."""
+        self.applying[plan.workshop] = plan
+        try:
+            await self._month_end(plan, bot, where, fleet, schedule, due)
+        finally:
+            self.applying.pop(plan.workshop, None)
+
+    async def _month_end(
+        self, plan: Plan, bot: AdminBot, where: tuple[int, str], fleet: Fleet, schedule: Plan,
+        due: list[monthend.Entry],
+    ) -> None:  # fmt: skip
+        """A month-end run (§11.5, #570; `monthend`'s module doc). `plan` is APPLYING already,
+        and `Planning._run` marked its workshop busy. Under the workshop's apply lock: each
+        row's VMs checked against its approval while a step that reaches them remains, and a row
+        whose VMs changed dropped; `!retire`'s steps for the rest, built now (`build_run`), in
+        `monthend.order`; `apply_start`, which names the schedule and its approvers; the steps
+        with `RunHooks`, and `apply_end`; then each row's state: `done` (retired) or `stopped`,
+        or still `running` after a restart, which the next look resumes, or when `apply_end`
+        couldn't be written for a row retired, which the next look records retired, then done
+        (`Planning._retired`)."""
+        server, store = self.server, self.server.store
+        assert store is not None and server.approvals is not None
+        db, ws = store.db, plan.workshop
+        dropped: dict[str, str] = {}  # out of the schedule, and why
+        halted: dict[str, str] = {}  # stopped before the run, and why
+        try:
+            if self.vms is None or self.tagged is None:  # never on a server: as `_live`
+                raise RunnerError("this server can't list its VMs yet")
+            # the roster afresh, under the lock: a `!keep-until` (or any roster write) that
+            # applied while the look awaited is seen here (Codex round 2 on #835)
+            fleet = await server.read_fleet(fleet.workshop)
+            people = await _people(fleet)
+            for e in due:
+                if why := await asyncio.to_thread(monthend.changed, e, fleet, people):
+                    dropped[e.slug] = why
+                    monthend.settle(db, e, monthend.DROPPED, why, server.clock())
+            slugs = tuple(e.slug for e in due if e.slug not in dropped)
+            vms = await asyncio.to_thread(self.vms, fleet, slugs)
+            tagged = await asyncio.to_thread(self.tagged, fleet, slugs)
+        except Exception as exc:  # a blip of EC2 or the roster: the rows wait (review, N8)
+            await self._unread(plan, bot, where, schedule, due, dropped, exc)
+            return
+        self.unread.pop(ws, None)
+        finished = {e.slug: monthend.done(db, e) for e in due}
+        for e in due:
+            at, exact = vms.get(e.slug, ""), tagged.get(e.slug, "")
+            if e.slug in dropped:
+                continue
+            stages = finished[e.slug]
+            if "protect" in stages and "teardown" not in stages and not (at or exact):
+                # review of #835, N2: gone after its protection off, its teardown not on
+                # record: one a restart cut short, most likely. Its bots stay active
+                why = (
+                    "its VM is gone after its protection off: its teardown may have run before a "
+                    f"restart. `!retire {e.slug} unsynced` deactivates its bots and marks it "
+                    "retired"
+                )
+                halted[e.slug] = why
+                monthend.settle(db, e, monthend.STOPPED, why, server.clock())
+            elif why := monthend.vm_changed(e, stages, at, exact):
+                dropped[e.slug] = why
+                monthend.settle(db, e, monthend.DROPPED, why, server.clock())
+        keep = [e for e in due if e.slug not in dropped and e.slug not in halted]
+        redone: list[str] = []  # review of #835, round 2, B1: their work no longer saved
+        for e in keep:  # the ledger as read under the lock: a rollout since forgot their sync
+            if lost := monthend.unsaved(finished[e.slug], fleet.ending.get(e.slug)):
+                monthend.forget(db, e, lost)  # done again, and on record again as it ends
+                finished[e.slug] = {s: v for s, v in finished[e.slug].items() if s not in lost}
+                if {"uninstall", "final-sync"} & set(lost):  # said only when so (#860, N1)
+                    redone.append(e.slug)
+        if not keep:  # every row dropped out or stopped
+            await self._unrun(plan, bot, where, schedule, "nothing to run", dropped, True, halted)
+            return
+        try:
+            built = build_run(fleet, [e.slug for e in keep], layout=server.paths.layout)
+        except ActionError as exc:  # a refusal, not a blip: nothing ran, and the rows stop
+            for e in keep:
+                monthend.settle(db, e, monthend.STOPPED, f"its run failed: {exc}"[:300],
+                                server.clock())  # fmt: skip
+            await self._unrun(plan, bot, where, schedule, f"{exc}. Nothing ran", dropped, False,
+                              halted)  # fmt: skip
+            return
+        action = dataclasses.replace(built, steps=tuple(monthend.order(built.steps, finished)))
+        command = Command("retire", selection=Selection(slugs=action.targets))
+        job = Job(plan, bot, where[0], where[1], command, action, fleet)
+        if dropped or halted or redone:  # review of #835, B3: on record first, then said
+            head = await server.audit(
+                "month_end", **_fields(plan), what="run", reason="out of the run",
+                dropped=dropped, stopped=halted, redone=redone,
+            )  # fmt: skip
+            await self._say(job, f"⚠ {plan.name}: {_outs(dropped, halted, redone)}", head)
+        # an error writing it (or anything after) fails the run (`Planning._abandoned`)
+        await server.audit(
+            "apply_start", **_fields(plan), hash="", verb=action.verb,
+            args=list(action.args), server=server.release, schedule=schedule.name,
+            approvers=list(server.approvals.approved_by(schedule.id)),
+            **ApplyEnd.start_fields(action.targets),
+        )  # fmt: skip
+        rows = Rows(action, vms)
+        rows.resume(built.steps, finished)  # what earlier runs did, in its cells (round 6)
+        await self._steps(job, plan, rows, hooks=RunHooks(self, plan, keep, fleet))
+        now = server.clock()  # not after a restart: its CancelledError went past this
+        for e in keep:
+            if rows.retired(e.slug):  # its bots step on the log: retired there, at its place
+                monthend.settle(db, e, monthend.DONE, f"retired by {plan.name}", now)
+                continue
+            cells = rows.cells.get(e.slug, {})
+            chain = [(s, cells.get(s, "not run")) for s in rows.order.get(e.slug, [])]
+            failed = next((f"{s} ({c})" for s, c in chain if c not in ("ok", "not run")), "")
+            unrun = next((s for s, c in chain if c == "not run"), "")
+            if failed:
+                note = f"stopped at {failed} in {plan.name}"
+            elif unrun and any(c == "ok" for _, c in chain):  # #860's review, N2
+                note = f"left before {unrun} in {plan.name}, the run having stopped"
+            else:
+                note = f"not reached in {plan.name}"
+            monthend.settle(db, e, monthend.STOPPED, note, now)
+
+    async def _unrun(
+        self, plan: Plan, bot: AdminBot, where: tuple[int, str], schedule: Plan, why: str,
+        dropped: dict[str, str], ok: bool, halted: dict[str, str] | None = None,
+    ) -> None:  # fmt: skip
+        """A run that ran nothing: its plan DONE (every row dropped out or stopped) or FAILED,
+        a `month_end` record, and one line in the schedule's topic."""
+        store = self.server.store
+        assert store is not None
+        store.move(plan.id, (APPLYING,), DONE if ok else FAILED, why[:NOTE_CHARS])
+        halted = halted or {}
+        head = await self.server.audit(
+            "month_end", **_fields(plan), what="run", reason=why, dropped=dropped,
+            stopped=halted,
+        )  # fmt: skip
+        text = f"{'⚠' if ok else '❌'} {plan.name}, a month-end run of {schedule.name}: {why}"
+        text += f"; {_outs(dropped, halted)}" if dropped or halted else "."
+        await bot.post(where[0], where[1], f"{text}\n{footer(head)}")
+
+    async def _unread(
+        self, plan: Plan, bot: AdminBot, where: tuple[int, str], schedule: Plan,
+        due: list[monthend.Entry], dropped: dict[str, str], exc: Exception,
+    ) -> None:  # fmt: skip
+        """A read at the run's start that failed, the roster's or EC2's (review of #835, N8):
+        nothing ran, and the rows, `running`, wait for the next look, which runs them again;
+        after `READ_TRIES` looks in a row, they stop, for a `!retire`. Each says so in the
+        schedule's topic."""
+        why = str(exc) if isinstance(exc, (RunnerError, ActionError, FleetError)) else (
+            type(exc).__name__
+        )  # fmt: skip
+        LOG.warning("%s: a month-end run's reads failed (%s)", plan.name, type(exc).__name__)
+        tries = self.unread[plan.workshop] = self.unread.get(plan.workshop, 0) + 1
+        if tries < READ_TRIES:
+            said = (
+                f"its rows or VMs can't be read ({why}). Nothing ran: the next look tries "
+                f"again ({tries} of {READ_TRIES})"
+            )
+            await self._unrun(plan, bot, where, schedule, said, dropped, False)
+            return
+        self.unread.pop(plan.workshop, None)
+        assert self.server.store is not None
+        for e in due:
+            if e.slug not in dropped:
+                monthend.settle(self.server.store.db, e, monthend.STOPPED,
+                                f"its run failed: {why}"[:300], self.server.clock())  # fmt: skip
+        said = f"its rows or VMs can't be read ({why}), {READ_TRIES} looks in a row. Nothing ran"
+        await self._unrun(plan, bot, where, schedule, said, dropped, False)
+
+    async def _schedule(self, job: Job, plan: Plan, live: Live) -> str:
+        """`!month-end schedule`'s apply (#570): its rows stored as the workshop's schedule
+        (`monthend.store`), with their VMs as the recheck found them, and their bots' keys and
+        the roster as it hashed them (review of #824, N7): a roster that changed since, by
+        hand, refuses it."""
+        store = self.server.store
+        assert store is not None and job.fleet is not None
+        hashed = self._hashed.get(plan.id) or digests(job.action)
+        path = job.fleet.workshop.roster
+        data = await asyncio.to_thread(Path(path).read_bytes)
+        if hashlib.sha256(data).hexdigest() != hashed.get(path):
+            raise RunnerError("the roster changed since the recheck: request again")
+        # read as every roster is read on the bot's side: `fleet.roster_rows` (Codex round 4)
+        people = {row["slug"]: row.get("zulip_user_id", "") for row in roster_rows(data)}
+        return monthend.store(
+            store.db, plan=plan.id, action=job.action, fleet=job.fleet, live=live,
+            digests=hashed, people=people, now=self.server.clock(),
+        )  # fmt: skip
+
+    async def _steps(
+        self, job: Job, plan: Plan, rows: Rows, live: Live | None = None,
+        hooks: RunHooks | None = None,
+    ) -> bool:  # fmt: skip
         """The steps in order, up to the first that fails, or each row's up to its own first
-        failure (`Rows`); `apply_end` however it ends."""
+        failure (`Rows`); `apply_end` however it ends, and whether it was recorded (`_end`).
+        `!month-end schedule` has no step: its apply stores the schedule (`_schedule`), from
+        the recheck's `live`. A month-end run's `hooks` (#570) may wait before a row's step or
+        stop its row, and record each one that ends. A `!retire`'s row's step, a month-end
+        run's too (#855), as it ends or is skipped, has its `retire_step` record (#837,
+        `_stepped`), and one that can't be written stops the apply; a month-end run then
+        records the step for its resume (`hooks.after`, `month_end_steps`), never before."""
         shown, steps, started = Capture(), list[Ran](), time.monotonic()
         deadline = started + limit(job.action)
         ticker: asyncio.Task[None] | None = None
@@ -944,16 +1508,29 @@ class Runner:
             message = await job.bot.post(job.stream, job.topic, text)
             if message is not None:
                 ticker = asyncio.create_task(self._ticker(job, message, steps, shown, text))
+            if job.action.verb == MONTH_END and live is not None:
+                shown.feed(await self._schedule(job, plan, live))
             failed = False
+            stepped = job.action.verb == "retire"  # a `!retire`'s, or a month-end run's (#855)
             for step in job.action.applied:
                 if rows.skip(step):
+                    if stepped:
+                        await self._stepped(plan, step, rows)
+                    continue
+                if hooks is not None and step.row and (why := await hooks.before(step, shown)):
+                    rows.stop(step, why)
                     continue
                 env = self.environment(tmp, step.env)
-                steps.append(ran := Ran(script(step.argv), row=step.row))
+                steps.append(ran := Ran(script(step.argv), row=step.row, at=self.server.clock()))
                 began = time.monotonic()
                 await self._step(step.argv, env, tmp, deadline, shown, ran=ran)
+                ran.took = time.monotonic() - began
                 if step.row:
-                    rows.ran(step, ran, time.monotonic() - began)
+                    rows.ran(step, ran, ran.took)
+                    if stepped:  # on the log first: one that can't be written stops the row
+                        await self._stepped(plan, step, rows)
+                if hooks is not None and step.row:  # then the resume's own record (#855): it
+                    hooks.after(step, ran)  # never claims a step the log doesn't have
                 if ran.ended or not (ran.ok or step.tolerated or step.row):
                     failed = True
                     break
@@ -973,14 +1550,39 @@ class Runner:
                 await asyncio.wait([ticker])
             if tmp:
                 shutil.rmtree(tmp, ignore_errors=True)
-            await self._end(job, plan, steps, shown, started, outcome, before, rows)
+            recorded = await self._end(job, plan, steps, shown, started, outcome, before, rows)
+        return recorded
+
+    async def _stepped(self, plan: Plan, step: Step, rows: Rows) -> None:
+        """A `!retire`'s row's step on the audit log as it ends, or is skipped: its
+        `retire_step` record, from which the ledger marks the row in place (#837,
+        `fleet.Ledger`), so that what it did is never lost with an `apply_end` a hard stop
+        cuts. One that can't be written stops the apply, as an `apply_start` that can't does:
+        nothing more runs without its record."""
+        cell = rows.cells.get(step.row, {}).get(step.stage, "")
+        if not step.row or not cell or cell == "not run":
+            return
+        try:
+            await self.server.audit(
+                "retire_step", workshop=plan.workshop, plan=plan.name, bot=plan.bot,
+                row=step.row, stage=step.stage, cell=cell[:200],
+            )  # fmt: skip
+        except Exception as exc:
+            LOG.warning("%s: a step's record not written (%s)", plan.name, type(exc).__name__)
+            # what is on record is what counts: the row's result and its line say so, as the
+            # ledger has it (#849's review of the rework, N1), with the step's own outcome:
+            # only one that exited 0 ran, for its line and its way back (Codex round 1, #860)
+            rows.stop(step, unrecorded(cell))
+            raise RunnerError("a step's record can't be written to the audit log") from exc
 
     async def _end(
         self, job: Job, plan: Plan, steps: list[Ran], shown: Capture, started: float, outcome: str,
         before: tuple[Any, ...] | None, rows: Rows,
-    ) -> None:  # fmt: skip
+    ) -> bool:  # fmt: skip
         """`apply_end`, then (unless the bot is stopping) the plan's state, its result and the
-        backup that follows a change."""
+        backup that follows a change: whether `apply_end` was recorded, from which alone the
+        fleet's ledger learns what the plan did (a month-end run's rows retired, Codex round 4
+        on #835)."""
         server, action = self.server, job.action
         assert server.store is not None
         failed = next((ran for ran in steps if not ran.ok), None)
@@ -992,6 +1594,7 @@ class Runner:
         ends = rows.ends() if rows.cells else None
         end = ApplyEnd(plan.workshop, plan.name, action.verb, action.args, code, action.targets,
                        ends)  # fmt: skip
+        recorded = False
         try:
             head = await server.audit(
                 "apply_end",
@@ -1006,13 +1609,15 @@ class Runner:
                 output_sha256=digest,
                 server=server.release,
             )
+            recorded = True
         except Exception as exc:  # the result says so (review of #354)
             LOG.warning("%s: apply_end not recorded (%s)", plan.name, type(exc).__name__)
         if outcome == "interrupted":
-            return  # still APPLYING: the next start marks it INTERRUPTED and says so
+            return recorded  # still APPLYING: the next start marks it INTERRUPTED and says so
         server.store.finish(plan.id, code == 0)
         await self._result(job, plan, outcome, steps, scrubbed, started, head, rows)
         await server.backups.after(job, before)
+        return recorded
 
     async def _result(
         self, job: Job, plan: Plan, outcome: str, steps: list[Ran], scrubbed: str,
@@ -1025,6 +1630,10 @@ class Runner:
             "failed": ("❌", f"failed at {where}. Nothing after it ran"),
             "timed out": ("⏱", f"timed out after {took(limit(job.action))}, at {where}"),
         }.get(outcome, ("❌", f"the runner failed, {n} of {total} steps begun. Nothing more ran"))
+        if job.action.verb == MONTH_END and outcome == "done":  # its apply has no step (#570)
+            count = len(job.action.targets)
+            what = ("✅", f"done in {took(time.monotonic() - started)}: {monthend.counted(count)} "
+                          "scheduled")  # fmt: skip
         table: list[str] = []
         if rows is not None and rows.cells:  # a row's failure stops that row alone
             what, table = self._rows(rows, outcome, started, what), [fence(rows.table())]
@@ -1063,7 +1672,7 @@ class Runner:
             said += f"; torn down unsynced: {', '.join(lost)}"
         stopped = next((row for row in rows.cells if row in rows.stopped), None)
         if stopped is not None:
-            stage = next(s for s, c in rows.cells[stopped].items() if c.startswith("failed"))
+            stage = stopped_at(rows.cells[stopped])
             said += f"; {stopped} stopped at {stage}" + " and more" * (len(rows.stopped) > 1)
         if outcome == "done":
             return "✅", f"done in {took(time.monotonic() - started)}, {said}"
@@ -1073,10 +1682,25 @@ class Runner:
 
     @staticmethod
     def _after(job: Job, rows: Rows) -> list[str]:
-        """Under the table: each stopped row's VM as it is left and how to go on, each archive
-        exported, and what the participants still do."""
-        out = [stopped_row(job.fleet, row, cells) for row, cells in rows.cells.items()
-               if row in rows.stopped]  # fmt: skip
+        """Under the table: each stopped row's VM as it is left and how to go on, the rows an
+        apply that stopped early never reached, each archive exported, and what the
+        participants still do."""
+        out = [stopped_row(job.fleet, row, cells, job.command.keywords)
+               for row, cells in rows.cells.items() if row in rows.stopped]  # fmt: skip
+        words = [w for w in ("export", "unsynced") if w in job.command.keywords]
+        never, part = [], []
+        for row, cells in rows.cells.items():
+            if row in rows.stopped or rows.retired(row):
+                continue
+            chain = [cells.get(s, "not run") for s in rows.order[row]]
+            if all(c == "not run" for c in chain):
+                never.append(row)
+            elif "not run" in chain:  # left part way by a run that stopped (#860's review, N2)
+                part.append(left_row(job.fleet, row, cells, rows.order[row], words))
+        out += part
+        if never:  # an apply that stopped before them (#849's review of the rework, N2)
+            again = " ".join(["!retire", *never, *words])
+            out.append(f"- not reached: {', '.join(never)}. Send `{again}` again.")
         out += [f"- {row}'s archive: `out/exports/export-{row}.tar.gz`, on the server"
                 for row, cells in rows.cells.items() if cells.get("export") == "ok"]  # fmt: skip
         out.append(

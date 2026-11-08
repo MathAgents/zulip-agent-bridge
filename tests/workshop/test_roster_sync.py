@@ -16,6 +16,7 @@ import roster_sync as rs
 import zulip_provision as zp
 
 from .member_realm import ADMINS, MODERATOR, MemberRealm
+from .scope import with_scope
 
 PROVISIONER, DREW, LI, SOREN, OLGA, BOT, GONE = 150, 1234567, 12345678, 300, 103, 900, 301
 CHANNEL = 55
@@ -76,7 +77,7 @@ def run(realm: MemberRealm, ws: dict, *mode: str, recheck: bool = True) -> int:
     if recheck and "--sync" in mode and "--dry-run" not in mode:
         run(realm, ws, *mode, "--dry-run")
     admin = zp.ZulipAdmin(SITE, "prov@example.org", KEY, transport=realm.transport())
-    return rs.main(argv, admin=admin, checks=ws["ec2"])
+    return with_scope(rs.main, argv, admin=admin, checks=ws["ec2"])
 
 
 def rows(ws: dict) -> dict[str, dict[str, str]]:
@@ -208,8 +209,13 @@ def test_the_apply_writes_only_the_changes_its_last_dry_run_listed(realm, ws, ca
 def test_a_sync_needs_its_changes_file_and_nothing_else_takes_one(realm, ws, capsys):
     admin = zp.ZulipAdmin(SITE, "prov@example.org", KEY, transport=realm.transport())
     base = ["--roster", str(ws["roster"]), "--zuliprc", str(ws["rc"]), "--out-dir", str(ws["out"])]
-    assert rs.main([*base, "--sync", "55"], admin=admin, checks=ws["ec2"]) == 2
-    assert rs.main([*base, "--remove", "x", "--changes", "f"], admin=admin, checks=ws["ec2"]) == 2
+    assert with_scope(rs.main, [*base, "--sync", "55"], admin=admin, checks=ws["ec2"]) == 2
+    assert (
+        with_scope(
+            rs.main, [*base, "--remove", "x", "--changes", "f"], admin=admin, checks=ws["ec2"]
+        )
+        == 2
+    )
     assert "--sync and --changes go together" in capsys.readouterr().err
 
 

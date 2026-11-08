@@ -537,21 +537,36 @@ class AdminBot:
         sent again without being posted twice. Anything else may hide a message that landed: a
         5xx (a worker killed after the commit, a proxy's 502), a 2xx whose body can't be read, a
         response lost after the request went out (re-reviews of #354)."""
+        posted, how = await self.delivered(**params)
+        return posted, how in (REFUSED, UNREACHED)
+
+    async def delivered(self, **params: Any) -> tuple[int | None, str]:
+        """`deliver`, saying how a failure went: `REFUSED`, a 4xx answer of Zulip's, which is
+        about the message; `UNREACHED`, no connection made, or Zulip's rate limit still on after
+        its retries, neither of them about the message; `UNSURE`, it may have landed. "" with the
+        message's ID (the month-end's warnings tell them apart, review of #829, B3)."""
         limit = self.client.limits.get("max_message_length", 10000)
         text = self.server.scrub(params["content"])
         params["content"] = text if len(text) <= limit else text[: limit - 2] + " …"
         for attempt in range(3):
             try:
-                return (await self.client.request("POST", "messages", **params))["id"], False
+                return (await self.client.request("POST", "messages", **params))["id"], ""
             except ZulipError as exc:
                 if exc.status != 429 or attempt == 2:
                     LOG.warning("%s bot: a post failed (%s)", self.label, exc.code)
-                    return None, 400 <= exc.status < 500
+                    if exc.status == 429:
+                        return None, UNREACHED
+                    return None, REFUSED if 400 <= exc.status < 500 else UNSURE
                 await asyncio.sleep(max(1.0, exc.retry_after))
             except Exception as exc:
                 LOG.warning("%s bot: a post failed (%s)", self.label, type(exc).__name__)
-                return None, not_sent(exc)
-        return None, True
+                return None, UNREACHED if not_sent(exc) else UNSURE
+        return None, UNREACHED
+
+
+#: How a post failed (`AdminBot.delivered`): the words of `monthend`'s warnings, which a test
+#: keeps equal (bot.py imports no planning module).
+REFUSED, UNREACHED, UNSURE = "refused", "unreached", "unsure"
 
 
 def backoff(failures: int) -> float:

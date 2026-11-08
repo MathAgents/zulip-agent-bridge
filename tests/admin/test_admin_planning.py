@@ -52,6 +52,7 @@ from .botkit import (
     TESS,
     TEST,
     TEST_CH,
+    audit_text,
     incoming,
     make_site,
     until,
@@ -112,7 +113,7 @@ def posts(site, by=None):
 
 
 def records(site, event=None):
-    text = site.audit.read_text() if site.audit.exists() else ""
+    text = audit_text(site.audit)
     rows = [json.loads(line) for line in text.splitlines()]
     return [r for r in rows if event is None or r["event"] == event]
 
@@ -1378,7 +1379,7 @@ async def test_a_refused_download_names_no_signed_link(site, server):
     plan = await request(server, f"!roster import [r.csv]({path})")
     assert plan.note == "the CSV could not be downloaded: HTTP 403"
     assert not any("temporary" in p["content"] for p in posts(site))
-    assert "temporary" not in _read(site.audit)
+    assert "temporary" not in audit_text(site.audit)
 
 
 async def test_one_status_per_workshop_at_once(site):

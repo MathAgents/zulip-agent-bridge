@@ -38,7 +38,15 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from zab.admin.config import SCOPE_KEY, Workshop
-from zab.admin.grammar import MAX_DISK_GB, SPECS, VERSION_RE, Command, Roster, Selection
+from zab.admin.grammar import (
+    MAX_DISK_GB,
+    SPECS,
+    VERSION_RE,
+    Command,
+    Roster,
+    Selection,
+    keep_until_end,
+)
 
 Argv = tuple[str, ...]
 #: How a verb's plan is hashed beyond its lists and inputs (§2.4's target-material table).
@@ -77,6 +85,7 @@ class Layout:
     fleet_key: str = "/var/lib/zab-admin/.ssh/id_ed25519.pub"  # its public half: key pairs
     config_request: str = "/var/lib/zab-admin-config/requests"  # to the config helper (§2.9)
     config_result: str = "/var/lib/zab-admin-config/result.json"  # the helper's outcome
+    upgrade: str = "/var/lib/zab-admin-upgrade"  # the upgrade helpers' requests/, results/ (#569)
 
 
 LAYOUT = Layout()
@@ -189,13 +198,15 @@ def _hhmm(ts: float) -> str:
 class Row:
     """A roster row as the scripts read it: its slug (`slug_of`), `ip` and `region` cells, and
     its `host` (`ws-<slug>` once launched), with which `launch.py` leaves a row alone;
-    `excluded`, its `excluded` cell set by `!roster remove` (#627)."""
+    `excluded`, its `excluded` cell set by `!roster remove` (#627); `keep_until`, its kept VM's
+    end as `!keep-until` wrote it (§11.5, #570)."""
 
     slug: str
     ip: str = ""
     region: str = ""
     host: str = ""
     excluded: bool = False
+    keep_until: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +404,7 @@ class _Job:
         ws = fleet.workshop
         self.command, self.fleet, self.layout, self.upload = command, fleet, layout, upload
         self.plan: str | None = None  # the plan's name, `P-n`, where a verb needs it (#627)
+        self.scheduled = False  # a month-end run's `!retire` (`build_run`, #570)
         self.slugs, self.spares = _targets(command, fleet)
         self.notes: list[str] = []
         self.ends: list[tuple[str, bool, bool, bool]] = []
@@ -777,6 +789,127 @@ def _build_grow_disk(j: _Job) -> tuple[Step, ...]:
     return (_dry(j.run("aws/grow_disk.py", j.roster, j.kh, j.tags, j.region, slug, size)),)
 
 
+#: How far ahead `!keep-until` may set a kept VM's end (ADMIN §11.5): a month, extended a few
+#: times, stays well within it, and a typo of the year doesn't.
+KEEP_UNTIL_DAYS = 366
+
+
+def _build_keep_until(j: _Job) -> tuple[Step, ...]:
+    """§11.5 (#570): each named row's `keep_until`, the end of its kept VM, written by
+    keep_until.py (`--set S=VALUE`, one per row); `none` clears it. An end must be in the
+    future, as the bot's clock read the fleet (`Fleet.read_at`), and at most `KEEP_UNTIL_DAYS`
+    ahead: checked at plan time and again at apply (`Planning.rebuild`), so a plan approved
+    after its end is STALE. A row a `!retire` ended has no VM left to keep: a date for it is
+    refused, and `none` clears it, which reaches no VM (review of #817, N3)."""
+    value = j.command.until
+    end = keep_until_end(value) if isinstance(value, str) else None
+    if value != "none" and end is None:
+        raise ActionError("expected a date like 2026-11-30, or none")
+    if end is not None:
+        now = j.fleet.read_at
+        if now is None:  # fail closed: the end can't be checked
+            raise ActionError("the bot's clock is not known: refused")
+        when = utc_words(end)
+        if end <= now:
+            raise ActionError(f"{when} has passed: give an end in the future")
+        if end > now + KEEP_UNTIL_DAYS * 86400:
+            raise ActionError(f"{when} is more than {KEEP_UNTIL_DAYS} days ahead: check the year")
+    gone = [s for s in j.slugs if not j.fleet.present(s)]
+    if gone and end is not None:
+        raise ActionError(
+            f"{_some(gone)} retired ({j.fleet.retired[gone[0]]}): its VM is gone, so there is "
+            "nothing to keep"
+        )
+    pairs = _cat(*(("--set", _value(f"{slug}={value}")) for slug in j.slugs))
+    if end is None:
+        j.notes.append(f"**Not kept until any date:** {_some(j.slugs)}.")
+    else:  # how each ends, from the month-end schedule in `state.db`: `Planning._kept` (#868)
+        j.notes.append(f"**Kept until {when}:** {_some(j.slugs)}.")
+    return (_dry(j.run("admin/keep_until.py", j.roster, pairs)),)
+
+
+def utc_words(ts: float) -> str:
+    """A time as the plans say it: `Monday, November 30, 2026, 15:00 UTC`."""
+    t = time.gmtime(ts)
+    return time.strftime(f"%A, %B {t.tm_mday}, %Y, %H:%M UTC", t)
+
+
+#: The schedule's verb (§11.5, #570): `zab.admin.monthend` keeps what its apply stores.
+MONTH_END = "month-end schedule"
+#: How the schedule's rows end, as its plan says (§11.5, #570).
+MONTH_END_HOW = (
+    "**At each end,** a run of the bot ends the row with these steps, under the workshop's "
+    "lock, and posts its result in this topic. A row it stops is ended by hand, with "
+    "`!retire`."
+)
+
+
+def _build_month_end(j: _Job) -> tuple[Step, ...]:
+    """§11.5 (#570): the workshop's schedule, every row in service with a `keep_until`
+    (`_targets`), each to end at its date with `!retire`'s steps.
+
+    Refused for a row whose end has passed by the bot's clock (`Fleet.read_at`), or is more than
+    `KEEP_UNTIL_DAYS` ahead, as `!keep-until` refuses it (a `!roster import` checks only its
+    form); and for one without an `ip`, which `!retire` takes only `unsynced`. The plan reads
+    the teardown's dry run of every row, which the hash covers with each row's VMs (`RETIRE`),
+    as `!retire`'s does, and `runner.vms_found` refuses a row as it does there: no VM found,
+    more than one, or VMs found by its address (or a `participant` tag in any case) other than
+    those tagged with its slug exactly. A single VM tagged with its slug but away from its
+    roster address is flagged in the plan, not refused (review of #824, N4). A recent
+    `!protect` doesn't hold the plan back, since it tears nothing down now."""
+    now = j.fleet.read_at
+    if now is None:  # fail closed: the ends can't be checked
+        raise ActionError("the bot's clock is not known: refused")
+    rows = {row.slug: row for row in j.fleet.rows}
+    ends = {slug: keep_until_end(rows[slug].keep_until) for slug in j.slugs}
+    bad = [slug for slug, end in ends.items() if end is None]
+    if bad:
+        raise ActionError(
+            f"{_some(bad)}: its keep_until is not a date like 2026-11-30: set it with !keep-until"
+        )
+    past = [slug for slug, end in ends.items() if end is not None and end <= now]
+    if past:
+        raise ActionError(
+            f"{_some(past)}: its keep_until has passed: `!retire {past[0]}` ends it, or "
+            "`!keep-until` gives it a later date"
+        )
+    # as `!keep-until`'s: an import checks only the form (review of #817, N1)
+    far = [slug for slug, end in ends.items() if end and end > now + KEEP_UNTIL_DAYS * 86400]
+    if far:
+        raise ActionError(
+            f"{_some(far)}: its keep_until is more than {KEEP_UNTIL_DAYS} days ahead: check "
+            "the year, and set it again with !keep-until"
+        )
+    never = [slug for slug in j.slugs if not rows[slug].ip]
+    if never:
+        raise ActionError(
+            f"{_some(never)}: no ip in the roster, so no VM to sync: `!retire {never[0]} "
+            f"unsynced` ends it, or `!keep-until none {never[0]}` leaves it out"
+        )
+    out = j.out[1]
+    j.notes.append(
+        f"**The month end** of {len(j.slugs)} rows, each at its own end, with `!retire`'s steps: "
+        "started, idle stop and the waker off, uninstalled, synced, protection off, then, 5 "
+        "minutes later, torn down, and its bots deactivated. A row stops at its first failure: "
+        "a row whose sync fails is not torn down."
+    )
+    for slug in j.slugs:
+        kinds = [k for k in BOT_KINDS if os.path.isfile(f"{out}/{slug}/{k}.zuliprc")]
+        bots = " and ".join(f"{k.capitalize()} · {slug}" for k in kinds) or "no bots"
+        j.notes.append(f"- {slug}: ends {utc_words(ends[slug] or 0)}; {bots}")
+    j.notes += [
+        "**What approving it approves:** these rows, their ends and those steps. Each run builds "
+        "its argument lists with the release then running, and checks its rows again first: a "
+        "row whose `keep_until`, VM or bots changed since, or that was retired or excluded, "
+        "drops out, and only a new `!month-end schedule` ends it. This replaces the workshop's "
+        "schedule, if it has one; `!month-end cancel` takes rows out of it at once.",
+        MONTH_END_HOW,
+    ]
+    head = j.run("aws/teardown.py", j.roster, j.tags, j.region, j.spares_file)
+    read = _cat(head, "--dry-run", _only(j.slugs))
+    return (Step(read, read, plan_only=True),)
+
+
 #: Why `!waker on` is refused without the workshop's alerts channel (§3, action 5).
 NO_ALERTS = "this workshop has no alerts_channel in admin.toml"
 
@@ -895,7 +1028,7 @@ def _build_retire(j: _Job) -> tuple[Step, ...]:
         raise ActionError("!retire names the rows that end, never `all` or the spares")
     ips = {row.slug: row.ip for row in j.fleet.rows}
     never = [s for s in j.slugs if not ips.get(s)]
-    if never and not unsynced:
+    if never and not unsynced and not j.scheduled:  # a run's resumed row: its teardown cleared it
         raise ActionError(
             f"{_some(never)} never launched, or torn down already (no ip in the roster): nothing "
             "to uninstall or sync; add `unsynced` to retire it (its bots, and any VM with its "
@@ -906,7 +1039,12 @@ def _build_retire(j: _Job) -> tuple[Step, ...]:
             f"`export` takes at most {EXPORT_ROWS} rows in one !retire (one VM's export may take "
             "55 minutes): retire the rows to export in plans of their own"
         )
-    if j.fleet.protection is not None and (why := j.fleet.protection.wait(j.fleet.read_at)):
+    # a month-end run waits that out instead (§11.5: its refusal is a wait)
+    if (
+        not j.scheduled
+        and j.fleet.protection is not None
+        and (why := j.fleet.protection.wait(j.fleet.read_at))
+    ):
         raise ActionError(why)
     out = j.out[1]
     # --roster and --spares-file: as `!teardown`'s (#604, #607)
@@ -944,6 +1082,7 @@ def _build_retire(j: _Job) -> tuple[Step, ...]:
     j.timeout = max(RETIRE_FLOOR_S, len(j.slugs) * RETIRE_ROW_S) + export * len(j.slugs) * (
         EXPORT_ROW_S
     )
+    j.timeout += PROTECT_SETTLE * j.scheduled  # a run's wait before its last teardown
     j.notes += _retire_notes(j, ips, unsynced=unsynced, export=export)
     return tuple(steps)
 
@@ -996,13 +1135,15 @@ REACH_VM = frozenset({"start", "stop", "rollout", "idle-stop", "uninstall", "fin
 
 #: What brings a retired row back into service (round 2 of #565): `launch.py` leaves a row alone
 #: whose `host` is recorded, and `adopt_spare.py` refuses one with a `host` or an `ip`. Its bots
-#: stay deactivated: Zulip reactivates a bot only for an organization administrator, and
-#: `!provision zulip` can't make new ones, whose e-mail addresses the old ones keep (#567).
+#: stay deactivated until their owner, or an organization administrator, reactivates them (Zulip's
+#: `can_admin_user`; #762), which no verb does, and `!provision zulip` can't make new ones, whose
+#: e-mail addresses the old ones keep (#567). Their owner is the provisioner, since
+#: `zulip_provision.py --deactivate` deactivates no other bot, so its key on the server does it.
 #: Seven retired rows of 32 characters still fit `planning.NOTE_CHARS`, as a STALE too.
 BACK = (
-    "To bring it back, a deployer clears its host and ip in the workshop's roster.csv, as "
-    "zab-admin on the server (ADMIN §3.3); then !launch or !adopt-spare it. Its bots stay "
-    "deactivated: only a Zulip organization administrator can reactivate them"
+    "To bring it back, a deployer, as zab-admin on the server, clears its host and ip in "
+    "roster.csv and reactivates its bots with the provisioner's key (only their owner or a Zulip "
+    "administrator can; ADMIN §3.3); then !launch or !adopt-spare it"
 )
 
 
@@ -1077,6 +1218,13 @@ VERBS: dict[str, Verb] = {
     # its target material, the row's VMs: one replaced between plan and apply is STALE; the
     # volume's size and modifications are read again by the script at apply
     "grow-disk": Verb(_build_grow_disk, TARGETS, region=True),
+    # §11.5 (#570): the roster is its input; exit 3 (`NOTHING`): no row changes, so no plan
+    "keep-until": Verb(_build_keep_until, INPUTS, nothing=True),
+    # §11.5 (#570): hashed as !retire's, on each row's VMs and the teardown's dry run, with the
+    # roster (so the ends) and the rows' bot keys among its inputs
+    MONTH_END: Verb(
+        _build_month_end, RETIRE, region=True, status=True, normalize=normalize_teardown
+    ),
     # Hashed on its dry run: the workshop's waker entry as it will be written (VMs, allowlists,
     # keys). push_waker.py --config-dir prints only this workshop's entry (§2.1).
     "waker": Verb(_build_waker, DRY_RUN, region=True, launched=True, normalize=normalize_dry_run),
@@ -1096,12 +1244,16 @@ VERBS: dict[str, Verb] = {
     # the server's (§2.9): `zab.admin.newworkshop` builds it, from admin.toml, with no fleet;
     # hashed on its dry run, which names the entry, the people and the region's setup
     "new-workshop": Verb(_server_verb, DRY_RUN, normalize=normalize_dry_run),
+    # #569, §1.6: `zab.admin.upgradeserver` builds it; hashed on its dry run whole, the plan
+    # helper's text (both tags, the reviewed SHA-256, the privileged diff), which names no time
+    "upgrade-server": Verb(_server_verb, DRY_RUN, normalize=normalize_exact),
 }
 #: The verbs that may name an excluded row (#627): the read, and the roster's own verbs.
 KEEP_EXCLUDED = frozenset({"status", "roster remove", "roster restore", "roster rename"})
 #: The verbs the bot answers itself, with no script (§2.2).
 BOT_VERBS = frozenset(
     {"help", "version", "plans", "plan", "audit", "console", "roster show", "approve", "reject"}
+    | {"month-end show", "month-end cancel"}  # the schedule's reading and its veto (#570)
 )
 #: Bare keywords → their fixed flags (§2.3).
 KEYWORD_FLAGS: dict[str, dict[str, Argv]] = {
@@ -1154,10 +1306,12 @@ def build(
     layout: Layout = LAYOUT,
     upload: str | None = None,
     plan: str | None = None,
+    scheduled: bool = False,
 ) -> Action:
     """The action for `command` against the bot's own `fleet`; `upload` is where the bot saved
     the CSV of `!roster import`; `plan`, the plan's name (`P-n`), for `!roster sync`'s file of
-    approved changes in `runs/P-n/`. Raises `ActionError` on anything but an exact mapping."""
+    approved changes in `runs/P-n/`; `scheduled`, a month-end run's `!retire` (`build_run`).
+    Raises `ActionError` on anything but an exact mapping."""
     name = command.verb if isinstance(command, Command) else None
     verb = VERBS.get(name) if isinstance(name, str) else None
     if verb is None or not isinstance(fleet, Fleet):
@@ -1170,7 +1324,7 @@ def build(
     if ("workshop", ws.name) not in ws.tags or SCOPE_KEY not in dict(ws.tags):
         raise ActionError("the workshop's scope lacks its workshop tag or the fleet's zab-scope")
     job = _Job(command, fleet, layout, upload)
-    job.plan = plan
+    job.plan, job.scheduled = plan, scheduled is True and name == "retire"
     # `!waker off` (`push_waker.py --remove`) makes no AWS call: `all` is every row, so that a
     # row whose `ip` was cleared still leaves the waker (review of #362)
     launched = verb.launched and not (name == "waker" and command.on is False)
@@ -1213,7 +1367,7 @@ def build(
     files = [ws.roster, *([upload] if upload else [])]
     if name.startswith("roster "):  # missing ones too: a file that appears makes it stale
         files += [layout.retired, *(other.roster for other in fleet.others or ())]
-    if name in ("deactivate-bots", "retire"):  # the bots' identities: a key made since is stale
+    if name in ("deactivate-bots", "retire", MONTH_END):  # the bots: a key made since is stale
         files += [f"{ws.out_dir}/{s}/{kind}.zuliprc" for s in job.slugs for kind in BOT_KINDS]
     files += [w for step in steps for w in step.argv if w.endswith((".whl", "/spares.json"))]
     return Action(
@@ -1230,6 +1384,16 @@ def build(
         ends=tuple(job.ends),
         timeout=job.timeout,
     )
+
+
+def build_run(fleet: Fleet, slugs: Sequence[str], *, layout: Layout = LAYOUT) -> Action:
+    """A month-end run's action (§11.5, #570): `!retire`'s steps for `slugs`, each argument list
+    built with the release running now. Without two of `!retire`'s refusals: a row without an
+    `ip` (one resumed past its teardown, which cleared it, #604), whose VM steps are done, and a
+    recent `!protect`, which the run waits out (§11.5: that refusal is a wait). Its apply
+    deadline has `PROTECT_SETTLE` more, for its wait before a teardown."""
+    command = Command("retire", selection=Selection(slugs=tuple(slugs)))
+    return build(command, fleet, layout=layout, scheduled=True)
 
 
 def digests(action: Action) -> dict[str, str]:
@@ -1286,6 +1450,14 @@ def _targets(command: Command, fleet: Fleet) -> tuple[Argv, Argv]:
     """The slugs and spares acted on, in roster and spares order, each one of this fleet's."""
     if command.verb in ("roster import", "roster sync"):
         return (), ()
+    if command.verb == MONTH_END:  # every row in service with an end (§11.5, #570)
+        kept = tuple(r.slug for r in fleet.rows if r.keep_until and fleet.in_all(r.slug))
+        if not kept:
+            raise ActionError(
+                "no row in service has a keep_until: give the kept rows their end with "
+                "!keep-until first"
+            )
+        return kept, ()
     if command.verb in ("roster remove", "roster restore", "roster rename"):
         if command.slug not in fleet.slugs:
             raise ActionError("a slug that is not in this workshop's roster: refused")

@@ -262,3 +262,11 @@ def test_turn_env_names_the_bot_or_removes_an_inherited_one():
     base = {"PATH": "/bin", "ZAB_BOT": "stale-bot"}
     assert turn_env("/x", base, bot="claude-alice")["ZAB_BOT"] == "claude-alice"
     assert "ZAB_BOT" not in turn_env("/x", base)
+
+
+def test_turn_env_names_the_session_or_removes_an_inherited_one():
+    """Issue #655: ZAB_SESSION tells `zab job` in the turn which session started a job."""
+    base = {"PATH": "/bin", "ZAB_SESSION": "the-bridges-own"}
+    env = turn_env("/x", base, bot="claude-alice", session="s-655")
+    assert env["ZAB_SESSION"] == "s-655" and env["ZAB_BOT"] == "claude-alice"
+    assert "ZAB_SESSION" not in turn_env("/x", base, bot="claude-alice")

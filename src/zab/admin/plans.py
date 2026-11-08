@@ -264,12 +264,20 @@ class PlanStore:
         """APPROVED → APPLYING if the apply begins within one TTL of the last approval, and
         `current`, the plan's `fingerprint` recomputed now, is the approved hash. Otherwise →
         EXPIRED or STALE, and the organizer requests again (§2.4, step 5)."""
+        if (late := self.late(plan_id)) is not None:
+            return late
         plan = self.need(plan_id)
-        if plan.state == APPROVED and self.clock() >= (plan.approved or 0) + self.ttl:
-            return self.move(plan_id, (APPROVED,), EXPIRED, "not applied within the TTL")
         if plan.state == APPROVED and current != plan.hash:
             return self.move(plan_id, (APPROVED,), STALE, f"hash now {current[:12]}")
         return self.move(plan_id, (APPROVED,), APPLYING)
+
+    def late(self, plan_id: int) -> Plan | None:
+        """An APPROVED plan whose apply hasn't begun within one TTL of its last approval →
+        EXPIRED, as `begin_apply` makes it; None for any other plan, left as it is."""
+        plan = self.need(plan_id)
+        if plan.state == APPROVED and self.clock() >= (plan.approved or 0) + self.ttl:
+            return self.move(plan_id, (APPROVED,), EXPIRED, "not applied within the TTL")
+        return None
 
     def finish(self, plan_id: int, ok: bool) -> Plan:
         return self.move(plan_id, (APPLYING,), DONE if ok is True else FAILED)

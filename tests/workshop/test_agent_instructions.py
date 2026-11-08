@@ -271,7 +271,7 @@ def test_the_agents_stay_visible_and_responsive_during_a_turn():
         # with no note between, 171 s of silence
         "Never make two waiting calls in a row without a note between them, even when little "
         "has changed.",
-        "with a progress note after every check",
+        "Write the note right after each check's result, before the next check",
         "Never end a turn waiting for a job, and never promise to report back later.",
         "continuing needs a new request",
         # item 4, for both agents
@@ -295,6 +295,38 @@ def test_the_agents_stay_visible_and_responsive_during_a_turn():
     assert "a long computation, a literature search" not in flat  # computations aren't delegated
     # the shell loop stays one code span on one line: a wrapped span would break it
     assert "\n    `for i in $(seq 5); do kill -0 $PID" in doc
+
+
+def test_the_agents_note_progress_while_a_subagent_runs():
+    """#668 (Drew, Nov 7: option 1 for both agents): while a background sub-agent runs, the
+    agent keeps reading its log and notes progress after every check. Claude Code's launch
+    message for a background agent says "You know nothing about its results until that
+    notification arrives — do not report, assume, or predict them" (the 2.1.283 fixture
+    `subagent_background.jsonl`), and with v0.2.11's text Claude went 130 s without a note
+    (DECISIONS, 2026-10-26): the text says that the warning is about findings, not progress."""
+    doc = (FILES / "agent-instructions.md").read_text()
+    section = " ".join(doc.split("## Sub-agents")[1].split("\n## ")[0].split())
+    for needle in (
+        "While it runs, keep checking on it as above, every 30 to 50 seconds until it is done.",
+        # the live check at 496b2f58: notes about 42 s apart, but two or three checks in a row
+        # without one (88 s and 127 s) in two topics of three
+        "Write the note right after each check's result, before the next check: never two "
+        "checks in a row without a note between them.",
+        "A note is one line: how long it has run and what its log shows.",
+        # #922's review, N6: a sub-agent has no PID for the `kill -0` loop
+        "Claude Code: check it with a bounded wait and its log's tail, for example "
+        "`for i in $(seq 4); do sleep 10; done; tail -n 5 sub.log`.",
+        "The message that starts a background sub-agent tells you not to report its results "
+        "until you are told that it has finished.",
+        "That is about its findings, not its progress: the notes are still due after every "
+        "check, and a status question still gets an answer.",
+        "Say what its log shows so far, and don't guess at what it will find.",
+    ):
+        assert needle in section, needle
+    # the loop stays one code span on one line
+    assert "\n    `for i in $(seq 4); do sleep 10; done; tail -n 5 sub.log`." in doc
+    fixture = FILES.parents[2] / "tests/fixtures/claude/2.1.283/subagent_background.jsonl"
+    assert "do not report, assume, or predict them" in fixture.read_text()  # what it answers
 
 
 def test_the_agents_write_times_as_zulip_times():

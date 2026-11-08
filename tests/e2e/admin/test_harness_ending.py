@@ -546,4 +546,4 @@ def test_the_launch_refusal_a9_matches_as_the_product_renders_it():
         action("!launch zab-test-r", retired)
     said = str(refused.value)
     assert "the roster keeps its host or ip" in said
-    assert "a deployer clears its host and ip in the workshop's roster.csv" in said
+    assert "clears its host and ip in roster.csv and reactivates its bots" in said

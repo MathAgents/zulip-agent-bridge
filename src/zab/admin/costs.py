@@ -10,11 +10,12 @@ What the collector sees of each VM, sampled every minute, is all it prices:
   until one is read, and where the role can't read it, 200 GB, `launch.py`'s root volume;
 - **its public IPv4 address,** an Elastic IP, held running or stopped, over the same time.
 
-Priced from `PRICES`, estimates of on-demand prices (VERIFY V13 checks them against the bill);
-the exact figure is AWS's (§11.2). §11.2 puts the table in admin.toml: that is a change of
-`config.py`, which is privileged (D32), so it is a constant here for now (#489). The table holds
-the regions in `REGIONS`; a workshop in any other region gets no dollars at all, and says so
-(`unpriced_region`), rather than US prices, which run low elsewhere (#499).
+Priced from `PRICES`, on-demand list prices (those compared with workshop fleets' bill matched
+it: VERIFY V13, at `REGIONS` below); the exact figure is AWS's (§11.2). §11.2 puts the table in
+admin.toml: that is a change of `config.py`, which is privileged (D32), so it is a constant here
+for now (#489). The table holds the regions in `REGIONS`; a workshop in any other region gets no
+dollars at all, and says so (`unpriced_region`), rather than US prices, which run low elsewhere
+(#499).
 
 - **This month:** the month to date, in UTC.
 - **Projected:** that, plus the hours left in the month at the VM's fixed cost and its type's
@@ -27,12 +28,12 @@ next start only.
 
 **What it doesn't see makes it err low:** a run the collector never saw (a start and a stop
 while it was down) is missing, and a run whose end it didn't see ends when it last saw the
-VM running. Otherwise it errs either way: the prices are estimates, and the volume is spread
-over a 730-hour month, where AWS prorates over the real one, so a whole month of it reads
-about 2% high in a 31-day month and 8% low in February (the review of #490). A volume grown
-(`!grow-disk`) is priced at its new size from the first read that shows it, so from up to
-`collector.VOLUME_EVERY` late; one grown before the collector first read it is priced at its
-new size from the VM's creation, high.
+VM running. Otherwise it errs either way: the prices are list prices, some not checked against
+a bill, and the volume is spread over a 730-hour month, where AWS prorates over the real one,
+so a whole month of it reads about 2% high in a 31-day month and 8% low in February (the review
+of #490). A volume grown (`!grow-disk`) is priced at its new size from the first read that
+shows it, so from up to `collector.VOLUME_EVERY` late; one grown before the collector first
+read it is priced at its new size from the VM's creation, high.
 """
 
 from __future__ import annotations
@@ -48,7 +49,12 @@ HOUR = 3600.0
 #: The regions `PRICES` holds. Their prices are the same: these instance prices, and gp3's
 #: below, as the price lists of AWS's EC2 and EBS pricing pages gave them on Oct 23, 2026
 #: (eu-west-1's, for comparison: about 10 to 12% higher, m7a 11.5%, and $0.088 a GB-month),
-#: and the address's, $0.005 an hour in every region. V13 checks them against the bill.
+#: and the address's, $0.005 an hour in every region; the EC2 page's list gave the same
+#: instance prices on Nov 7. VERIFY V13 (DECISIONS, 2026-11-07) compared these with workshop
+#: fleets' bill for October and Nov 1-6, 2026, and each one compared matched exactly:
+#: m7a.2xlarge (us-east-2, us-west-2), m7a.xlarge (us-west-2), gp3 (us-east-2, us-west-2) and
+#: the address, idle and in use (us-east-2, us-west-2). The lists' alone, as no VM of those
+#: fleets ran them: m7a.xlarge in us-east-2, the other types, and every us-east-1 price.
 REGIONS = ("us-east-1", "us-east-2", "us-west-2")
 #: On-demand Linux prices in USD an hour, for the fleet's types and the rig's, by (region, type).
 _PRICE = {

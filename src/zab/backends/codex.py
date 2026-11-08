@@ -27,6 +27,17 @@ from zab.core.reason import must_verify
 from zab.render.redact import redact_secrets
 
 PIN = "0.157.1"
+#: Why a thread another client loaded is refused (§5.5): its shells run in that client's
+#: environment. After a boot or wake, typically a terminal's `codex resume` that loaded it before
+#: the topic's next message (#632); the app-server unloads it once no client holds it and no turn
+#: runs. The loader may also be this bridge before a restart, which the check can't tell apart
+#: (an `!attach` soon after a restart, a thread loaded before #830: review of #854, N3).
+REFUSED = (
+    "Codex thread is already loaded with an unverified git identity, by another client such "
+    "as a terminal's codex, or by this bridge before it restarted: quit that client if any, "
+    "wait a minute after any turn there ends, then send !status or !attach again (or restart "
+    "the app-server when all its turns are idle)"
+)
 SOURCES = [
     "cli",
     "vscode",
@@ -71,6 +82,11 @@ SIDE_CONFIG = {"apps._default.enabled": False, "features.apps": False, "web_sear
 PROGRESS_ITEMS, PROGRESS_CHARS, PROGRESS_ITEM_CHARS = 50, 6000, 600
 #: How many pages of `mcpServerStatus/list` a side question reads; more left refuses it.
 SIDE_MCP_PAGES = 10
+#: `!stop` (#660): how long stopping a thread's sub-agents may take before the thread's own
+#: `turn/interrupt` goes out anyway, the page size of `thread/loaded/list` (#858), how deep
+#: below the thread the stop follows them, and how many threads it reads at a time.
+SUBAGENT_STOP_S, SUBAGENT_LIST_LIMIT, SUBAGENT_MAX_DEPTH = 10.0, 100, 8
+SUBAGENT_READS = 8
 DECISIONS = {
     t.ApprovalDecision.ACCEPT: "accept",
     t.ApprovalDecision.ACCEPT_FOR_SESSION: "acceptForSession",
@@ -107,6 +123,7 @@ class CodexBackend:
             rename=True,
             fork=True,  # thread/fork, verified on 0.157.1 (#202, DECISIONS 2026-10-10)
             side_question=True,  # `!btw`: an ephemeral thread/fork, one read-only turn (#716)
+            stop_subagents=True,  # `!stop` with no turn: the loaded threads, loads nothing
         )
         # `!btw` (#716): the messages of each side question's ephemeral thread, by thread id,
         # and the threads of the last ones answered, whose stragglers are dropped
@@ -130,6 +147,17 @@ class CodexBackend:
         self.pending_context: dict[str, str] = {}
         self.own_turns: set[tuple[str, str]] = set()
         self.starting: set[str] = set()
+        self.load_locks: dict[str, asyncio.Lock] = {}  # `_loading`
+        # The threads this connection sent `thread/resume` for, the identity check passed
+        # (#632): a load that failed after it, or was cancelled, is retried as the bridge's own.
+        # Also the threads it started or forked, which nothing else vouches for once `!attach`
+        # passes no record (#830). Each with the identity it sent (`identity_marker`).
+        self.resumed: dict[str, dict[str, str] | str] = {}
+        # The threads whose identity `_load` reported (`_announce`) in this process
+        self.announced: set[str] = set()
+        # The run of the app-server this connection reaches (`app_server_instance`, #830): a
+        # record of an applied identity vouches only for a load in this run
+        self.instance: str | None = None
         self.pending_requests: dict[str, list[dict[str, Any]]] = {}
         self.client_ids: set[str] = set()
         self.requests: dict[str, tuple[Any, str]] = {}
@@ -165,7 +193,10 @@ class CodexBackend:
                     "Connected: %s; home=%s", rpc.identity.get("userAgent", "Codex"), self.home
                 )
                 self.rpc = rpc
+                self.instance = rpc.instance
                 self.observed.clear()
+                self.resumed.clear()  # a new connection: whatever is loaded is checked again
+                self.mapper.reconnected()  # sub-agents' states: unknown now (#660)
                 self.catalog = ModelCatalog()
                 self.epoch = uuid4().hex
                 self.ready.set()
@@ -210,6 +241,8 @@ class CodexBackend:
                                 params["tokenUsage"],
                                 time.time(),
                             )
+                        elif message["method"] == "thread/closed":  # unloaded: no longer ours
+                            self.resumed.pop(message["params"]["threadId"], None)
                         for event in self.mapper.notification(
                             message["method"], message.get("params", {})
                         ):
@@ -368,8 +401,9 @@ class CodexBackend:
                 selected = self.catalog.find(value) if field == "model" else None
                 params[key] = selected["model"] if selected else value
         response = await self._call("thread/start", **params)
-        spec = remember_identity(spec)
+        spec = remember_identity(spec, self.instance)
         info = self._info(response["thread"], spec.settings)
+        self.resumed[info.native_id] = identity_marker(spec)  # loaded by this connection
         self.settings[info.native_id] = spec.settings
         self._remember_defaults(info.native_id, response, spec.settings)
         self.specs[info.native_id] = spec
@@ -378,6 +412,111 @@ class CodexBackend:
         return info
 
     async def open_session(self, native_id: str, spec: t.SessionSpec) -> t.SessionInfo:
+        """Reopen a session (SPEC §7.8.1, §8.4): `thread/resume` when the app-server holds the
+        thread loaded, as a turn still running across a bridge restart needs, at no new cost;
+        a thread it doesn't hold is only read, and loaded at its next use (#632). Each loaded
+        thread runs its own stdio MCP servers (on the VMs, a `lean-lsp-mcp` of about 54 MB),
+        and the app-server holds none after a boot or wake: resuming every session then loaded
+        one per Codex session the VM ever had.
+
+        Unloaded, `thread/read` says `notLoaded` and `thread/turns/list` reads the rollout,
+        both without loading it on 0.157.1, where a turn the app-server lost reads
+        `interrupted`: the snapshot a resume would give. The thread joins `mapper.closed`,
+        which `start_turn`, `fork_session`, `side_question` and `update_settings` load first
+        (`_load`). A read that fails, or a turn in progress (another client loaded it
+        meanwhile), resumes it now, as before."""
+        async with self._loading(native_id):
+            return await self._open(native_id, spec)
+
+    def _loading(self, native_id: str) -> asyncio.Lock:
+        """One open or load of a thread at a time (#632): a second one, such as a `!btw` while
+        the first turn after a wake loads the thread, would find it loaded by the first and,
+        were it still in `mapper.closed`, refuse it as another client's."""
+        return self.load_locks.setdefault(native_id, asyncio.Lock())
+
+    async def _load(self, native_id: str, spec: t.SessionSpec) -> None:
+        """At its next use, load a thread `open_session` read unloaded or the server closed,
+        then report the identity it is now loaded with (`_announce`), at once: whatever its
+        caller does next may fail (a refused `!effort`, a fork without a completed turn, a
+        `turn/start` error), and the thread's later uses load nothing, so nothing else would
+        report it (codex round 2 on #818). A settings change reports again after it."""
+        async with self._loading(native_id):
+            if native_id in self.mapper.closed:
+                await self._resume(native_id, spec)
+                self._announce(native_id, self.settings[native_id])
+
+    def _announce(self, native_id: str, settings: t.SessionSettings) -> None:
+        """`SessionChanged` with the session's settings, which the core persists: after the
+        bridge's own load, its `applied_git_identity` (§5.5), which the unloaded open didn't
+        record, so that a restart of the bridge alone trusts the thread the bridge loaded and
+        checks one another client loaded first (review of #818). Again after a settings change,
+        so that an announcement still queued never overwrites it with older settings."""
+        self.announced.add(native_id)
+        self.queue.put_nowait(t.SessionChanged(session_id=native_id, settings=settings))
+
+    async def _open(self, native_id: str, spec: t.SessionSpec) -> t.SessionInfo:
+        turns = None
+        try:
+            thread = (await self._call("thread/read", threadId=native_id, includeTurns=False))[
+                "thread"
+            ]
+            if (thread.get("status") or {}).get("type") == "notLoaded":
+                turns = await self._call(
+                    "thread/turns/list",
+                    threadId=native_id,
+                    limit=2,
+                    sortDirection="desc",
+                    itemsView="summary",
+                )
+        except RpcError:  # no rollout yet, …: resumed, as before
+            turns = None
+        if turns is None or any(turn["status"] == "inProgress" for turn in turns["data"]):
+            return await self._resume(native_id, spec)
+        # Its spec (owned turns, client ids) is the one `_load` resumes it with. No identity is
+        # recorded as applied (§5.5): whoever loads the thread first sets its environment, maybe
+        # a terminal's client, and a persisted record would vouch for that load after a restart
+        # of the bridge alone (review of #818). `_load` reports it once the bridge has loaded it.
+        extra = {k: v for k, v in spec.settings.extra.items() if k not in APPLIED}
+        spec = replace(spec, settings=replace(spec.settings, extra=extra))
+        info = self._info(thread, spec.settings)
+        self._listed(info, turns["data"])
+        self.mapper.active.pop(native_id, None)
+        # No defaults, pending settings or policy until a resume reports the resolved ones
+        # (`_remember_defaults` sets the defaults once): `thread/read` gives the persisted
+        # model and effort, or null "when unavailable" (codex round 1 on #818). They are shown
+        # meanwhile (`observed`, which every resume replaces); what is sent or validated is
+        # read only after the load (`start_turn`, `fork_session`, `side_question`,
+        # `update_settings`).
+        self.observed[native_id] = t.SessionSettings(
+            model=thread.get("model"), effort=thread.get("reasoningEffort")
+        )
+        self.settings[native_id] = spec.settings
+        self.specs[native_id] = spec
+        if spec.context_prompt:
+            self.pending_context[native_id] = spec.context_prompt
+        self.mapper.closed.add(native_id)
+        return info
+
+    @staticmethod
+    def _listed(info: t.SessionInfo, turns: list[dict[str, Any]]) -> None:
+        """The preview, and the running and last ended turns, from `thread/turns/list`."""
+        users = [
+            item
+            for turn in turns
+            for item in reversed(turn.get("items", []))
+            if item["type"] == "userMessage"
+        ]
+        if users:
+            info.preview = item_info(users[0]).text
+        for turn in turns:
+            if turn["status"] == "inProgress":
+                info.active_turn_id = turn["id"]
+            elif info.last_turn is None:
+                info.last_turn = turn_summary(turn)
+
+    async def _resume(self, native_id: str, spec: t.SessionSpec) -> t.SessionInfo:
+        """`thread/resume`, then the snapshot: the thread is loaded, and this connection gets
+        its events. Under `_loading`."""
         revision = self.mapper.revisions.get(native_id, 0)
         # Restore only proven bridge-owned turns before resume can replay approvals.
         self.own_turns.update(
@@ -386,33 +525,35 @@ class CodexBackend:
         self.client_ids.update(spec.settings.extra.get("client_ids", []))
         # Loaded threads ignore resume's shell_environment_policy on 0.157.1.
         # Never silently use a participant's identity or interrupt another client.
-        previous = self.specs.get(native_id)
-        known = (
-            previous is not None and previous.git_identity == spec.git_identity
-        ) or spec.settings.extra.get("applied_git_identity") == identity_marker(spec)
-        if not known:
+        # The config first: between the check and the resume only the resume's send is left,
+        # for another client to load the thread in (review of #818, N1).
+        config = await self._identity_config(spec)
+        if not self._vouched(native_id, spec):
             cursor = None
             while True:
                 page = await self._call("thread/loaded/list", cursor=cursor, limit=100)
                 if native_id in page["data"]:
                     # This thread only: the daemon is up, and its other threads reopen.
-                    raise t.SessionRefused(
-                        "Codex thread is already loaded with an unverified git identity; "
-                        "restart its app-server when all turns are idle, then retry"
-                    )
+                    raise t.SessionRefused(REFUSED)
                 cursor = page.get("nextCursor")
                 if not cursor:
                     break
-        params = {
-            "threadId": native_id,
-            "excludeTurns": True,
-            "config": await self._identity_config(spec),
-        }
+        params = {"threadId": native_id, "excludeTurns": True, "config": config}
         if spec.context_prompt:
             # Also install the bridge instructions when attaching a native CLI thread.
             params["developerInstructions"] = spec.context_prompt
-        response = await self._call("thread/resume", **params)
-        spec = remember_identity(spec)
+        held = self.resumed.get(native_id)
+        self.resumed[native_id] = identity_marker(spec)
+        try:
+            response = await self._call("thread/resume", **params)
+        except RpcError:
+            # refused: loaded by this connection only if it held it before (review of #854, N2)
+            if held is None:
+                self.resumed.pop(native_id, None)
+            else:
+                self.resumed[native_id] = held
+            raise
+        spec = remember_identity(spec, self.instance)
         info = self._info(response["thread"], spec.settings)
         turns = await self._call(
             "thread/turns/list",
@@ -421,19 +562,7 @@ class CodexBackend:
             sortDirection="desc",
             itemsView="summary",
         )
-        users = [
-            item
-            for turn in turns["data"]
-            for item in reversed(turn.get("items", []))
-            if item["type"] == "userMessage"
-        ]
-        if users:
-            info.preview = item_info(users[0]).text
-        for turn in turns["data"]:
-            if turn["status"] == "inProgress":
-                info.active_turn_id = turn["id"]
-            elif info.last_turn is None:
-                info.last_turn = turn_summary(turn)
+        self._listed(info, turns["data"])
         if self.mapper.revisions.get(native_id, 0) != revision:
             info.active_turn_id = self.mapper.active.get(native_id)
             # A turn whose completion the stream handled during this call, and which the list
@@ -465,6 +594,33 @@ class CodexBackend:
         self.mapper.closed.discard(native_id)
         return info
 
+    def _vouched(self, native_id: str, spec: t.SessionSpec) -> bool:
+        """Whether a load of the thread the app-server may hold is the bridge's own, with the
+        spec's identity (§5.5); if not, `_resume` checks it as an unknown one, refused when it
+        is loaded.
+
+        - A thread this connection started or forked, or resumed after the check, is loaded by
+          the bridge, also when the resume failed or was cancelled after it went out (review
+          of #818): retried with the identity it sent, never refused. With another one (a
+          bot of the same backend attaching it), it is checked, and refused.
+        - A thread this connection doesn't hold (opened unloaded, or closed by the server) may
+          have been loaded since by another client, in its own environment (#632).
+        - Otherwise the spec's record says what the bridge's load applied, and in which run of
+          the app-server (`applied_instance`). A record from an earlier boot or run of the
+          daemon, or from before #830, vouches for nothing: that run's loads are gone, and the
+          thread's first loader since may be a terminal's client (#830). Only the spec's record
+          counts, not one held from before: `!attach` passes none (§8.7), so a detached
+          session's thread is checked, whatever loaded it since the detach."""
+        if (applied := self.resumed.get(native_id)) is not None:
+            return applied == identity_marker(spec)
+        extra = spec.settings.extra
+        return (
+            native_id not in self.mapper.closed
+            and self.instance is not None
+            and extra.get("applied_instance") == self.instance
+            and extra.get("applied_git_identity") == identity_marker(spec)
+        )
+
     async def fork_session(self, native_id: str, spec: t.SessionSpec) -> t.SessionInfo:
         """An independent child thread through the parent's last ended turn (#202, SPEC §8.8).
 
@@ -482,8 +638,7 @@ class CodexBackend:
         parent = self.specs.get(native_id)
         if parent is None:
             raise ValueError("The session to fork from isn't open.")
-        if native_id in self.mapper.closed:
-            await self.open_session(native_id, parent)  # as start_turn would, with its own spec
+        await self._load(native_id, parent)  # as start_turn would, with its own spec
         listed = await self._call(
             "thread/turns/list",
             threadId=native_id,
@@ -526,9 +681,10 @@ class CodexBackend:
             if value := getattr(settings, field) or fallback.get(field):
                 params[key] = value
         response = await self._call("thread/fork", **params)
-        spec = remember_identity(replace(spec, settings=settings))
+        spec = remember_identity(replace(spec, settings=settings), self.instance)
         info = self._info(response["thread"], spec.settings)
         child = info.native_id
+        self.resumed[child] = identity_marker(spec)  # loaded by this connection
         self.settings[child] = spec.settings
         self._remember_defaults(child, response, spec.settings)
         self.specs[child] = spec
@@ -559,8 +715,7 @@ class CodexBackend:
         answered = False
         try:
             async with asyncio.timeout(timeout_s):
-                if native_id in self.mapper.closed:
-                    await self.open_session(native_id, parent)  # as its next turn would
+                await self._load(native_id, parent)  # as its next turn would
                 listed = await self._call(
                     "thread/turns/list",
                     threadId=native_id,
@@ -837,8 +992,8 @@ class CodexBackend:
         return parts
 
     async def start_turn(self, session_id: str, turn_input: t.UserInput) -> str:
-        if session_id in self.mapper.closed:
-            await self.open_session(session_id, self.specs[session_id])
+        if session_id in self.mapper.closed:  # opened unloaded, or closed since (#632)
+            await self._load(session_id, self.specs[session_id])
         settings = self.effective_settings(session_id) or self.settings[session_id]
         params = {
             k: v
@@ -889,8 +1044,244 @@ class CodexBackend:
             raise t.SteerRejected(str(exc)) from exc
 
     async def interrupt(self, session_id: str) -> None:
+        """Stop the thread's turn (§8.4) and its sub-agents' (#660 case 3): the thread's own
+        `turn/interrupt` doesn't reach them (codex-rs 0.157.1; DECISIONS, 2026-11-05).
+
+        The running sub-agents its events told of go first, so that their `turn/completed`
+        comes before the thread's, whose answer then doesn't call them running. Then the
+        thread's turn, if one runs, and in any case any further one the daemon's loaded
+        threads show running under it, which a bridge restart left untracked (#858): also
+        when the thread's turn ended meanwhile, or its interrupt is refused, which is raised
+        after that (Codex round 2 on #825). Each sub-agent step has `SUBAGENT_STOP_S`, and its
+        failure never holds back or fails the thread's own stop: it is logged, and a sub-agent
+        the events track that still runs is in the turn's answer, whose note says to send
+        `!stop` (#822; Codex round 1 on #851)."""
+        stopped: set[tuple[str, str]] = set()  # (thread, turn): a resumed one is stopped again
+        await self._stop_subagents(session_id, stopped, listed=False)
+        refused: Exception | None = None
         if tid := self.mapper.active.get(session_id):
-            await self._call("turn/interrupt", threadId=session_id, turnId=tid)
+            try:
+                await self._call("turn/interrupt", threadId=session_id, turnId=tid)
+            except Exception as exc:  # e.g. RpcError: the turn just ended
+                refused = exc
+        await self._stop_subagents(session_id, stopped, listed=True)
+        if refused is not None:
+            raise refused
+
+    async def stop_subagents(self, native_id: str) -> t.SubagentStop:
+        """`!stop` with no turn of the session running (#847): `interrupt`'s second pass
+        alone, which needs no loaded thread and loads none (the thread of a session reopened
+        unloaded stays so, #632), and no turn of the thread. The number of sub-agent turns
+        it interrupted. When any step failed (the daemon down, a read, a sub-agent's lookup or
+        its interrupt while its turn runs) or the tree goes past the cap, one may still run:
+        `unseen` with what it stopped, or `BackendUnavailable` if it stopped none (Codex round
+        1 on #851, round 2 on #861).
+
+        First the thread's own status, from `thread/read` with `includeTurns: false`, which
+        loads nothing (DECISIONS, 2026-11-05): `active` is a turn the core doesn't drive, such
+        as a terminal client's on a thread it loaded (§8.6), whose sub-agents are that turn's,
+        so nothing is stopped (`TurnElsewhere`; review of #851). That read has
+        `SUBAGENT_STOP_S`, as the walk does: a hung daemon never holds the session for the
+        call's own timeout (review round 2 of #851).
+
+        Live, `thread/list` lists no sub-agent thread (DECISIONS, 2026-11-05, #858): the
+        loaded threads, all read, hold every running sub-agent, one started before the
+        bridge's last restart included: `unseen` only when not all could be read."""
+        try:
+            async with asyncio.timeout(SUBAGENT_STOP_S):
+                thread = await self._call("thread/read", threadId=native_id, includeTurns=False)
+        except (RpcError, TimeoutError) as exc:
+            raise t.BackendUnavailable("Codex's thread could not be read") from exc
+        if ((thread.get("thread") or {}).get("status") or {}).get("type") == "active":
+            raise t.TurnElsewhere(native_id)
+        interrupted, complete = await self._stop_subagents(native_id, set(), listed=True)
+        if not complete and not interrupted:
+            raise t.BackendUnavailable("Codex's sub-agents could not all be stopped or checked")
+        # what it stopped, and that one may still run (Codex round 2 on #861)
+        return t.SubagentStop(len(interrupted), unseen=not complete)
+
+    async def _stop_subagents(
+        self, session_id: str, stopped: set[tuple[str, str]], *, listed: bool
+    ) -> tuple[list[str], bool]:
+        """Interrupt the running turn of each sub-agent of the thread, at any depth up to
+        `SUBAGENT_MAX_DEPTH`, unless `stopped` has that very turn: the thread runs on during
+        the first pass and can resume a sub-agent it stopped, with a new turn (Codex round 4
+        on #825). The tree is every spawn the threads' events reported
+        (`EventMapper.subagents`: an interrupt or a message names no sub-agent), and with
+        `listed` also the relations the daemon's loaded threads give (`_loaded_subagents`,
+        #858), whatever each one's state: a running grandchild can sit under an idle child
+        (Codex on #825). Activity matters only for the interrupt: a sub-agent the events show
+        running, or whose read says `active`, is asked for its turn in progress. A sub-agent
+        thread that is itself an open session, attached in another topic, is left to that
+        topic's `!stop`, and so is all below it
+        (review of #825). Its exec sessions run on: Codex ends them only when a thread shuts
+        down (DECISIONS, 2026-11-05). The sub-agent threads whose turn it interrupted, and
+        whether every step got through: a sub-agent whose turn couldn't be looked up, or whose
+        interrupt was refused while its turn runs, may run on (Codex round 1 on #851), and
+        each is logged."""
+        log = logging.getLogger(__name__)
+        interrupted: list[str] = []
+        try:
+            async with asyncio.timeout(SUBAGENT_STOP_S):
+                edges = {parent: list(kids) for parent, kids in self.mapper.subagents.items()}
+                active: set[str] = set()
+                pairs, complete = (
+                    await self._loaded_subagents(session_id, SUBAGENT_STOP_S / 2)
+                    if listed
+                    else ([], True)
+                )
+                for parent, child, busy in pairs:
+                    edges.setdefault(parent, []).append(child)
+                    if busy:
+                        active.add(child)
+                queue, visited = [(session_id, 0)], {session_id}
+                while queue:
+                    parent, depth = queue.pop(0)
+                    if depth >= SUBAGENT_MAX_DEPTH:
+                        if edges.get(parent):  # deeper than the cap: not walked (review of #861)
+                            complete = False
+                            log.warning("Sub-agents of %s: deeper than the cap", session_id)
+                        continue
+                    running = self.mapper.running_subagents(parent)
+                    for child in dict.fromkeys(edges.get(parent, [])):
+                        if child in visited:  # a cycle, or a child listed twice
+                            continue
+                        visited.add(child)
+                        if child in self.specs:  # another topic's session (`!attach`)
+                            continue
+                        queue.append((child, depth + 1))
+                        turn = self.mapper.active.get(child)
+                        try:
+                            if turn is None and (child in active or child in running):
+                                turn = await self._running_turn(child)
+                            if turn and (child, turn) not in stopped:
+                                stopped.add((child, turn))
+                                if await self._interrupted(child, turn):
+                                    interrupted.append(child)
+                        except RpcError as exc:
+                            complete = False
+                            log.warning(
+                                "Sub-agent %s of %s not stopped: %s",
+                                child,
+                                session_id,
+                                type(exc).__name__,
+                            )
+        except Exception as exc:  # deliberate breadth: never in the way of the thread's stop
+            log.warning("Sub-agents of %s not all stopped: %s", session_id, type(exc).__name__)
+            return interrupted, False
+        return interrupted, complete
+
+    async def _interrupted(self, thread_id: str, turn_id: str) -> bool:
+        """`turn/interrupt` for a sub-agent's turn: True once sent. A refusal is a turn that
+        just ended only if the thread's newest turn isn't in progress any more (False);
+        otherwise, or if that lookup fails, it is raised."""
+        try:
+            await self._call("turn/interrupt", threadId=thread_id, turnId=turn_id)
+        except RpcError:
+            if await self._running_turn(thread_id) is None:
+                return False
+            raise
+        return True
+
+    async def _loaded_subagents(
+        self, root: str, budget_s: float
+    ) -> tuple[list[tuple[str, str, bool]], bool]:
+        """Each loaded thread that is a sub-agent: `thread/loaded/list`, every page, then
+        `thread/read` of each (`includeTurns: false`, which loads nothing), whose
+        `parentThreadId` is set only on a sub-agent (the pinned schema). A running
+        sub-agent's turn keeps its thread loaded, so these hold every one the stop has to
+        reach, one no event of this connection told of included (after a bridge restart);
+        `thread/list` lists none (both 2026-11-05 rows of DECISIONS, #858). Its parent, its id,
+        and whether it is `active`. Only `parentThreadId` makes an edge: a thread's
+        `sessionId` is its whole tree's, beyond the topic's thread when that is itself a
+        sub-agent, and a thread without a parent is no sub-agent (Codex round 1 on #861).
+
+        An idle sub-agent between the root and a running one may be unloaded: its read gives
+        the next edge up, a level at a time, `SUBAGENT_MAX_DEPTH` levels at most; a chain
+        still going then makes the pass incomplete, as a failed read does (review of #861).
+        Reads go `SUBAGENT_READS` at a time. A topic's own session (`specs`) isn't read: the
+        walk leaves it, and what is below it, to its own `!stop`. Whether every read got
+        through within `budget_s`."""
+        pairs: list[tuple[str, str, bool]] = []
+        started, ids, failed = time.monotonic(), [], 0
+        gate = asyncio.Semaphore(SUBAGENT_READS)
+        # each thread as its read completes: past the budget, what was read still counts
+        # (Codex round 2 on #861), and the stop interrupts what it gives
+        threads: dict[str, dict[str, Any]] = {}
+
+        async def read(thread_id: str) -> None:
+            nonlocal failed
+            async with gate:
+                try:
+                    result = await self._call("thread/read", threadId=thread_id, includeTurns=False)
+                except RpcError:
+                    failed += 1
+                    return
+            threads[thread_id] = result["thread"]
+
+        try:
+            async with asyncio.timeout(budget_s):
+                cursor: str | None = None
+                cursors: set[str] = set()
+                while True:
+                    page = await self._call(
+                        "thread/loaded/list",
+                        limit=SUBAGENT_LIST_LIMIT,
+                        **({"cursor": cursor} if cursor else {}),
+                    )
+                    ids += page.get("data") or []
+                    cursor = page.get("nextCursor")
+                    if not cursor or cursor in cursors:
+                        break
+                    cursors.add(cursor)
+                fresh = [i for i in dict.fromkeys(ids) if i not in self.specs]
+                for _ in range(SUBAGENT_MAX_DEPTH + 1):  # the loaded ones, then their ancestors
+                    if not fresh:
+                        break
+                    await asyncio.gather(*map(read, fresh))
+                    fresh = list(
+                        dict.fromkeys(
+                            up
+                            for thread_id in fresh
+                            if (up := (threads.get(thread_id) or {}).get("parentThreadId"))
+                            and up != root
+                            and up not in threads
+                            and up not in self.specs
+                        )
+                    )
+                if fresh:  # a chain deeper than the cap: what is above it is unknown
+                    failed += 1
+        except (RpcError, TimeoutError) as exc:
+            logging.getLogger(__name__).warning(
+                "Loaded threads read in part (%d): %s", len(threads), type(exc).__name__
+            )
+            failed += 1
+        for thread_id, thread in list(threads.items()):
+            if parent := thread.get("parentThreadId"):
+                busy = (thread.get("status") or {}).get("type") == "active"
+                pairs.append((parent, thread_id, busy))
+        logging.getLogger(__name__).info(
+            "Loaded threads read: %d, %d sub-agents, %.2f s%s",
+            len(ids),
+            len(pairs),
+            time.monotonic() - started,
+            f", {failed} failed" if failed else "",
+            extra={"event": "subagent_loaded"},
+        )
+        return pairs, not failed
+
+    async def _running_turn(self, thread_id: str) -> str | None:
+        """The id of the thread's turn in progress, from its newest turn; RpcError if the
+        lookup fails, never taken for none running (Codex round 1 on #851)."""
+        result = await self._call(
+            "thread/turns/list",
+            threadId=thread_id,
+            limit=1,
+            sortDirection="desc",
+            itemsView="notLoaded",
+        )
+        turns = result.get("data") or []
+        return turns[0]["id"] if turns and turns[0].get("status") == "inProgress" else None
 
     async def respond(self, request_id: str, decision: t.ApprovalDecision) -> None:
         if not self.rpc or request_id not in self.requests:
@@ -961,6 +1352,26 @@ class CodexBackend:
     ) -> t.SessionSettings:
         if settings.sandbox:
             self._sandbox_policy(settings.sandbox)
+        field, value = self._changed(session_id, settings)
+        if (
+            session_id in self.mapper.closed
+            and session_id not in self.defaults
+            and session_id in self.specs
+        ):
+            # Opened unloaded and never resumed here (#632): a change, and a later reset to
+            # the session's own model or effort, are resolved against what a resume reports,
+            # as they were when every session was resumed at the start (codex round 1 on #818).
+            # A value Codex can't take is refused before that load, and a thread another client
+            # holds refuses an unmentioned command as quietly as a wrong value (§4.5; review of
+            # #818). The load reports the identity it applied whatever follows, and an accepted
+            # change is reported after that (codex round 2 on #818).
+            await self._precheck(field, value)
+            try:
+                await self._load(session_id, self.specs[session_id])
+            except t.SessionRefused as exc:
+                if must_verify.get():
+                    raise t.InvalidSetting(field, value, [], str(exc)) from exc
+                raise
         previous = self.settings.get(session_id, t.SessionSettings())
         current = self.effective_settings(session_id)
         default = self.defaults.get(session_id, t.SessionSettings())
@@ -973,9 +1384,6 @@ class CodexBackend:
             candidate = self.catalog.validate(candidate, previous, default)
         elif must_verify.get():
             # An unmentioned `!model`/`!effort` (#713): unverified, it may be Claude's value.
-            original = self.settings.get(session_id, t.SessionSettings())
-            field = "model" if settings.model != original.model else "effort"
-            value = settings.model if field == "model" else settings.effort
             raise t.InvalidSetting(field, value, [], "Codex's model list is unavailable.")
         accepted = replace(
             settings,
@@ -983,13 +1391,37 @@ class CodexBackend:
             effort=candidate.effort,
             extra=dict(settings.extra),
         )
-        if "applied_git_identity" in previous.extra:
-            accepted.extra["applied_git_identity"] = previous.extra["applied_git_identity"]
+        accepted.extra |= {k: previous.extra[k] for k in APPLIED if k in previous.extra}
         self.settings[session_id] = accepted
         self.settings_pending[session_id] = self.catalog.effective(candidate, default)
         if session_id in self.specs:
             self.specs[session_id] = replace(self.specs[session_id], settings=accepted)
+        if session_id in self.announced:  # after any announcement still queued (`_announce`)
+            self._announce(session_id, accepted)
         return accepted
+
+    def _changed(self, session_id: str, settings: t.SessionSettings) -> tuple[str, str | None]:
+        """The field a `!model` or `!effort` changes, and its new value."""
+        original = self.settings.get(session_id, t.SessionSettings())
+        field = "model" if settings.model != original.model else "effort"
+        return field, settings.model if field == "model" else settings.effort
+
+    async def _precheck(self, field: str, value: str | None) -> None:
+        """Before a `!model` or `!effort` loads its thread (review of #818): a value no model
+        of the catalog takes is refused, and so, for an unmentioned command (`must_verify`), is
+        one without a catalog, as `update_settings` refuses them after it. A reset passes."""
+        if value is None:
+            return
+        models = await self.catalog.load(self)
+        if models is None:
+            if must_verify.get():
+                raise t.InvalidSetting(field, value, [], "Codex's model list is unavailable.")
+            return
+        if field == "model" and self.catalog.find(value) is None:
+            raise t.InvalidSetting("model", value, sorted({m["model"] for m in models}))
+        efforts = {e["reasoningEffort"] for m in models for e in m["supportedReasoningEfforts"]}
+        if field == "effort" and value not in efforts:
+            raise t.InvalidSetting("effort", value, sorted(efforts))
 
     async def rename(self, session_id: str, name: str) -> None:
         await self._call("thread/name/set", threadId=session_id, name=name.removeprefix("✔ "))
@@ -1120,8 +1552,12 @@ class CodexBackend:
         return results
 
 
+#: The record of what the bridge's own load applied to a thread (§5.5): the identity, and the
+#: run of the app-server it was loaded in (#830).
+APPLIED = ("applied_git_identity", "applied_instance")
 GIT_KEYS = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")
 BOT_KEY = "ZAB_BOT"  # the session's bot, for `zab history` (issue #248)
+SESSION_KEY = "ZAB_SESSION"  # the session's id, for `zab job` (issue #655; SPEC §5.6)
 
 
 def identity_marker(spec: t.SessionSpec) -> dict[str, str] | str:
@@ -1129,15 +1565,12 @@ def identity_marker(spec: t.SessionSpec) -> dict[str, str] | str:
     return {"name": who.name, "email": who.email} if who else "off"
 
 
-def remember_identity(spec: t.SessionSpec) -> t.SessionSpec:
-    """Record only after start/resume succeeded; core persists returned settings."""
-    return replace(
-        spec,
-        settings=replace(
-            spec.settings,
-            extra=spec.settings.extra | {"applied_git_identity": identity_marker(spec)},
-        ),
-    )
+def remember_identity(spec: t.SessionSpec, instance: str | None = None) -> t.SessionSpec:
+    """Record only after start/resume succeeded; core persists returned settings. With the run
+    of the app-server that loaded the thread (`app_server_instance`, #830), the only one whose
+    load the record vouches for."""
+    record = {"applied_git_identity": identity_marker(spec), "applied_instance": instance}
+    return replace(spec, settings=replace(spec.settings, extra=spec.settings.extra | record))
 
 
 def identity_config(spec: t.SessionSpec, policy: dict | None = None) -> dict:
@@ -1149,15 +1582,18 @@ def identity_config(spec: t.SessionSpec, policy: dict | None = None) -> dict:
         values.update(zip(GIT_KEYS, (who.name, who.email, who.name, who.email), strict=True))
     if spec.bot:
         values[BOT_KEY] = spec.bot
-    # Explicit overrides apply after exclusions; off also strips inherited identity, and no
-    # bot strips an inherited ZAB_BOT. A thread that is already loaded keeps the environment
-    # it was loaded with (DECISIONS, 2026-10-11). Unlike an unknown git identity, that is not
-    # refused for ZAB_BOT: it only picks a default (any agent may pass `zab history --bot`),
-    # and without it `zab history` takes the only bot or asks for --bot, naming each bot's
-    # backend.
+    if spec.session:
+        values[SESSION_KEY] = spec.session
+    # Explicit overrides apply after exclusions; off also strips inherited identity, no bot
+    # strips an inherited ZAB_BOT, and no session an inherited ZAB_SESSION (#655). A thread
+    # that is already loaded keeps the environment it was loaded with (DECISIONS, 2026-10-11).
+    # Unlike an unknown git identity, that is not refused for ZAB_BOT: it only picks a default
+    # (any agent may pass `zab history --bot`), and without it `zab history` takes the only bot
+    # or asks for --bot, naming each bot's backend. Nor for ZAB_SESSION: the bridge checks a
+    # job's session itself, and a job with a stale one is unattached (SPEC §7.14).
     return {
         "shell_environment_policy.set": values,
         "shell_environment_policy.exclude": list(
-            dict.fromkeys([*(policy.get("exclude") or []), *GIT_KEYS, BOT_KEY])
+            dict.fromkeys([*(policy.get("exclude") or []), *GIT_KEYS, BOT_KEY, SESSION_KEY])
         ),
     }

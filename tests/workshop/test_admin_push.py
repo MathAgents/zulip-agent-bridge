@@ -137,7 +137,7 @@ def test_render_config_toml_round_trips_and_matches_the_profile(tmp_path):
     assert data["bridge"] == {
         "machine": "alice",
         "default_project": "~/work/thesis",
-        "max_concurrent_turns": 4,
+        "max_concurrent_turns": 10,  # per backend (#919, SPEC §7.10)
         "mention_after_s": 120,  # SPEC §4.8, the bridge's default unless the workshop's (#711)
         "default_workspace": "worktree",  # each topic its own worktree (issue #36, Mon 18:15)
         "allow_public_channels": True,  # public channels allowed (Drew, issue #36, Tue 06:30)
@@ -165,11 +165,22 @@ def test_render_config_toml_round_trips_and_matches_the_profile(tmp_path):
     cfg_path = tmp_path / "config.toml"
     cfg_path.write_text(text)
     cfg = load_config(cfg_path)
-    assert cfg.bridge.machine == "alice" and cfg.bridge.max_concurrent_turns == 4
+    assert cfg.bridge.machine == "alice" and cfg.bridge.max_concurrent_turns == 10
     home = pathlib.Path.home()
     assert cfg.bridge.service_path_prepend == [str(home / "venv/bin"), str(home / ".elan/bin")]
     assert cfg.bridge.service_env == {"VIRTUAL_ENV": str(home / "venv")}
     assert {b.name for b in cfg.bots} == {"codex", "claude"}
+
+
+def test_status_lists_every_turn_a_vm_may_run():
+    """`!status` cuts a VM's running turns at status.py's `MAX_ITEMS`, then planning's
+    `MAX_TURNS` (#919): both cover the turns push_config's VMs may run, the limit times the
+    bots' backends (one semaphore each, `Runtime.start`)."""
+    from zab.admin import planning
+
+    data = tomllib.loads(pc.render_config_toml({"github": "a", "repo": "a/b", "email": "a@x"}))
+    most = data["bridge"]["max_concurrent_turns"] * len({b["backend"] for b in data["bots"]})
+    assert most == 20 and st.MAX_ITEMS >= most and planning.MAX_TURNS >= most
 
 
 def test_render_config_requires_zulip_user_id():
@@ -221,9 +232,9 @@ def test_rollout_vm_sequence_and_quoting(out_dir, monkeypatch):
     remotes = runner.remotes(ALICE)
     # the VM's own record is read before anything else, then the staging directory
     assert remotes[0] == pc.OWNER_CMD and remotes[1] == pc.MKTEMP_CMD
-    # eleven files scp'd into the staging directory, in order, with the same pinned options:
-    # the tools list's two (#475) and the sage wrapper's two (#482) with the instructions, the
-    # warm-up's two (#461) after them
+    # twelve files scp'd into the staging directory, in order, with the same pinned options:
+    # the tools list's two (#475), the sage wrapper's two (#482) and the apt repair (#947) with
+    # the instructions, the warm-up's two (#461) after them
     scps = [c for c in runner.calls if c[0] == "scp"]
     assert [c[-1] for c in scps] == [
         f"ubuntu@{ALICE}:{STAGING}/{name}"
@@ -237,6 +248,7 @@ def test_rollout_vm_sequence_and_quoting(out_dir, monkeypatch):
             "tools-nt-agents-2026-v3.json",
             "sage_wrapper.py",
             "sage",
+            "apt_repair.py",
             "warm_cache.py",
             "zab-warm-cache.service",
         )
@@ -263,7 +275,8 @@ def test_rollout_vm_sequence_and_quoting(out_dir, monkeypatch):
         f"'cd / && {{ {pc.SENTINEL_OFF}; zab service install && systemctl --user restart "
         "zab.service || echo ---ZAB-SERVICE-FAILED; }; zab doctor --service-env --json'"
     )
-    assert scps[-3][-2] == str(pc.SAGE_WRAPPER) and pc.SAGE_WRAPPER.is_file()
+    assert scps[-4][-2] == str(pc.SAGE_WRAPPER) and pc.SAGE_WRAPPER.is_file()
+    assert scps[-3][-2] == str(pc.APT_SCRIPT) and pc.APT_SCRIPT.is_file()
     # the image's `sage` link replaced by the new images' wrapper, as agent, where it is that
     # link (#482): here the wrapper is there already
     assert remotes[5] == (
@@ -277,6 +290,8 @@ def test_rollout_vm_sequence_and_quoting(out_dir, monkeypatch):
         f"sudo /usr/bin/python3 {STAGING}/tools_list.py install "
         f"{STAGING}/tools-nt-agents-2026-v3.json --with sage-wrapper"
     )
+    # the image's expired Macaulay2 snapshot source, as root, by the uploaded script (#947)
+    assert remotes[7] == f"sudo /usr/bin/python3 {STAGING}/apt_repair.py"
     # last, the agents' instructions, spliced as agent by the uploaded script (PM on #36, Mon
     # 19:00; last since Mon 22:30, so that this file can never hold up the rest), their tools
     # section made from that list by the script beside it
@@ -289,13 +304,13 @@ def test_rollout_vm_sequence_and_quoting(out_dir, monkeypatch):
         f"if sudo test -L {packages}; then :; elif sudo test -d {packages}; "
         "then echo ---ZAB-LEAN-NOT-SHARED; else echo ---ZAB-NO-LEAN-WORKSPACE; fi; }"
     )
-    assert remotes[7] == (
+    assert remotes[8] == (
         f"sudo chmod 0644 {text} {script} {STAGING}/tools_list.py && sudo -u agent -H "
         "bash -lc " + shlex.quote(f"cd / && /usr/bin/python3 {script} {text}") + probe
     )
     # then the page-cache warm-up after each boot (#461), and staging is removed
-    assert remotes[8] == pc.warm_on_cmd(STAGING)
-    assert remotes[9] == f"rm -rf -- {STAGING}"
+    assert remotes[9] == pc.warm_on_cmd(STAGING)
+    assert remotes[10] == f"rm -rf -- {STAGING}"
     assert not result.notes  # the wrapper was there already: nothing to say
 
 
@@ -609,8 +624,9 @@ def test_main_dry_run_contacts_nothing(roster, out_dir, monkeypatch, capsys):
     assert [line for line in out.splitlines() if line.startswith("dry-run")] == [
         f"dry-run alice ({ALICE}): owner check; staging dir; idle-stop hold; scp config.toml "
         "alice/codex.zuliprc alice/claude.zuliprc agent-instructions.md agent_instructions.py "
-        "tools_list.py tools-nt-agents-2026-v3.json sage_wrapper.py sage; config installed; "
-        "zab installed; service install + doctor; sage wrapper; tools list; agent instructions; "
+        "tools_list.py tools-nt-agents-2026-v3.json sage_wrapper.py sage apt_repair.py; config "
+        "installed; zab installed; service install + doctor; sage wrapper; tools list; "
+        "apt source; agent instructions; "
         "scp warm_cache.py zab-warm-cache.service; warm-up on; staging removed; "
         "hold released"
     ]
@@ -1892,7 +1908,8 @@ def test_the_tools_list_is_installed_before_the_instructions(out_dir, answer, no
     assert result.ok
     remotes = runner.remotes(ALICE)
     step = remotes.index(pc.tools_cmd(STAGING, (pc.SAGE_FEATURE,)))
-    assert "agent_instructions.py" in remotes[step + 1]
+    assert remotes[step + 1] == pc.apt_cmd(STAGING)  # the apt source between (#947)
+    assert "agent_instructions.py" in remotes[step + 2]
     assert result.notes == ([answer.strip()] if note else [])
 
 
@@ -2827,7 +2844,8 @@ def test_the_sage_wrapper_goes_in_before_the_list_that_says_what_it_changes(out_
     sage = remotes.index(pc.sage_cmd(STAGING))
     assert remotes[sage + 1] == pc.tools_cmd(STAGING, ("sage-wrapper",))
     assert remotes[sage + 1].endswith(" --with sage-wrapper")
-    assert "agent_instructions.py" in remotes[sage + 2]
+    assert remotes[sage + 2] == pc.apt_cmd(STAGING)
+    assert "agent_instructions.py" in remotes[sage + 3]
     assert pc.SERVICE_INSTALL_CMD in remotes[:sage]  # after the release and its doctor
     # as agent, from the staging directory, every value quoted (CONTRIBUTING.md, rule 3)
     assert pc.sage_cmd(STAGING) == ac.remote_chain(

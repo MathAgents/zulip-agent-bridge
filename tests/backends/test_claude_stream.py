@@ -378,6 +378,12 @@ def test_classify_error_reset_time():
 ZKEY = "Q7xK" + "a1B2" * 7
 GHP = "ghp_" + "Z9y8X7w6" * 4 + "V5u4"
 PEM = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\n"
+#: What `str.strip` takes and the zuliprc rule's blanks (` `, tab) don't, ending no line (#666).
+STRIPPED = [
+    c
+    for c in map(chr, range(0x3001))
+    if c.isspace() and c not in " \t" and len(f"a{c}b".splitlines()) == 1
+]
 
 
 @pytest.mark.parametrize(
@@ -395,6 +401,16 @@ def test_an_error_is_redacted_before_it_is_cut(text, stderr, hidden):
     assert hidden not in message and len(message) <= 1000 and "[redacted" in message
 
 
+@pytest.mark.parametrize("blank", STRIPPED, ids=lambda c: f"U+{ord(c):04X}")
+def test_an_error_is_stripped_before_it_is_redacted(blank):
+    """#666: `.strip()` takes a blank that ends no line, so `key=<32>` and one is a whole
+    zuliprc line only once stripped; the result text and stderr are stripped first."""
+    line = "boom\nkey=" + ZKEY + blank
+    for text, stderr in ((line, ""), ("", line), ("", blank + "key=" + ZKEY + blank)):
+        message = cs.classify_error(None, text, stderr).message
+        assert ZKEY[:4] not in message and "[redacted zulip api key]" in message
+
+
 @pytest.mark.parametrize(
     ("stderr", "hidden"),
     [
@@ -402,6 +418,8 @@ def test_an_error_is_redacted_before_it_is_cut(text, stderr, hidden):
         ("starting\n" + PEM, "MIIEvQ"),  # the last line, a key's body without its BEGIN
         ("boom\nkey=" + ZKEY + "\n", ZKEY[:4]),  # a whole zuliprc line, the last one
         ("progress 10%\rkey=" + ZKEY, ZKEY[:4]),  # a line `splitlines` ends at a lone `\r`
+        # a whole line only once `.strip()` took the U+3000 (#666): the line's own redaction
+        *[("boom\nkey=" + ZKEY + blank, ZKEY[:4]) for blank in STRIPPED],
     ],
 )
 def test_an_exit_without_a_result_is_redacted_before_its_cut(stderr, hidden):
@@ -409,7 +427,8 @@ def test_an_exit_without_a_result_is_redacted_before_its_cut(stderr, hidden):
     line goes after `claude exited with code N without a result: `, so no whole-line rule
     matches it once there: on main a zuliprc key line showed whole (review of #663). A line
     `splitlines` ends at a lone carriage return, or another line end that `^` and `$` don't
-    know, is a whole line too."""
+    know, is a whole line too. So is one that `.strip()` makes whole after the redaction, which
+    the taken line's own redaction is for (#666)."""
     sid = "11111111-2222-4333-8444-555555555555"
     (done,) = [
         e for e in cs.StreamParser(sid, "t").finish(1, stderr) if isinstance(e, TurnCompleted)
@@ -941,3 +960,17 @@ def test_a_tool_title_is_redacted_before_it_is_put_on_one_line(sep):
     kind, title = cs.classify_tool("Bash", {"command": command})
     assert kind is ItemKind.COMMAND
     assert title == "cat > ~/.zuliprc <<'EOF' [api] [redacted zulip api key] EOF"
+
+
+@pytest.mark.parametrize("blank", STRIPPED, ids=lambda c: f"U+{ord(c):04X}")
+def test_a_title_is_redacted_again_once_its_blanks_are_spaces(blank):
+    """#666: one line's blanks are single spaces, which can make a zuliprc line, or a
+    `ZULIP_API_KEY =`, that the first redaction didn't see; the title is redacted again."""
+    for command in (
+        "key=" + ZKEY + blank,
+        f"key{blank}={blank}{ZKEY}",
+        f"export ZULIP_API_KEY{blank}={blank}{ZKEY}",
+        f"curl -u{blank}bot@x.y:{ZKEY} https://z/api",
+    ):
+        _kind, title = cs.classify_tool("Bash", {"command": command})
+        assert ZKEY[:4] not in title and "[redacted zulip api key]" in title

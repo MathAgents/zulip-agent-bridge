@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""`roster_import.py --roster R --input U [--dry-run] [--zuliprc PROV] [--org ORG] [--tag K=V…]
-[--region RG] [--retired FILE] [--workshop-roster WS=ROSTER…]` (ADMIN §3.1).
+"""`roster_import.py --roster R --input U [--dry-run] [--zuliprc PROV] [--org ORG] --tag K=V…
+--region RG [--retired FILE] [--workshop-roster WS=ROSTER…]` (ADMIN §3.1).
 
 Replaces the roster's participant rows (README.md §4) with an organizer's upload, the CSV of
 `!roster import`, and prints the diff the plan shows: rows added, changed column by column, and
@@ -61,6 +61,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from admin_common import (
     ROSTER_COLUMNS,
     check_duplicates,
+    keep_until_value,
     load_roster,
     load_zuliprc,
     read_roster,
@@ -82,10 +83,14 @@ from provision_repos import (
 )
 from zulip_provision import ZulipAdmin, _user_email, open_invitations, recorded_id
 
-#: What an organizer supplies (ORGANIZERS §3.1, ADMIN §3.1); `slug` is the key.
-INPUT_COLUMNS = ("slug", "first_name", "last_name", "email", "repo", "region", "notes", "github")
-#: Input columns the scripts write too: an empty cell keeps the recorded value.
-SHARED_COLUMNS = frozenset({"region", "repo", "github"})
+#: What an organizer supplies (ORGANIZERS §3.1, ADMIN §3.1); `slug` is the key. `keep_until`, a
+#: kept VM's end (ADMIN §11.5, #570), is `!keep-until`'s too.
+INPUT_COLUMNS = (
+    "slug", "first_name", "last_name", "email", "repo", "region", "notes", "github", "keep_until"
+)  # fmt: skip
+#: Input columns the scripts write too: an empty cell keeps the recorded value, so that an upload
+#: made before a column existed, or with it blank, never clears what a script recorded.
+SHARED_COLUMNS = frozenset({"region", "repo", "github", "keep_until"})
 #: Compared case-insensitively (`check_duplicates`, `zab.config.allowed_users`, GitHub logins).
 CASELESS_COLUMNS = frozenset({"email", "github"})
 #: Filled by the scripts (README.md §4): always the current roster's.
@@ -106,7 +111,7 @@ RESERVED_SLUGS = frozenset(
 _WORKSHOP_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 MAX_UPLOAD_BYTES = 1 << 20  # the bot downloads at most 1 MB (§3.1)
 NOTHING = 3  # a dry run that changes no row: the admin bot's `actions.NOTHING` (#708)
-_REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z]+)+-[0-9]{1,2}$")
+_REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z]+)++-[0-9]{1,2}$")
 REBIND = "a rebind (ADMIN §2.5), which a deployer does by hand until stage 3"
 #: Its holder, joining, would be subscribed to `<slug>-sandbox` (and, before the rollout, admitted
 #: by the VM's `allow_emails`): the invitation must go before the record of it does. The apply
@@ -127,7 +132,6 @@ REPOSITORY = (
     "removing or renaming it is refused (a new row with its slug would inherit its repository "
     "and the work in it); remove it by hand after teardown"
 )
-DEFAULT_REGION = "us-west-2"  # launch.py's: where a row without `region` gets its VM
 #: Every state but `terminated`: a stopped or half-launched VM still belongs to its slug.
 VM_STATES = ("pending", "running", "shutting-down", "stopping", "stopped")
 
@@ -294,6 +298,8 @@ def read_upload(path: str) -> tuple[list[dict[str, str]], frozenset[str], list[s
     for n, (row, cell) in enumerate(zip(parsed, cells, strict=True), start=1):
         if not any(row.get(c) for c in header):
             continue  # an empty line of a spreadsheet export
+        for column in INPUT_COLUMNS:  # `keep_until` is not one of every roster's columns
+            row.setdefault(column, "")
         slug = row["slug"]
         if not cell or cell != slug:
             raise ValueError(f"row {n}: no slug")
@@ -307,6 +313,14 @@ def read_upload(path: str) -> tuple[list[dict[str, str]], frozenset[str], list[s
             raise ValueError(f"{slug}: no e-mail (required, ORGANIZERS §3.1)")
         if row["region"] and not _REGION_RE.match(row["region"]):
             raise ValueError(f"{slug}: invalid region {row['region']!r}")
+        if row["keep_until"]:  # as `!keep-until` takes it, which also checks that it is ahead
+            value = keep_until_value(row["keep_until"])
+            if value is None:
+                raise ValueError(
+                    f"{slug}: keep_until {row['keep_until']!r} is not a date like 2026-11-30, "
+                    "or 2026-11-30T15:00 (UTC)"
+                )
+            row["keep_until"] = value
         # `@alice` or a profile URL, as organizers copy it: the login, as provision_repos.py
         # reads the Zulip field (#327)
         row["github"] = normalize_login(row["github"])
@@ -588,7 +602,7 @@ def plan_import(
     upload: list[dict[str, str]],
     columns: frozenset[str],
     checks: Checks,
-    region: str = DEFAULT_REGION,
+    region: str,
     taken: Mapping[str, str] | None = None,
     elsewhere: Mapping[str, str] | None = None,
 ) -> Import:
@@ -607,7 +621,8 @@ def plan_import(
                 imp.refusals.append(taken_refusal(slug, taken[slug]))
             row = {c: "" for c in ROSTER_COLUMNS}
             row.update({c: up[c] for c in INPUT_COLUMNS if c in columns})
-            imp.added.append((slug, [Change(c, "", row[c]) for c in INPUT_COLUMNS[1:] if row[c]]))
+            added = [Change(c, "", row[c]) for c in INPUT_COLUMNS[1:] if row.get(c)]
+            imp.added.append((slug, added))
             imp.rows.append(row)
             continue
         row = dict(old)
@@ -757,7 +772,7 @@ def main(argv: list[str] | None = None, *, checks: Checks | None = None) -> int:
     add_tag_argument(parser)
     parser.add_argument(
         "--region",
-        default=DEFAULT_REGION,
+        required=True,
         help="the workshop's region, the only one a row may name",
     )
     parser.add_argument("--retired", metavar="FILE", help="the server's retired-slugs.txt")

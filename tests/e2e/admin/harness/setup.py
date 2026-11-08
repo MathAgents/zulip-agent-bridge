@@ -13,7 +13,9 @@ there and a run that died part-way is completed by the next:
    commit's `deploy.sh`: `--bootstrap` the first time (after deleting an earlier server's key
    pairs), an upgrade after that, with the server's key pairs tagged with the rig's scope
    (#422) and the rig's admin.toml, allowed_signers and backup_recipients installed first if
-   the server's differ; then the test workshops' rosters
+   the server's differ. SSH must first answer steadily (`startup.steady_ssh`), and a deploy.sh
+   that could not connect runs again (#804): the run's *Start-up* lists each step. Then the
+   test workshops' rosters
    and `out/` emptied (each run starts from no roster: A2), and the release's fleet wheel placed
    with `deploy.sh --wheel` (A6's rollout).
 
@@ -35,11 +37,19 @@ from typing import Any
 from e2e.admin.harness import admin_toml
 from e2e.admin.harness.aws_rig import AwsRig
 from e2e.admin.harness.gate import Gate
-from e2e.admin.harness.release import Releases, ensure_keys, next_version, write_ssh
+from e2e.admin.harness.release import (
+    Deployed,
+    Releases,
+    connect_failed,
+    ensure_keys,
+    next_version,
+    write_ssh,
+)
 from e2e.admin.harness.rig import E2E, E2E2, SERVER_GROUP, SERVER_TAGS, AdminRig
 from e2e.admin.harness.server import Server
 from e2e.admin.harness.zulip_rig import ZulipIds, ZulipRig, private_dir, stage_secrets
 from e2e.harness.secret_files import label_of, read_secret
+from e2e.harness.startup import DEPLOY_PAUSES_S, Timeline, steady_ssh
 
 ETC_FILES = ("admin.toml", "allowed_signers", "backup_recipients")
 #: The secrets a later setup installs when they change: Q9's, placeholders until Drew's.
@@ -87,9 +97,12 @@ class Setup:
         zulip_clients: Any,  # () -> (zab-tester's client, zab-tester2's)
         server: Any = Server,  # (ip, rig) -> Server
         out: Path,
+        timeline: Timeline | None = None,
     ) -> None:
         self.rig, self.gate, self.aws, self.releases = rig, gate, aws, releases
         self.zulip_clients, self.make_server, self.out = zulip_clients, server, out
+        #: The server's start-up, for the report (#804)
+        self.timeline = timeline or Timeline()
 
     async def _zulip(self) -> tuple[ZulipIds, frozenset[str]]:
         tester, tester2 = self.zulip_clients()
@@ -126,7 +139,11 @@ class Setup:
             if not gate.dry_run:  # an earlier server's: never this one's
                 rig.host_key.unlink(missing_ok=True)
             inst = aws.launch_server(server_group)
+        if not gate.dry_run:
+            self.timeline.note(f"EC2 {inst['State']['Name']}")
         ip = aws.start(inst)
+        if not gate.dry_run:
+            self.timeline.note(f"EC2 running at {ip}")
         rigged = Rigged(commit, "", "", inst["InstanceId"], ip, image["ImageId"], groups)
         rigged.zulip, rigged.github_token = asdict(ids), real_token
         rigged.provisioner = real_provisioner
@@ -184,12 +201,8 @@ class Setup:
             gate.write("ssh: stop the bot, empty the test workshops' rosters and out/, start it")
             return
         server = self.make_server(rigged.ip, self.rig)
-        for _ in range(60):
-            if server.reachable():
-                break
-            self.aws.sleep(10)
-        else:
-            raise TimeoutError(f"no SSH to the server at {rigged.ip} after 10 minutes")
+        steady_ssh(server, rigged.ip, self.timeline, self.aws.sleep)  # #804, as #690
+        self._sweep(server)  # what an earlier run's deploy.sh left
         running = server.running()
         version = next_version(rel.base_version(commit), running)
         rel.ensure_repo()
@@ -199,11 +212,11 @@ class Setup:
         log = self.out / "deploy.log"
         if running is None:
             self.aws.drop_key_pairs()
-            done = rel.deploy(script, version, "--bootstrap", out=self.out, log=log)
+            done = self._deploy_sh(script, version, "--bootstrap", ip=rigged.ip, log=log)
         else:
             self.aws.scope_key_pairs()  # imported by an earlier bootstrap, maybe unscoped
             self._sync_etc(server)
-            done = rel.deploy(script, version, out=self.out, log=log)
+            done = self._deploy_sh(script, version, ip=rigged.ip, log=log)
         self._sync_secrets(server)
         rigged.deploys.append(f"{version}: {'ok' if done.ok else done.why()}")
         if not done.ok:
@@ -211,11 +224,40 @@ class Setup:
         server.bot("stop")
         server.reset_workshops()
         server.bot("start")
-        wheel = rel.deploy(script, version, "--wheel", out=self.out, log=log)
+        wheel = self._deploy_sh(script, version, "--wheel", ip=rigged.ip, log=log)
         rigged.deploys.append(f"{version} --wheel: {'ok' if wheel.ok else wheel.why()}")
         if not wheel.ok:
             raise RuntimeError(f"deploy.sh --wheel {version}: {wheel.why()} (log: {log})")
         rigged.wheel = f"zulip_agent_bridge-{version[1:]}-py3-none-any.whl"
+        self._sweep(server)  # what this run's tries that couldn't connect left
+
+    def _sweep(self, server: Server) -> None:
+        """deploy.sh's payload directories that a run which couldn't connect left in the
+        server's /tmp (`Server.sweep_deploy_dirs`), removed at the next connection that
+        succeeds: a bootstrap's holds the rig's etc/ and secrets/ (#804, review N2)."""
+        if gone := server.sweep_deploy_dirs():
+            self.timeline.note(f"removed what deploy.sh left: {' '.join(gone)}")
+
+    def _deploy_sh(self, script: Path, version: str, *flags: str, ip: str, log: Path) -> Deployed:
+        """deploy.sh, run again DEPLOY_PAUSES_S later when it failed only because it never
+        connected to the server (`release.connect_failed`): its `remote()` never retries a
+        connect, and in a run that never connected, no step of its server half ran (#804, as
+        #690 for push_config). Any other failure is returned at once. A run that copied its
+        payload before a connect failed may leave it in /tmp, which `_sweep` removes."""
+        pauses = list(DEPLOY_PAUSES_S)
+        while True:
+            began = self.timeline.mark()
+            done = self.releases.deploy(script, version, *flags, out=self.out, log=log)
+            cause = connect_failed(done.result, ip)
+            if not cause:
+                return done
+            then = f"deploy.sh again in {pauses[0]:g} s" if pauses else "no tries left"
+            took = self.timeline.clock() - began[0]
+            what = " ".join(["deploy.sh", *flags, version])
+            self.timeline.note(f"{what} failed after {took:.1f} s: {cause}; {then}", began)
+            if not pauses:
+                return done
+            self.aws.sleep(pauses.pop(0))
 
     def _sync_etc(self, server: Server) -> None:
         """The rig's trust files on the server, where they differ (a new AMI, a new key): the

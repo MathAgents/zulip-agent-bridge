@@ -15,6 +15,10 @@ workshop/adminserver
 src/zab/admin/confighelper.py
 src/zab/admin/config.py
 src/zab/admin/checks.py
+# #569: the root helpers of !upgrade-server (zab-admin-upgrade-plan.service and, with the apply,
+# zab-admin-upgrade.service), which take their requests through confighelper's `take`, load
+# admin.toml with config's loader, fetch with the deploy key and run deploy.sh as root.
+src/zab/admin/upgradehelper.py
 # D32: what `deploy.sh --wheel` builds with, pyproject.toml (which deploy.sh holds to hatchling's
 # own build) and the backend's pins, build-constraints.txt; and uv.lock, the third-party code of
 # the server's venv, which the bot (with the fleet key), the starter (with the role) and the

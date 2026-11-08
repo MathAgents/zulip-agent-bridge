@@ -50,6 +50,7 @@ def test_dm_help_identifies_supported_commands_then_shares_topic_help():
         "!vm",
         "!tools",
         "!restart",  # answered by `zab sentinel` (#204)
+        "!unmentioned",  # the VM's rule for a message without a mention (#878)
     }
     assert "`!restart codex`" in header and "if your bots stop answering" in header.lower()
     assert "only" in header and "other commands" in header

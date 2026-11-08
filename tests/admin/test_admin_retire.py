@@ -39,7 +39,7 @@ from zab.admin.fleet import ApplyEnd, Ledger, RowEnd, retire_rows
 from zab.admin.grammar import SPECS, Command, Rejected, parse
 from zab.admin.planning import NOTE_CHARS, Planning
 from zab.admin.plans import DONE, FAILED, PENDING, REFUSED, STALE, Requirement
-from zab.admin.runner import Runner, limit
+from zab.admin.runner import Runner, limit, stopped_row
 
 from .botkit import DREW, OLGA, OSCAR, ZULIP_ITALIC, make_site
 from .test_admin_actions import CONFIG, FLEET, OUT, PY, TAG, R, command, context
@@ -167,7 +167,9 @@ def test_the_protection_wait_refuses_it_as_a_teardown():
 
 
 def test_the_class_and_the_phrase():
-    assert approvals.DESTRUCTIVE_VERBS == {"teardown", "deactivate-bots", "retire"}
+    assert approvals.DESTRUCTIVE_VERBS == {
+        "teardown", "deactivate-bots", "retire", "month-end schedule"
+    }  # fmt: skip
     for message, phrase in [
         ("!retire bob", ("retire", "1")),
         ("!retire bob dave", ("retire", "2")),
@@ -288,7 +290,7 @@ def test_a_retired_row_named_is_refused_by_the_verbs_that_reach_its_vm(message, 
         assert make(message, retired, wheels).targets == ("bob",), message
         return
     why = r"^bob retired \(P-50 at 2026-10-29 14:02 UTC\): its VM is gone, .* To bring it back, "
-    why += "a deployer clears its host and ip"
+    why += "a deployer, as zab-admin on the server, clears its host and ip"
     with pytest.raises(ActionError, match=why):
         make(message, retired, wheels)
 
@@ -310,6 +312,10 @@ NAME_A_RETIRED_ROW = {
     "roster restore": "the roster only: its mark",
     "roster rename": "the roster only: refused for a row with anything provisioned",
     "new-workshop": "the server's: a new workshop has no row",
+    "upgrade-server": "the server's: an upgrade of the server names no row (#569)",
+    # #570: a kept VM's end, and the schedule of the rows in service
+    "keep-until": "the roster only: a date is refused by its own check, `none` clears it",
+    "month-end schedule": "names no row: it takes the rows in service (`actions._targets`)",
     "waker": "`off` only: `on` looks each VM up by its address (`actions._reaches_vm`)",
 }
 
@@ -339,7 +345,7 @@ def test_a_retired_row_comes_back_only_once_its_host_and_ip_are_cleared(message,
         why = (
             r"^bob retired \(P-50 at 2026-10-29 14:02 UTC\), and the roster keeps its host or "
             r"ip, so launch.py would leave it alone and adopt_spare.py refuse it. To bring it "
-            r"back, a deployer clears its host and ip in the workshop's roster.csv"
+            r"back, a deployer, as zab-admin on the server, clears its host and ip in roster.csv"
         )
         with pytest.raises(ActionError, match=why):
             make(message, kept, wheels)
@@ -352,7 +358,8 @@ def test_a_retired_row_comes_back_only_once_its_host_and_ip_are_cleared(message,
 
 
 def test_the_longest_refusals_of_retired_rows_fit_a_plans_note(wheels):
-    """#567: `BACK` says who runs the roster command and that the bots stay deactivated; the
+    """#567: `BACK` says who runs the roster command, and (#762) that the bots come back only
+    when their owner, the provisioner, or an organization administrator reactivates them; the
     refusal of more rows than `_some` names, with the longest slugs and plan ID, still fits
     `NOTE_CHARS` whole, as `Planning._apply`'s STALE too."""
     slugs = [str(n) * 32 for n in range(1, 8)]  # grammar.SLUG_RE's longest
@@ -365,8 +372,9 @@ def test_the_longest_refusals_of_retired_rows_fit_a_plans_note(wheels):
         note = f"it no longer builds: {refused.value}"
         assert "and 2 more retired" in note and note.endswith(BACK)
         assert len(note) <= NOTE_CHARS, len(note)
-    assert "as zab-admin on the server (ADMIN §3.3)" in BACK
-    assert "Its bots stay deactivated: only a Zulip organization administrator" in BACK
+    assert "a deployer, as zab-admin on the server, clears its host and ip" in BACK
+    assert "reactivates its bots with the provisioner's key (only their owner or a Zulip " in BACK
+    assert "administrator can; ADMIN §3.3); then !launch or !adopt-spare it" in BACK
 
 
 def test_all_leaves_the_retired_rows_out_and_they_never_count_in_the_fleet():
@@ -855,7 +863,153 @@ async def test_a_row_stopped_after_idle_stop_says_how_to_put_it_back(site, serve
     # no idle-stop minutes recorded: the rollout's default (#704), named, since the retire's
     # step turned bob's off on purpose, which the default leaves off
     assert ("  To put it back in service instead: `!waker on bob` (if it was opted in), then "
-            "`!rollout <release> bob idle-stop=60`.") in result  # fmt: skip
+            "`!rollout <release> bob idle-stop=60`. A participant who signed the VM out of Codex "
+            "and Claude (ORGANIZERS §5.2) then sends `!login` to both bots.") in result  # fmt: skip
+
+
+#: A `!retire … export` row's stages, in the order they run (`_build_retire`)
+EXPORT_STAGES = ("start", "idle-stop", "waker", "uninstall", "final-sync", "export", "protect",
+                 "teardown", "bots")  # fmt: skip
+
+
+def stopped(stage: str, *tolerated: str) -> dict[str, str]:
+    """A `!retire … export` row's cells, stopped at `stage`: `ok` before it, but the failures
+    `unsynced` tolerated, `not run` after."""
+    at = EXPORT_STAGES.index(stage)
+    return {
+        s: "failed: exit 1" if n == at or s in tolerated else "ok" if n < at else "not run"
+        for n, s in enumerate(EXPORT_STAGES)
+    }
+
+
+@pytest.mark.parametrize(
+    ("stage", "said"),
+    [
+        *((s, ["!retire bob export", "!retire bob export unsynced"])
+          for s in ("start", "idle-stop", "waker", "uninstall", "final-sync")),
+        ("export", ["!retire bob export", "!retire bob", "!retire bob export"]),
+        *((s, ["!retire bob", "!retire bob unsynced"]) for s in ("protect", "teardown", "bots")),
+    ],
+)  # fmt: skip
+def test_a_stopped_export_row_keeps_export_until_its_archive_is_in(stage, said):
+    """#820: a row of `!retire bob export` stopped at any step is sent again with `export`
+    while its export is still to come; after it, the archive is in, and `!retire bob` ends it.
+    The commands are the line's, in order."""
+    line = stopped_row(None, "bob", stopped(stage), frozenset({"export"}))
+    assert line.startswith(f"- bob stopped at {stage}")
+    assert re.findall(r"`(!retire [^`]*)`", line) == said
+
+
+def test_a_row_stopped_at_its_export_is_told_how_to_let_its_participant_fix_it():
+    """#820: stopped at its export, the row is uninstalled and its sync ran. The line says
+    how to end it without the archive, and how to put it back in service first, so that its
+    participant can change what the export refused (#802, ORGANIZERS §5.6), then retire it
+    with `export` again (`_put_back`: the waker, then a rollout that names idle stop)."""
+    cells = stopped("export") | {"export": "failed: exit 1"}
+    assert stopped_row(None, "bob", cells, frozenset({"export"})) == (
+        "- bob stopped at export (`failed: exit 1`): its VM runs, with idle stop off, the waker "
+        "off, its bridge uninstalled. Fix the cause, then send `!retire bob export` again, or "
+        "`!retire bob` to end it without the archive.\n"
+        "  If its participant must change what the export refused (ORGANIZERS §5.6), put it "
+        "back in service first: `!waker on bob` (if it was opted in), then `!rollout <release> "
+        "bob idle-stop=60`. A participant who signed the VM out of Codex and Claude (ORGANIZERS "
+        "§5.2) then sends `!login` to both bots, before an agent can change it. Then send "
+        "`!retire bob export` again."
+    )
+
+
+def test_a_gone_repository_keeps_export_in_the_way_to_end_it():
+    """#714's line, for a row of `!retire bob export` (#820): `unsynced` tears it down after its
+    export, which may take what the repository never got."""
+    cells = stopped("final-sync") | {"final-sync": f"failed: {runner_mod.GONE_CELL}"}
+    line = stopped_row(None, "bob", cells, frozenset({"export"}))
+    assert re.findall(r"`(!retire [^`]*)`", line) == ["!retire bob export unsynced"]
+    assert line.endswith("what wasn't pushed before the repository went, unless its export "
+                         "takes it.")  # fmt: skip
+
+
+def test_under_unsynced_the_row_stopped_where_it_stopped_and_keeps_its_options():
+    """#820: under `unsynced`, a failed sync and export are tolerated, and the row stops at its
+    protection. It stopped there, not at the first failure, and is sent again as it ran."""
+    cells = stopped("protect", "final-sync", "export")
+    assert runner_mod.stopped_at(cells) == "protect"
+    line = stopped_row(None, "bob", cells, frozenset({"export", "unsynced"}))
+    assert line.startswith("- bob stopped at protect (`failed: exit 1`): its VM runs, with ")
+    assert re.findall(r"`(!retire [^`]*)`", line) == ["!retire bob export unsynced"]
+
+
+async def test_a_retire_whose_export_fails_says_how_to_go_on(site, server):
+    """#820, through the bot: `!retire bob export` whose export fails stops at it, and the
+    line under the table keeps `export`, with the way back into service first."""
+    fake(site, "admin/collect_exports.py", 'print("bob: refused"); sys.exit(1)')
+    plan = await retire(server, "!retire bob export", "retire 1")
+    assert plan.state == FAILED and ran(site, "bob") == [*EVERY[:5], "admin/collect_exports.py"]
+    result = posts(site)[-1]
+    assert "; bob stopped at export." in result.split("\n", 1)[0]
+    assert ("- bob stopped at export (`failed: exit 1`): its VM runs, with idle stop off, the "
+            "waker off, its bridge uninstalled. Fix the cause, then send `!retire bob export` "
+            "again, or `!retire bob` to end it without the archive.") in result  # fmt: skip
+    assert "  If its participant must change what the export refused (ORGANIZERS §5.6), put" in (
+        result
+    )
+    login = "sends `!login` to both bots, before an agent can change it. Then send `!retire bob "
+    assert login + "export` again." in result
+
+
+def test_a_row_the_deadline_stopped_before_its_export_keeps_export():
+    """#827's review, B1: on a timeout the steps stop at once, so the row's cells end at the
+    one that timed out, with no `export` cell: whether the plan exports is the plan's."""
+    cells = {s: "ok" for s in EXPORT_STAGES[:4]} | {"final-sync": "failed: timed out"}
+    line = stopped_row(None, "bob", cells, frozenset({"export"}))
+    assert line.startswith("- bob stopped at final-sync (`failed: timed out`): its VM runs, ")
+    assert re.findall(r"`(!retire [^`]*)`", line) == ["!retire bob export",
+                                                     "!retire bob export unsynced"]  # fmt: skip
+    assert stopped_row(None, "bob", cells).count("export") == 0  # a plan without it
+
+
+@pytest.mark.parametrize(
+    ("stage", "rollout"), [("waker", False), ("uninstall", False), ("final-sync", True)]
+)
+def test_every_way_back_says_to_sign_in_again(stage, rollout):
+    """#827's review, N1, and #808: the participants sign their VM out before the `!retire`
+    (ORGANIZERS §5.2), whether or not it then uninstalled the bridge, so every way back into
+    service ends with `!login` to both bots: a rollout's after the uninstall, the waker's and
+    idle stop's before it."""
+    line = stopped_row(None, "bob", stopped(stage), frozenset({"export"}))
+    back = line.split("\n")[1]
+    assert back.startswith("  To put it back in service instead: ")
+    assert back.endswith("sends `!login` to both bots.") and ("!rollout" in back) is rollout
+
+
+@pytest.mark.parametrize("stage", ["teardown", "bots"])
+def test_a_row_whose_vm_may_be_gone_is_sent_again_with_its_plans_words(stage):
+    """#827's review, N3: under `unsynced`, the row is sent again with it, and the `unsynced`
+    alternative is not offered twice."""
+    line = stopped_row(None, "bob", stopped(stage), frozenset({"export", "unsynced"}))
+    assert (
+        line == f"- bob stopped at {stage}: its VM may be gone. Send `!retire bob unsynced` again."
+    )
+    line = stopped_row(None, "bob", stopped(stage), frozenset({"export"}))
+    assert re.findall(r"`(!retire [^`]*)`", line) == ["!retire bob", "!retire bob unsynced"]
+
+
+async def test_the_deadline_before_an_export_keeps_export_in_the_advice(site, server, monkeypatch):
+    """#827's review, B1, through the bot: `!retire bob export` whose sync hangs until the
+    apply's deadline is sent again with `export`."""
+    from zab.admin import actions
+
+    monkeypatch.setattr(actions, "RETIRE_FLOOR_S", 3.0)
+    monkeypatch.setattr(actions, "RETIRE_ROW_S", 1.0)
+    monkeypatch.setattr(actions, "EXPORT_ROW_S", 0.0)
+    fake(site, "admin/final_sync.py", "time.sleep(30)")
+    plan = await retire(server, "!retire bob export", "retire 1")
+    assert plan.state == FAILED
+    assert "admin/collect_exports.py" not in ran(site, "bob")
+    result = posts(site)[-1]
+    assert ("- bob stopped at final-sync (`failed: timed out`): its VM runs, with idle stop "
+            "off, the waker off, its bridge uninstalled. Fix the cause, then send `!retire bob "
+            "export` again, or `!retire bob export unsynced` to tear it down with its "
+            "work.") in result  # fmt: skip
 
 
 async def test_the_deadline_in_a_row_stops_every_row_after_it(site, server, monkeypatch):
@@ -922,7 +1076,8 @@ async def test_each_step_names_its_row_in_the_output_and_the_record(site, server
     """N7: `apply.txt` frames each run with its row, and `apply_end`'s steps name it."""
     plan = await retire(server, "!retire alice", "retire 1")
     end = records(site, "apply_end")[-1]
-    assert end["steps"][0] == {"script": "aws/power.py", "exit": 0, "ended": ""}  # the prelude
+    prelude = {k: v for k, v in end["steps"][0].items() if k not in ("at", "s")}  # times: #570
+    assert prelude == {"script": "aws/power.py", "exit": 0, "ended": ""}  # the prelude
     assert {s.get("row") for s in end["steps"][1:]} == {"alice"}
     saved = (Path(site.paths.state) / end["output"]).read_text()
     assert "── aws/teardown.py for alice\n" in saved
@@ -993,3 +1148,477 @@ async def test_status_all_with_every_row_retired_says_so(site, server):
     answer = posts(site)[-1]
     assert answer.startswith("Every row is retired: nothing to read.\n\n*Retired, so left out: ")
     assert all(f"{r} (P-" in answer for r in ("alice", "bob", "carol"))
+
+
+# ---------------------------------------------- #837: each retire step on the audit log
+
+#: A `!retire`'s row's chain, without `export`.
+STAGES = ("start", "idle-stop", "waker", "uninstall", "final-sync", "protect", "teardown", "bots")
+
+
+def started(site):
+    """A server of `site`, as a restart makes one."""
+    srv = site.server()
+
+    def found(fleet_, names):
+        return {n: site.vms[n] for n in names if n in site.vms}
+
+    srv.planner = Planning(Runner(srv, vms=found, tagged=found))
+    return srv
+
+
+def held(site, script: str, slug: str) -> None:
+    """`script`, as the site fakes it, held for a minute for `slug` (not its dry run)."""
+    import textwrap
+
+    body = textwrap.dedent(FAKES[script]).format(prot=str(site.tmp / "protected"))
+    hold = f'if not DRY and "{slug}" in sys.argv:\n    time.sleep(60)  # cut here\n'
+    fake(site, script, hold + body)
+
+
+async def until_running(site, slug: str, script: str) -> None:
+    import asyncio
+
+    for _ in range(600):
+        if script in ran(site, slug):
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"{script} never ran for {slug}: {ran(site, slug)}")
+
+
+async def cut_by_hand(srv, rows: dict[str, int], command: str):
+    """A `!retire` as a restart leaves it, its records by hand as the runner writes them: its
+    `apply_start` with its rows' chains, then each row's first `rows[row]` steps, `ok`."""
+    from zab.admin.plans import APPLYING
+
+    plan = await request(srv, command, mid=5000)
+    srv.store.move(plan.id, (PENDING,), APPLYING)
+    head = dict(workshop="harvard-2026", plan=plan.name, bot=plan.bot, verb="retire")
+    await srv.audit("apply_start", **head, args=list(rows), hash="", targets=list(rows),
+                    chains={row: list(STAGES) for row in rows})  # fmt: skip
+    for row, n in rows.items():
+        for stage in STAGES[:n]:
+            await srv.audit("retire_step", **head, row=row, stage=stage, cell="ok")
+    return plan
+
+
+async def test_a_hard_stop_mid_retire_keeps_what_its_rows_did(site, monkeypatch):
+    """#837: `!retire alice bob` cut by a hard stop after alice's bots and bob's protection
+    off, while bob's teardown runs: its `apply_end` is never written (the process killed:
+    `Runner._end` never runs). Each step was on the audit log as it ended (`retire_step`):
+    the ledger has alice retired and bob uninstalled and synced, from those records, in this
+    process and read back at each start; and the message at the next start says what was
+    done to each row and what is left, from the same records."""
+    held(site, "aws/teardown.py", "bob")
+
+    async def killed(self, *args, **kwargs):  # the process gone: no `apply_end`, no result
+        return False
+
+    srv = started(site)
+    await srv.start()
+    try:
+        plan = await request(srv, "!retire alice bob", mid=5000)
+        assert plan.state == PENDING, plan.note
+        monkeypatch.setattr(Runner, "_end", killed)
+        await approve(srv, plan, sender=DREW, phrase="retire 2", mid=LATE + 5000)
+        await until_running(site, "bob", "aws/teardown.py")
+        state = srv.ledger.workshop("harvard-2026")
+        assert "alice" in state.retired and state.ending()["bob"].counts  # in place, at once
+    finally:
+        await srv.close()
+    monkeypatch.undo()
+    assert not [r for r in records(site, "apply_end") if r["plan"] == plan.name]
+    steps = [(r["row"], r["stage"], r["cell"]) for r in records(site, "retire_step")]
+    assert steps == [("alice", s, "ok") for s in STAGES] + [("bob", s, "ok") for s in STAGES[:6]]
+    for _ in range(2):  # the next start, then one after it: the same, said once
+        srv = started(site)
+        await srv.start()
+        try:
+            state = srv.ledger.workshop("harvard-2026")
+            assert "alice" in state.retired and "bob" not in state.retired
+            assert state.ending()["bob"].counts  # his sync, from his own steps
+            said = [p for p in posts(site) if p.startswith(f"⏹ {plan.name} was interrupted")]
+            assert len(said) == 1, said
+            assert "- alice: retired, every step done." in said[0], said[0]
+            assert (
+                "- bob: done start, idle-stop, waker, uninstall, final-sync, protect; not done "
+                "teardown, bots. Its VM may be gone: send `!retire bob` again; if its plan "
+                "finds no VM, `!retire bob unsynced`."
+            ) in said[0], said[0]
+        finally:
+            await srv.close()
+    assert len([r for r in records(site, "interrupted") if r["plan"] == plan.name]) == 1
+
+
+async def test_a_stop_of_the_service_after_a_teardown_says_what_ends_the_bots(site, monkeypatch):
+    """Codex round 4 on #849: a stop of the service (its `apply_end` written, `interrupted`)
+    after bob's teardown, while his bots step runs. At the next start the message gives
+    `!retire bob unsynced`, his VM being gone, and the ledger has him uninstalled and synced,
+    not retired."""
+    held(site, "admin/zulip_provision.py", "bob")
+    srv = started(site)
+    await srv.start()
+    try:
+        plan = await request(srv, "!retire bob", mid=5000)
+        await approve(srv, plan, sender=DREW, phrase="retire 1", mid=LATE + 5000)
+        await until_running(site, "bob", "admin/zulip_provision.py")
+    finally:
+        await srv.close()  # as `systemctl stop`: the run writes its `apply_end`
+    (end,) = [r for r in records(site, "apply_end") if r["plan"] == plan.name]
+    assert end["outcome"] == "interrupted"
+    srv = started(site)
+    await srv.start()
+    try:
+        state = srv.ledger.workshop("harvard-2026")
+        assert "bob" not in state.retired and state.ending()["bob"].counts
+        said = next(p for p in posts(site) if p.startswith(f"⏹ {plan.name} was interrupted"))
+        assert (
+            "- bob: done start, idle-stop, waker, uninstall, final-sync, protect, teardown; not "
+            "done bots. Its VM is gone: `!retire bob unsynced` ends its bots."
+        ) in said, said
+    finally:
+        await srv.close()
+
+
+def test_an_interrupted_retire_says_what_is_left_of_each_row():
+    """#837's message: a row retired; one whose teardown ran, its VM gone, for `!retire …
+    unsynced`; one stopped before it, for the same `!retire` again, with the plan's words; one
+    cut or failed at its teardown, whose VM may be gone, after a failure `unsynced` tolerated
+    too; one retired `unsynced` after a failed sync, as the result says it; one with no VM
+    found; and one whose archive is in, sent again without `export` (#820)."""
+    from types import SimpleNamespace
+
+    def end(cells, retired=False):
+        return RowEnd(tuple(cells.items()), retired)
+
+    def chain(stages, *done, **cells):
+        out = {s: "ok" if s in done else "not run" for s in stages}
+        return out | {s.replace("_", "-"): c for s, c in cells.items()}
+
+    ends = {
+        "alice": end(dict.fromkeys(STAGES, "ok"), True),
+        "bob": end(chain(STAGES, *STAGES[:7])),
+        "carol": end(chain(STAGES, *STAGES[:2])),
+        "dave": end(chain(STAGES, *STAGES[:6], teardown="failed: exit 1")),
+        "erin": end({**dict.fromkeys(STAGES, "ok"), "final-sync": "failed: exit 1"}, True),
+        "frank": end(chain(STAGES, *STAGES[:4], "protect", final_sync="failed: exit 1")),
+        "gail": end(chain(STAGES, start="failed: no VM")),
+        "hank": end(chain(EXPORT_STAGES, *EXPORT_STAGES[:6])),
+    }
+    said = Planning._left(SimpleNamespace(command="!retire alice bob carol export"), ends)
+    assert said.splitlines() == [
+        "What it did to each row:",
+        "- alice: retired, every step done.",
+        "- bob: done start, idle-stop, waker, uninstall, final-sync, protect, teardown; not done "
+        "bots. Its VM is gone: `!retire bob unsynced` ends its bots.",
+        "- carol: done start, idle-stop; not done waker, uninstall, final-sync, protect, "
+        "teardown, bots. Its VM is as those steps left it: send `!retire carol export` again.",
+        "- dave: done start, idle-stop, waker, uninstall, final-sync, protect; failed teardown; "
+        "not done bots. Its VM may be gone: send `!retire dave export` again; if its plan finds "
+        "no VM, `!retire dave unsynced`.",
+        "- erin: retired, torn down unsynced (final-sync failed).",
+        "- frank: done start, idle-stop, waker, uninstall, protect; failed final-sync; not done "
+        "teardown, bots. Its VM may be gone: send `!retire frank export` again; if its plan "
+        "finds no VM, `!retire frank unsynced`.",
+        "- gail: done nothing; failed start; not done idle-stop, waker, uninstall, final-sync, "
+        "protect, teardown, bots. Its VM may be gone: send `!retire gail export` again; if "
+        "its plan finds no VM, `!retire gail unsynced`.",
+        "- hank: done start, idle-stop, waker, uninstall, final-sync, export; not done protect, "
+        "teardown, bots. Its VM is as those steps left it: send `!retire hank` again.",
+    ]
+
+
+async def test_a_cut_retire_whose_interrupted_record_fails_is_right_in_the_ledger(
+    site, monkeypatch
+):
+    """Codex round 1 on #849, against this design: the `interrupted` record of a cut `!retire`
+    fails at the start that marks it. Its rows' facts are on the log already, its steps' own:
+    alice is retired there and at the next start, and the message is posted once, at the
+    first."""
+    srv = started(site)
+    await srv.start()
+    try:
+        plan = await cut_by_hand(srv, {"alice": 8, "bob": 6}, "!retire alice bob")
+    finally:
+        await srv.close()
+    srv = started(site)
+    real = srv.audit
+
+    async def refused(event, **fields):
+        if event == "interrupted":
+            raise OSError("no space left on the device")
+        return await real(event, **fields)
+
+    monkeypatch.setattr(srv, "audit", refused)
+    await srv.start()  # the record can't be written: the start goes on
+    monkeypatch.undo()
+    try:
+        assert "alice" in srv.ledger.workshop("harvard-2026").retired
+        said = [p for p in posts(site) if p.startswith(f"⏹ {plan.name} was interrupted")]
+        assert len(said) == 1 and "- alice: retired, every step done." in said[0], said
+    finally:
+        await srv.close()
+    srv = started(site)
+    await srv.start()
+    try:
+        state = srv.ledger.workshop("harvard-2026")
+        assert "alice" in state.retired and "bob" not in state.retired
+        assert len([p for p in posts(site) if p.startswith(f"⏹ {plan.name}")]) == 1
+    finally:
+        await srv.close()
+
+
+async def test_later_plans_win_over_a_cut_retire_by_the_logs_order(site):
+    """Codex round 2 on #849 and its reviewer's probe, against this design: a cut `!retire
+    alice bob` (alice every step done, bob through his protection off); then a `!launch` of
+    alice and a `!rollout` naming bob. Their records come after the steps': alice is in
+    service, and bob has no uninstall or sync, so a plain `!teardown bob` would be refused;
+    and the same read back from the log."""
+    srv = started(site)
+    await srv.start()
+    try:
+        plan = await cut_by_hand(srv, {"alice": 8, "bob": 6}, "!retire alice bob")
+    finally:
+        await srv.close()
+    srv = started(site)
+    await srv.start()
+    try:
+        for n, (verb, rows) in enumerate((("launch", ["alice"]), ("rollout", ["bob"]))):
+            later = dict(workshop="harvard-2026", plan=f"P-{90 + n}", bot=plan.bot, verb=verb,
+                         args=rows, targets=rows)  # fmt: skip
+            await srv.audit("apply_start", **later, hash="")
+            await srv.audit("apply_end", **later, exit=0, outcome="done")
+        state = srv.ledger.workshop("harvard-2026")
+        assert "alice" not in state.retired and "bob" not in state.ending()
+    finally:
+        await srv.close()
+    srv = started(site)
+    await srv.start()
+    try:
+        state = srv.ledger.workshop("harvard-2026")
+        assert "alice" not in state.retired and "bob" not in state.ending()
+    finally:
+        await srv.close()
+
+
+async def test_a_retire_whose_end_could_not_be_written_keeps_what_it_did(site, server, monkeypatch):
+    """Codex round 3 on #849, against this design: `!retire alice` runs every step, but its
+    `apply_end` can't be written. Its steps were on the log as they ended: alice is retired
+    at once, and at the next start, with no message of an interruption, since none came."""
+    real, failing = server.audit, [True]
+
+    async def audit(event, **fields):
+        if event == "apply_end" and fields.get("verb") == "retire" and failing[0]:
+            failing[0] = False
+            raise OSError("no space left on the device")
+        return await real(event, **fields)
+
+    monkeypatch.setattr(server, "audit", audit)
+    plan = await retire(server, "!retire alice", "retire 1")
+    assert plan.state == DONE
+    assert "alice" in server.ledger.workshop("harvard-2026").retired
+    await server.close()
+    srv = started(site)
+    await srv.start()
+    try:
+        assert "alice" in srv.ledger.workshop("harvard-2026").retired
+        assert not [p for p in posts(site) if p.startswith(f"⏹ {plan.name}")]
+    finally:
+        await srv.close()
+
+
+async def test_a_step_whose_record_cant_be_written_stops_the_retire(site, server, monkeypatch):
+    """#837: a `retire_step` record that can't be written stops the apply, as an
+    `apply_start` that can't does: nothing more runs without its record."""
+    real = server.audit
+
+    async def audit(event, **fields):
+        if event == "retire_step" and fields.get("stage") == "uninstall":
+            raise OSError("no space left on the device")
+        return await real(event, **fields)
+
+    monkeypatch.setattr(server, "audit", audit)
+    plan = await retire(server, "!retire alice", "retire 1")
+    assert plan.state == FAILED
+    assert ran(site, "alice") == EVERY[:4]  # its uninstall ran; nothing after it
+    result = next(p for p in posts(site) if p.startswith(f"❌ **{plan.name}**"))
+    assert "a step's record can't be written to the audit log" in result, result
+
+
+async def test_a_long_interrupted_retire_attaches_what_it_did_to_each_row(site):
+    """Codex round 1 on #849's rework: a cut `!retire` of 100 rows, 60 of them three steps
+    in and 40 never reached. Its message would be past Zulip's 10,000 characters, which would
+    cut whole rows' lines for good: it says how many rows are retired and which are left,
+    keeps its footer, and attaches the whole report, the 40 rows never reached on one line."""
+    rows = [f"r{n:02d}" for n in range(100)]
+    srv = started(site)
+    await srv.start()
+    try:
+        plan = await cut_by_hand(srv, {}, "!retire alice bob")
+        head = dict(workshop="harvard-2026", plan=plan.name, bot=plan.bot, verb="retire")
+        await srv.audit("apply_start", **head, args=rows, hash="", targets=rows,
+                        chains={row: list(STAGES) for row in rows})  # fmt: skip
+        for row in rows[:60]:
+            for stage in STAGES[:3]:
+                await srv.audit("retire_step", **head, row=row, stage=stage, cell="ok")
+    finally:
+        await srv.close()
+    srv = started(site)
+    await srv.start()
+    try:
+        said = next(p for p in posts(site) if p.startswith(f"⏹ {plan.name} was interrupted"))
+        assert len(said) < 10000 - runner_mod.RESULT_ROOM, len(said)
+        assert said.splitlines()[:2] == [
+            f"⏹ {plan.name} was interrupted by a restart of the bots: nothing resumes on its own.",
+            "0 of 100 rows retired; left: r00, r01, r02, r03, r04 and 95 more.",
+        ], said[:300]
+        assert f"too long to show here: [{plan.name}-interrupted.txt](" in said
+        assert said.splitlines()[-1].startswith("`audit #")  # its footer kept
+        (whole,) = [v.decode() for k, v in site.realm.uploads.items()
+                    if k.endswith(f"{plan.name}-interrupted.txt")]  # fmt: skip
+        assert len(whole) > 10000 - planning.REPORT_ROOM  # past what one message keeps
+        assert all(f"- {row}: done start, idle-stop, waker; not done uninstall" in whole
+                   for row in rows[:60])  # fmt: skip
+        assert f"- not started: {', '.join(rows[60:])}. Send `!retire {' '.join(rows[60:])}` " \
+               "again." in whole  # fmt: skip
+    finally:
+        await srv.close()
+
+
+async def test_a_log_that_breaks_mid_retire_counts_what_is_on_record(site, server, monkeypatch):
+    """#849's review of the rework, N1 and N2: the audit log breaks at bob's bots step, so
+    neither its `retire_step` record nor the `apply_end` is written. The result counts what
+    is on record, as the ledger has it: bob is not retired, and his line gives `!retire bob
+    unsynced` for once the log is fixed."""
+    real, broken = server.audit, [False]
+
+    async def audit(event, **fields):
+        if event == "retire_step" and (fields.get("row"), fields.get("stage")) == ("bob", "bots"):
+            broken[0] = True
+        if broken[0]:
+            raise OSError("no space left on the device")
+        return await real(event, **fields)
+
+    monkeypatch.setattr(server, "audit", audit)
+    plan = await retire(server, "!retire alice bob", "retire 2")
+    assert plan.state == FAILED
+    held = server.ledger.workshop("harvard-2026")
+    assert "alice" in held.retired and "bob" not in held.retired
+    result = next(p for p in posts(site) if p.startswith(f"❌ **{plan.name}**"))
+    assert "; 1 of 2 rows retired; bob stopped at bots" in result.split("\n")[0], result[:200]
+    assert "`!retire bob unsynced`" in result, result
+    assert "failed: may not be on the audit log" in result  # it may have landed (#855)
+    assert "⚠ `apply_end` was not written to the audit log" in result
+
+
+async def test_a_retire_stopped_by_its_log_says_what_to_send_for_the_rows_left(
+    site, server, monkeypatch
+):
+    """N2: a step record that can't be written at alice's uninstall stops `!retire alice
+    bob` before bob: the result says to send it again for him."""
+    real = server.audit
+
+    async def audit(event, **fields):
+        if event == "retire_step" and fields.get("stage") == "uninstall":
+            raise OSError("no space left on the device")
+        return await real(event, **fields)
+
+    monkeypatch.setattr(server, "audit", audit)
+    plan = await retire(server, "!retire alice bob", "retire 2")
+    assert not ran(site, "bob")
+    result = next(p for p in posts(site) if p.startswith(f"❌ **{plan.name}**"))
+    assert "- not reached: bob. Send `!retire bob` again." in result, result
+
+
+def test_a_step_that_ran_unrecorded_counts_as_run_in_its_line():
+    """#855, from #849's review: bob's uninstall ran, but its record may not be on the log.
+    His line counts it as run: his VM runs with his bridge uninstalled, and the way back into
+    service begins with the `!rollout` that puts it back."""
+    cells = {"start": "ok", "idle-stop": "ok", "waker": "ok",
+             "uninstall": runner_mod.UNRECORDED, "final-sync": "not run", "protect": "not run",
+             "teardown": "not run", "bots": "not run"}  # fmt: skip
+    line = stopped_row(None, "bob", cells)
+    assert line.startswith(
+        "- bob stopped at uninstall (`failed: may not be on the audit log`): its VM runs, with "
+        "idle stop off, the waker off, its bridge uninstalled"
+    ), line
+    assert "`!rollout <release> bob" in line, line
+
+
+async def test_a_long_report_whose_attachment_fails_keeps_its_summary(site, monkeypatch):
+    """#855, from #849's review: the long report's attachment fails: the message keeps how
+    many rows are retired and which are left, then the whole lines that fit."""
+    rows = [f"r{n:02d}" for n in range(100)]
+    srv = started(site)
+    await srv.start()
+    try:
+        plan = await cut_by_hand(srv, {}, "!retire alice bob")
+        head = dict(workshop="harvard-2026", plan=plan.name, bot=plan.bot, verb="retire")
+        await srv.audit("apply_start", **head, args=rows, hash="", targets=rows,
+                        chains={row: list(STAGES) for row in rows})  # fmt: skip
+        for row in rows:
+            for stage in STAGES[:3]:
+                await srv.audit("retire_step", **head, row=row, stage=stage, cell="ok")
+    finally:
+        await srv.close()
+
+    async def failed(self, bot, name, text):
+        return None
+
+    monkeypatch.setattr(Planning, "_attach", failed)
+    srv = started(site)
+    await srv.start()
+    try:
+        said = next(p for p in posts(site) if p.startswith(f"⏹ {plan.name} was interrupted"))
+        lines = said.splitlines()
+        assert lines[1] == "0 of 100 rows retired; left: r00, r01, r02, r03, r04 and 95 more."
+        assert lines[2].startswith("- r00: done start, idle-stop, waker; not done uninstall")
+        assert lines[-2].endswith("more lines: the attachment failed.*"), lines[-2]
+        assert len(said) < 10000
+    finally:
+        await srv.close()
+
+
+@pytest.mark.parametrize("outcome", ["exited 0", "failed"])
+async def test_an_unrecorded_step_counts_as_run_only_when_it_exited_0(
+    site, server, monkeypatch, outcome
+):
+    """Codex round 1 on #860: bob's waker step's record can't be written. If the step exited
+    0, it ran: his line says the waker is off, and his way back puts it on; if it failed, it
+    changed nothing: his line says neither, and keeps its own failure."""
+    if outcome == "failed":
+        fake(site, "admin/push_waker.py", 'import sys\nprint("refused")\nsys.exit(1)\n')
+    real = server.audit
+
+    async def audit(event, **fields):
+        if event == "retire_step" and fields.get("stage") == "waker":
+            raise OSError("no space left on the device")
+        return await real(event, **fields)
+
+    monkeypatch.setattr(server, "audit", audit)
+    plan = await retire(server, "!retire bob", "retire 1")
+    result = next(p for p in posts(site) if p.startswith(f"❌ **{plan.name}**"))
+    lines = result.splitlines()
+    at = next(n for n, x in enumerate(lines) if x.startswith("- bob stopped at waker"))
+    line = " ".join(lines[at : at + 2])  # and its way back into service, under it
+    if outcome == "exited 0":
+        assert "(`failed: may not be on the audit log`): its VM runs, with idle stop off, the " \
+               "waker off" in line, line  # fmt: skip
+        assert "`!waker on bob`" in line, line
+    else:
+        assert "(`failed: exit 1, may not be on the audit log`): its VM runs, with idle stop " \
+               "off." in line, line  # fmt: skip
+        assert "waker off" not in line and "`!waker on bob`" not in line, line
+    assert runner_mod.unrecorded("skipped: no VM") == (
+        "failed: skipped: no VM, may not be on the audit log"
+    )
+
+
+def test_a_gone_repository_keeps_its_line_when_its_record_may_be_lost():
+    """#860's review, N4: final_sync.py's repository-gone outcome keeps its own line under the
+    result when the step's record may not be on the audit log."""
+    cells = {**dict.fromkeys(STAGES[:4], "ok"),
+             "final-sync": runner_mod.unrecorded(f"failed: {runner_mod.GONE_CELL}"),
+             **dict.fromkeys(STAGES[5:], "not run")}  # fmt: skip
+    line = stopped_row(None, "bob", cells)
+    assert "no longer exists here: the participant deleted or transferred it" in line, line

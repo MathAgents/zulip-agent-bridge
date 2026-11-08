@@ -6,8 +6,9 @@ rig's channels and in DMs to the rig's bots (the dev org's `zab-dev*` channels a
 participant's only): `restrict()` names them, and
 anything else, or anything before it, raises `PostingRefused`, as `TestEc2` refuses untagged
 instances. A transient Zulip or network error during a wait is retried with backoff until the
-deadline, each retry logged. The zuliprc is read by `zab.zulip.client`; its key is never
-printed.
+deadline, each retry logged. A wait that times out says for how long the rig's calls failed, and
+one that failed on the rig's side, not the bridge's, is a `RigTimeout` (`harness.rig_failure`,
+#877). The zuliprc is read by `zab.zulip.client`; its key is never printed.
 """
 
 from __future__ import annotations
@@ -23,12 +24,19 @@ from typing import Any, TypeVar
 
 import httpx
 
+from e2e.harness.refusal import Refused, refusal
+from e2e.harness.rig_failure import Outage, RigFailure, RigTimeout, earlier, shown, stamp, utc
 from e2e.harness.secret_files import label_of, read_secret
 from zab.zulip.client import ZulipClient, ZulipError
 
 T = TypeVar("T")
 Narrow = list[dict[str, Any]]
 LOG = logging.getLogger("zab.e2e")
+#: How long a wait that timed out waits for the connection to come back, to read what it missed
+BACK_S = 120.0
+#: The key under which a message read from Zulip (`after`, `message`) carries the rig's time
+#: (epoch seconds) just before the request that read it: what `settled` sets an edit beside
+ASKED = "_asked"
 
 
 class PostingRefused(RuntimeError):
@@ -79,8 +87,10 @@ class TestUser:
         every: float = 3.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
+        wall: Callable[[], float] = time.time,  # beside Zulip's timestamps
     ) -> None:
         self.client, self.every, self.sleep, self.clock = client, every, sleep, clock
+        self.wall = wall
         self._me: dict[str, Any] | None = None
         self._users: list[dict[str, Any]] | None = None
         # nothing may be posted until restrict() names the rig's channels and bots
@@ -189,16 +199,53 @@ class TestUser:
     # -------------------------------------------------------------------------- reading
 
     async def message(self, message_id: int) -> dict[str, Any]:
+        """The message as Zulip serves it now, stamped with `ASKED`."""
+        asked = self.wall()
         data = await self.client.request("GET", f"messages/{message_id}", apply_markdown=False)
-        return dict(data["message"])
+        return {**data["message"], ASKED: asked}
+
+    async def history(self, message_id: int) -> list[dict[str, Any]]:
+        """The message's versions, oldest first, each with its raw `content` and `timestamp`."""
+        data = await self.client.request("GET", f"messages/{message_id}/history")
+        return list(data["message_history"])
+
+    async def settled(self, msg: dict[str, Any], pattern: str) -> None:
+        """Message `msg`'s final state matches `pattern` (at its start), or an AssertionError.
+        When the version Zulip served doesn't, the last entry of its edit history is read. A
+        last entry that differs and matches, from an edit made before Zulip served `msg` (its
+        `ASKED`, by `rig_failure.earlier`), means Zulip served an older version: a
+        `RigFailure` quoting both (#877). An edit made after the read, or too close to it to
+        tell, leaves the read as it was: the bridge's failure."""
+        served = str(msg["content"])
+        if re.match(pattern, served):
+            return
+        failed = f"message {msg['id']} reads {served[:200]!r}, not {pattern!r}"
+        try:
+            until = self.clock() + BACK_S
+            last = (await self.retrying(lambda: self.history(msg["id"]), until=until,
+                                        what="the edit history"))[-1]  # fmt: skip
+        except Exception as exc:
+            raise AssertionError(f"{failed} (its edit history unread: {exc!r})"[:400]) from exc
+        content, edited = str(last.get("content", "")), stamp(last)
+        if content != served and re.match(pattern, content):
+            asked = msg.get(ASKED)
+            if asked is not None and earlier(edited, asked):
+                raise RigFailure(
+                    f"Zulip served message {msg['id']} as {served[:120]!r} at {utc(asked)}, but "
+                    f"its edit history ends with {content[:120]!r} from {utc(edited)}"
+                )
+            read = f"the read at {utc(asked)}" if asked is not None else "the read"
+            failed += f" (its edit history ends with a match from {utc(edited)}, not before {read})"
+        raise AssertionError(failed)
 
     async def after(self, narrow: Narrow, after_id: int, page: int = 200) -> list[dict[str, Any]]:
-        """Every message of `narrow` newer than `after_id`, oldest first, as they are now: page
-        after page until Zulip says it reached the newest (codex on #277: a reply past the
-        first page, or a sender there, must count)."""
+        """Every message of `narrow` newer than `after_id`, oldest first, as they are now, each
+        stamped with `ASKED`: page after page until Zulip says it reached the newest (codex on
+        #277: a reply past the first page, or a sender there, must count)."""
         out: list[dict[str, Any]] = []
         anchor = after_id
         while True:
+            asked = self.wall()
             data = await self.client.request(
                 "GET",
                 "messages",
@@ -209,7 +256,7 @@ class TestUser:
                 narrow=json.dumps(narrow),
                 apply_markdown=False,
             )
-            batch = [m for m in data["messages"] if m["id"] > anchor]
+            batch = [{**m, ASKED: asked} for m in data["messages"] if m["id"] > anchor]
             out.extend(batch)
             newest = data.get("found_newest")
             if newest or not batch or (newest is None and len(batch) < page):
@@ -217,40 +264,86 @@ class TestUser:
             anchor = batch[-1]["id"]
 
     async def wait_for(
-        self, probe: Callable[[], Awaitable[T | None]], *, within: float, what: str
+        self,
+        probe: Callable[[], Awaitable[T | None]],
+        *,
+        within: float,
+        what: str,
+        missed: Callable[[float, float], Awaitable[str | None]] | None = None,
     ) -> T:
-        """Poll `probe` every `every` seconds until it returns something; TimeoutError after
-        `within` seconds, naming `what`. A transient error is retried (`retrying`)."""
-        deadline = self.clock() + within
-        while True:
-            found = await self.retrying(probe, until=deadline, what=what)
-            if found is not None:
-                return found
-            if self.clock() >= deadline:
-                raise TimeoutError(f"no {what} within {within:.0f} s")
-            await self.sleep(self.every)
-
-    async def retrying(self, call: Callable[[], Awaitable[T]], *, until: float, what: str) -> T:
-        """`call()`, again after a transient error (`transient`), with a growing pause (the poll
-        interval doubled each time, at most 60 s), logged each time, until `until`; then, or
-        on any other error, the error is raised."""
-        failures = 0
+        """Poll `probe` every `every` seconds until it returns something; after `within` seconds,
+        a TimeoutError naming `what`, and for how long the rig's calls failed (`Outage`, #877).
+        A transient error is retried (`retrying`). The timeout is a `RigTimeout` when `missed`,
+        asked once the connection is back, names something that matched between the wait's
+        start and its deadline (epoch seconds) and was never seen; or when the calls still
+        failed at the deadline and Zulip couldn't be reached after it: the rig couldn't look."""
+        outage, since = Outage(self.clock(), within), self.wall()
         while True:
             try:
-                return await call()
+                found = await self.retrying(probe, until=outage.end, what=what, outage=outage)
             except Exception as exc:
-                if not transient(exc) or self.clock() >= until:
+                if not transient(exc):
+                    raise
+                break  # `retrying` gives up on a transient error only at the deadline
+            if found is not None:
+                return found
+            if self.clock() >= outage.end:
+                break
+            await self.sleep(self.every)
+        lost, down, saw = outage.text(self.clock()), outage.down, f"no {what} within {within:.0f} s"
+        if missed is not None:
+            try:
+                seen = await self.retrying(
+                    lambda: missed(since, since + within), until=self.clock() + BACK_S,
+                    what="the edit history",
+                )  # fmt: skip
+                down = False  # the rig looked, after the deadline
+            except Exception as exc:  # unread: the timeout as it was
+                seen, down = None, down and transient(exc)  # an answer: Zulip was reached
+                unread = f"the edit history unread ({type(exc).__name__})"
+                lost = f"{lost}, {unread}" if lost else unread
+            if seen:
+                how = lost or "Zulip didn't serve it, with no connection errors"
+                raise RigTimeout(f"{seen}, but the rig never saw it: {how}; {saw}")
+        if down:
+            raise RigTimeout(f"{lost}: the rig couldn't look; {saw}")
+        raise TimeoutError(f"{lost}; {saw}" if lost else saw)
+
+    async def retrying(
+        self,
+        call: Callable[[], Awaitable[T]],
+        *,
+        until: float,
+        what: str,
+        outage: Outage | None = None,
+    ) -> T:
+        """`call()`, again after a transient error (`transient`), with a growing pause (the poll
+        interval doubled each time, at most 60 s), logged each time, until `until`; then, or
+        on any other error, the error is raised. Each transient error, and the next answer,
+        goes in `outage`."""
+        failures = 0
+        while True:
+            began = self.clock()
+            try:
+                found = await call()
+            except Exception as exc:
+                if not transient(exc):
+                    raise
+                error = str(exc) if isinstance(exc, ZulipError) else type(exc).__name__
+                if outage is not None:
+                    outage.failed(began, error)
+                if self.clock() >= until:
                     raise
                 failures += 1
                 pause = min(self.every * 2**failures, 60.0, max(0.0, until - self.clock()))
                 LOG.warning(
-                    "e2e: %s while waiting for %s; retry %d in %.0f s",
-                    exc if isinstance(exc, ZulipError) else type(exc).__name__,
-                    what,
-                    failures,
-                    pause,
+                    "e2e: %s while waiting for %s; retry %d in %.0f s", error, what, failures, pause
                 )
                 await self.sleep(pause)
+            else:
+                if outage is not None:
+                    outage.back(began)
+                return found
 
     async def wait_reply(
         self,
@@ -262,16 +355,34 @@ class TestUser:
         within: float,
     ) -> dict[str, Any]:
         """The first message newer than `after_id` from one of `senders` whose raw content
-        matches `pattern` (a regular expression; edits count, as the bridge edits its status)."""
+        matches `pattern` (a regular expression; edits count, as the bridge edits its status).
+        One from them saying that OpenAI refused a Codex request with a 429 raises `Refused` at
+        once, whatever `pattern` is: that turn will never answer (#842). At the deadline, their
+        messages' edit histories are read: a version that matched before it, which the rig
+        never saw (a status shown only while the connection failed, or one Zulip didn't
+        serve), makes the timeout a `RigTimeout` (#877)."""
         wanted, regex = set(senders), re.compile(pattern, re.S)
 
         async def probe() -> dict[str, Any] | None:
             for msg in await self.after(narrow, after_id):
-                if msg["sender_id"] in wanted and regex.search(msg["content"]):
+                if msg["sender_id"] not in wanted:
+                    continue
+                if line := refusal(msg["content"]):
+                    raise Refused(line)
+                if regex.search(msg["content"]):
                     return msg
             return None
 
-        return await self.wait_for(probe, within=within, what=f"reply matching {pattern!r}")
+        async def missed(since: float, before: float) -> str | None:
+            for msg in await self.after(narrow, after_id):
+                if msg["sender_id"] in wanted:
+                    history = await self.history(msg["id"])
+                    if seen := shown(history, regex, since=since, before=before, every=self.every):
+                        return f"message {msg['id']} {seen}"
+            return None
+
+        what = f"reply matching {pattern!r}"
+        return await self.wait_for(probe, within=within, what=what, missed=missed)
 
     async def wait_reaction(
         self, message_id: int, *, emoji_code: str, user_id: int, within: float

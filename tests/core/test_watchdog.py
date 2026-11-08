@@ -14,6 +14,23 @@ from zab.core import watchdog
 pytestmark = pytest.mark.integration
 
 
+async def renewed(*heartbeats, times=3, within=10.0):
+    """Wait until each heartbeat has been renewed `times` times from now, as a listener
+    waiting in `watchdog.waiting` renews it every `WAIT_INTERVAL`. This counts renewals rather
+    than bounding the newest one's age. `fresh(..., 0.04)` with renewals every 5 ms failed once
+    under load, at #865's head: the test process was descheduled longer than that between a
+    renewal and the check."""
+    first = [heartbeat.last_seen for heartbeat in heartbeats]
+    seen: list[set[float]] = [set() for _ in heartbeats]
+    deadline = time.monotonic() + within
+    while any(len(values) < times for values in seen):
+        assert time.monotonic() < deadline, "a waiting listener stopped renewing its lease"
+        await asyncio.sleep(0.001)
+        for values, heartbeat, start in zip(seen, heartbeats, first, strict=True):
+            if heartbeat.last_seen != start:
+                values.add(heartbeat.last_seen)
+
+
 async def test_heartbeat_event_advances_cursor_and_file(bridge):
     b, fake, _ = bridge
     fake.emit({"type": "heartbeat"})
@@ -202,8 +219,7 @@ async def test_two_listeners_waiting_on_topic_creation_stay_live(tmp_path, monke
     await entered.wait()
     second = asyncio.create_task(sibling())
     try:
-        await asyncio.sleep(0.1)  # ten shortened liveness windows
-        assert watchdog.fresh([owner, peer], 0.04)
+        await renewed(owner, peer)  # both renew their leases while they wait
         second.cancel()
         await asyncio.gather(second, return_exceptions=True)
         assert lock.locked()  # cancelling the waiter must not release the owner's lock
@@ -224,8 +240,8 @@ async def test_listener_waiting_for_recovery_creation_lock_stays_live(bridge, mo
 
     task = asyncio.create_task(listener())
     try:
-        await asyncio.sleep(0.1)
-        assert watchdog.fresh([b.heartbeat], 0.04)
+        await renewed(b.heartbeat)
+        assert not task.done()  # still waiting for the lock
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -262,9 +278,8 @@ async def test_reaction_recovery_actor_queue_wait_stays_live(bridge, monkeypatch
 
     task = asyncio.create_task(listener())
     try:
-        await asyncio.sleep(0.1)
+        await renewed(b.heartbeat)
         assert not task.done()
-        assert watchdog.fresh([b.heartbeat], 0.04)
         queue.task_done()
         await asyncio.wait_for(task, 1)
     finally:

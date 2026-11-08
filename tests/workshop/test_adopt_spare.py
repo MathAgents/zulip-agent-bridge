@@ -11,6 +11,8 @@ import adopt_spare as ad
 import aws_common as ac
 import pytest
 
+from .scope import FLEET_SCOPE, with_scope
+
 ROSTER = """slug,first_name,last_name,email,repo,host,ip,region,host_keys,zulip_user_id,notes
 alice,Alice,Smith,alice@example.org,,ws-alice,203.0.113.5,us-west-2,SHA256:a,101,
 late,Lena,Late,lena@example.org,,,,,,,joined Wednesday
@@ -129,7 +131,7 @@ def setup(tmp_path, monkeypatch):
 
 def test_a_spare_is_retagged_and_the_row_filled(setup, capsys):
     roster, spares, ec2, argv = setup
-    assert ad.main(argv) == 0
+    assert with_scope(ad.main, argv) == 0
     assert ec2.probed == [("198.51.100.7", ad.SSH_WAIT_S)]  # its port 22, before the retag
     # instance, volume and Elastic IP now carry the participant's tags; the request names only
     # `Name` and `participant`, never the unchanged `workshop` (ADMIN.md §5's aws:TagKeys)
@@ -151,7 +153,7 @@ def test_a_spare_is_retagged_and_the_row_filled(setup, capsys):
     out = capsys.readouterr().out
     assert "--adopt-spare late" in out and "scan_hosts.py --only late" in out
     # never twice
-    assert ad.main([*argv, "--force"]) == 1
+    assert with_scope(ad.main, [*argv, "--force"]) == 1
     assert "already given to late" in capsys.readouterr().err
 
 
@@ -160,9 +162,9 @@ def test_the_spares_idle_stop_is_held_before_the_retag(setup, capsys):
     connects to it before push_config.py's hold. So the apply holds it first, over SSH, its key
     pinned to spares.json's fingerprints, then retags it; a dry run holds nothing."""
     _roster, _spares, ec2, argv = setup
-    assert ad.main([*argv, "--dry-run"]) == 0 and not ec2.events
+    assert with_scope(ad.main, [*argv, "--dry-run"]) == 0 and not ec2.events
     capsys.readouterr()
-    assert ad.main(argv) == 0
+    assert with_scope(ad.main, argv) == 0
     assert ec2.events == [
         ("pinned", "198.51.100.7", "SHA256:s7a SHA256:s7b"),
         ("ssh", "ubuntu@198.51.100.7", ad.HOLD_CHECK_CMD),
@@ -175,7 +177,7 @@ def test_a_spare_whose_key_cant_be_pinned_is_refused_with_nothing_changed(setup,
     roster, spares, ec2, argv = setup
     ec2.pin_fails = "its key SHA256:x is not one its console printed: nothing installed"
     before = (roster.read_text(), spares.read_text())
-    assert ad.main(argv) == 1
+    assert with_scope(ad.main, argv) == 1
     err = capsys.readouterr().err
     assert err.startswith("refusing: zab-spare-7's idle stop could not be held for the hand-over")
     assert "its key" in err and "nothing changed; request again in a minute" in err
@@ -199,7 +201,7 @@ def test_a_hold_whose_ssh_drops_resumes_the_spares_idle_stop(setup, capsys, resu
     roster, spares, ec2, argv = setup
     ec2.hold_fails, ec2.resume_fails = "Connection to 198.51.100.7 closed by remote host.", resume
     before = (roster.read_text(), spares.read_text())
-    assert ad.main(argv) == 1
+    assert with_scope(ad.main, argv) == 1
     err = capsys.readouterr().err
     assert err == (
         "refusing: zab-spare-7's idle stop could not be held for the hand-over (ssh: Connection "
@@ -215,7 +217,7 @@ def test_a_retag_that_fails_resumes_the_spares_idle_stop(setup, capsys):
     roster, spares, ec2, argv = setup
     ec2.tag_fails = "RequestLimitExceeded: Request limit exceeded."
     before = (roster.read_text(), spares.read_text())
-    assert ad.main(argv) == 1
+    assert with_scope(ad.main, argv) == 1
     err = capsys.readouterr().err
     assert err == (
         "refusing: the retag failed (RuntimeError: RequestLimitExceeded: Request limit "
@@ -233,7 +235,7 @@ def test_a_spare_already_shutting_down_is_refused_before_the_retag(setup, capsys
     roster, spares, ec2, argv = setup
     ec2.system = "stopping"
     before = (roster.read_text(), spares.read_text())
-    assert ad.main(argv) == 1
+    assert with_scope(ad.main, argv) == 1
     err = capsys.readouterr().err
     assert err == (
         "refusing: zab-spare-7 is shutting down: its idle stop powered it off just now, and its "
@@ -246,7 +248,7 @@ def test_a_spare_already_shutting_down_is_refused_before_the_retag(setup, capsys
         "{ systemctl is-system-running || true; }"
     )  # the hold, then idle stop quiesced (Codex round 3 on #729), then the state
     ec2.system = "degraded"
-    assert ad.main(argv) == 0 and ec2.tagged
+    assert with_scope(ad.main, argv) == 0 and ec2.tagged
 
 
 def test_a_spare_without_host_keys_has_no_idle_stop_to_hold(setup, capsys):
@@ -256,7 +258,7 @@ def test_a_spare_without_host_keys_has_no_idle_stop_to_hold(setup, capsys):
     data = json.loads(spares.read_text())
     data[KEY]["host_keys"] = ""
     spares.write_text(json.dumps(data))
-    assert ad.main(argv) == 0 and ec2.events == [("retag",)]
+    assert with_scope(ad.main, argv) == 0 and ec2.events == [("retag",)]
     assert "warning: zab-spare-7 has no host_keys in spares.json, nor its own idle stop: none " \
         "held" in capsys.readouterr().out  # fmt: skip
 
@@ -264,7 +266,7 @@ def test_a_spare_without_host_keys_has_no_idle_stop_to_hold(setup, capsys):
 def test_a_dry_run_changes_nothing(setup, capsys):
     roster, spares, ec2, argv = setup
     before = (roster.read_text(), spares.read_text())
-    assert ad.main([*argv, "--dry-run"]) == 0
+    assert with_scope(ad.main, [*argv, "--dry-run"]) == 0
     assert not ec2.tagged and (roster.read_text(), spares.read_text()) == before
     assert "dry run" in capsys.readouterr().out
 
@@ -309,7 +311,7 @@ def test_every_check_refuses_without_changing_anything(setup, capsys, change, me
     roster, spares, ec2, argv = setup
     change(roster, spares, ec2)
     before = (roster.read_text(), spares.read_text())
-    assert ad.main(argv) == 1
+    assert with_scope(ad.main, argv) == 1
     assert message in capsys.readouterr().err
     assert not ec2.tagged and (roster.read_text(), spares.read_text()) == before
 
@@ -335,7 +337,7 @@ def test_a_spare_stopping_or_pending_is_refused_with_the_wait_it_needs(
     roster, spares, ec2, argv = setup
     ec2.instances[0]["State"] = {"Code": 80, "Name": state}
     before = (roster.read_text(), spares.read_text())
-    assert ad.main([*argv, "--dry-run"] if dry_run else argv) == 1
+    assert with_scope(ad.main, [*argv, "--dry-run"] if dry_run else argv) == 1
     out, err = capsys.readouterr()
     assert err == f"refusing: {ad.not_ready(SPARE, state)}\n" == f"refusing: {said}\n" and not out
     assert unchanged(roster, spares, ec2, before) and not ec2.probed and not ec2.started
@@ -344,7 +346,7 @@ def test_a_spare_stopping_or_pending_is_refused_with_the_wait_it_needs(
 def test_a_spare_with_no_state_is_refused(setup, capsys):
     _roster, _spares, ec2, argv = setup
     del ec2.instances[0]["State"]
-    assert ad.main(argv) == 1
+    assert with_scope(ad.main, argv) == 1
     err = capsys.readouterr().err
     assert "zab-spare-7 is in an unknown state, neither running nor stopped" in err
     assert not ec2.tagged and not ec2.started
@@ -372,13 +374,13 @@ def test_a_stopped_spare_is_started_for_the_adoption(setup, capsys, no_wait):
     only then adopts it as before."""
     _roster, spares, ec2, argv = setup
     ec2.instances[0]["State"] = {"Code": 80, "Name": "stopped"}
-    assert ad.main([*argv, "--dry-run"]) == 0
+    assert with_scope(ad.main, [*argv, "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert (
         out.splitlines()[0] == "zab-spare-7: stopped, started for the adoption" == ad.started(SPARE)
     )
     assert not ec2.started and not ec2.probed and not ec2.tagged  # the dry run starts nothing
-    assert ad.main(argv) == 0
+    assert with_scope(ad.main, argv) == 0
     out = capsys.readouterr().out
     assert ec2.started == [["i-spare7"]]
     assert "zab-spare-7: started; it runs, and its SSH answers" in out
@@ -409,7 +411,7 @@ def test_a_started_spare_that_doesnt_come_up_is_refused_before_the_retag(
     if quiet:
         no_wait[1].add("198.51.100.7")
     before = (roster.read_text(), spares.read_text())
-    assert ad.main(argv) == 1
+    assert with_scope(ad.main, argv) == 1
     err = capsys.readouterr().err
     assert err.startswith("refusing: zab-spare-7 ") and said in err, err
     assert ec2.started == [["i-spare7"]] and unchanged(roster, spares, ec2, before)
@@ -421,7 +423,7 @@ def test_a_start_that_ec2_refuses_is_refused(setup, capsys, no_wait):
     _roster, _spares, ec2, argv = setup
     ec2.instances[0]["State"] = {"Code": 80, "Name": "stopped"}
     ec2.start_fails = "IncorrectInstanceState: the instance is not in a state to start"
-    assert ad.main(argv) == 1
+    assert with_scope(ad.main, argv) == 1
     err = capsys.readouterr().err
     assert err.startswith("refusing: zab-spare-7 could not be started: RuntimeError: Incorrect")
     assert not ec2.tagged
@@ -444,13 +446,13 @@ def test_the_wait_is_bounded_from_before_the_start_and_each_lookup_by_it(setup, 
     slow = FakeEc2()
     slow.start, slow.find_instances = slow_start, lookup
     with pytest.raises(ad.AdoptError, match=r"was started, but the EC2 lookup failed: .*Timeout"):
-        ad.start_spare(slow, SPARE, "i-spare7", "198.51.100.7", ac.parse_tags(None),
+        ad.start_spare(slow, SPARE, "i-spare7", "198.51.100.7", FLEET_SCOPE,
                        answers=lambda ip: True, sleep=lambda s: None,
                        clock=lambda: now[0])  # fmt: skip
     assert seen == [ad.START_WAIT_S]  # from before the start: 300, not 250 + 300
     made = {}
     monkeypatch.setattr(ad, "Ec2", lambda region, **config: made.update(config) or ec2)
-    assert ad.main([*argv, "--dry-run"]) == 0
+    assert with_scope(ad.main, [*argv, "--dry-run"]) == 0
     assert made == {"config": ad.EC2_CONFIG}
 
 
@@ -461,7 +463,7 @@ def test_a_running_spare_whose_ssh_doesnt_answer_is_refused(setup, capsys, dry_r
     roster, spares, ec2, argv = setup
     ec2.ssh_up = False
     before = (roster.read_text(), spares.read_text())
-    assert ad.main([*argv, "--dry-run"] if dry_run else argv) == 1
+    assert with_scope(ad.main, [*argv, "--dry-run"] if dry_run else argv) == 1
     err = capsys.readouterr().err
     assert err == f"refusing: {ad.no_ssh(SPARE, '198.51.100.7')}\n"
     assert "198.51.100.7:22" in err and "request again in a minute" in err
@@ -475,14 +477,14 @@ def test_the_apply_checks_again_a_spare_stopped_since_the_plan(setup, capsys, no
     retag, so the chain stops with nothing changed."""
     roster, spares, ec2, argv = setup
     before = (roster.read_text(), spares.read_text())
-    assert ad.main([*argv, "--dry-run"]) == 0
+    assert with_scope(ad.main, [*argv, "--dry-run"]) == 0
     capsys.readouterr()
     ec2.instances[0]["State"] = {"Code": 80, "Name": "stopping"}
-    assert ad.main(argv) == 1
+    assert with_scope(ad.main, argv) == 1
     assert "zab-spare-7 is stopping: request again" in capsys.readouterr().err
     assert unchanged(roster, spares, ec2, before) and not ec2.started
     ec2.instances[0]["State"] = {"Code": 80, "Name": "stopped"}
-    assert ad.main(argv) == 0
+    assert with_scope(ad.main, argv) == 0
     assert ec2.started == [["i-spare7"]] and ec2.tagged
 
 
@@ -492,7 +494,7 @@ def test_the_other_checks_come_first(setup, capsys):
     _roster, _spares, ec2, argv = setup
     ec2.instances[0]["State"] = {"Code": 80, "Name": "stopped"}
     ec2.addresses[0].update(PublicIp="198.51.100.99")
-    assert ad.main(argv) == 1
+    assert with_scope(ad.main, argv) == 1
     err = capsys.readouterr().err
     assert "Elastic IP is 198.51.100.99" in err and "!start" not in err
 
@@ -503,11 +505,11 @@ def test_launch_then_finds_the_vm_as_the_rows(setup):
     import launch
 
     _roster, _spares, ec2, argv = setup
-    assert ad.main(argv) == 0
-    wanted = launch.lookup_tags("late")
+    assert with_scope(ad.main, argv) == 0
+    wanted = launch.lookup_tags("late", FLEET_SCOPE)
     assert [i["InstanceId"] for i in ec2.find_instances(wanted, ad.STATES)] == ["i-spare7"]
     assert [a["AllocationId"] for a in ec2.find_addresses(wanted)] == ["eipalloc-7"]
-    assert ec2.find_instances(launch.lookup_tags(SPARE), ad.STATES) == []
+    assert ec2.find_instances(launch.lookup_tags(SPARE, FLEET_SCOPE), ad.STATES) == []
 
 
 def test_the_retag_never_names_a_scope_tag(tmp_path, monkeypatch):
@@ -526,7 +528,7 @@ def test_the_retag_never_names_a_scope_tag(tmp_path, monkeypatch):
     monkeypatch.setattr(ad, "wait_for_ssh", ec2.wait_for_ssh)
     argv = ["--roster", str(roster), "--slug", "late", "--spare", SPARE]
     argv += ["--spares-file", str(spares), "--tag", "zab-role=test", "--tag", "workshop=zab-test"]
-    assert ad.main(argv) == 0
+    assert with_scope(ad.main, argv) == 0
     ((ids, sent),) = ec2.tagged
     assert ids == ["i-spare7", "vol-7", "eipalloc-7"]
     assert sent == {"Name": "ws-late", "participant": "late"} and ad.RETAG_KEYS == tuple(sent)
@@ -541,10 +543,10 @@ def test_a_row_that_kept_the_spares_address_has_its_ip_cleared(setup, capsys):
     roster, _, _, argv = setup
     roster.write_text(ROSTER.replace("203.0.113.5", "198.51.100.7"))
     before = roster.read_text()
-    assert ad.main([*argv, "--dry-run"]) == 0 and roster.read_text() == before
+    assert with_scope(ad.main, [*argv, "--dry-run"]) == 0 and roster.read_text() == before
     said = "roster: alice's ip 198.51.100.7 cleared: released with its own VM, it is zab-spare-7's"
     assert said in capsys.readouterr().out
-    assert ad.main(argv) == 0
+    assert with_scope(ad.main, argv) == 0
     rows = {r["slug"]: r for r in ac.read_roster(str(roster))}
     assert (rows["late"]["ip"], rows["alice"]["ip"]) == ("198.51.100.7", "")
     assert rows["alice"]["host"] == "ws-alice" and rows["alice"]["zulip_user_id"] == "101"
@@ -561,7 +563,7 @@ def test_a_stale_rows_ip_fixed_meanwhile_is_not_cleared(setup, monkeypatch, caps
         {**r, "ip": "198.51.100.7"} if r["slug"] == "alice" else r for r in read(path)
     ])  # fmt: skip
     roster.write_text(ROSTER.replace("203.0.113.5", "203.0.113.55"))  # the file, by then
-    assert ad.main(argv) == 0
+    assert with_scope(ad.main, argv) == 0
     rows = {r["slug"]: r for r in ac.read_roster(str(roster))}
     assert (rows["late"]["ip"], rows["alice"]["ip"]) == ("198.51.100.7", "203.0.113.55")
 
@@ -586,6 +588,6 @@ def test_a_spare_handed_over_by_hand_is_never_given_again(setup, capsys, keys, w
     )
     before = (roster.read_text(), spares.read_text())
     for extra in (["--dry-run"], []):
-        assert ad.main([*argv, *extra]) == 1
+        assert with_scope(ad.main, [*argv, *extra]) == 1
         assert why in capsys.readouterr().err
     assert not ec2.tagged and (roster.read_text(), spares.read_text()) == before

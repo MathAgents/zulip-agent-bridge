@@ -18,7 +18,10 @@ INIT = '{"type":"system","subtype":"init","session_id":"s"}'
 # A parent that exits on SIGINT, with a child that ignores SIGINT and SIGTERM and keeps the
 # inherited stdout open: the shape of a tool process that must not outlive a stop (§9.6). The
 # child writes the first line once it ignores both, so a stop after that line finds the group
-# ready, however slowly the child started (#548).
+# ready, however slowly the child started (#548). The parent waits in 10 ms sleeps, never in
+# one of 60 s: its handler runs only when the eval loop checks for signals, and `time.sleep`
+# makes no check before its syscall, so a SIGINT that lands just before it would wait out the
+# sleep, and the SIGTERM a grace later would kill the parent before its handler ran (#910).
 STUBBORN_TOOL = (
     "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); "
     f"signal.signal(signal.SIGTERM, signal.SIG_IGN); print({INIT!r}, flush=True); time.sleep(60)"
@@ -27,7 +30,8 @@ STUBBORN_CHILD = f"""
 import signal, subprocess, sys, time
 signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 child = subprocess.Popen([sys.executable, "-c", {STUBBORN_TOOL!r}])
-time.sleep(60)
+for _ in range(6000):  # 60 s, never in one sleep
+    time.sleep(0.01)
 """
 
 SLEEPER = f"""

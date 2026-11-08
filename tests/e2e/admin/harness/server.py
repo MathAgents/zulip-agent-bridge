@@ -18,6 +18,10 @@ from e2e.admin.harness.rig import WORKSHOPS, AdminRig
 from e2e.harness.vm import CONNECT_TRIES, RemoteError, Result, Vm, say
 
 BOT = "zab-admin-bot.service"
+#: deploy.sh's payload directories on the server, `mktemp -d /tmp/zab-deploy.XXXXXXXXXX` run as
+#: `ubuntu`, for `find`
+DEPLOY_DIRS = ("/tmp", "-maxdepth", "1", "-type", "d", "-user", "ubuntu", "-name",  # noqa: S108
+               "zab-deploy.??????????")  # fmt: skip
 VAR = "/var/lib/zab-admin"
 CURRENT = "/opt/zab-admin/current"
 #: The test workshops' state, emptied before a run: each starts from no roster (A2).
@@ -88,9 +92,22 @@ class Server:
         argv = [*(["sudo"] if sudo else []), "bash", "-c", literal, "bash", *args]
         return self.run(argv, input=input, **kw)
 
+    def probe(self) -> Result:
+        """One connection that runs `true`, never retried: its callers poll it, with their own
+        pauses (`startup.steady_ssh`), and its stderr says why it failed."""
+        return self.run(["true"], timeout=30, check=False, tries=1)
+
     def reachable(self) -> bool:
-        """One probe, never retried: its callers poll it."""
-        return self.run(["true"], timeout=30, check=False, tries=1).ok
+        return self.probe().ok
+
+    def sweep_deploy_dirs(self) -> list[str]:
+        """deploy.sh's payload directories left in /tmp, removed; their names. deploy.sh makes
+        one with `mktemp -d /tmp/zab-deploy.XXXXXXXXXX` as `ubuntu`, and its exit trap removes
+        it only if it can still connect: after a connect failed, it may stay, and a
+        bootstrap's holds the rig's etc/ and secrets/ (#804, review N2)."""
+        found = self.run(["sudo", "find", *DEPLOY_DIRS, "-print", "-exec", "rm", "-rf", "--",
+                          "{}", "+"])  # fmt: skip
+        return found.stdout.split()
 
     def running(self) -> str | None:
         """The release `current` points to (`v0.2.4rc1`), or None before the bootstrap."""

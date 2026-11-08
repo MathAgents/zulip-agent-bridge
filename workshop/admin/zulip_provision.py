@@ -54,8 +54,9 @@ a bot for `!login` out of ~80 does not DM someone else's (PM on issue #36, Mon 0
 A Zulip user matched by two rows is bound to neither, and a row that is ambiguous or unmatched
 has its `zulip_user_id` cleared, so a stale id never survives a doubtful run (PM review of PR
 #47). Idempotent: existing bots and channels are reused, and a bot's key is only regenerated
-with `--regenerate-keys`. `--deactivate` deactivates the roster's bots, which invalidates their
-keys (README.md §7.3). `--dry-run` performs only GET requests.
+with `--regenerate-keys`. `--deactivate` deactivates the roster's bots, whose keys then stop
+working; a reactivation revives every copy of the old key, which `--regenerate-keys` replaces
+(README.md §7.3). `--dry-run` performs only GET requests.
 `--no-rebind` (the admin bot always passes it; docs/ADMIN.md §2.4) never replaces or clears a
 recorded `zulip_user_id`: a row whose e-mail now matches another user, or none, keeps its id, gets
 no bot, channel or permission change, and is reported (`binding changed: refused`).
@@ -1212,7 +1213,7 @@ def deactivate(
     dry_run: bool,
     out_dir: pathlib.Path | None = None,
 ) -> list[Report]:
-    """Deactivate the roster's bots, invalidating their keys (README.md §7.3).
+    """Deactivate the roster's bots, whose keys stop working until a reactivation (README.md §7.3).
 
     With `out_dir` (as `main` always runs it): each bot is the one whose e-mail its
     `out/<slug>/<kind>.zuliprc` holds, the file the admin bot's plan hashed (docs/ADMIN.md

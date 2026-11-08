@@ -82,6 +82,8 @@ class FakeGitHub:
     def user(self, login):
         if "user" in self.fail:
             raise pr.GitHubError("GET", f"/users/{login}", 502, {"message": self.fail["user"]})
+        if "user-transport" in self.fail:  # a failure before GitHub answers (#799)
+            raise urllib.error.URLError(self.fail["user-transport"])
         canonical = self.users.get(login.casefold())
         return {"login": canonical, "id": 1000 + len(canonical)} if canonical else None
 
@@ -855,6 +857,17 @@ def test_a_github_error_in_the_invitation_is_reported_not_fatal(roster):
     assert run_main(roster, gh, FakeRunner(gh)) == 0
     login, state = invite_state(roster)
     assert login == "AliceGH" and state.startswith("failed: GitHub GET /users/alicegh: HTTP 502")
+    assert rows_of(roster)["alice"]["repo_status"] == "ok"
+
+
+def test_a_transport_failure_in_the_invitation_is_reported_not_fatal(roster):
+    """#799: a failure before GitHub answers, such as `URLError` or a timeout, is the row's
+    invitation's alone, as GitHub's own errors are: the repository is ready, so the row stays
+    `ok` and the run exits 0 (ORGANIZERS §3.4)."""
+    gh = FakeGitHub(fail={"user-transport": "timed out"})
+    assert run_main(roster, gh, FakeRunner(gh)) == 0
+    login, state = invite_state(roster)
+    assert login == "AliceGH" and state == "failed: URLError: <urlopen error timed out>"
     assert rows_of(roster)["alice"]["repo_status"] == "ok"
 
 

@@ -82,6 +82,43 @@ def _add_columns(db: sqlite3.Connection) -> None:
     db.commit()
 
 
+#: Tables created in an existing database where they are missing, again without a new
+#: `user_version`: an older zab ignores them. `message_edits` keeps the edits of each message a
+#: bot edited, for their bounds (`EditBounds.keep`; SPEC §4.9, §6.2; #757): how many, and when
+#: the last went out, on the wall clock, which a reboot doesn't start again. `message_finals`
+#: holds a row for each of those whose final edit went out (#806), and in `pending` a repeat of
+#: it held back for its gap, until it is sent. A table of its own, not a column of
+#: `message_edits`, whose zab (#757) writes its rows by position: with a fifth column there, a
+#: rollback to it would fail every edit-count write, and so every edit.
+_ADDED_TABLES = {
+    "message_edits": """CREATE TABLE IF NOT EXISTS message_edits (
+ bot TEXT NOT NULL, message_id INTEGER NOT NULL, edits INTEGER NOT NULL,
+ edited_at REAL NOT NULL, PRIMARY KEY (bot, message_id)
+)""",
+    "message_finals": """CREATE TABLE IF NOT EXISTS message_finals (
+ bot TEXT NOT NULL, message_id INTEGER NOT NULL, pending TEXT, PRIMARY KEY (bot, message_id)
+)""",
+}
+#: A final mark whose message has no count: one #757's zab forgot after a rollback, which
+#: never names `message_finals`. Removed at each start.
+_ORPHAN_FINALS = """DELETE FROM message_finals WHERE NOT EXISTS (SELECT 1 FROM message_edits e
+ WHERE e.bot=message_finals.bot AND e.message_id=message_finals.message_id)"""
+
+
+def _add_tables(db: sqlite3.Connection) -> None:
+    present = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if _ADDED_TABLES.keys() <= present:
+        return
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for schema in _ADDED_TABLES.values():  # IF NOT EXISTS: another store may have made it
+            db.execute(schema)
+    except BaseException:
+        db.rollback()
+        raise
+    db.commit()
+
+
 class Store:
     """Small synchronous transactions; callers must never await within one."""
 
@@ -99,9 +136,12 @@ class Store:
         if version == 0:
             _migration_1(self.db)
         _add_columns(self.db)
+        _add_tables(self.db)
+        with self.transaction():
+            self.db.execute(_ORPHAN_FINALS)
         self._columns = {
             name: {r[1] for r in self.db.execute(f"PRAGMA table_info({name})")}
-            for name in ("sessions", "turns", "approvals", "inbound", "held", "kv")
+            for name in ("sessions", "turns", "approvals", "inbound", "held", "kv", *_ADDED_TABLES)
         }
 
     def close(self) -> None:
@@ -244,6 +284,78 @@ class Store:
             (session_id, end, start),
         )
         return [row["bot"] for row in rows]
+
+    def edit_counts(self, bot: str) -> list[tuple[int, int, float, bool]]:
+        """The edits kept of `bot`'s messages (`EditBounds.keep`, #757): (message id, edits, when
+        the last went out, whether its final edit did), the least recently edited first."""
+        rows = self.db.execute(
+            "SELECT e.message_id, e.edits, e.edited_at, f.message_id IS NOT NULL"
+            " FROM message_edits e LEFT JOIN message_finals f"
+            " ON f.bot=e.bot AND f.message_id=e.message_id WHERE e.bot=?"
+            " ORDER BY e.edited_at, e.message_id",
+            (bot,),
+        )
+        return [(row[0], row[1], row[2], bool(row[3])) for row in rows]
+
+    def keep_edit_count(
+        self,
+        bot: str,
+        message_id: int,
+        edits: int,
+        edited_at: float,
+        forget: tuple[int, ...] = (),
+        *,
+        final: bool = False,
+    ) -> None:
+        """Keep a message's edits and whether its final edit went out, and forget those of the
+        messages in `forget`, at once. Columns by name: a later table may have more (#806)."""
+        with self.transaction():
+            self.db.execute(
+                "INSERT INTO message_edits (bot, message_id, edits, edited_at) VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(bot, message_id)"
+                " DO UPDATE SET edits=excluded.edits, edited_at=excluded.edited_at",
+                (bot, message_id, edits, edited_at),
+            )
+            self.db.execute(
+                "INSERT OR IGNORE INTO message_finals (bot, message_id) VALUES (?, ?)"
+                if final
+                else "DELETE FROM message_finals WHERE bot=? AND message_id=? AND pending IS NULL",
+                (bot, message_id),
+            )
+            self.forget_edit_counts(bot, forget)
+
+    def hold_final(self, bot: str, message_id: int, content: str) -> None:
+        """Keep a repeat of a message's final edit, held back for its gap, until it is sent."""
+        with self.transaction():
+            self.db.execute(
+                "INSERT INTO message_finals (bot, message_id, pending) VALUES (?, ?, ?)"
+                " ON CONFLICT(bot, message_id) DO UPDATE SET pending=excluded.pending",
+                (bot, message_id, content),
+            )
+
+    def release_final(self, bot: str, message_id: int) -> None:
+        with self.transaction():
+            self.db.execute(
+                "UPDATE message_finals SET pending=NULL WHERE bot=? AND message_id=?",
+                (bot, message_id),
+            )
+
+    def held_finals(self, bot: str) -> list[tuple[int, str]]:
+        """`bot`'s final edits held back and not sent yet: (message id, content)."""
+        rows = self.db.execute(
+            "SELECT message_id, pending FROM message_finals WHERE bot=? AND pending IS NOT NULL"
+            " ORDER BY message_id",
+            (bot,),
+        )
+        return [(row[0], row[1]) for row in rows]
+
+    def forget_edit_counts(self, bot: str, message_ids: tuple[int, ...]) -> None:
+        with self.transaction():
+            for table in ("message_edits", "message_finals"):
+                self.db.executemany(
+                    f"DELETE FROM {table} WHERE bot=? AND message_id=?",  # noqa: S608
+                    [(bot, mid) for mid in message_ids],
+                )
 
     def get(self, key: str, default: Any = None) -> Any:
         rows = self.rows("kv", key=key)

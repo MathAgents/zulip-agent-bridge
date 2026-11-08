@@ -18,7 +18,7 @@ from zab.admin.bot import StartupError
 from zab.admin.config import parse_admin_config
 from zab.waker import queues
 
-from .botkit import ADMINS_CH, CODEX_BOB, GLOBAL, OLGA, PAT, make_site
+from .botkit import ADMINS_CH, CODEX_BOB, GLOBAL, OLGA, PAT, audit_text, make_site
 from .test_admin_starter import CONFIG
 
 pytestmark = pytest.mark.integration
@@ -97,7 +97,7 @@ def chmod(path, mode):
 
 
 def records(site):
-    text = site.audit.read_text() if site.audit.exists() else ""
+    text = audit_text(site.audit)
     rows = [json.loads(line) for line in text.splitlines()]
     return [r for r in rows if r["event"] == "wake_check"]
 
@@ -131,7 +131,7 @@ async def test_a_start_after_the_owners_dm_raises_no_alert(site, server):
     (record,) = records(site)
     assert (record["outcome"], record["message"], record["via"]) == ("matched", sent, "codex")
     assert (record["instance"], record["participant"], record["owner"]) == (I1, "bob", PAT)
-    assert WORDS not in site.audit.read_text()  # the matched message's ID and time, no text
+    assert WORDS not in audit_text(site.audit)  # the matched message's ID and time, no text
     await server.wakes.check_pass()
     assert len(records(site)) == 1  # checked once
 
@@ -188,7 +188,7 @@ async def test_a_start_with_no_message_alerts_once(site, server):
     assert record["outcome"] == "unmatched" and type(record["alert"]) is int
     await server.wakes.check_pass()
     assert len(alerts(site)) == 1 and len(records(site)) == 1
-    assert WORDS not in site.audit.read_text()  # IDs and times only, never the text
+    assert WORDS not in audit_text(site.audit)  # IDs and times only, never the text
     assert all(WORDS not in p["content"] for p in site.realm.posts())
 
 

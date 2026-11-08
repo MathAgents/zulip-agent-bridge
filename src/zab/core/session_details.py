@@ -14,7 +14,8 @@ if TYPE_CHECKING:
     from zab.core.session import SessionActor
 
 
-def session_details(actor: SessionActor) -> str:
+def session_details(actor: SessionActor, unmentioned: str = "") -> str:
+    """`unmentioned`: where a message without a mention goes in the topic (#878), a line."""
     row = actor.row
     overrides = t.SessionSettings(**json.loads(row["settings_json"]))
     effective = effective_settings(actor.backend, row["native_id"])
@@ -46,5 +47,6 @@ def session_details(actor: SessionActor) -> str:
         f"branch {view.code(row.get('branch') or 'detached')}\n"
         + " · ".join(fields)
         + f"\nState: {row['state']} · {len(turns)} turns · {tokens} tokens\n"
+        + (unmentioned + "\n" if unmentioned else "")
         + f"For SSH users — resume in a terminal: {view.code(actor.resume)}"
     )

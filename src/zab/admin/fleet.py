@@ -36,16 +36,21 @@ what has been applied (docs/ADMIN.md §2.1, §2.6, §2.8; §3, action 7).
     - a record of those verbs without its `targets`, from a runner older or newer than this
       code, forgets every row of its workshop: it fails closed;
     - a `!retire` (#559) runs each row's steps alone, so its `apply_end` says per row which of
-      them exited 0 (`ApplyEnd.rows`), whatever the plan's exit: a row's uninstall that did
+      them exited 0 (`ApplyEnd.rows`), whatever the plan's exit; and each step is on the log
+      as it ends, a `retire_step` record, from which the ledger marks the row in place (#837),
+      so that a hard stop that cuts the `apply_end` loses none of it: a row's uninstall that did
       marks it uninstalled, and its sync, which follows it, synced, as the separate verbs
       would; a row whose steps all ran to their end is retired (`Recorded.retired`), and `all`
-      leaves it out from then on. A later `!launch` or `!adopt-spare` of it makes it a row in
-      service again, from its `apply_start`, whatever its outcome: a launch that failed may
-      have left a VM, which `all` must reach (review of #565). Both are refused for a retired
-      row until a deployer clears its `host` and `ip` in the roster (`actions.BACK`): with
-      them, `launch.py` would leave it alone and exit 0, and the row would be back in `all`
-      with no VM and a released address. A `rows` field that doesn't read back exactly marks
-      nothing.
+      leaves it out from then on. A month-end run writes the same `retire_step` records (#855);
+      a `month_end` record of `what: "retired"`, which only the development builds between
+      #835 and #860 wrote, never a release, for a run's row that a restart left with every step
+      done but no `apply_end`, still retires it. A later `!launch` or `!adopt-spare` of it
+      makes it a row in service again, from its `apply_start`, whatever its outcome: a launch
+      that failed may have left a VM, which `all` must reach (review of #565). Both are refused
+      for a retired row until a deployer clears its `host` and `ip` in the roster
+      (`actions.BACK`): with them, `launch.py` would leave it alone and exit 0, and the row
+      would be back in `all` with no VM and a released address. A `rows` field that doesn't
+      read back exactly marks nothing.
 
     The waker (§3, action 5) can start a VM outside any plan, but after `!uninstall` no agent
     answers on it.
@@ -98,21 +103,34 @@ def _text(path: str) -> str | None:
         return None
     except OSError as exc:
         raise FleetError(f"{Path(path).name}: {exc.strerror}") from None
+    return _decoded(data, Path(path).name)
+
+
+def _decoded(data: bytes, name: str) -> str:
     if len(data) > MAX_FILE:
-        raise FleetError(f"{Path(path).name} is larger than {MAX_FILE} bytes")
+        raise FleetError(f"{name} is larger than {MAX_FILE} bytes")
     try:
         return data.decode("utf-8-sig")  # a byte-order mark, as aws_common.read_roster
     except UnicodeDecodeError:
-        raise FleetError(f"{Path(path).name} is not UTF-8") from None
+        raise FleetError(f"{name} is not UTF-8") from None
 
 
 def read_roster(path: str) -> list[dict[str, str]]:
-    """The roster's participant rows, each column stripped and its name lower-cased; a row's
-    `slug` is its `github` login in lower case when it has none, as the scripts read it. A
-    missing roster has no rows: a new workshop's."""
+    """The roster's participant rows (`roster_rows`). A missing roster has no rows: a new
+    workshop's."""
     text = _text(path)
-    if text is None:
-        return []
+    return [] if text is None else _rows(text)
+
+
+def roster_rows(data: bytes, name: str = "roster.csv") -> list[dict[str, str]]:
+    """A roster's participant rows from its bytes, as `read_roster` reads its file: the one
+    reading of a roster on the bot's side, for bytes already read and hashed (`Runner._schedule`;
+    Codex round 4 on #829). Each column stripped and its name lower-cased; a row's `slug` is
+    its `github` login in lower case when it has none, as the scripts read it."""
+    return _rows(_decoded(data, name))
+
+
+def _rows(text: str) -> list[dict[str, str]]:
     rows = []
     for raw in csv.DictReader(io.StringIO(text, newline="")):
         row = {str(k).strip().lower(): (v or "").strip() for k, v in raw.items() if k is not None}
@@ -177,6 +195,7 @@ def read_fleet(
                 r.get("region", ""),
                 r.get("host", ""),
                 excluded=bool(r.get("excluded")),
+                keep_until=r.get("keep_until", ""),  # a kept VM's end (#570)
             )
             for r in rows
         ),
@@ -303,6 +322,11 @@ def retire_rows(record: Mapping[str, Any], targets: tuple[str, ...]) -> dict[str
     return out
 
 
+def _when(plan: str, ts: object) -> str:
+    """The ledger's words for when a plan did something: `P-<n> at <date> <time> UTC`."""
+    return f"{plan} at {ts[:16].replace('T', ' ')} UTC" if isinstance(ts, str) else plan
+
+
 def _words(value: object) -> tuple[str, ...] | None:
     if isinstance(value, list) and all(isinstance(word, str) for word in value):
         return tuple(value)
@@ -390,6 +414,10 @@ class Ledger:
     #: plan → (workshop, verb) of each apply that changes termination protection, from its
     #: `apply_start` to its `apply_end`: an `interrupted` record of it counts as its end
     protecting: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: plan → (workshop, each row's chain, from its `apply_start`) of a `!retire` whose end is
+    #: not on record, and its rows' cells so far (`retire_step`; #837)
+    chains: dict[str, tuple[str, dict[str, list[str]]]] = field(default_factory=dict)
+    cells: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
 
     def workshop(self, name: str) -> Recorded | None:
         return self.workshops.get(name)
@@ -416,6 +444,77 @@ class Ledger:
             self._protection(record)
         if event == "apply_end" and (end := ApplyEnd.read(record)) and end.exit == 0:
             self._applied(end)
+        if event == "month_end" and record.get("what") == "retired":
+            self._recovered(record)
+        if event == "apply_start" and record.get("verb") == "retire" and isinstance(plan, str):
+            self._chained(plan, record)
+        if event == "retire_step":
+            self._stepped(record)
+        if isinstance(plan, str) and (event == "interrupted" or (
+            event == "apply_end" and record.get("outcome") != "interrupted"
+        )):  # fmt: skip
+            # its end on record (a stop of the service's `apply_end` is not: the next start
+            # marks the plan, and says what its steps did)
+            self.chains.pop(plan, None)
+            self.cells.pop(plan, None)
+
+    def _chained(self, plan: str, record: Mapping[str, Any]) -> None:
+        """A `!retire` begins: its rows' chains, which its `retire_step` records fill in."""
+        ws, chains = record.get("workshop"), record.get("chains")
+        if isinstance(ws, str) and isinstance(chains, dict):
+            ok = {row: list(stages) for row, stages in chains.items()
+                  if isinstance(row, str) and _words(stages) is not None}  # fmt: skip
+            self.chains[plan], self.cells[plan] = (ws, ok), {}
+
+    def _stepped(self, record: Mapping[str, Any]) -> None:
+        """A `!retire`'s row's step, at its place in the log (#837; module doc): its uninstall
+        `ok` marks the row uninstalled, its sync `ok` synced after it, its bots `ok`, its last
+        step, retired, as its `apply_end` would; a later plan naming the row changes them as
+        it always does. The plan's cells so far are kept until its end is on record, for the
+        message of a restart that cuts it (`Planning.start`)."""
+        words = _words([record.get(k) for k in ("workshop", "plan", "row", "stage", "cell")])
+        if words is None:
+            return
+        ws, plan, row, stage, cell = words
+        self.cells.setdefault(plan, {}).setdefault(row, {})[stage] = cell
+        if cell == "ok" and stage in ("uninstall", "final-sync", "bots"):
+            state = self.workshops.setdefault(ws, Recorded())
+            when = _when(plan, record.get("ts"))
+            if stage == "uninstall":
+                state.down[row] = when
+            elif stage == "final-sync":
+                state.synced[row] = (when, state.down.get(row, ""))
+            else:
+                state.retired[row] = when
+
+    def cut(self, plan: str) -> dict[str, RowEnd]:
+        """A `!retire` whose end is not on record, from its own records: each row's chain with
+        its cells (`not run` for a step that never ended), retired when its last step is `ok`,
+        as `Rows.retired` has it; {} for any other plan."""
+        if plan not in self.chains:
+            return {}
+        _, chains = self.chains[plan]
+        cells = self.cells.get(plan, {})
+        out = {}
+        for row, stages in chains.items():
+            got = tuple((s, cells.get(row, {}).get(s, "not run")) for s in stages)
+            out[row] = RowEnd(got, bool(got) and got[-1][1] == "ok")
+        return out
+
+    def _recovered(self, record: Mapping[str, Any]) -> None:
+        """A month-end run's rows whose steps a restart left all done, its `apply_end` never
+        written (module doc): as that record would have said, retired. Only the development
+        builds between #835 and #860 wrote such records, never a release; a run's steps are
+        `retire_step` records now, which mark the rows in place, and the ledger still reads the
+        old ones, as an audit log those builds wrote has them."""
+        ws, plan, targets = (
+            record.get("workshop"),
+            record.get("plan"),
+            _words(record.get("targets")),
+        )
+        if isinstance(ws, str) and isinstance(plan, str) and targets is not None:
+            state = self.workshops.setdefault(ws, Recorded())
+            self._retired(state, record, targets, _when(plan, record.get("ts")))
 
     def _protection(self, record: Mapping[str, Any]) -> None:
         """The workshop's last apply that changes termination protection (module doc)."""
@@ -475,8 +574,7 @@ class Ledger:
             return
         if targets is None or not isinstance(plan, str):
             return
-        ts = record.get("ts")
-        when = f"{plan} at {ts[:16].replace('T', ' ')} UTC" if isinstance(ts, str) else plan
+        when = _when(plan, record.get("ts"))
         if verb == "retire":  # each row's own steps, whatever the plan's exit (#559)
             self._retired(state, record, targets, when)
             return

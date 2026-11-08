@@ -34,9 +34,11 @@ looked-up slug, spare, keyword or range-checked integer.
 
 from __future__ import annotations
 
+import calendar
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime
 
 SLUG_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?", re.ASCII)
 WS_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,45}[a-z0-9])?", re.ASCII)  # §2.2, §2.9
@@ -44,9 +46,10 @@ SPARE_RE = re.compile(r"zab-spare-[0-9]{1,3}", re.ASCII)
 VERSION_RE = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:rc[0-9]+)?", re.ASCII)
 _PLAN_RE = re.compile(r"P-([1-9][0-9]{0,8})", re.ASCII)
 _HASH6_RE = re.compile(r"[0-9a-f]{6}", re.ASCII)
+_SHA256_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)  # !upgrade-server sha256= (#569)
 _NUMBER_RE = re.compile(r"0|[1-9][0-9]{0,3}", re.ASCII)
-_SHOWABLE = re.compile(r"!?[A-Za-z0-9._=-]{1,40}", re.ASCII)
-_REGION_RE = re.compile(r"[a-z]{2}(?:-[a-z]+)+-[0-9]{1,2}", re.ASCII)  # zab.admin.config's
+_SHOWABLE = re.compile(r"!?[A-Za-z0-9._=:-]{1,40}", re.ASCII)  # `:`: a time (#570)
+_REGION_RE = re.compile(r"[a-z]{2}(?:-[a-z]+)++-[0-9]{1,2}", re.ASCII)  # zab.admin.config's
 _NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?", re.ASCII)  # a workshop's, ditto
 _ID_RE = re.compile(r"[1-9][0-9]{0,18}", re.ASCII)
 _SIZE_RE = re.compile(r"([1-9][0-9]{0,3})(?:GB|gb)", re.ASCII)  # !grow-disk's `300GB`
@@ -55,6 +58,14 @@ _SIZE_RE = re.compile(r"([1-9][0-9]{0,3})(?:GB|gb)", re.ASCII)  # !grow-disk's `
 #: is a constant for the same reason. `grow_disk.MAX_GB` refuses above it too; a test keeps the
 #: two equal.
 MAX_DISK_GB = 1000
+#: `!keep-until`'s end of a kept VM (ADMIN §11.5): a date, or a date and a time, in UTC; `t` is
+#: read as `T`. The roster's `keep_until` holds it as written here (`keep_until_value`), and
+#: `workshop/admin/admin_common.keep_until_value` reads the column the same way: a test keeps
+#: the two equal.
+_UNTIL_RE = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})(?:[Tt]([0-9]{2}):([0-9]{2}))?", re.ASCII)
+#: The hour, UTC, at which a kept VM given a date alone ends: morning in the Americas and
+#: afternoon in Europe, while organizers there can watch it.
+END_HOUR = 15
 #: Zulip's compose box links an attachment as `[name](/user_uploads/<realm>/…/<name>)`.
 _UPLOAD_LINK = re.compile(r"\]\((/user_uploads/[^\s)]*)\)")
 _UPLOAD_MARKDOWN = re.compile(r" ?\[[^\]\n]*\]\(/user_uploads/[^\s)]*\)")  # the whole link
@@ -98,7 +109,8 @@ class VerbSpec:
     optional: tuple[str, ...] = ()  # an `only_global` verb's settings that may be left out
 
 
-#: The verbs the bots offer (§2.2's table). `roster` and `provision` take a subcommand.
+#: The verbs the bots offer (§2.2's table). `roster`, `provision` and `month-end` take a
+#: subcommand.
 SPECS: dict[str, VerbSpec] = {
     "help": VerbSpec("read", "!help [command]", ("topic?",), server=True, dm=True),
     "version": VerbSpec("read", "!version", server=True),
@@ -153,6 +165,13 @@ SPECS: dict[str, VerbSpec] = {
     "adopt-spare": VerbSpec("change", "!adopt-spare slug zab-spare-N", ("slug", "spare")),
     # one row's root volume, to N GB (#553): EBS only grows, and bills every GB a month
     "grow-disk": VerbSpec("change", "!grow-disk slug NGB", ("slug", "size")),
+    # a kept VM's end (ADMIN §11.5, #570): the roster's `keep_until`; `none` clears it
+    "keep-until": VerbSpec("change", "!keep-until DATE|none SEL", ("until",), selection=True),
+    # the automated month-end (§11.5, #570): one schedule per workshop, of every row in service
+    # with a `keep_until`; its reading; and its veto, at once, as `!reject` is a plan's
+    "month-end schedule": VerbSpec("destructive", "!month-end schedule"),
+    "month-end show": VerbSpec("read", "!month-end show"),
+    "month-end cancel": VerbSpec("approval", "!month-end cancel SEL", selection=True),
     "waker": VerbSpec("change", "!waker on|off SEL", ("on",), selection=True),
     "final-sync": VerbSpec("change", "!final-sync SEL", selection=True),
     "export": VerbSpec("change", "!export SEL", selection=True),
@@ -186,14 +205,25 @@ SPECS: dict[str, VerbSpec] = {
         only_global=True,
         optional=("channel",),
     ),
+    # §1.6, #569: the server's own upgrade, to a newer signed release; `sha256=`, required, is
+    # the reviewed diff's, as the deployer's own review printed it, which the plan must match.
+    # It only goes forward: `downgrade` is refused, with the way back (`_FORWARD_ONLY`)
+    "upgrade-server": VerbSpec(
+        "deploy",
+        "!upgrade-server VERSION sha256=<your review's SHA-256>",
+        ("version",),
+        settings=("sha256",),
+        server=True,
+        only_global=True,
+    ),
     "approve": VerbSpec(
         "approval", "!approve P-n hash6 [phrase]", ("plan", "hash6", "phrase*"), server=True
     ),
     "reject": VerbSpec("approval", "!reject P-n", ("plan",), server=True),
 }
 #: Verbs of later stages (§8.1): not offered through the bots yet; a deployer runs them by hand.
-LATER = frozenset({"rebind", "upgrade-server", "cancel"})
-_GROUPS = frozenset(key.split()[0] for key in SPECS if " " in key)  # roster, provision
+LATER = frozenset({"rebind", "cancel"})
+_GROUPS = frozenset(key.split()[0] for key in SPECS if " " in key)  # roster, provision, month-end
 _TOPICS = frozenset(key.split()[0] for key in SPECS) | LATER
 #: Words that are keywords or setting names wherever a slug may stand (`steer` included, so that
 #: a bare `steer` can't select a participant of that name): no roster slug may be one of them.
@@ -214,6 +244,7 @@ _EXPECTED = {
     "topic": "a command name",
     "ws-name": "a new workshop's name: a-z, 0-9 and '-', at most 47 characters",
     "new-slug": "a new slug: a-z, 0-9 and inner '-', at most 32 characters, not a keyword",
+    "until": "a date like 2026-11-30, or 2026-11-30T15:00 (UTC), or none",
 }
 
 
@@ -320,6 +351,7 @@ class Command:
     new_slug: str | None = None  # !roster rename slug new-slug (#627)
     spare: str | None = None  # !adopt-spare
     size: int | None = None  # !grow-disk: the root volume's new size, in GB (1 to MAX_DISK_GB)
+    until: str | None = None  # !keep-until: `keep_until_value`'s form, or "none"
     plan: int | None = None  # !plan, !approve, !reject: P-<plan>, unique on the server
     hash6: str | None = None  # !approve
     phrase: tuple[str, ...] = ()  # !approve: the typed confirmation, e.g. ("stop", "35")
@@ -331,6 +363,7 @@ class Command:
     like: str | None = None  # !new-workshop like=: the workshop whose settings it copies
     organizers: tuple[int, ...] | None = None  # !new-workshop organizers=: Zulip user IDs
     channel: str | None = None  # !new-workshop channel="…": the participants' channel (#627)
+    sha256: str | None = None  # !upgrade-server sha256=: the reviewed diff's (#569)
 
     def __post_init__(self) -> None:
         """A `Command` built directly is held to what `parse` guarantees: a verb of SPECS, and
@@ -415,7 +448,7 @@ def _render(kind: str, value: object) -> list[str]:
 def _show(word: str) -> str:
     if _SHOWABLE.fullmatch(word):
         return f"`{word}`"
-    return "a word with characters outside a-z, 0-9, '-', '.' and '='"
+    return "a word with characters outside a-z, 0-9, '-', '.', ':' and '='"
 
 
 def _missing_slug(word: str, reason: str) -> _Reject:
@@ -440,6 +473,32 @@ def _size(word: str) -> int | None:
     """`300GB` (or `300gb`) → 300, from 1 to `MAX_DISK_GB`."""
     match = _SIZE_RE.fullmatch(word)
     return int(match[1]) if match and int(match[1]) <= MAX_DISK_GB else None
+
+
+def keep_until_value(word: str) -> str | None:
+    """A kept VM's end as the roster's `keep_until` holds it: `2026-11-30`, or `2026-11-30T15:00`
+    (UTC), a real date and time; None for anything else."""
+    match = _UNTIL_RE.fullmatch(word)
+    if match is None:
+        return None
+    year, month, day, hour, minute = match.groups()
+    try:
+        datetime(int(year), int(month), int(day), int(hour or 0), int(minute or 0))
+    except ValueError:
+        return None
+    return f"{year}-{month}-{day}" + (f"T{hour}:{minute}" if hour else "")
+
+
+def keep_until_end(value: str) -> float | None:
+    """The end a `keep_until` value names, in seconds since the epoch: a date alone at
+    `END_HOUR` UTC that day. None when it isn't one."""
+    word = keep_until_value(value)
+    if word is None:
+        return None
+    day, _, time = word.partition("T")
+    hour, minute = (int(x) for x in time.split(":")) if time else (END_HOUR, 0)
+    year, month, mday = (int(x) for x in day.split("-"))
+    return float(calendar.timegm((year, month, mday, hour, minute, 0)))
 
 
 def _minutes(word: str) -> int | None:
@@ -469,6 +528,8 @@ _SETTINGS = {
     "organizers": (lambda v: _ids(v), "Zulip user IDs, comma-separated, each once, at most 20"),
     # a one-word name may go unquoted; one in quotes is read before the words (`_command`)
     "channel": (channel_name, CHANNEL_RULE),
+    # !upgrade-server's (#569): the reviewed diff's SHA-256, whole, as deploy.sh prints it
+    "sha256": (lambda v: v if _SHA256_RE.fullmatch(v) else None, "the 64 hex digits of a SHA-256"),
 }
 
 
@@ -500,6 +561,7 @@ def _head(kind: str, word: str, ctx: Context, roster: Roster) -> object:
         "ws-name": lambda: word if WS_NAME_RE.fullmatch(word) else None,
         # `!roster rename`'s (#627): its shape here; roster_sync.py checks it is free
         "new-slug": lambda: word if _new_slug(word) else None,
+        "until": lambda: "none" if word == "none" else keep_until_value(word),
     }
     return lookup[kind]()
 
@@ -570,8 +632,18 @@ def _selection(spec: VerbSpec, seen: set[str], roster: Roster) -> Selection:
     return Selection(every, every_spare, slugs, spare_names)
 
 
+#: `!upgrade-server` only goes forward (no in-band downgrades): its old keyword, refused with
+#: the way back.
+_FORWARD_ONLY = (
+    "`!upgrade-server` only goes forward: go back with `deploy.sh --downgrade` from a "
+    "deployer's machine (BOOTSTRAP §13.4)"
+)
+
+
 def _unexpected(word: str, spec: VerbSpec) -> _Reject:
     verb = spec.usage.split()[0]
+    if verb == "!upgrade-server" and word == "downgrade":
+        return _Reject(_FORWARD_ONLY)
     if SPARE_RE.fullmatch(word):
         why = f"{_show(word)} is not an available spare" if spec.spares else "no spares here"
     elif word in RESERVED or word.partition("=")[0] in _SETTINGS:
@@ -632,7 +704,8 @@ def _command(body: str, content: str, ctx: Context, dm: bool) -> Command:
         fields["channel"] = quoted[0]
     required = [key for key in spec.settings if key not in spec.optional]
     if spec.only_global and any(_field(key) not in fields for key in required):
-        raise _Reject(f"each setting but {', '.join(spec.optional)} is required: {spec.usage}")
+        but = f" but {', '.join(spec.optional)}" if spec.optional else ""
+        raise _Reject(f"each setting{but} is required: {spec.usage}")
     if verb == "roster import":
         fields["upload"] = _upload(content)
     return Command(verb, **fields)

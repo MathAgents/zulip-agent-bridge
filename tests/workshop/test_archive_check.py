@@ -14,8 +14,11 @@ of small files, generated, re-packs well within the CPU limit.
 from __future__ import annotations
 
 import array
+import ctypes
+import ctypes.util
 import gzip
 import io
+import itertools
 import ntpath
 import os
 import pathlib
@@ -23,12 +26,14 @@ import posixpath
 import re
 import resource
 import socket
+import stat
 import struct
 import subprocess
 import sys
 import tarfile
 import threading
 import time
+import unicodedata
 
 import archive_check as ac_check
 import collect_exports as ce
@@ -1004,29 +1009,42 @@ def linked(*members: tuple[str, bytes, str]) -> bytes:
     return data.getvalue()
 
 
-def two_targets() -> bytes:
+def ustar(name: str, kind: bytes, target: str = "", body: bytes = b"") -> bytes:
+    """One member in ustar format, its data padded to a block."""
+    info = tarfile.TarInfo(name)
+    info.type, info.linkname, info.size = kind, target, len(body)
+    info.mode = 0o755 if kind in (tarfile.DIRTYPE, tarfile.LNKTYPE) else 0o644
+    return info.tobuf(format=tarfile.USTAR_FORMAT) + body + b"\0" * (-len(body) % 512)
+
+
+def longlink(target: bytes) -> bytes:
+    """A GNU `K` record: the next member's link target."""
+    info = tarfile.TarInfo("././@LongLink")
+    info.type, info.size = tarfile.GNUTYPE_LONGLINK, len(target) + 1
+    body = target + b"\0"
+    return info.tobuf(format=tarfile.GNU_FORMAT) + body + b"\0" * (-len(body) % 512)
+
+
+def linkpath(target: bytes, kind: bytes = tarfile.XHDTYPE) -> bytes:
+    """A PAX header (the next member's, or with `kind` XGLTYPE a global one) naming a target."""
+    return pax_header(pax_record("linkpath", target), kind=kind)
+
+
+def two_targets(under: str = "h/zab/key") -> bytes:
     """The re-review of #360 at 7d6801c: a hard link `h` whose target tarfile reads from a GNU
     `K` record (`a`) and GNU tar from a PAX `linkpath` (`c`, a symlink to `.config`); GNU tar
-    then writes `h/zab/key` to `.config/zab/key`."""
-
-    def member(name: str, kind: bytes, target: str = "", body: bytes = b"") -> bytes:
-        info = tarfile.TarInfo(name)
-        info.type, info.linkname, info.size = kind, target, len(body)
-        info.mode = 0o755 if kind in (tarfile.DIRTYPE, tarfile.LNKTYPE) else 0o644
-        return info.tobuf(format=tarfile.USTAR_FORMAT) + body + b"\0" * (-len(body) % 512)
-
-    longlink = tarfile.TarInfo("././@LongLink")
-    longlink.type, longlink.size = tarfile.GNUTYPE_LONGLINK, 2
+    then writes `h/zab/key` to `.config/zab/key`. With `H/zab/key` (the review of #887, N1),
+    GNU tar does so on a case-insensitive filesystem."""
     raw = [
-        member(".config", tarfile.DIRTYPE),
-        member("c", tarfile.SYMTYPE, ".config"),
-        member("a", tarfile.REGTYPE, body=b"a"),
-        longlink.tobuf(format=tarfile.GNU_FORMAT) + b"a\0" + b"\0" * 510,
-        pax_header(pax_record("linkpath", b"c")),
-        member("h", tarfile.LNKTYPE, "zz"),
-        member("h/zab/key", tarfile.REGTYPE, body=b"secret"),
+        ustar(".config", tarfile.DIRTYPE),
+        ustar("c", tarfile.SYMTYPE, ".config"),
+        ustar("a", tarfile.REGTYPE, body=b"a"),
+        longlink(b"a"),
+        linkpath(b"c"),
+        ustar("h", tarfile.LNKTYPE, "zz"),
+        ustar(under, tarfile.REGTYPE, body=b"secret"),
     ]
-    return gzip.compress(b"".join(raw) + b"\0" * 10240)
+    return gzip.compress(b"".join(raw) + END)
 
 
 DIRS = ((".codex", tarfile.DIRTYPE, ""), ("work", tarfile.DIRTYPE, ""))
@@ -1116,8 +1134,7 @@ THROUGH = {
         ("work/h", tarfile.LNKTYPE, "WORK/a/L"),
         ("work/h/zab/key", tarfile.REGTYPE, ""),
     ),
-    # the re-review of #360 at 7d6801c: nothing under a hard link, whatever target is read
-    "a file under a hard link with two targets": two_targets(),
+    # the re-review of #360 at 7d6801c: nothing under a hard link (its two targets: below)
     "a file under a hard link": linked(
         *DIRS,
         ("work/a", tarfile.REGTYPE, ""),
@@ -1166,13 +1183,8 @@ def test_a_hard_link_to_or_through_a_symlink_is_refused_at_the_link(tmp_path, na
     )
 
 
-def test_a_hard_link_with_two_targets_is_refused_under_it(tmp_path):
-    """The readers disagree on `h`'s target (tarfile `a`, GNU tar `c`), and both list the same
-    names; the file under `h` is refused, whichever target either reads."""
-    path = tmp_path / "x.tar.gz"
-    path.write_bytes(two_targets())
-    with tarfile.open(path) as tar:
-        assert tar.getmember("h").linkname == "a"
+def gnu_target(path: pathlib.Path, name: str) -> str:
+    """The link target GNU tar lists for the member `name` of the gzip tar at `path`."""
     listing = subprocess.run(  # noqa: S603
         ["/usr/bin/tar", "--list", "--verbose", "--gzip", "--file", str(path)],
         capture_output=True,
@@ -1180,10 +1192,408 @@ def test_a_hard_link_with_two_targets_is_refused_under_it(tmp_path):
         check=True,
         env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
     ).stdout
-    assert any(line.endswith(" h link to c") for line in listing.splitlines()), listing
-    assert check_archive(path) == (
-        "a member written through an earlier symlink or hard link (h/zab/key): deleted"
-    )
+    found = [m[1] for m in re.finditer(rf" {name} (?:link to|->) (.*)", listing)]
+    assert len(found) == 1, listing
+    return found[0]
+
+
+def tarfile_target(path: pathlib.Path, name: str) -> str:
+    with tarfile.open(path) as tar:
+        return tar.getmember(name).linkname
+
+
+TWO_WAYS = "a name or link target that GNU tar and tarfile can read two ways (h): deleted"
+
+
+@pytest.mark.parametrize("under", ["h/zab/key", "H/zab/key"])
+def test_a_hard_link_with_two_targets_is_refused_at_the_link(tmp_path, under):
+    """#360's archive, with `h/zab/key`, and the review of #887's, with `H/zab/key`: the readers
+    disagree on `h`'s target (tarfile `a`, GNU tar `c`, a symlink), and since #888 that refuses
+    `h` itself, before any name under it is read in either case (#819 matches `H/zab/key`
+    against the hard link `h` by its exact name)."""
+    path = tmp_path / "x.tar.gz"
+    path.write_bytes(two_targets(under))
+    assert (tarfile_target(path, "h"), gnu_target(path, "h")) == ("a", "c")
+    assert check_archive(path) == TWO_WAYS
+
+
+def comment(kind: bytes = tarfile.XHDTYPE) -> bytes:
+    """A PAX header without a `linkpath`."""
+    return pax_header(pax_record("comment", b"q"), kind=kind)
+
+
+#: Headers before a link `h` whose own header names `z`, after files `a`, `c` and `z`; then
+#: what tarfile and GNU tar 1.35 read as its target
+READ_TWO_WAYS = {
+    "a K record, then a PAX linkpath (#360)": ((longlink(b"a"), linkpath(b"c")), "a", "c"),
+    "the same, a Solaris PAX header": (
+        (longlink(b"a"), linkpath(b"c", tarfile.SOLARIS_XHDTYPE)),
+        "a",
+        "c",
+    ),
+    "two K records": ((longlink(b"a"), longlink(b"c")), "a", "c"),
+    "two PAX linkpaths": ((linkpath(b"a"), linkpath(b"c")), "a", "c"),
+    "a PAX linkpath, then a PAX header without": ((linkpath(b"a"), comment()), "a", "z"),
+    "a global linkpath, then a K record": (
+        (linkpath(b"c", tarfile.XGLTYPE), longlink(b"a")),
+        "a",
+        "c",
+    ),
+    "a global linkpath, then a global header without": (
+        (linkpath(b"c", tarfile.XGLTYPE), comment(tarfile.XGLTYPE)),
+        "c",
+        "z",
+    ),
+}
+#: The same, where both read one target
+READ_ONE_WAY = {
+    "no extension header": ((), "z"),
+    "a K record": ((longlink(b"a"),), "a"),
+    "a PAX linkpath": ((linkpath(b"c"),), "c"),
+    "a PAX linkpath, then a K record": ((linkpath(b"c"), longlink(b"a")), "c"),
+    "a K record, then the same PAX linkpath": ((longlink(b"a"), linkpath(b"a")), "a"),
+    "a K record, then a PAX header without": ((longlink(b"a"), comment()), "a"),
+    "a global header without, then a K record": ((comment(tarfile.XGLTYPE), longlink(b"a")), "a"),
+}
+LINKS = [tarfile.LNKTYPE, tarfile.SYMTYPE]
+
+
+def headed(path: pathlib.Path, headers: tuple[bytes, ...], kind: bytes) -> pathlib.Path:
+    files = [ustar(name, tarfile.REGTYPE, body=name.encode()) for name in ("a", "c", "z")]
+    path.write_bytes(gzip.compress(b"".join([*files, *headers, ustar("h", kind, "z")]) + END))
+    return path
+
+
+@pytest.mark.parametrize("kind", LINKS, ids=["hard", "symlink"])
+@pytest.mark.parametrize("name", list(READ_TWO_WAYS))
+def test_a_link_target_read_two_ways_is_refused(tmp_path, name, kind):
+    """#888: GNU tar reads a member's PAX header over its `K` record, a global header over a
+    `K` record, and the last of two headers of a kind; tarfile the first of a `K` record and a
+    PAX header, and every global header so far. Each such archive is refused at the link."""
+    headers, python, gnu = READ_TWO_WAYS[name]
+    path = headed(tmp_path / "x.tar.gz", headers, kind)
+    assert (tarfile_target(path, "h"), gnu_target(path, "h")) == (python, gnu)
+    assert check_archive(path) == TWO_WAYS
+
+
+@pytest.mark.parametrize("kind", LINKS, ids=["hard", "symlink"])
+@pytest.mark.parametrize("name", list(READ_ONE_WAY))
+def test_a_link_target_read_one_way_passes(tmp_path, name, kind):
+    """#888: a link whose target both readers read alike passes, a hard link a copy of it."""
+    headers, target = READ_ONE_WAY[name]
+    path = headed(tmp_path / "x.tar.gz", headers, kind)
+    assert tarfile_target(path, "h") == gnu_target(path, "h") == target
+    problem, _, new = repacked(tmp_path, path.read_bytes())
+    assert problem == ""
+    files = [("a", b"a"), ("c", b"c"), ("z", b"z")]
+    if kind == tarfile.LNKTYPE:
+        assert contents(new) == [*files, ("h", target.encode())]
+    else:
+        manifest = ac_check.MANIFEST_HEAD + f"h\t{target}\n".encode()
+        assert contents(new) == [*files, (ac_check.MANIFEST, manifest)]
+
+
+@pytest.mark.parametrize("fmt", ["gnu", "posix"])
+@pytest.mark.parametrize("writer", ["gnu", "tarfile"])
+def test_long_link_names_and_targets_pass_in_either_format(tmp_path, writer, fmt):
+    """#888: what GNU tar and tarfile write for links whose names and targets pass ustar's 100
+    bytes, `L` and `K` records in GNU format, a PAX header each in PAX format, passes."""
+    deep = "work/" + "d" * 120
+    tree = tmp_path / "tree" / deep
+    tree.mkdir(parents=True)
+    (tree / ("f" * 120)).write_text("f")
+    os.link(tree / ("f" * 120), tree / ("h" * 120))
+    (tree / ("s" * 120)).symlink_to("f" * 120)
+    path = tmp_path / "x.tar.gz"
+    if writer == "gnu":
+        argv = ["tar", "--create", "--gzip", f"--format={fmt}", "--file", str(path)]
+        subprocess.run([*argv, "-C", str(tmp_path / "tree"), "work"], check=True)  # noqa: S603
+    else:
+        form = tarfile.GNU_FORMAT if fmt == "gnu" else tarfile.PAX_FORMAT
+        with tarfile.open(path, "w:gz", format=form) as tar:
+            tar.add(tmp_path / "tree" / "work", arcname="work")
+    raw = gzip.decompress(path.read_bytes())
+    assert (b"././@LongLink" in raw) == (fmt == "gnu") and (b" linkpath=" in raw) == (fmt != "gnu")
+    with tarfile.open(path) as tar:
+        assert sum(m.islnk() for m in tar) == 1 and sum(m.issym() for m in tar) == 1
+    assert check_archive(path) == ""
+    got = dict(contents(path.with_name(path.name + ".new")))
+    assert got[f"{deep}/{'f' * 120}"] == got[f"{deep}/{'h' * 120}"] == b"f"
+    assert f"{deep}/{'s' * 120}\t{'f' * 120}\n".encode() in got[ac_check.MANIFEST]
+
+
+def libarchive_tar(path: pathlib.Path, fmt: str, members: list[tuple[str, int, str, bytes]]):
+    """`members` (name, file type, link target, data), each name and target UTF-8, written to
+    `path` by libarchive (bsdtar's library, through ctypes) in its format `fmt`, as bsdtar
+    writes them: a hard link a regular entry with a target and no data."""
+    found = ctypes.util.find_library("archive")
+    if not found:
+        pytest.skip("no libarchive")
+    la, p, s = ctypes.CDLL(found), ctypes.c_void_p, ctypes.c_char_p
+    for name, result, args in (
+        ("archive_write_new", p, []),
+        (f"archive_write_set_format_{fmt}", ctypes.c_int, [p]),
+        ("archive_write_open_filename", ctypes.c_int, [p, s]),
+        ("archive_entry_new", p, []),
+        ("archive_entry_update_pathname_utf8", ctypes.c_int, [p, s]),
+        ("archive_entry_update_symlink_utf8", ctypes.c_int, [p, s]),
+        ("archive_entry_update_hardlink_utf8", ctypes.c_int, [p, s]),
+        ("archive_entry_set_filetype", None, [p, ctypes.c_uint]),
+        ("archive_entry_set_perm", None, [p, ctypes.c_uint]),
+        ("archive_entry_set_size", None, [p, ctypes.c_int64]),
+        ("archive_write_header", ctypes.c_int, [p, p]),
+        ("archive_write_data", ctypes.c_ssize_t, [p, s, ctypes.c_size_t]),
+        ("archive_entry_free", None, [p]),
+        ("archive_write_close", ctypes.c_int, [p]),
+        ("archive_write_free", ctypes.c_int, [p]),
+        ("archive_error_string", s, [p]),
+    ):
+        getattr(la, name).restype, getattr(la, name).argtypes = result, args
+    writer = la.archive_write_new()
+    assert getattr(la, f"archive_write_set_format_{fmt}")(writer) == 0
+    assert la.archive_write_open_filename(writer, str(path).encode()) == 0
+    for name, kind, target, body in members:
+        entry = la.archive_entry_new()
+        la.archive_entry_update_pathname_utf8(entry, name.encode())
+        la.archive_entry_set_filetype(entry, kind)
+        la.archive_entry_set_perm(entry, 0o755 if kind == stat.S_IFDIR else 0o644)
+        if kind == stat.S_IFLNK:
+            la.archive_entry_update_symlink_utf8(entry, target.encode())
+        elif target:
+            la.archive_entry_update_hardlink_utf8(entry, target.encode())
+        la.archive_entry_set_size(entry, len(body))
+        assert la.archive_write_header(writer, entry) == 0, la.archive_error_string(writer)
+        assert la.archive_write_data(writer, body, len(body)) == len(body)
+        la.archive_entry_free(entry)
+    assert la.archive_write_close(writer) == 0
+    la.archive_write_free(writer)
+    path.write_bytes(gzip.compress(path.read_bytes()))
+
+
+@pytest.mark.parametrize("fmt", ["pax_restricted", "pax", "gnutar"])
+def test_what_libarchive_writes_passes(tmp_path, fmt):
+    """#888 (the review of #892, N1): libarchive, in bsdtar's default format (`pax_restricted`),
+    `pax` and `gnutar`, writes one PAX header, or at most one `L` and one `K` record, before
+    each entry. Links whose names and targets pass 100 bytes, an absolute symlink target, and
+    a hard link and a symlink to a name with a decomposed `é` (which libarchive composes), a
+    composed one and CJK, pass."""
+    deep, uni = "work/" + "d" * 120, "work/e\u0301t\u00e9-\u4e2d\u6587"
+    f, h, s = f"{deep}/{'f' * 120}", f"{deep}/{'h' * 120}", f"{deep}/{'s' * 120}"
+    members = [
+        ("work", stat.S_IFDIR, "", b""),
+        (deep, stat.S_IFDIR, "", b""),
+        (f, stat.S_IFREG, "", b"f"),
+        (h, stat.S_IFREG, f, b""),
+        (s, stat.S_IFLNK, "f" * 120, b""),
+        ("work/abs", stat.S_IFLNK, "/" + "x" * 150, b""),
+        (uni, stat.S_IFREG, "", b"u"),
+        (f"{uni}-link", stat.S_IFREG, uni, b""),
+        (f"{uni}-sym", stat.S_IFLNK, uni.removeprefix("work/"), b""),
+    ]
+    path = tmp_path / "x.tar.gz"
+    libarchive_tar(path, fmt, members)
+    raw = gzip.decompress(path.read_bytes())
+    assert (b"././@LongLink" in raw) == (fmt == "gnutar")
+    assert (b" path=" in raw) == (fmt != "gnutar")
+    assert check_archive(path) == ""
+    got = dict(contents(path.with_name(path.name + ".new")))
+    uni = unicodedata.normalize("NFC", uni)
+    assert got[f] == got[h] == b"f" and got[uni] == got[f"{uni}-link"] == b"u"
+    assert got[ac_check.MANIFEST].splitlines()[2:] == [
+        f"{s}\t{'f' * 120}".encode(),
+        b"work/abs\t/" + b"x" * 150,
+        f"{uni}-sym\t{uni.removeprefix('work/')}".encode(),
+    ]
+
+
+def seen_kinds(data: bytes) -> list[tuple[str, str]]:
+    """Each member's name, with the types of its headers that `_Header` noted, in order."""
+    stream = ac_check._Stream(gzip.GzipFile(fileobj=io.BytesIO(data)), 1 << 30)  # type: ignore[arg-type]
+    kinds = []
+    with tarfile.open(fileobj=stream, mode="r:", tarinfo=ac_check._Header) as tar:
+        while (member := tar.next()) is not None:
+            kinds.append((member.name, b"".join(stream.kinds).decode()))
+            stream.kinds = []
+    return kinds
+
+
+def test_tarfile_shows_the_check_its_headers():
+    """#888 (the review of #892, B1): `_Header` notes the type of each header tarfile reads,
+    first to last, and whether a member's own header has a prefix that GNU tar drops."""
+    assert ac_check.seen()
+    assert seen_kinds(two_targets())[-2:] == [("h", "Kx1"), ("h/zab/key", "0")]
+    stream = ac_check._Stream(io.BytesIO(prefixed("q", b"ustar  \0") + END), 1 << 20)  # type: ignore[arg-type]
+    with tarfile.open(fileobj=stream, mode="r:", tarinfo=ac_check._Header) as tar:
+        member = tar.next()
+    assert (member.name, member.dropped) == ("pre/q", True)
+
+
+def _member_only(self, tar):
+    """A tarfile that shows the subclass only a member's own header."""
+    if self.type not in (*ac_check._RECORDS, *ac_check._PAX, tarfile.XGLTYPE):
+        tar.fileobj.kinds.append(self.type)
+        self.dropped = False
+    return tarfile.TarInfo._proc_member(self, tar)
+
+
+def _no_block(self, tar):
+    """A tarfile that reads something between a header and `_proc_member`."""
+    tar.fileobj.kinds.append(self.type)
+    return tarfile.TarInfo._proc_member(self, tar)
+
+
+@pytest.mark.parametrize("hook", [None, _member_only, _no_block], ids=["none", "member", "block"])
+def test_every_archive_is_refused_if_tarfile_hides_its_headers(monkeypatch, capsys, hook):
+    """#888 (the review of #892, B1): without `_Header._proc_member` for each header, as read,
+    `_alike` would pass the chains it refuses. `seen` notices, so every archive is refused,
+    the good one included, and `selfcheck`, which `deploy.sh` runs, fails; and `_alike` refuses
+    a member that `_Header` wasn't shown, should `seen` pass all the same."""
+    if hook is None:
+        monkeypatch.delattr(ac_check._Header, "_proc_member")
+    else:
+        monkeypatch.setattr(ac_check._Header, "_proc_member", hook)
+    assert not ac_check.seen()
+    hidden = b"R" + struct.pack(">I", len(ac_check.HIDDEN)) + ac_check.HIDDEN.encode()
+    assert answer_of(GOOD) == (1, hidden)
+    assert ac_check.selfcheck() == 1
+    assert capsys.readouterr().out == f"archive_check: selfcheck FAILED: {ac_check.HIDDEN}\n"
+    monkeypatch.setattr(ac_check, "seen", lambda: True)  # `seen` alone sees the member variant
+    if hook is not _member_only:
+        with tarfile.open(fileobj=io.BytesIO(GOOD)) as tar:
+            first = tar.getnames()[0]
+        why = ac_check.scan(io.BytesIO(GOOD), 1 << 30)[0]
+        assert why == f"{ac_check.HIDES} (it couldn't see the headers of {first})"
+
+
+def prefixed(name: str, magic: bytes, kind: bytes = tarfile.REGTYPE, body: bytes = b"q") -> bytes:
+    """A member whose header has the `prefix` `pre` and the 8 bytes of `magic` and version."""
+    info = tarfile.TarInfo(name)
+    info.type, info.size, info.mode = kind, len(body), 0o644
+    block = bytearray(info.tobuf(format=tarfile.USTAR_FORMAT))
+    block[345:348], block[257:265] = b"pre", magic
+    block[148:156] = b"%06o\0 " % (sum(block) - sum(block[148:156]) + 8 * ord(" "))
+    return bytes(block) + body + b"\0" * (-len(body) % 512)
+
+
+def longname(name: bytes) -> bytes:
+    """A GNU `L` record: the next member's name."""
+    info = tarfile.TarInfo("././@LongLink")
+    info.type, info.size = tarfile.GNUTYPE_LONGNAME, len(name) + 1
+    body = name + b"\0"
+    return info.tobuf(format=tarfile.GNU_FORMAT) + body + b"\0" * (-len(body) % 512)
+
+
+def path_header(name: bytes, kind: bytes = tarfile.XHDTYPE) -> bytes:
+    return pax_header(pax_record("path", name), kind=kind)
+
+
+Q = ustar("q", tarfile.REGTYPE, body=b"q")
+#: Headers before a file whose own header names it `q`; then the name tarfile and GNU tar 1.35
+#: read
+NAMES_TWO_WAYS = {
+    "an L record, then a PAX path": ((longname(b"x"), path_header(b"c"), Q), "x", "c"),
+    "two L records": ((longname(b"x"), longname(b"c"), Q), "x", "c"),
+    "two PAX paths": ((path_header(b"a"), path_header(b"c"), Q), "a", "c"),
+    "a PAX path, then a PAX header without": ((path_header(b"a"), comment(), Q), "a", "q"),
+    "a global path, then an L record": (
+        (path_header(b"c", tarfile.XGLTYPE), longname(b"x"), Q),
+        "x",
+        "c",
+    ),
+    "a global path, then a global header without": (
+        (path_header(b"c", tarfile.XGLTYPE), comment(tarfile.XGLTYPE), Q),
+        "c",
+        "q",
+    ),
+    "an empty PAX path": ((path_header(b""), Q), "", "q"),
+    "a prefix under GNU's magic": ((prefixed("q", b"ustar  \0"),), "pre/q", "q"),
+    "a prefix without a magic": ((prefixed("q", b"\0" * 8),), "pre/q", "q"),
+}
+#: The same, where both read one name
+NAMES_ONE_WAY = {
+    "an L record": ((longname(b"x"), Q), "x"),
+    "a PAX path": ((path_header(b"c"), Q), "c"),
+    "a PAX path with a trailing slash": ((path_header(b"c/"), Q), "c"),
+    "a PAX path, then an L record": ((path_header(b"c"), longname(b"x"), Q), "c"),
+    "a global header without a path, then an L record": (
+        (comment(tarfile.XGLTYPE), longname(b"x"), Q),
+        "x",
+    ),
+    "a prefix under POSIX's magic": ((prefixed("q", b"ustar\x0000"),), "pre/q"),
+    "a prefix under GNU's magic, after an L record": (
+        (longname(b"x"), prefixed("q", b"ustar  \0")),
+        "x",
+    ),
+}
+
+
+def tarfile_names(path: pathlib.Path) -> list[str]:
+    with tarfile.open(path) as tar:
+        return tar.getnames()
+
+
+@pytest.mark.parametrize("name", list(NAMES_TWO_WAYS))
+def test_a_name_read_two_ways_is_refused(tmp_path, name):
+    """#888 (the review of #892, B2): GNU tar reads a member's name as it reads a link target,
+    and its own header's `prefix` only under POSIX's magic; tarfile under any. Each such member
+    is refused, a file as a link would be."""
+    headers, python, gnu = NAMES_TWO_WAYS[name]
+    path = tmp_path / "x.tar.gz"
+    path.write_bytes(gzip.compress(b"".join(headers) + END))
+    assert (tarfile_names(path), gnu_names(path)) == ([python], [gnu])
+    assert check_archive(path) == TWO_WAYS.replace("(h)", f"({python})")
+
+
+@pytest.mark.parametrize("name", list(NAMES_ONE_WAY))
+def test_a_name_read_one_way_passes(tmp_path, name):
+    headers, both = NAMES_ONE_WAY[name]
+    path = tmp_path / "x.tar.gz"
+    path.write_bytes(gzip.compress(b"".join(headers) + END))
+    assert tarfile_names(path) == gnu_names(path) == [both]
+    problem, _, new = repacked(tmp_path, path.read_bytes())
+    assert problem == "" and contents(new) == [(both, b"q")]
+
+
+def test_gnu_tars_incremental_archives_are_refused(tmp_path):
+    """#888 (the review of #892, N3): GNU tar's `--listed-incremental` headers hold the access
+    time where POSIX's hold `prefix`, which tarfile joins to every name, so the first member is
+    refused. `export.sh` makes none. Each member's prefix is its own access time: GNU tar reads
+    the directory before writing its header, which on a `relatime` mount can move its access
+    time past the file's (the review of #892 at a589c2a3), so only their digits are compared."""
+    tree = tmp_path / "tree" / "work"
+    tree.mkdir(parents=True)
+    (tree / "a.md").write_text("a")
+    path = tmp_path / "x.tar.gz"
+    argv = ["tar", "--create", "--gzip", "--format=gnu", "--file", str(path)]
+    argv += ["--listed-incremental", str(tmp_path / "snap"), "-C", str(tree.parent), "work"]
+    subprocess.run(argv, check=True)  # noqa: S603
+    names = [name.split("/", 1) for name in tarfile_names(path)]
+    assert [tail for _, tail in names] == ["work/", "work/a.md"]
+    assert all(atime.isdigit() for atime, _ in names)
+    assert gnu_names(path) == ["work", "work/a.md"]
+    assert check_archive(path) == TWO_WAYS.replace("(h)", f"({'/'.join(names[0])})")
+
+
+@pytest.mark.parametrize("under", ["H/zab/key", "c/zab/key"])
+def test_a_symlink_named_two_ways_is_refused(tmp_path, under):
+    """The review of #892, B2: a symlink that tarfile names `x` (an `L` record) and GNU tar `c`
+    (a PAX `path`), to `.config`. A hard link `h` to `c` was then a copy of the file `c` for
+    tarfile, and a link to the symlink for GNU tar, which wrote `H/zab/key` to `.config/zab/key`
+    on a case-insensitive filesystem; or, without the hard link, `c/zab/key`, on any. Both are
+    refused at the symlink."""
+    raw = [
+        ustar(".config", tarfile.DIRTYPE),
+        ustar("c", tarfile.REGTYPE, body=b"c"),
+        longname(b"x"),
+        path_header(b"c"),
+        ustar("q", tarfile.SYMTYPE, ".config"),
+        *([ustar("h", tarfile.LNKTYPE, "c")] if under.startswith("H") else []),
+        ustar(under, tarfile.REGTYPE, body=b"secret"),
+    ]
+    path = tmp_path / "x.tar.gz"
+    path.write_bytes(gzip.compress(b"".join(raw) + END))
+    assert tarfile_names(path)[2] == "x" and gnu_target(path, "c") == ".config"
+    assert check_archive(path) == TWO_WAYS.replace("(h)", "(x)")
 
 
 def test_honest_symlinks_and_hard_links_pass(tmp_path):
@@ -1210,14 +1620,17 @@ def test_honest_symlinks_and_hard_links_pass(tmp_path):
 def test_honest_archives_of_an_absolute_path_pass(tmp_path):
     """GNU tar's `--create` and tarfile's `add` strip the leading `/` of each name and hard
     link target; a symlink keeps its absolute target, which is allowed. Names that differ
-    only in case pass when no symlink is among them."""
+    only in case, `a.md` and `A.md`, pass: neither is a symlink's, and a hard link is matched
+    by its exact name (#819), so this passes in any directory order, as it would with the hard
+    link a second name of `a.md` (#802; the next test)."""
     tree = tmp_path / "tree" / "work"
     tree.mkdir(parents=True)
     (tree / "a.md").write_text("a")
     (tree / "A.md").write_text("A")
+    (tree / "b.md").write_text("b")
     (tree / "l").symlink_to("a.md")
     (tree / "abs").symlink_to("/etc/hostname")
-    os.link(tree / "a.md", tree / "h.md")
+    os.link(tree / "b.md", tree / "h.md")
     gnu = tmp_path / "gnu.tar.gz"
     argv = ["tar", "--create", "--gzip", "--file", str(gnu), str(tree)]
     subprocess.run(argv, check=True, stderr=subprocess.DEVNULL)  # noqa: S603
@@ -1233,6 +1646,108 @@ def test_honest_archives_of_an_absolute_path_pass(tmp_path):
         assert any(m.islnk() for m in members)
         assert any(m.issym() and m.linkname == "/etc/hostname" for m in members)
         assert check_archive(path) == "", path.name
+
+
+#: One inode, `a.md` and `h.md`, beside `A.md` and a symlink `l` to `a.md` (#802)
+LINKED = ("a.md", "A.md", "h.md", "l")
+
+
+@pytest.mark.parametrize("writer", ["tarfile", "gnu"])
+def test_case_twins_beside_a_hard_link_pass_in_every_order(tmp_path, writer):
+    """#802, #819: either writer stores the first name of an inode as the file and each later
+    one as a hard link to it, in the order it meets them (GNU tar: the directory's, which varies
+    from one filesystem to the next). With `h.md` first, `a.md` is the hard link, and a later
+    `A.md` lies at its name, folded. A hard link is matched by its exact name, so every order
+    passes, those four among them, and every re-pack holds the same plain files: `h.md` a copy
+    of `a.md`, and the symlink listed in SYMLINKS.txt (a symlink is a link at its own name, not
+    at its target's)."""
+    tree = tmp_path / "tree" / "work"
+    tree.mkdir(parents=True)
+    (tree / "a.md").write_text("a")
+    (tree / "A.md").write_text("A")
+    (tree / "l").symlink_to("a.md")
+    os.link(tree / "a.md", tree / "h.md")
+    orders = list(itertools.permutations(LINKED))
+    twins, repacks = [], set()
+    for i, order in enumerate(orders):
+        path, names = tmp_path / f"{i}.tar.gz", [f"work/{name}" for name in order]
+        if writer == "gnu":  # the names in this order, each once
+            argv = ["tar", "--create", "--gzip", "--no-recursion", "--file", str(path)]
+            argv += ["-C", str(tree.parent), "work", *names]
+            subprocess.run(argv, check=True)  # noqa: S603
+        else:
+            with tarfile.open(path, "w:gz") as tar:
+                for name in ("work", *names):
+                    tar.add(tree.parent / name, arcname=name, recursive=False)
+        with tarfile.open(path) as tar:
+            members = [(m.name, m.type, m.linkname) for m in tar.getmembers()]
+        first, second = sorted(("work/a.md", "work/h.md"), key=names.index)
+        assert members == [
+            ("work", tarfile.DIRTYPE, ""),
+            *((n, tarfile.LNKTYPE, first) if n == second else (n, *TYPES[n]) for n in names),
+        ]
+        if second == "work/a.md" and names.index(second) < names.index("work/A.md"):
+            twins.append(order)
+        assert check_archive(path) == "", order
+        repacks.add(tuple(sorted(contents(path.with_name(path.name + ".new")))))
+    assert twins == [o for o in orders if o.index("h.md") < o.index("a.md") < o.index("A.md")]
+    assert len(twins) == 4
+    assert repacks == {
+        (
+            (ac_check.MANIFEST, ac_check.MANIFEST_HEAD + b"work/l\ta.md\n"),
+            ("work", None),
+            ("work/A.md", b"A"),
+            ("work/a.md", b"a"),
+            ("work/h.md", b"a"),
+        )
+    }
+
+
+#: The members of `LINKED` that are no hard link, as either writer stores them
+TYPES = {
+    "work/a.md": (tarfile.REGTYPE, ""),
+    "work/A.md": (tarfile.REGTYPE, ""),
+    "work/h.md": (tarfile.REGTYPE, ""),
+    "work/l": (tarfile.SYMTYPE, "a.md"),
+}
+
+
+@pytest.mark.parametrize("twin", ["work/L", "work/L/x", "WORK/l/x"])
+@pytest.mark.parametrize("kind", [tarfile.SYMTYPE, tarfile.LNKTYPE], ids=["symlink", "hard"])
+def test_a_symlink_is_matched_folded_and_a_hard_link_by_its_exact_name(tmp_path, kind, twin):
+    """#819: a member at or under an earlier link's name spelled in another case is refused
+    after a symlink (on a Mac, `work/L` is `work/l`) and passes after a hard link, which the
+    re-pack makes a plain file; spelled as the link is, it is refused after either."""
+    earlier = ("work/l", kind, "a" if kind == tarfile.SYMTYPE else "work/a")
+    for name in (twin.lower(), twin):
+        data = linked(*DIRS, ("work/a", tarfile.REGTYPE, ""), earlier, (name, tarfile.REGTYPE, ""))
+        refused = f"a member written through an earlier symlink or hard link ({name}): deleted"
+        passes = kind == tarfile.LNKTYPE and name != name.lower()
+        assert check(tmp_path, data) == ("" if passes else refused), name
+
+
+def test_a_hard_link_to_a_case_twin_of_a_hard_link_passes(tmp_path):
+    """#819: `H` and `a`, then `h`, a second name of `a`, and `g`, one of `H`: either writer
+    links `g` to `work/H`, which folded lies at the hard link `work/h`. A hard link's target is
+    matched by its exact name too, so `g` passes, a copy of `H`; linked to `work/h` itself, it
+    is refused at the link."""
+    files = [("work/H", b"H"), ("work/a", b"a")]
+    data = tar_of(
+        *(file_(name, body) for name, body in files),
+        link("work/h", "work/a"),
+        link("work/g", "work/H"),
+    )
+    problem, _, new = repacked(tmp_path, data)
+    assert problem == ""
+    assert contents(new) == [*files, ("work/h", b"a"), ("work/g", b"H")]
+    refused = tar_of(
+        *(file_(name, body) for name, body in files),
+        link("work/h", "work/a"),
+        link("work/g", "work/h"),
+    )
+    assert check(tmp_path, refused) == (
+        "a hard link to or through an earlier symlink or hard link (work/g): deleted"
+    )
 
 
 def time_t_overflow() -> bytes:

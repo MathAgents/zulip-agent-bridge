@@ -147,11 +147,13 @@ def test_only_a_one_step_verb_that_says_so_has_nothing_to_change(layout):
     unread, and the verb's `nothing_flag`: `!provision repos` says so with `invites-only` alone,
     by construction (review of #726, 2). The verbs that say so are the ones #708 names."""
     nothing = [v for v, verb in VERBS.items() if verb.nothing]
-    assert nothing == ["roster import", "roster sync", "provision repos"]  # sync's: its own file
+    # sync's: its own file; keep-until's (#570): a date every row named has already
+    assert nothing == ["roster import", "roster sync", "provision repos", "keep-until"]
     for message in (
         "!roster import [r.csv](/user_uploads/2/a/r.csv)",
         "!provision repos invites-only all",
         "!provision repos invites-only alice",
+        "!keep-until 2026-11-30 alice",
     ):
         action = make(message, layout)
         assert len(action.steps) == 1 and says_nothing(action), message

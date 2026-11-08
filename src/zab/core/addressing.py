@@ -90,7 +90,7 @@ def unaddressed(text: str, mentions: Iterable[re.Pattern[str]]) -> tuple[str, li
     patterns = [p.pattern for p in mentions]
     if not patterns:
         return normalized, removed
-    leading = re.compile("(?:" + "|".join(patterns) + r")(?:\s|,|:(?![\w+-]+:))*")
+    leading = re.compile("(?:" + "|".join(patterns) + r")(?:\s|,|:(?![\w+-]+:))*+")
     while match := leading.match(normalized):
         removed.append(match[0])
         normalized = normalized[match.end() :].lstrip()

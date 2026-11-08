@@ -11,6 +11,7 @@ import teardown
 
 from zab.admin import runner
 
+from .scope import with_scope
 from .test_aws import TAG, FakeEc2, populated
 
 
@@ -104,7 +105,9 @@ def run_protect(ec2, clock, **kw) -> tuple[int, list[str]]:
 
 def run_teardown(ec2, clock, **kw) -> tuple[int, list[str]]:
     log: list[str] = []
-    rc = teardown.teardown(ec2, TAG, yes=True, log=log.append, sleep=clock.sleep, clock=clock, **kw)
+    rc = teardown.teardown(
+        ec2, TAG, region="us-west-2", yes=True, log=log.append, sleep=clock.sleep, clock=clock, **kw
+    )
     return rc, log
 
 
@@ -181,8 +184,8 @@ def test_no_wait_and_dry_run_read_nothing_back(monkeypatch):
     seen: dict = {}
     monkeypatch.setattr(protect, "Ec2", lambda region: object())
     monkeypatch.setattr(protect, "protect", lambda ec2, tag, **kw: seen.update(kw) or 0)
-    assert protect.main(["--no-wait"]) == 0 and seen["wait"] is False
-    assert protect.main([]) == 0 and seen["wait"] is True
+    assert with_scope(protect.main, ["--no-wait"]) == 0 and seen["wait"] is False
+    assert with_scope(protect.main, []) == 0 and seen["wait"] is True
 
 
 # ---------------------------------------------------------------------------- teardown.py

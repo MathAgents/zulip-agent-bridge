@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from zab.backends.claude import StreamInput, run_turn, shorten
+from zab.backends.claude import WAITED_TASK_TYPES, StreamInput, run_turn, shorten
 from zab.core import presentation as view
 from zab.core.types import (
     BackendEvent,
@@ -159,8 +159,10 @@ def classify_error(
         kind = ErrorKind.NETWORK
     # Redacted, NULs dropped first as the renderer does, before a line is taken out of it and
     # before the cut: either can leave too little of a secret for its rule (SPEC §11.6, #661).
-    message = redact_secrets(text.replace("\x00", "")).strip()
-    lines = redact_secrets(stderr.replace("\x00", "")).strip().splitlines()  # may be none
+    # Stripped before it, too: `.strip()` takes blanks that end no line (U+3000, U+00A0), so
+    # `boom\nkey=<32>` + U+3000 is a whole zuliprc line only after it (#666).
+    message = redact_secrets(text.replace("\x00", "").strip())
+    lines = redact_secrets(stderr.replace("\x00", "").strip()).splitlines()  # may be none
     if not message and lines:
         message = lines[-1]
     if not message:
@@ -493,13 +495,18 @@ class StreamParser:
         if obj.get("subtype") == "background_tasks_changed" and not obj.get("parent_tool_use_id"):
             # The CLI lists the running tasks and drops a finished one (2.1.283, checked live for
             # the PM on #193: `[task]` → `[]` when it completes); its entries have no status. Should
-            # a later version keep finished ones with a status, only running ones count.
+            # a later version keep finished ones with a status, only running ones count. A
+            # background sub-agent is left out: the CLI waits for it, and its notification's loop
+            # ends in a further `result`, so it is never stopped at the turn's end (#660).
             tasks = obj.get("tasks")
             self._background_tasks = sum(
                 1
                 for task in (tasks if isinstance(tasks, list) else [])
                 if not isinstance(task, Mapping)
-                or task.get("status") in (None, "running", "pending")
+                or (
+                    task.get("status") in (None, "running", "pending")
+                    and task.get("task_type") not in WAITED_TASK_TYPES
+                )
             )
             return []
         if obj.get("subtype") != "init":

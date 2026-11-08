@@ -2,8 +2,8 @@
 """Give the spares their own idle stop (#715; ORGANIZERS §3.7; workshop/admin/README.md §8).
 
     uv run --with boto3 python workshop/aws/spare_idle_stop.py --roster roster.csv \\
-        --minutes N --only zab-spare-N … [--tag KEY=VALUE …] [--region R] [--spares-file FILE] \\
-        [--started] [--dry-run]
+        --minutes N --only zab-spare-N … --tag KEY=VALUE [--tag …] --region R \\
+        [--spares-file FILE] [--started] [--dry-run]
 
 A spare gets neither the waker nor a row's idle stop: it has no bots, and `all` never names it.
 This gives each spare named `idle_stop.py --spare --minutes N`, run once a minute by its timer,
@@ -227,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--only", action="append", default=[], metavar="SPARE", help="zab-spare-N (repeatable)"
     )
-    parser.add_argument("--region", default="us-west-2")
+    parser.add_argument("--region", required=True, help="the workshop's region")
     parser.add_argument("--spares-file", metavar="FILE", help=f"default {SPARES_FILE}")
     add_tag_argument(parser)
     parser.add_argument(

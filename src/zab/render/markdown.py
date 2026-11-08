@@ -61,9 +61,11 @@ _CLOSER_OF = {"\\[": "\\]", "\\(": "\\)", "$$": "$$"}
 _PARAGRAPH_END = re.compile(r"[ \t]*(?=\n\n|\n?\Z)")
 # pandoc tex_math_dollars: `$` followed by non-space ... non-space `$` not followed by a digit;
 # neither `$` escaped or adjacent to another `$`; no blank line and no bare `$` inside (an
-# escaped `\$` is fine), so `$100 and $200; compute $x^2$` converts only the formula.
+# escaped `\$` is fine), so `$100 and $200; compute $x^2$` converts only the formula. The
+# inner run is possessive: it can't pass a bare `$`, so it ends where a lazy one could, and a
+# lazy or greedy repeat of a group keeps a frame of `re` per character, 147 MB on 1 MB (#833).
 _DOLLAR_MATH = re.compile(
-    r"(?<![\\$])\$(?!\$)(?=\S)(?P<inner>(?:(?!\n[ \t]*\n)(?:\\.|[^$\\]))+?)(?<=\S)\$(?![\d$])",
+    r"(?<![\\$])\$(?!\$)(?=\S)(?P<inner>(?:(?!\n[ \t]*\n)(?:\\.|[^$\\]))++)(?<=\S)\$(?![\d$])",
     re.DOTALL,
 )
 

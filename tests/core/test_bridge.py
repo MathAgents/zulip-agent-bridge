@@ -150,6 +150,57 @@ async def test_public_refusal_and_bad_options_do_not_create_session(bridge):
     backend.create_session.assert_not_awaited()
 
 
+#: Zulip's channel privacy settings, as its channel object (`GET /streams/{id}`) carries them:
+#: `invite_only`, `is_web_public` and `history_public_to_subscribers`. A web-public channel is
+#: never invite-only, and a public one's history is always shared.
+PRIVACY = {
+    "public": dict(invite_only=False, is_web_public=False, history_public_to_subscribers=True),
+    "web-public": dict(invite_only=False, is_web_public=True, history_public_to_subscribers=True),
+    "private, shared history": dict(
+        invite_only=True, is_web_public=False, history_public_to_subscribers=True
+    ),
+    "private, protected history": dict(
+        invite_only=True, is_web_public=False, history_public_to_subscribers=False
+    ),
+}
+
+
+@pytest.mark.parametrize("privacy", list(PRIVACY))
+async def test_private_reads_zulips_channel_object(bridge, privacy):
+    """#805 (the review of #792): `private` on the channel object as Zulip returns it, with its
+    other fields beside the privacy ones, read through `channel` from the fake Zulip. Only the
+    two private settings are private: SPEC §4.5 refuses sessions in a public or web-public
+    channel. A mention in the others gets the refusal and no session."""
+    b, fake, backend = bridge
+    fake.streams[2] = {
+        "stream_id": 2,
+        "name": "zab-dev-x",
+        "description": "",
+        "rendered_description": "",
+        "date_created": 1760000000,
+        "first_message_id": None,
+        "message_retention_days": None,
+        "stream_post_policy": 1,
+        "is_announcement_only": False,
+        **PRIVACY[privacy],
+    }
+    assert b.private(await b.channel(2)) is privacy.startswith("private")
+    if not privacy.startswith("private"):
+        await user_message(b, fake, "@**Test Bot** hello", stream=2)
+        backend.create_session.assert_not_awaited()
+        refusal = b.note("sessions are disabled in public channels")
+        assert [m["content"] for m in fake.messages.values()].count(refusal) == 1
+
+
+def test_a_channel_object_without_its_privacy_is_not_private():
+    """`private` reads only `invite_only` (true) and `is_web_public` (absent or false): a
+    channel object without them is public, and so refused, rather than taken for private."""
+    assert not BotBridge.private({"stream_id": 2, "name": "x"})
+    assert not BotBridge.private({"invite_only": "true"})  # a string is no `true`
+    assert BotBridge.private({"invite_only": True})
+    assert not BotBridge.private({"invite_only": True, "is_web_public": True})
+
+
 async def test_unseen_bot_mention_is_ignored(bridge):
     b, fake, backend = bridge
     fake.members.append({"user_id": 30, "full_name": "Other Bot", "is_bot": True})
@@ -168,11 +219,12 @@ async def test_queue_recovery_retries_transient_card_refresh(bridge):
     b.client.events = AsyncMock(
         side_effect=[ZulipError("BAD_EVENT_QUEUE_ID", 400), asyncio.CancelledError()]
     )
-    b.refresh_cards = AsyncMock(side_effect=[httpx.ReadTimeout("retry"), None])
+    b.confirm_working_cards = AsyncMock(side_effect=[httpx.ReadTimeout("retry"), None])
     b.reconcile_messages = AsyncMock()
     with pytest.raises(asyncio.CancelledError):
         await b.listen()
-    assert b.refresh_cards.await_count == 2
+    assert b.confirm_working_cards.await_count == 2
+    await b.housekeeping  # reconciliation follows the replay, in the background (§7.8.2)
     b.reconcile_messages.assert_awaited_once()
 
 
@@ -1248,9 +1300,11 @@ async def test_reattach_restart_preserves_approval_ownership(bridge, tmp_path, o
         fresh = CodexBackend("codex", BackendConfig(kind="codex", codex_home="/isolated"))
         fresh.rpc = AsyncMock()
         fresh.rpc.up = True
+        running = {"type": "active", "activeFlags": []}  # still loaded, its turn running
         fresh.rpc.call.side_effect = [
-            {"data": [], "nextCursor": None},
+            {"thread": {"id": "native", "cwd": str(tmp_path), "status": running}},
             {"config": {}},
+            {"data": [], "nextCursor": None},
             {"thread": {"id": "native", "cwd": str(tmp_path)}},
             {"data": [{"id": "turn1", "status": "inProgress"}]},
         ]

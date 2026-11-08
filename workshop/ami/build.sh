@@ -28,13 +28,19 @@
 #   WITH_SAGE=1       also install SageMath through conda (adds ~10-20 min)
 #   SAGE_VERSION      conda-forge sage version                (default 10.9, with SAGE_PYTHON 3.12)
 #   LMFDB_MCP_URL     the LMFDB MCP server                    (default https://mcp.lmfdb.org/mcp)
+#   M2_DEBS           the pinned Macaulay2 packages and their sources (a tarball, as build_ami.py
+#                     copies it, or a directory): the files files/apt/macaulay2-debs.sha256 lists,
+#                     from their release (README.md, "Macaulay2's packages"). Required.
+#   PARI_DATA         PARI's data packages from their release (a tarball, as build_ami.py copies
+#                     it, or a directory): used where each matches its pinned sha256 below,
+#                     PARI's site otherwise (README.md, "PARI's data packages"). Optional.
 #   AMI_FILES         workshop/ami/files (a directory, or a tarball of it, as build_ami.py copies
 #                     it): the agents' instruction file, the smoke-test sources, the comparator
 #                     wrapper. Default: the files/ directory next to this script.
 #   LEAN_LSP_MCP_VERSION  lean-lsp-mcp from PyPI               (default 0.31.0)
 #   LEAN4_SKILLS_TAG, LEAN4_SKILLS_SHA  the lean4-skills plugin (default v4.11.3 = b6243b8…)
 #   IMAGE_NAME        the image's name in /etc/zab/tools.json (build_ami.py passes --name)
-# Never commit the Magma files: build_ami.py copies them from Drew's machine for the build only.
+# Never commit the Magma files: build_ami.py copies them from the build's machine, for the build only.
 set -euo pipefail
 
 CODEX_VERSION="${CODEX_VERSION:-0.157.1}"   # the M1 pin (docs/DECISIONS.md, SPEC §8.3)
@@ -46,6 +52,8 @@ PARI_VERSION="${PARI_VERSION:-2.17.4}"
 MAGMA_TARBALL="${MAGMA_TARBALL:-}"
 MAGMA_PASSFILE="${MAGMA_PASSFILE:-}"
 MAGMA_LICENCE_SETUP="${MAGMA_LICENCE_SETUP:-}"
+M2_DEBS="${M2_DEBS:-}"
+PARI_DATA="${PARI_DATA:-}"
 SAGE_VERSION="${SAGE_VERSION:-10.9}"
 SAGE_PYTHON="${SAGE_PYTHON:-3.12}"
 LMFDB_MCP_URL="${LMFDB_MCP_URL:-https://mcp.lmfdb.org/mcp}"
@@ -71,6 +79,11 @@ AGENT_HOME=/home/$AGENT
 # on 2026-10-02 from the downloaded files; docs/DECISIONS.md). The data packages are the ones the
 # Ubuntu pari-* packages used to supply: elldata (Cremona's tables), galdata (polgalois in degree
 # 8-11), seadata (SEA point counting), galpol (galoisgetpol) and nflistdata (nflist).
+# Their names carry no version (packages/<name>.tgz): a new upload replaces the file, and the
+# replaced one is kept, if at all, under a name not known beforehand (packages/old/
+# elldata-500000.tgz, replaced in 2021; packages/nflistdata-old.tgz, replaced in 2022), so the
+# pinned sha256 then stops the build. So the build takes them from a release of their own,
+# PARI_DATA (step 3; README.md, "PARI's data packages"; #945), and PARI's site is the fallback.
 PARI_SHA256="02651d99c391007d384b3fadbc20abc6916b77036f9e496c99e9ce8688ca4b53"
 declare -A PARI_DATA_SHA256=(
   [elldata]="dd551e64932d4ab27b3f2b2d1da871c2353672fc1a74705c52e3c0de84bd0cf6"
@@ -126,6 +139,15 @@ if [ -n "$MAGMA_TARBALL" ] && [ -z "$MAGMA_PASSFILE" ]; then
   echo "MAGMA_TARBALL needs MAGMA_PASSFILE too" >&2
   exit 1
 fi
+if [ -z "$M2_DEBS" ] || ! [ -e "$M2_DEBS" ]; then
+  echo "M2_DEBS: no Macaulay2 packages at '$M2_DEBS'; build_ami.py fetches them from their" \
+    "release (README.md, \"Macaulay2's packages\")" >&2
+  exit 1
+fi
+if [ -n "$PARI_DATA" ] && ! [ -e "$PARI_DATA" ]; then  # a mistyped one, not a quiet fallback
+  echo "PARI_DATA: nothing at '$PARI_DATA' (README.md, \"PARI's data packages\")" >&2
+  exit 1
+fi
 if [ -n "$MAGMA_LICENCE_SETUP" ] && [ -z "$MAGMA_TARBALL" ]; then
   echo "MAGMA_LICENCE_SETUP is for Magma: it needs MAGMA_TARBALL and MAGMA_PASSFILE" >&2
   exit 1
@@ -133,7 +155,7 @@ fi
 # Work from a directory every user can read. uv, run as agent below, looks for uv.toml in the
 # working directory and its parents and aborts on an unreadable one, such as /home/ubuntu (0750
 # on 24.04), where `ssh ubuntu@builder 'bash build.sh'` starts.
-for var in ZAB_WHEEL MAGMA_TARBALL MAGMA_PASSFILE MAGMA_LICENCE_SETUP AMI_FILES; do
+for var in ZAB_WHEEL MAGMA_TARBALL MAGMA_PASSFILE MAGMA_LICENCE_SETUP M2_DEBS PARI_DATA AMI_FILES; do
   if [ -n "${!var}" ]; then printf -v "$var" '%s' "$(realpath -- "${!var}")"; fi
 done
 cd /
@@ -187,6 +209,12 @@ $APT autoremove -y
 # one included, and makes piped results come back colour-coded and cut off at 40 lines with
 # `[+++]` (PM review on #60). Delete it; dpkg keeps a deleted conffile deleted on upgrades.
 sudo rm -f /etc/gprc
+# The system's trust store holds none of the roots files/bin/trust_stores.py lists (#671).
+# Installing ca-certificates above upgrades it to the archive's newest: 20260816ubuntu0.24.04.1
+# (USN-8944-1) dropped emSign ECC Root CA - G3. Checked here, before the long steps, and again by
+# the smoke test, with every Python environment's certifi.
+/usr/bin/python3 -I "$FILES/bin/trust_stores.py" /etc/ssl/certs \
+  || { echo "/etc/ssl/certs holds a distrusted root: is ca-certificates the newest?" >&2; exit 1; }
 
 # --- 1b. LaTeX (PM's AMI v2 list, item 1) -----------------------------------------------------
 # TeX Live 2023 from noble. The PM's list, plus babel for European, French and German papers,
@@ -220,40 +248,55 @@ $APT install -y --no-install-recommends \
   imagemagick poppler-utils librsvg2-bin ghostscript z3 cadical pandoc 4ti2 lrslib nauty \
   normaliz topcom coinor-csdp cohomcalg bison gpg
 
-# --- 1d. Macaulay2 from its official PPA (issue #474) -------------------------------------
+# --- 1d. Macaulay2 from its official PPA's pinned packages (issues #474, #945) ------------
 # noble's macaulay2 is 1.22; the Macaulay2 team's PPA (ppa:macaulay2/macaulay2, their
 # documented route for Ubuntu) builds the current release for noble, with newer gfan and msolve.
-# Its signing key is committed (files/apt/macaulay2-ppa.asc, from keyserver.ubuntu.com) and
-# checked against the fingerprint Launchpad publishes for the archive (the file must hold that
-# one key: apt trusts every key in it); apt then checks every package against the signed index.
-# The source is Launchpad's snapshot of the PPA at M2_PPA_SNAPSHOT, not the PPA itself: a PPA
-# keeps only its newest upload, while a snapshot serves the same signed index and files for
-# good, so Macaulay2, gfan and msolve stay exactly as tested here and on later rebuilds, and the
-# VMs' own `apt upgrade` never pulls a newer upload. The versions are pinned on top. To move to
-# a newer Macaulay2 (review #481): pick a later snapshot time (UTC, YYYYMMDDTHHMMSSZ), read its
-# dists/noble/main/binary-amd64/Packages for the new versions, change M2_PPA_SNAPSHOT and the
-# three versions below and their test (tests/workshop/test_ami_stack.py) in a PR, and rebuild.
-M2_PPA_FPR=5B17CD31DA995CFAA1B0D4FD08416FF271BC6AA8
-M2_PPA_SNAPSHOT=20261018T000000Z
-M2_VERSION=1.26.06+ds-2~ubuntu24.04.1        # macaulay2, macaulay2-common
+# The PPA keeps only its newest upload, and Launchpad stops serving a snapshot of it about 16
+# days after the PPA publishes again (#945, DECISIONS' verification log), so neither is a source
+# a rebuild months later can use. The five packages and the source packages they were built
+# from live in a GitHub release instead, each pinned by its SHA-256 in
+# files/apt/macaulay2-debs.sha256: build_ami.py fetches them with the deployer's gh, checks
+# them, and copies them here as M2_DEBS (README.md, "Macaulay2's packages", also for a build by
+# hand). They are checked again here and installed as files, their dependencies from noble, and
+# held at the end (step 14). This step writes no apt source for the PPA, so a VM's `apt-get
+# update` never depends on Launchpad, and noble's own macaulay2, gfan and msolve are older.
+# The source packages go to /usr/src/macaulay2-ppa: the image carries the source of the GPL
+# programs it adds. To move to a newer Macaulay2: m2_debs.py capture, a new release, and the
+# manifest and the three versions below, with their test (tests/workshop/test_ami_stack.py), in
+# a PR (README.md).
+M2_VERSION=1.26.06+ds-5~ubuntu24.04.1        # macaulay2, macaulay2-common
 M2_GFAN_VERSION=0.8~beta-2~ubuntu24.04.1
 M2_MSOLVE_VERSION=0.9.4-2ppa2~ubuntu24.04.1  # msolve, libmsolve3
-log "Macaulay2 $M2_VERSION (PPA snapshot $M2_PPA_SNAPSHOT)"
-gnupg=$(mktemp -d)
-keys=$(gpg --homedir "$gnupg" --show-keys --with-colons "$FILES/apt/macaulay2-ppa.asc")
-rm -rf "$gnupg"
-got=$(awk -F: '$1 == "fpr" && !n++ {print $10}' <<<"$keys")  # the primary key's fingerprint
-[ "$(grep -c '^pub:' <<<"$keys")" = 1 ] && [ "$got" = "$M2_PPA_FPR" ] \
-  || { echo "the Macaulay2 PPA key file must hold exactly key $M2_PPA_FPR (first: '$got')" >&2; exit 1; }
-sudo install -d -m 0755 /etc/apt/keyrings
-sudo install -m 0644 "$FILES/apt/macaulay2-ppa.asc" /etc/apt/keyrings/macaulay2-ppa.asc
-printf '%s\n' 'Types: deb' \
-  "URIs: https://snapshot.ppa.launchpadcontent.net/macaulay2/macaulay2/ubuntu/$M2_PPA_SNAPSHOT" \
-  'Suites: noble' 'Components: main' 'Signed-By: /etc/apt/keyrings/macaulay2-ppa.asc' \
-  | sudo tee /etc/apt/sources.list.d/macaulay2.sources >/dev/null
-apt_update
-$APT install -y --no-install-recommends "macaulay2=$M2_VERSION" "macaulay2-common=$M2_VERSION" \
-  "gfan=$M2_GFAN_VERSION" "msolve=$M2_MSOLVE_VERSION" "libmsolve3=$M2_MSOLVE_VERSION"
+log "Macaulay2 $M2_VERSION (the pinned packages in $M2_DEBS)"
+m2=$(mktemp -d /tmp/m2-debs.XXXXXX)
+if [ -d "$M2_DEBS" ]; then cp -- "$M2_DEBS"/* "$m2"/; else tar -xf "$M2_DEBS" -C "$m2"; fi
+chmod -R a+rX "$m2"  # apt reads a local .deb as _apt
+if ! bad=$(cd "$m2" && sha256sum --check --strict --quiet "$FILES/apt/macaulay2-debs.sha256" 2>&1); then
+  echo "the Macaulay2 packages in $M2_DEBS don't match files/apt/macaulay2-debs.sha256:" >&2
+  echo "$bad" >&2
+  echo "fetch them again from their release: build_ami.py does it (README.md, \"Macaulay2's packages\")" >&2
+  exit 1
+fi
+m2_install=("macaulay2_${M2_VERSION}_amd64.deb" "macaulay2-common_${M2_VERSION}_all.deb"
+  "gfan_${M2_GFAN_VERSION}_amd64.deb" "msolve_${M2_MSOLVE_VERSION}_amd64.deb"
+  "libmsolve3_${M2_MSOLVE_VERSION}_amd64.deb")
+# Only what the manifest checked is installed (review of #950); no `grep -q` in a pipe, whose
+# early exit would make its writer's SIGPIPE fail the build under pipefail.
+m2_listed=" $(cut -d' ' -f3 "$FILES/apt/macaulay2-debs.sha256" | tr '\n' ' ') "
+for deb in "${m2_install[@]}"; do
+  case $m2_listed in
+    *" $deb "*) ;;
+    *) echo "$deb isn't in files/apt/macaulay2-debs.sha256: the versions and it disagree" >&2; exit 1 ;;
+  esac
+done
+$APT install -y --no-install-recommends "${m2_install[@]/#/$m2/}"  # held in step 14
+sudo install -d -m 0755 /usr/src/macaulay2-ppa
+while read -r _sum name; do
+  case $name in *.deb) ;; *) sudo install -m 0644 "$m2/$name" /usr/src/macaulay2-ppa/ ;; esac
+done < "$FILES/apt/macaulay2-debs.sha256"
+grep -v '\.deb$' "$FILES/apt/macaulay2-debs.sha256" > "$m2/SHA256SUMS"  # the sources' lines only
+sudo install -m 0644 "$m2/SHA256SUMS" /usr/src/macaulay2-ppa/SHA256SUMS
+rm -rf "$m2"
 
 # --- 2. the participant's user -----------------------------------------------------------------
 log "user $AGENT"
@@ -281,9 +324,11 @@ sudo install -d -o "$AGENT" -g "$AGENT" -m 0700 "$AGENT_HOME/.ssh"
 log "PARI/GP $PARI_VERSION from source"
 if ! [ -x /usr/local/bin/gp ] || [ "$(/usr/local/bin/gp --version-short 2>/dev/null)" != "$PARI_VERSION" ]; then
   src=$(mktemp -d /tmp/pari-src.XXXXXX)
-  # the current release sits in unix/; after the next release it moves to unix/OLD/<major.minor>/
+  # A current release sits in unix/; a superseded one moves to OLD/<major.minor>/, beside unix/
+  # (2.17.0 to 2.17.2 are in OLD/2.17/; there is no unix/OLD/, #945). fetch_checked retries the
+  # first URL's 404 for about a minute before it tries the second.
   fetch_checked "$PARI_SHA256" "$src/pari-$PARI_VERSION.tar.gz" \
-    "$PARI_URL/unix/pari-$PARI_VERSION.tar.gz" "$PARI_URL/unix/OLD/${PARI_VERSION%.*}/pari-$PARI_VERSION.tar.gz"
+    "$PARI_URL/unix/pari-$PARI_VERSION.tar.gz" "$PARI_URL/OLD/${PARI_VERSION%.*}/pari-$PARI_VERSION.tar.gz"
   tar -xzf "$src/pari-$PARI_VERSION.tar.gz" -C "$src"
   ( cd "$src/pari-$PARI_VERSION" \
     && ./Configure --prefix=/usr/local --with-gmp --with-readline >/dev/null \
@@ -293,13 +338,28 @@ if ! [ -x /usr/local/bin/gp ] || [ "$(/usr/local/bin/gp --version-short 2>/dev/n
 fi
 sudo ldconfig
 sudo install -d -m 0755 /usr/local/share/pari
+# The release's copy of each package (PARI_DATA, #945) goes where fetch_checked looks first: it
+# downloads from PARI's site only if the copy is missing or isn't the pinned one.
+# A directory is read in place, package by package: a glob there would pass a literal `*.tgz` to
+# cp when it holds none, and fail the build before the fallback (Codex round 1 on #952).
+pari_data=""
+if [ -d "$PARI_DATA" ]; then
+  pari_data=$PARI_DATA
+elif [ -n "$PARI_DATA" ]; then
+  pari_data=$(mktemp -d /tmp/pari-data.XXXXXX)
+  tar -xf "$PARI_DATA" -C "$pari_data"
+fi
 for name in "${!PARI_DATA_SHA256[@]}"; do
   if [ ! -d "/usr/local/share/pari/$name" ]; then
+    if [ -n "$pari_data" ] && [ -f "$pari_data/$name.tgz" ]; then
+      cp -- "$pari_data/$name.tgz" "/tmp/$name.tgz"
+    fi
     fetch_checked "${PARI_DATA_SHA256[$name]}" "/tmp/$name.tgz" "$PARI_URL/packages/$name.tgz"
     sudo tar -xzf "/tmp/$name.tgz" -C /usr/local/share/pari --strip-components=1
     rm -f "/tmp/$name.tgz"
   fi
 done
+[ -z "$pari_data" ] || [ "$pari_data" = "$PARI_DATA" ] || rm -rf "$pari_data"  # the tar's only
 
 # --- 3b. atlas, the Atlas of Lie Groups and Representations software (issue #474) ---------
 # Built from source as its INSTALL file describes for a system-wide installation (liegroups.org
@@ -328,7 +388,11 @@ fi
 
 # --- 4. uv and the Python environment ---------------------------------------------------------
 log "uv"
-if ! as_agent test -x "$AGENT_HOME/.local/bin/uv"; then
+# uv's own roots (#816), through which !rollout's `uv tool install --force` resolves the bridge's
+# dependencies, unhashed: 0.13.4 dropped emSign ECC Root CA - G3 (GHSA-hq85-5cpj-mr62). The
+# installer gives the newest; an older uv, from an earlier run on this builder, is replaced.
+UV_FLOOR_OK='v=$(~/.local/bin/uv --version 2>/dev/null | cut -d" " -f2) && test "$(printf "0.13.4\n%s\n" "$v" | sort -V | head -n1)" = 0.13.4'
+if ! as_agent bash -c "$UV_FLOOR_OK"; then
   as_agent bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh -s -- --no-modify-path'
 fi
 log "python venv ~/venv"
@@ -356,9 +420,10 @@ as_agent bash -c 'grep -q "venv/bin/activate" ~/.bashrc || printf "\n# workshop 
 # LEAN_PROJECT_PATH), so it works in the participants' own repositories too. Registered with
 # both agents in steps 5 and 6.
 log "lean-lsp-mcp $LEAN_LSP_MCP_VERSION"
-# --exclude-newer bounds the unpinned transitive dependencies to what existed at the pin.
+# --exclude-newer bounds the unpinned transitive dependencies to what existed at the pin; certifi's
+# is later, for 2026.10.23, without emSign ECC Root CA - G3 (#671), as in files/*-requirements.in.
 as_agent "$AGENT_HOME/.local/bin/uv" tool install -q --force --exclude-newer 2026-10-04T00:00:00Z \
-  "lean-lsp-mcp==$LEAN_LSP_MCP_VERSION"
+  --exclude-newer-package certifi=2026-10-24T00:00:00Z "lean-lsp-mcp==$LEAN_LSP_MCP_VERSION"
 
 # --- 5. Codex CLI from the GitHub release package (SPEC §8.3) ---------------------------------
 # The whole package goes to ~/.local/lib/codex-<version>, with ~/.local/bin/codex a symlink to
@@ -431,13 +496,21 @@ fi
 # then reports "Auto-updates: disabled (set by env: DISABLE_AUTOUPDATER)". Same as the first boot.
 sudo install -d -m 0755 /etc/claude-code
 # claude.ai connectors off as well (Drew, Sun 20:42 on #36; DECISIONS): an interactive `claude`
-# over SSH must not reach the participant's Gmail or Drive either. Merged into an existing file.
-sudo python3 - <<'PY'
-import json, os
-path = "/etc/claude-code/managed-settings.json"
+# over SSH must not reach the participant's Gmail or Drive either. CLAUDE_CODE_CERT_STORE=system
+# (#882): the requests that take Claude Code's own CA list (the messages API and its settings
+# fetches, as seen on 2.1.283) trust the system store alone, not also its bundled roots, which
+# hold emSign ECC Root CA - G3 in the pinned 2.1.283 (#859). A request without that list, such
+# as a plain `fetch`, still gets the bundled roots: only a pin of 2.1.304, or of a later release
+# byte-searched the same way, takes G3 out. Merged into an existing file, every other key kept;
+# one that isn't a JSON object stops the build. The same lines as the first boot's
+# (aws_common.COMMON_FIRST_BOOT).
+sudo python3 - /etc/claude-code/managed-settings.json <<'PY'
+import json, os, sys
+path = sys.argv[1]
 data = json.load(open(path)) if os.path.exists(path) else {}
 data.setdefault("env", {})["DISABLE_AUTOUPDATER"] = "1"
-data["disableClaudeAiConnectors"] = True
+data["env"]["CLAUDE_CODE_CERT_STORE"] = "system"  # Claude Code's own CA list (#882)
+data["disableClaudeAiConnectors"] = True  # claude.ai connectors off (issue #36, DECISIONS)
 with open(path, "w") as f:
     json.dump(data, f)
 PY
@@ -554,6 +627,15 @@ if [ "${WITH_SAGE:-0}" = "1" ]; then
   if ! as_agent bash -c "~/miniforge/envs/sage/bin/sage --version 2>/dev/null | grep -qE '(^| )$SAGE_VERSION(,|\$)'"; then
     as_agent bash -c "~/miniforge/bin/conda create -y -q -n sage -c conda-forge 'sage=$SAGE_VERSION' 'python=$SAGE_PYTHON'"
   fi
+  # Both environments' trust stores (#671, #816), none with emSign ECC Root CA - G3 from these
+  # versions on: ca-certificates' ssl/cacert.pem; certifi's, which by its build is a cacert.pem
+  # of its own or that one; and pip's vendored certifi, which pip loads beside the system's.
+  # The installer is miniforge's latest and may carry older ones. Nothing to do where all three
+  # are new enough already (the smoke test reads what each environment's certifi returns).
+  for env in base sage; do
+    as_agent "$AGENT_HOME/miniforge/bin/conda" install -y -q -n "$env" -c conda-forge \
+      'ca-certificates>=2026.10.23' 'certifi>=2026.10.23' 'pip>=26.2.2'
+  done
   # ~/.local/bin/sage is files/bin/sage, which puts the environment's bin first on PATH as
   # `conda activate` does: conda's launcher doesn't, and Sage's giac(), r() and gap() then find
   # no program or a system copy (issue #474, review on #480). It replaces the old symlink.
@@ -706,11 +788,13 @@ echo "Julia/Oscar step: $((SECONDS - start)) s, depot $(sudo du -sh "$AGENT_HOME
 # --- 11c. certbot for IP address certificates (refserve, rc6; Drew Sun 20:20, item 5) -------
 # In its own venv, from hash-pinned requirements, so that push_config never installs it on 40 VMs.
 log "certbot $CERTBOT_VERSION"
-if ! /opt/certbot/bin/certbot --version 2>/dev/null | grep -q "$CERTBOT_VERSION"; then
+# The venv once; the hash-pinned install at every run, so that a rerun on a builder takes the
+# file's newer pins too, certifi's for one (#671). With every pin installed it changes nothing.
+if ! [ -x /opt/certbot/bin/python ]; then
   sudo "$AGENT_HOME/.local/bin/uv" venv -q --python 3.12 /opt/certbot
-  sudo env VIRTUAL_ENV=/opt/certbot "$AGENT_HOME/.local/bin/uv" pip install -q --require-hashes \
-    -r "$FILES/certbot-requirements.txt"
 fi
+sudo env VIRTUAL_ENV=/opt/certbot "$AGENT_HOME/.local/bin/uv" pip install -q --require-hashes \
+  -r "$FILES/certbot-requirements.txt"
 
 # --- 12. instructions for both agents (PM's AMI v2 list, item 5) -----------------------------
 # Claude reads ~/.claude/CLAUDE.md under `claude -p` (zab passes no --bare or --setting-sources;
@@ -812,6 +896,47 @@ HC_SMOKE='out=$(timeout 900 julia -e "using Oscar, HomotopyContinuation; println
 check as_agent bash -c "$HC_SMOKE"
 check bash -c "/opt/certbot/bin/certbot --version 2>&1 | grep -q '$CERTBOT_VERSION' && /opt/certbot/bin/certbot --help all | grep -q -- --ip-address"
 check bash -c 'jq -e ".disableClaudeAiConnectors == true and .env.DISABLE_AUTOUPDATER == \"1\"" /etc/claude-code/managed-settings.json'
+# #882: the requests that take Claude Code's own CA list trust the system store alone (step 6),
+# which agent reads: a certificate in its bundle, and hashed ones in the directory. An empty or
+# unreadable store would make Claude Code fall back to its bundled roots.
+check bash -c 'jq -e ".env.CLAUDE_CODE_CERT_STORE == \"system\"" /etc/claude-code/managed-settings.json'
+SYSTEM_STORE='grep -q -e "-----BEGIN CERTIFICATE-----" /etc/ssl/certs/ca-certificates.crt && ls /etc/ssl/certs | grep -Eqx "[0-9a-f]{8}\.[0-9]+"'
+check as_agent bash -c "$SYSTEM_STORE"
+# #882: neither SSL_CERT_FILE nor CODEX_CA_CERTIFICATE is set for agent, in its login shell, its
+# user manager's environment (zab.service's) or zab.service's own: either adds roots to the
+# system's, Codex's built-in ones among them (#859). The report names each one set.
+if ca_env=$(sudo /usr/bin/python3 -I "$FILES/bin/ca_env.py" "$AGENT" 2>&1); then
+  printf 'ok   agent environment:\n%s\n' "$ca_env" | sed '2,$s/^/     | /'
+else
+  printf 'FAIL agent environment:\n%s\n' "$ca_env" | sed '2,$s/^/     | /'
+  fail=1
+fi
+# #671: no trust store the build installed holds a root files/bin/trust_stores.py lists: the
+# system's, and the certifi of every Python environment it created: the venv, certbot's, the uv
+# tools (lean-lsp-mcp, zab), each read whole; conda's two, their ssl/cacert.pem and the bundles
+# their certifi and pip's vendored certifi return (step 9), a path that isn't there if either
+# fails; and a uv-managed CPython if one was installed, whose pip vendors a certifi (#816). The
+# report shows each certifi's version. As root: agent's home is 0750.
+TRUST_PATHS=(/etc/ssl/certs "$AGENT_HOME/venv" /opt/certbot "$AGENT_HOME/.local/share/uv/tools")
+if [ "${WITH_SAGE:-0}" = "1" ]; then
+  TRUST_PATHS+=("$AGENT_HOME/miniforge/ssl" "$AGENT_HOME/miniforge/envs/sage/ssl")
+  WHERE_PY='import certifi; from pip._vendor import certifi as v; print(certifi.where()); print(v.where())'
+  for py in "$AGENT_HOME/miniforge/bin/python" "$AGENT_HOME/miniforge/envs/sage/bin/python"; do
+    where=$(as_agent "$py" -I -c "$WHERE_PY") || where="$py: certifi.where() failed"
+    while IFS= read -r line; do TRUST_PATHS+=("$line"); done <<<"$where"
+  done
+fi
+if as_agent test -d "$AGENT_HOME/.local/share/uv/python"; then
+  TRUST_PATHS+=("$AGENT_HOME/.local/share/uv/python")
+fi
+# uv 0.13.4 or newer (step 4): its roots lack emSign ECC Root CA - G3 (#816).
+check as_agent bash -c "$UV_FLOOR_OK"
+if trust=$(sudo /usr/bin/python3 -I "$FILES/bin/trust_stores.py" "${TRUST_PATHS[@]}" 2>&1); then
+  printf 'ok   trust stores:\n%s\n' "$trust" | sed '2,$s/^/     | /'
+else
+  printf 'FAIL trust stores:\n%s\n' "$trust" | sed '2,$s/^/     | /'
+  fail=1
+fi
 # The tools manifest (issue #474), last: every tool of files/tools.toml, its version and a small
 # computation, run as agent with the services' PATH (as the agents run them), and only if all
 # pass /etc/zab/tools.json with the versions seen. `!tools` and the agents' instructions read it.
@@ -835,6 +960,12 @@ if [ "$fail" -ne 0 ]; then echo "smoke test FAILED" >&2; exit 1; fi
 # Instance metadata: launch.py sets HttpTokens=required (IMDSv2, ../aws/README.md); nothing
 # here depends on IMDS.
 sudo rm -f /home/ubuntu/.bash_history "$AGENT_HOME/.bash_history"
+# The Macaulay2 packages stay held, as a rollout's apt_repair.py leaves an older image's (#947).
+# Step 1d writes no snapshot source any more (#945), so on a fresh builder the removal finds
+# nothing; it stays for a rerun on one an older build.sh prepared, since Launchpad expires a PPA's
+# snapshots and an expired one fails every `apt-get update`.
+sudo apt-mark hold macaulay2 macaulay2-common gfan msolve libmsolve3 >/dev/null
+sudo rm -f /etc/apt/sources.list.d/macaulay2.sources
 # Image hygiene: package caches, the journal, build leftovers (PM note on #56).
 $APT clean
 as_agent "$AGENT_HOME/.local/bin/uv" cache clean -q 2>/dev/null || true

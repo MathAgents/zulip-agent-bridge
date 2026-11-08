@@ -8,6 +8,10 @@ them, and only under `ZAB_LIVE=e2e` (the root conftest skips `e2e` tests otherwi
 A scenario whose clean-up failed (`harness.cleanup.Leftover`) adds a run problem to the report,
 naming what it left on the VM; when the later scenarios can't run in that state, the run stops
 after it (pytest's `Session.shouldstop`, #517) and the scenarios not run say why.
+
+A part in which OpenAI refused a Codex request with a 429 runs once more after a wait, and its
+row names that external cause (`harness.refusal`, #842). So does a part that failed on the rig's
+side (`harness.rig_failure`, #877); if it fails so again, it has no result (a skip), not a FAIL.
 """
 
 from __future__ import annotations
@@ -19,12 +23,17 @@ from pathlib import Path
 
 import pytest
 
-from e2e.harness import config, report
+from e2e.harness import config, refusal, report
 from e2e.harness.cleanup import Leftover
 from e2e.harness.recorder import Recorder
+from e2e.harness.rig_failure import RigFailure
 from e2e.harness.vm import say
 
 _RECORDER = Recorder()
+#: The refused parts this run may still run again (`harness.refusal`, #842)
+_RETRIES = refusal.Budget()
+#: The parts failed on the rig's side this run may still run again (`harness.rig_failure`, #877)
+_RIG_RETRIES = refusal.Budget()
 
 
 def _number(item: pytest.Item) -> int | None:
@@ -58,6 +67,38 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     # a selected scenario's report row lists all its parts: one left out stays visible
     for number in {n for item in items if (n := _number(item)) is not None}:
         _RECORDER.expect(number, parts[number])
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item: pytest.Item):
+    """A part in which OpenAI refused a Codex request with a 429 runs once more, after a wait,
+    with a fresh nonce, while the run's `_RETRIES` last; its row names the cause, and a second
+    refusal fails it (`harness.refusal`, #842). A part that failed on the rig's side runs once
+    more the same way, while `_RIG_RETRIES` last; failed so again, or with the budget spent, it
+    is skipped: no result, as the bridge wasn't seen to fail (`harness.rig_failure`, #877)."""
+    number = _number(item)
+    if number is None or not item.get_closest_marker("e2e"):
+        return (yield)
+    row = _RECORDER.row(number)
+    kept, noted = len(row.timings), len(row.notes)
+    try:
+        return (yield)
+    except (refusal.Refused, RigFailure) as first:
+        funcargs = getattr(item, "funcargs", {})
+
+        def renew() -> None:
+            if "nonce" in funcargs:
+                funcargs["nonce"] = new_nonce()
+
+        budget = _RIG_RETRIES if isinstance(first, RigFailure) else _RETRIES
+        if budget.left > 0:
+            say(f"{item.name}: {first}; running it again in {first.wait_s:.0f} s")
+        try:
+            refusal.retry(item.name, first, row, kept=kept, noted=noted, budget=budget,
+                          run=item.runtest, renew=renew)  # fmt: skip
+        except RigFailure as last:
+            pytest.skip(f"no result: {last}")
+        return None
 
 
 @pytest.hookimpl(wrapper=True)
@@ -230,15 +271,30 @@ async def shared_stream(rig: config.RigConfig, tester) -> int:
     return await tester.stream_id(rig.shared_channel)
 
 
+#: This run's reset of the VM's rule for a message without a mention to `all` (#878): whether
+#: it succeeded, once tried (`flows.reset_rule`).
+_RULE_RESET: list[bool] = []
+
+
 @pytest.fixture
 async def chat(rig: config.RigConfig, tester, bots, stream):
-    """`zab-tester` talking to the two bots: `harness/flows.Chat`."""
-    from e2e.harness.flows import Chat
+    """`zab-tester` talking to the two bots: `harness/flows.Chat`. Its first use in a run sets
+    the VM's rule for a message without a mention to `all`, the default the scenarios expect:
+    a run killed in scenario 1's part under `last` (#878) can't leave it to the next run. It is
+    tried once: after a failure, each later use fails at once, rather than wait again."""
+    from e2e.harness.flows import Chat, reset_rule
 
-    return Chat(tester, bots, rig.bots, stream)
+    chat = Chat(tester, bots, rig.bots, stream)
+    await reset_rule(chat, _RULE_RESET)
+    return chat
+
+
+def new_nonce() -> str:
+    return f"{time.strftime('%H%M%S')}-{os.urandom(3).hex()}"
 
 
 @pytest.fixture
 def nonce() -> str:
-    """A token unique to this test, for topics and the words the agents are asked to echo."""
-    return f"{time.strftime('%H%M%S')}-{os.urandom(3).hex()}"
+    """A token unique to this test, for topics and the words the agents are asked to echo; a
+    part run again after a refusal (`pytest_runtest_call`) gets another."""
+    return new_nonce()

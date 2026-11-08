@@ -78,7 +78,6 @@ from admin_common import (
 from aws_common import _EMAIL_RE, add_tag_argument, is_spare_name, parse_tags
 from roster_import import (
     _REGION_RE,
-    DEFAULT_REGION,
     RESERVED_SLUGS,
     Checks,
     LiveChecks,
@@ -536,7 +535,7 @@ def main(
     parser.add_argument("--roster", required=True)
     parser.add_argument("--zuliprc", required=True, help="the provisioner's zuliprc")
     parser.add_argument("--out-dir", required=True, help="the bots' keys, out/<slug>/")
-    parser.add_argument("--region", default=DEFAULT_REGION, help="the workshop's region")
+    parser.add_argument("--region", required=True, help="the workshop's region")
     add_tag_argument(parser)
     parser.add_argument("--retired", metavar="FILE", help="the server's retired-slugs.txt")
     parser.add_argument("--workshop-roster", action="append", default=[], metavar="WS=ROSTER")

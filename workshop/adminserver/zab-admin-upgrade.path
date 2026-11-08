@@ -1,0 +1,12 @@
+# docs/ADMIN.md §1.6 (#569): start the upgrade's apply helper when an approved !upgrade-server's
+# apply has written its request (renamed into place by zab-admin). The helper deletes the request
+# once read.
+[Unit]
+Description=zab admin upgrade helper: watch for an approved !upgrade-server's request
+
+[Path]
+PathExists=/var/lib/zab-admin-upgrade/requests/apply.json
+Unit=zab-admin-upgrade.service
+
+[Install]
+WantedBy=paths.target

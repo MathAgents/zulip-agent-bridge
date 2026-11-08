@@ -3,9 +3,16 @@ against the test server, as a deployer runs it, with the rig's test-only signing
 
 The four refusals are deploy.sh's own (its laptop half refuses them before anything reaches the
 server, and the server half repeats the checks), each named by its reason; after each, the
-server still runs what it ran. The good rc then deploys: `!version` shows it, the audit log has
-its `upgrade` record with the reviewed diff's SHA-256, and its venv holds exactly the hashed
-wheels of `uv.lock`'s admin group, made by uv, with zab itself on a `.pth` and nothing built.
+server still runs what it ran. The good rc then deploys as a last hand deploy does when
+`release_repo` is the public repository (#958, BOOTSTRAP §13.4): reviewed in the rig's own
+repository, which plays the private one, since the running release; exported to the rig's
+public repository (`Releases.export`); and deployed from that public commit, from a clone of
+the public repository holding the running release's private tag alone, with
+`--expect-diff-sha256` of the private review, which holds the deploy to the release paths
+reviewed. `!version` shows the public commit, the audit log has its `upgrade` record with that
+commit and the reviewed diff's SHA-256, and its venv holds exactly the hashed wheels of
+`uv.lock`'s admin group, made by uv, with zab itself on a `.pth` and nothing built. A10b's
+in-band upgrades then start from that public release.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from e2e.admin.conftest import DONE
+from e2e.admin.harness import upgrade
 from e2e.admin.harness.chat import Talk
 from e2e.admin.harness.release import Releases, next_version, older_version
 from e2e.admin.harness.rig import ADMINS_CHANNEL, GLOBAL_BOT
@@ -76,7 +84,7 @@ async def test_deploy_gate(scenario, admin_rig, rigged, server, tester, tmp_path
     refused(good, r"not signed with an SSH key", "unsigned tag")
     rel.release(rigged.commit, good, signer="unknown")
     refused(good, r"not signed by a key in", "a tag signed by an unknown key")
-    commit = rel.release(rigged.commit, good)  # signed: the good one, deployed last
+    private = rel.release(rigged.commit, good)  # signed: the good one, reviewed, then exported
     renamed = next_version(rel.base_version(rigged.commit), good)
     rel.alias(renamed, rel.git("rev-parse", f"refs/tags/{good}"))
     try:
@@ -87,13 +95,25 @@ async def test_deploy_gate(scenario, admin_rig, rigged, server, tester, tmp_path
     rel.release(rigged.commit, older)
     refused(older, rf"{re.escape(older)} is older than {re.escape(running)}", "older, no flag")
 
+    # #958: reviewed in the private repository, since the running release, with its deploy.sh;
+    # deployed from the public commit, whose diff from the private base must be the review's
+    reviewed = upgrade.reviewed_sha256(script, admin_rig.repo, admin_rig.etc, private, running,
+                                       tmp_path)  # fmt: skip
+    commit = rel.export(good, private)
+    clone = rel.deploy_clone(running, tmp_path / "deploy-clone")
     started = time.monotonic()
-    done = rel.deploy(script, good, out=tmp_path, log=log)
-    assert done.ok, f"the signed rc {good} was refused: {done.why()}"
+    done = rel.deploy(script, good, "--expect-diff-sha256", reviewed, out=tmp_path, log=log,
+                      repo=clone)  # fmt: skip
+    assert done.ok, f"the signed rc {good}'s public commit was refused: {done.why()}"
     scenario.timing("deploy of the good rc", time.monotonic() - started)
     assert server.running() == good
     DONE["release"] = good  # what the server runs from now on
-    assert re.fullmatch(r"[0-9a-f]{64}", done.diff_sha256), "deploy.sh printed no diff SHA-256"
+    assert done.diff_sha256 == reviewed, "the public commit's diff isn't the private review's"
+    assert "It is the diff you reviewed (--expect-diff-sha256)" in done.result.stderr
+    scenario.notes.append(
+        f"{good} deployed from its public commit {commit[:12]}, reviewed as {private[:12]} in the "
+        "private repository: the same diff SHA-256 (#958)"
+    )
 
     ids = rigged.ids()
     admins = Talk(tester, ids.bots[GLOBAL_BOT][0], ids.channels[ADMINS_CHANNEL], f"e2e-A10-{nonce}")

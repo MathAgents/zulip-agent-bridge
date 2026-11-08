@@ -1,0 +1,58 @@
+# docs/ADMIN.md §1.6 (#569): the plan helper of !upgrade-server (zab.admin.upgradehelper, `plan`).
+# Started by zab-admin-upgrade-plan.path, it reads and deletes the bot's request, fetches two tags
+# (the release asked for and the running one) from admin.toml's release_repo with the deploy key,
+# checks the release as deploy.sh does, has the running release's deploy.sh review it, and writes
+# the outcome, with the review's SHA-256, for the plan. It installs nothing and restarts nothing.
+# A deployer's request starts it before any approval, so it runs in a sandbox: it writes only its
+# own state (the request's directory in it, the bot's, to delete the request), holds one
+# capability, CAP_DAC_OVERRIDE, to read and delete the request in zab-admin's 0700 directory, and
+# reaches the network (GitHub) but not IMDS.
+# What root runs (§1.6, #437): the system interpreter with -I -B -S, never the venv's; sys.path
+# is the standard library and the release's src/, resolved once through `current`. The helper
+# imports upgradehelper, confighelper, config and checks, and the standard library
+# (tests/admin/test_admin_imports.py, UPGRADE_IMPORTS); then git, ssh, ssh-keygen, and the
+# running release's deploy.sh --review with what it runs (git, python3 -I, perl).
+# Of /etc/zab-admin/secrets it sees the deploy key alone: the rest is under an empty read-only
+# tmpfs. Hidden too: /var/lib/zab-admin (the fleet key, the bot's state, the participants'
+# keys), the console's state (its cookie secret), Caddy's (its TLS keys), the SSH host keys
+# (ssh runs with -F /dev/null and its own known_hosts) and the password hashes. The rest of the
+# system it may read, as root, but not write.
+# TimeoutStartSec covers its own limits, a fetch (GIT_SECONDS) and a review (REVIEW_SECONDS),
+# with room: it always writes its outcome before systemd would stop it.
+[Unit]
+Description=zab admin upgrade helper: check a release for an !upgrade-server plan
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B -S -c "import os, sys; sys.path.append(os.path.realpath('/opt/zab-admin/current/src')); from zab.admin.upgradehelper import main; sys.exit(main(['plan']))"
+ReadWritePaths=/var/lib/zab-admin-upgrade
+TemporaryFileSystem=/etc/zab-admin/secrets:ro
+BindReadOnlyPaths=-/etc/zab-admin/secrets/release-key
+InaccessiblePaths=-/var/lib/zab-admin -/var/lib/zab-console -/var/lib/caddy -/etc/ssh -/etc/shadow -/etc/gshadow
+TimeoutStartSec=1200
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+IPAddressDeny=169.254.169.254 fd00:ec2::254
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=CAP_DAC_OVERRIDE

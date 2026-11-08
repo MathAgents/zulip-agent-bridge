@@ -45,6 +45,8 @@ class FakeRealm:
         self.now = 1_800_000_000  # each message's `timestamp`, as a test sets it
         self.received: dict[int, list[int]] = {}  # user ID → the messages delivered to them
         self.broken: set[int] = set()  # users whose GET /messages and POST /messages answer 500
+        #: users deactivated: a DM to one is refused with a 400, as Zulip refuses it (#883)
+        self.deactivated: set[int] = set()
         #: POST /messages/{id}/reactions, as (user, message ID, params), the IDs unchecked: tests
         #: hand the bots messages the realm never saw (#466)
         self.reactions: list[tuple[int, int, dict[str, str]]] = []
@@ -255,6 +257,8 @@ class FakeRealm:
         if path == "messages" and request.method == "POST":
             if who in self.broken:
                 return self._error("INTERNAL_SERVER_ERROR", 500)
+            if params["type"] == "private" and self.deactivated & set(json.loads(params["to"])):
+                return self._error("BAD_REQUEST", 400)
             self.sent.append((who, params))
             mid = self._next("message")
             message = {

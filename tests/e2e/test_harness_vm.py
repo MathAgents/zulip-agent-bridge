@@ -74,8 +74,9 @@ def test_unit_reads_the_agent_user_manager_and_signals_are_checked():
         "SubState": "running",
     }
     words = shlex.split(rec.calls[-1][-1])
-    assert words[:6] == ["sudo", "-u", "agent", "-H", "env", "XDG_RUNTIME_DIR=/run/user/1001"]
-    assert words[7:10] == ["systemctl", "--user", "show"]
+    assert words[:8] == ["sudo", "-u", "agent", "-H", "env", "-C", "/home/agent",
+                         "XDG_RUNTIME_DIR=/run/user/1001"]  # fmt: skip
+    assert words[9:12] == ["systemctl", "--user", "show"]
     machine.signal(4242, "STOP")
     assert shlex.split(rec.calls[-1][-1]) == ["sudo", "kill", "-STOP", "4242"]
     for pid, sig in ((1, "STOP"), (4242, "HUP"), ("4242", "STOP")):
@@ -90,19 +91,22 @@ def test_the_watchdog_bound_is_read_from_the_installed_unit():
     WatchdogSec, abort timeout and RestartSec, as systemd prints them, and 60 s to start."""
     from e2e import test_scenarios_slow as slow
 
-    shown = "WatchdogUSec=5min\nTimeoutAbortUSec=30s\nRestartUSec=5s\n"  # the shipped unit
+    shown = "WatchdogUSec=5min\nTimeoutAbortUSec=30s\nRestartUSecNext=5s\n"  # the shipped unit
     machine, rec = vm({"id -u agent": Result(0, "1001\n", ""), "show": Result(0, shown, "")})
     assert slow.restart_limits(machine) == (395, 300)
     words = shlex.split(rec.calls[-1][-1])
-    assert words[7:] == ["systemctl", "--user", "show", "zab.service", "--property=WatchdogUSec",
-                         "--property=TimeoutAbortUSec", "--property=RestartUSec"]  # fmt: skip
+    assert words[9:] == ["systemctl", "--user", "show", "zab.service", "--property=WatchdogUSec",
+                         "--property=TimeoutAbortUSec", "--property=RestartUSecNext"]  # fmt: skip
     for text, seconds in (("1min 30s", 90), ("100ms", 0.1), ("0", 0), ("2h", 7200)):
         assert span_seconds(text) == seconds
     assert span_seconds("infinity") == float("inf")
     for bad in ("", "5 min", "30", "1x", "-5s"):
         with pytest.raises(ValueError):
             span_seconds(bad)
-    for unit, why in (("WatchdogUSec=0\n", "no watchdog"), ("RestartUSec=infinity\n", "unbounded")):
+    for unit, why in (
+        ("WatchdogUSec=0\n", "no watchdog"),
+        ("RestartUSecNext=infinity\n", "unbounded"),
+    ):
         machine, _ = vm({"id -u agent": Result(0, "1001\n", ""),
                          "show": Result(0, shown + unit, "")})  # fmt: skip
         with pytest.raises(AssertionError, match=why):
@@ -298,9 +302,10 @@ def test_select_scenarios():
         13,
         14,
         16,
-    ]  # 14 fast (#305), 16 (#709)
-    assert report.select("all") == list(range(1, 17))
-    for bad in ("", "17", "0-2", "x"):
+        17,
+    ]  # 14 fast (#305), 16 (#709), 17 (#660)
+    assert report.select("all") == list(range(1, 18))
+    for bad in ("", "18", "0-2", "x"):
         with pytest.raises(ValueError):
             report.select(bad)
 

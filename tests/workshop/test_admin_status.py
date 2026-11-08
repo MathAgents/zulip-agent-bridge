@@ -22,6 +22,8 @@ import status as st
 from zab.commands.status import read_status
 from zab.core.store import Store
 
+from .scope import FLEET_SCOPE, with_tag
+
 ROSTER = """github,first_name,last_name,email,repo,github_id,host,ip,zulip_user_id,notes
 alice,Alice,Smith,alice@example.org,alice/thesis,1,ws-alice,203.0.113.5,101,
 bob,Bob,Jones,bob@example.org,sandbox,2,ws-bob,203.0.113.6,102,
@@ -248,7 +250,8 @@ def test_gather_unreachable_and_main_csv(tmp_path, monkeypatch, capsys):
     roster = tmp_path / "roster.csv"
     roster.write_text(ROSTER)
     out_csv = tmp_path / "status.csv"
-    code = st.main(
+    code = with_tag(
+        st.main,
         [
             "--roster",
             str(roster),
@@ -258,7 +261,7 @@ def test_gather_unreachable_and_main_csv(tmp_path, monkeypatch, capsys):
             "3",
             "--known-hosts",
             str(tmp_path / "kh"),
-        ]
+        ],
     )
     assert code == 0
     text = capsys.readouterr().out
@@ -277,7 +280,7 @@ def test_gather_unreachable_and_main_csv(tmp_path, monkeypatch, capsys):
     # a roster with two rows on one IP is refused before any connection
     roster.write_text(ROSTER + "dave,D,K,d@example.org,d/x,4,ws-dave,203.0.113.5,104,\n")
     runner.calls.clear()
-    assert st.main(["--roster", str(roster)]) == 1 and not runner.calls
+    assert with_tag(st.main, ["--roster", str(roster)]) == 1 and not runner.calls
     assert "roster: duplicate ip" in capsys.readouterr().err
     assert "sudo -u agent -H XDG_RUNTIME_DIR=/run/user/$uid" in st.STATUS_CMD
     assert 'bash -lc "cd / && $1"' in st.STATUS_CMD  # probes start from / (round 3)
@@ -659,11 +662,11 @@ def test_unreachable_vms_that_ec2_says_are_stopped_say_so(fake_ec2):
     results = [
         st.VmStatus(slug=r["slug"], bridge="unreachable", last_error="timeout") for r in rows
     ]
-    states, problem = st.ec2_states({st.region_of(r) for r in rows})
+    states, problem = st.ec2_states({st.region_of(r) for r in rows}, tag=FLEET_SCOPE)
     assert not problem and sorted(fake_ec2.regions) == ["us-east-2", "us-west-2"]
     st.mark_stopped(results, rows, states)
     assert [(r.bridge, r.last_error) for r in results] == [
-        ("stopped", ""),  # the region defaults to us-west-2; the stopped VM keeps its EIP
+        ("stopped", ""),  # no region recorded: us-west-2; the stopped VM keeps its EIP
         ("unreachable", "timeout"),  # running but unreachable: a real problem
         ("starting", ""),
         ("unreachable", "timeout"),  # no instance at all
@@ -676,16 +679,18 @@ def test_a_handed_over_vm_is_matched_by_address_not_by_name(fake_ec2):
     his name, must not hide that the spare he uses now is unreachable."""
     rows = [{"slug": "frank", "region": "us-west-2", "ip": "203.0.113.30"}]
     results = [st.VmStatus(slug="frank", bridge="unreachable", last_error="timeout")]
-    states, _ = st.ec2_states({"us-west-2"})
+    states, _ = st.ec2_states({"us-west-2"}, tag=FLEET_SCOPE)
     st.mark_stopped(results, rows, states)
     assert (results[0].bridge, results[0].last_error) == ("unreachable", "timeout")
 
 
 def test_a_failed_ec2_lookup_says_why_and_changes_nothing(fake_ec2):
     fake_ec2.fail = True
-    states, problem = st.ec2_states({"us-west-2"})
+    states, problem = st.ec2_states({"us-west-2"}, tag=FLEET_SCOPE)
     assert states == {} and problem == "ImportError: No module named 'boto3'"
-    states, problem = st.ec2_states({"us-east-2", "us-west-2"})  # one reason for all: alone
+    states, problem = st.ec2_states(
+        {"us-east-2", "us-west-2"}, tag=FLEET_SCOPE
+    )  # one reason for all: alone
     assert states == {} and problem == "ImportError: No module named 'boto3'"
 
 
@@ -700,7 +705,9 @@ def test_a_region_that_fails_is_said_and_the_others_are_read(monkeypatch, fake_e
         return found(self, tags, states)
 
     monkeypatch.setattr(fake_ec2, "find_instances", find_instances)
-    states, problem = st.ec2_states({"ap-south-1", "eu-west-1", "us-east-2", "us-west-2"})
+    states, problem = st.ec2_states(
+        {"ap-south-1", "eu-west-1", "us-east-2", "us-west-2"}, tag=FLEET_SCOPE
+    )
     assert states["203.0.113.7"] == "stopped" and states["203.0.113.9"] == "pending"
     assert problem == (
         "RuntimeError: UnauthorizedOperation in ap-south-1 (in ap-south-1); "
@@ -718,7 +725,12 @@ def test_the_first_lookup_reads_the_regions_of_rows_with_a_vm(
     roster = tmp_path / "roster.csv"
     head = "slug,first_name,last_name,email,region,ip"
     roster.write_text(f"{head}\nerin,E,L,e@example.org,us-east-2,203.0.113.9\nlate,L,T,l@x.org,,\n")
-    assert st.main(["--roster", str(roster), "--known-hosts", str(tmp_path / "kh"), "--json"]) == 0
+    assert (
+        with_tag(
+            st.main, ["--roster", str(roster), "--known-hosts", str(tmp_path / "kh"), "--json"]
+        )
+        == 0
+    )
     captured = capsys.readouterr()
     vms = {vm["slug"]: vm for vm in json.loads(captured.out)["vms"]}
     assert vms["erin"]["bridge"] == "starting" and vms["late"]["bridge"] is None
@@ -739,7 +751,7 @@ def test_main_reads_ec2_first_and_never_tries_ssh_on_a_stopped_vm(
     monkeypatch.setattr(st, "subprocess_runner", runner)
     roster = tmp_path / "roster.csv"
     roster.write_text(ROSTER)  # carol, at 203.0.113.7, is stopped (and SSH can't reach her)
-    assert st.main(["--roster", str(roster), "--known-hosts", str(tmp_path / "kh")]) == 0
+    assert with_tag(st.main, ["--roster", str(roster), "--known-hosts", str(tmp_path / "kh")]) == 0
     captured = capsys.readouterr()
     carol = next(line for line in captured.out.splitlines() if line.startswith("carol"))
     assert "stopped" in carol and "No route to host" not in carol and "203.0.113.7" in carol
@@ -751,7 +763,7 @@ def test_main_reads_ec2_first_and_never_tries_ssh_on_a_stopped_vm(
         runner.calls.clear()
         fake_ec2.regions.clear()
         fake_ec2.fail = not flags
-        st.main(["--roster", str(roster), "--known-hosts", str(tmp_path / "kh"), *flags])
+        with_tag(st.main, ["--roster", str(roster), "--known-hosts", str(tmp_path / "kh"), *flags])
         captured = capsys.readouterr()
         assert "2 unreachable, 0 stopped" in captured.out
         assert ssh_hosts(runner) == ["203.0.113.5", "203.0.113.6", "203.0.113.7"]
@@ -769,8 +781,8 @@ def test_a_failed_lookup_is_said_only_when_a_vm_is_unreachable(
     roster.write_text(ROSTER.rsplit("carol", 1)[0])  # alice and bob, both reachable
     fake_ec2.fail = True
     argv = ["--roster", str(roster), "--known-hosts", str(tmp_path / "kh")]
-    assert st.main(argv) == 0 and not capsys.readouterr().err
-    assert st.main([*argv, "--json"]) == 0
+    assert with_tag(st.main, argv) == 0 and not capsys.readouterr().err
+    assert with_tag(st.main, [*argv, "--json"]) == 0
     captured = capsys.readouterr()
     assert json.loads(captured.out)["ec2_error"] is None and not captured.err
 
@@ -793,7 +805,12 @@ def test_a_vm_that_stops_while_ssh_tries_is_looked_up_again(
     roster = tmp_path / "roster.csv"
     head = ROSTER.split("\n", 1)[0]
     roster.write_text(f"{head}\ndave,D,K,d@example.org,d/x,4,ws-dave,203.0.113.8,104,\n")
-    assert st.main(["--roster", str(roster), "--known-hosts", str(tmp_path / "kh"), "--json"]) == 0
+    assert (
+        with_tag(
+            st.main, ["--roster", str(roster), "--known-hosts", str(tmp_path / "kh"), "--json"]
+        )
+        == 0
+    )
     (dave,) = json.loads(capsys.readouterr().out)["vms"]
     assert (dave["bridge"], dave["last_error"]) == ("stopping", None)
     assert calls == ["us-west-2"] * 2 and ssh_hosts(runner) == ["203.0.113.8"]
@@ -876,7 +893,7 @@ def golden_run(tmp_path, monkeypatch, capsys, *extra: str) -> str:
     roster = tmp_path / "roster.csv"
     roster.write_text(GOLDEN_ROSTER)
     argv = ["--roster", str(roster), "--known-hosts", str(tmp_path / "kh"), "--parallel", "1"]
-    assert st.main([*argv, *extra]) == 0
+    assert with_tag(st.main, [*argv, *extra]) == 0
     return capsys.readouterr().out
 
 
@@ -900,7 +917,7 @@ def test_json_with_a_failed_ec2_lookup_and_the_tag(tmp_path, monkeypatch, capsys
     out = json.loads(golden_run(tmp_path, monkeypatch, capsys, "--json"))
     assert out["ec2_error"] == "ImportError: No module named 'boto3'"
     assert out["vms"][2]["bridge"] == "unreachable"
-    # --tag scopes the EC2 lookup (FakeEc2 itself asserts the default workshop tag)
+    # --tag scopes the EC2 lookup (FakeEc2 itself asserts the tests' scope, FLEET_SCOPE)
     seen = []
     fake_ec2.fail = False
     monkeypatch.setattr(fake_ec2, "find_instances", lambda _, tags, s: seen.append(tags) or [])
@@ -908,7 +925,7 @@ def test_json_with_a_failed_ec2_lookup_and_the_tag(tmp_path, monkeypatch, capsys
     # both lookups: the first, and again for carol, unreachable since EC2 lists nothing (#439)
     assert seen == [{"zab-role": "test", "workshop": "w"}] * 2
     with pytest.raises(SystemExit):
-        st.main(["--roster", "r.csv", "--tag", "participant=x"])  # a per-participant key
+        with_tag(st.main, ["--roster", "r.csv", "--tag", "participant=x"])  # a per-participant key
 
 
 def test_the_new_sections_are_fixed_literals_read_without_root():

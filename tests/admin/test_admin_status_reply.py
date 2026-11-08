@@ -8,7 +8,8 @@ import re
 
 import pytest
 
-from zab.admin import planning
+from zab.admin import planning, wakerdown
+from zab.admin.fleet import Recorded
 from zab.admin.planning import ATTACH, Planning, status_reply
 from zab.admin.scrub import Scrubber
 
@@ -339,3 +340,52 @@ async def test_the_bot_answers_status_with_the_table(tmp_path):
         assert b"vm-54  active" in attached and b'"schema": 1' in attached
     finally:
         await server.close()
+
+
+async def test_the_footer_survives_an_answer_at_the_limit_with_every_line_under_it(
+    tmp_path, monkeypatch
+):
+    """#767: the answer is fitted with room for the lines under it, the cost line, the waker's
+    and the retired rows', and for the audit footer; Zulip's limit would cut the footer off."""
+    # status.py's own answer, cut by the room: 60 VMs, as wide as a real workshop's, each with
+    # three doctor failures and another last error
+    rows = workshop_rows(60)
+    for vm in rows:
+        vm.bridge, vm.last_error = "active, doctor FAIL", "status: " + "e" * 70
+        vm.doctor_failures = ["zulip:claude: 401 " + "u" * 140] * 3
+    unpriced = ", ".join(f"x{n}g.48xlarge" for n in range(8))
+    cost = (f"cost (estimate, EC2 last read 2027-01-15 07:02 UTC): $12,345 this month, $45,678 "
+            f"projected, leaving out every VM that ran as, or is now, {unpriced} (no price) · "
+            "38 of 60 running · spares: 3 of 3 running")  # fmt: skip
+    down = wakerdown.down_line(1_799_990_000.0)
+    monkeypatch.setattr(planning, "cost_line", lambda *a: cost)
+    monkeypatch.setattr(planning, "status_line", lambda *a: down)
+    site = make_site(tmp_path)
+    # the roster: those 60, and 12 more with the longest slugs, retired by the longest plan IDs
+    gone = [f"retired-{n:02d}-{'x' * 21}" for n in range(12)]
+    lines = [f"{s},F,L,{s}@example.com,,198.51.100.{n + 1},us-west-2"  # 72 rows: RFC 5737's
+             for n, s in enumerate([vm.slug for vm in rows] + gone)]  # fmt: skip
+    roster = tmp_path / "ws" / "harvard-2026" / "roster.csv"
+    roster.write_text("slug,first_name,last_name,email,github,ip,region\n" + "\n".join(lines))
+    server = site.server(planner=Planning(Reads(read(*rows))))
+    await server.start()
+    when = f"P-{planning.MAX_PLAN_ID} at 2026-10-29 14:02 UTC"
+    retired = server.ledger.workshops.setdefault("harvard-2026", Recorded()).retired
+    retired.update(dict.fromkeys(gone, when))
+    harvard = next(b for b in server.bots if b.user_id == HARVARD)
+    limit = harvard.client.limits["max_message_length"] = 10000  # the organization's
+    try:
+        await harvard.on_message(incoming(OLGA, "!status all", mid=5000))
+        while server.planner.tasks:
+            await next(iter(server.planner.tasks))
+    finally:
+        await server.close()
+    text = site.realm.posts(HARVARD)[-1]["content"]
+    under = text.split("\n\n")[-1].split("\n")[0]
+    assert len(gone[0]) == 32 and under.endswith(f"{gone[9]} ({when}), and 2 more.*")
+    assert under.startswith(f"*Retired, so left out: {gone[0]} (")
+    assert len(cost) + len(down) + len(under) > 1200
+    assert limit - 600 < len(text) <= limit  # at the limit, with the link and the footer
+    assert "lines under it left out. The whole status: [status.txt](" in text
+    assert f"\n\n{cost}\n\n{down}\n\n{under}\n`audit #" in text
+    assert re.fullmatch(r"`audit #\d+ · chain [0-9a-f]{12}`", text.split("\n")[-1])

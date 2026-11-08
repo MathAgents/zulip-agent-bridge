@@ -113,9 +113,17 @@ skip the basics.
     message from the participant ends the wait at once.
 - Start one at a time, unless the participant asks for more. A sub-agent doesn't start
   sub-agents of its own: say so in its task.
-- While it runs, check in as above, with a progress note after every check. Ask the sub-agent
-  to write its progress to a log file of its own, and read the log's tail at each check (not
-  Claude Code's output file for the sub-agent: that is its whole transcript).
+- While it runs, keep checking on it as above, every 30 to 50 seconds until it is done. Write
+  the note right after each check's result, before the next check: never two checks in a row
+  without a note between them. A note is one line: how long it has run and what its log shows.
+  Ask the sub-agent to write its progress to a log file of its own, and read the log's tail at
+  each check (not Claude Code's output file for the sub-agent: that is its whole transcript).
+  - Claude Code: check it with a bounded wait and its log's tail, for example
+    `for i in $(seq 4); do sleep 10; done; tail -n 5 sub.log`. The message that starts a
+    background sub-agent tells you not to report its results until you are told that it has
+    finished. That is about its findings, not its progress: the notes are still due after every
+    check, and a status question still gets an answer. Say what its log shows so far, and don't
+    guess at what it will find.
 - Don't end your turn while a sub-agent runs. Under zab, Claude's turn then lasts until the
   sub-agent is done, and the participant's messages wait for it; Codex's sub-agent finishes,
   but its answer never reaches the participant. If the turn must end before it is done (it

@@ -47,6 +47,7 @@ workshop/admin/admin_common.py
 workshop/admin/archive_check.py
 workshop/admin/collect_exports.py
 workshop/admin/final_sync.py
+workshop/admin/keep_until.py
 workshop/admin/new_workshop.py
 workshop/admin/provision_repos.py
 workshop/admin/push_config.py
@@ -56,6 +57,8 @@ workshop/admin/roster_sync.py
 workshop/admin/scan_hosts.py
 workshop/admin/stage_server.py
 workshop/admin/status.py
+workshop/admin/trust_fix.py
+workshop/admin/upgrade_server.py
 workshop/admin/zulip_provision.py
 workshop/aws/adopt_spare.py
 workshop/aws/aws_common.py
@@ -67,12 +70,15 @@ workshop/aws/protect.py
 workshop/aws/spare_idle_stop.py
 workshop/aws/teardown.py
 # What the scripts above copy to the VMs or into a repository: collect_exports.py's export.sh,
-# final_sync.py's remote half, push_config.py's five scripts, the Oct 9 image's list of its
-# software and the AMI's three files it installs again (the sage wrapper since #482), and
+# final_sync.py's and trust_fix.py's remote halves, push_config.py's six scripts, the Oct 9
+# image's list of its software and the AMI's three files it installs again (the sage wrapper
+# since #482), the AMI's trust check that trust_fix.py sends with its own, and
 # provision_repos.py's template, an empty repository's first commit.
 workshop/admin/export.sh
 workshop/admin/final_sync_remote.py
+workshop/admin/trust_fix_remote.py
 workshop/admin/agent_instructions.py
+workshop/admin/apt_repair.py
 workshop/admin/idle_stop.py
 workshop/admin/sage_wrapper.py
 workshop/admin/tools_list.py
@@ -81,4 +87,5 @@ workshop/admin/warm_cache.py
 workshop/ami/files/agent-instructions.md
 workshop/ami/files/bin/lean-project
 workshop/ami/files/bin/sage
+workshop/ami/files/bin/trust_stores.py
 workshop/template

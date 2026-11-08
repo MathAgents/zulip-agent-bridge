@@ -1,12 +1,13 @@
 """Terminate the workshop VMs and release their Elastic IPs (README.md, "teardown.py").
 
-    uv run --with boto3 python workshop/aws/teardown.py --tag workshop=nt-agents-2026 \\
-        [--tag KEY=VALUE …] [--region us-west-2] [--only SLUG …] [--dry-run] [--yes] [--strict] \\
+    uv run --with boto3 python workshop/aws/teardown.py --tag workshop=NAME \\
+        [--tag KEY=VALUE …] --region REGION [--only SLUG …] [--dry-run] [--yes] [--strict] \\
         [--roster roster.csv]
 
-Standalone script (boto3 is not a zab dependency), run by Drew for a workshop; agents run it only
-on test infrastructure, with `--tag zab-role=test` among the scope tags, so
-nothing else matches. Lists what it would terminate and asks for confirmation unless `--yes`.
+Standalone script (boto3 is not a zab dependency), run by the admin bot or a deployer for a
+workshop; agents run it only on test infrastructure, with `--tag zab-role=test` among the scope
+tags, so nothing else matches. Lists what it would terminate and asks for confirmation unless
+`--yes`.
 Root volumes are deleted with the instances (`DeleteOnTermination`, README.md, "The VMs"). An
 instance with termination protection (a kept VM, `protect.py`; issue #207) is left alone, and so is
 the Elastic IP associated with it; the list says so, and `protect.py --off --only SLUG` lifts the
@@ -220,7 +221,7 @@ def teardown(
     clock: Callable[[], float] | None = None,  # time.monotonic, likewise
     roster: str | None = None,
     spares_file: str | None = None,
-    region: str = "us-west-2",
+    region: str,  # spares.json's key, with the scope (#808: no default)
 ) -> int:
     skipped: list[dict] = []
     try:
@@ -356,7 +357,7 @@ def forget(path: str, released: set[str], log: Callable[[str], None]) -> bool:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Terminate workshop VMs and release their IPs.")
     add_tag_argument(parser)
-    parser.add_argument("--region", default="us-west-2")
+    parser.add_argument("--region", required=True, help="the workshop's region")
     parser.add_argument(
         "--only",
         action="append",

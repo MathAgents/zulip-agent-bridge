@@ -60,7 +60,7 @@ _DOCUMENT = re.compile(r"zab-admin-([1-9][0-9]*)\.json", re.ASCII)  # what --out
 _NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?", re.ASCII)
 _TAG_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/+@-]{0,127}", re.ASCII)
 _TAG_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/+@-]{0,255}", re.ASCII)
-_REGION = re.compile(r"[a-z]{2}(?:-[a-z]+)+-[0-9]{1,2}", re.ASCII)
+_REGION = re.compile(r"[a-z]{2}(?:-[a-z]+)++-[0-9]{1,2}", re.ASCII)
 _INSTANCE_TYPE = re.compile(r"[a-z][a-z0-9-]*\.[a-z0-9]+", re.ASCII)
 
 

@@ -73,6 +73,11 @@ async def attach(bridge: BotBridge, message: dict[str, Any], text: str, channel:
         settings = t.SessionSettings(
             **json.loads(max(previous, key=lambda r: r["updated_at"])["settings_json"])
         )
+        # What the backend recorded applying to the thread (§5.5) vouched for that binding's
+        # load, not for whatever loaded the thread since the detach, perhaps a terminal's
+        # client: the open checks it as an unknown identity (#830).
+        for key in ("applied_git_identity", "applied_instance"):
+            settings.extra.pop(key, None)
     elif cached:
         # Listings can omit settings (notably Codex); only populated fields override defaults.
         settings = replace(
@@ -92,11 +97,13 @@ async def attach(bridge: BotBridge, message: dict[str, Any], text: str, channel:
     if found.settings.account:
         settings.account = found.settings.account
     bridge.attaching[found.native_id] = []
+    session_id = str(uuid4())  # before open_session: ZAB_SESSION in its turns (#655)
     info = await bridge.backend.open_session(
         found.native_id,
         t.SessionSpec(
             git_identity=bridge.git_identity,
             bot=bridge.bot.name,
+            session=session_id,
             cwd=found.cwd or prepared.cwd,
             name=message["subject"].removeprefix("✔ "),
             settings=settings,
@@ -127,7 +134,7 @@ async def attach(bridge: BotBridge, message: dict[str, Any], text: str, channel:
         raise ValueError("Session is already attached; use !detach in its topic first.")
     snapshot = await bridge.manager.snapshot(workspace)
     row = dict(
-        id=str(uuid4()),
+        id=session_id,
         bot=bridge.bot.name,
         backend=bridge.bot.backend,
         native_id=info.native_id,

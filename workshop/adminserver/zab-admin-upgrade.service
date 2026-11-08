@@ -1,0 +1,34 @@
+# docs/ADMIN.md §1.6 (#569): the apply helper of !upgrade-server (zab.admin.upgradehelper,
+# `apply`). Started by zab-admin-upgrade.path, it reads and deletes the bot's request, checks it
+# against the plan helper's own record of the plan and makes every check again on the server's
+# copies of the tags, then runs the release's own deploy.sh twice: --build-wheel, the fleet wheel
+# built as zab-build and placed for !rollout, unless one is there; then --server --in-band, as a
+# deployer's laptop has root run it over SSH: the build at the final path as zab-build, the
+# switch, the record, the units, and their restart, all but the bots' (the bot restarts itself
+# once it has posted the result). It fetches nothing: the plan's recheck has just done so.
+# It is the deploy, so it has root's system, as sudo over SSH has: deploy.sh installs users,
+# units, tmpfiles entries, the IMDS rule's files, Caddy's configuration and the release under
+# /opt, and runs systemctl, runuser and nft. Its guard is what it runs (a signed tag's deploy.sh,
+# after the checks), never a sandbox: tests/workshop/test_adminserver_units.py names it apart.
+# What it does keep: no new privileges (runuser needs none as root), its own /tmp, no home
+# directories, /usr and /boot read-only (deploy.sh writes neither on an upgrade), UMask=0077.
+# The next release's deploy.sh runs under this release's unit: an upgrade step that writes /usr
+# (an apt-get install of a new package, which deploy.sh runs only at a bootstrap today) would
+# fail in-band: such a release is deployed with deploy.sh, as BOOTSTRAP §13.4 says.
+# What root runs first (§1.6, #437): the system interpreter with -I -B -S, never the venv's;
+# sys.path is the standard library and the running release's src/ (UPGRADE_IMPORTS).
+[Unit]
+Description=zab admin upgrade helper: install the release of an approved !upgrade-server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B -S -c "import os, sys; sys.path.append(os.path.realpath('/opt/zab-admin/current/src')); from zab.admin.upgradehelper import main; sys.exit(main(['apply']))"
+# deploy.sh's two runs within it: upgradehelper.WHEEL_SECONDS and DEPLOY_SECONDS, 300 and 1080
+TimeoutStartSec=1500
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=true

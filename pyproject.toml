@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zulip-agent-bridge"
-version = "0.2.18"
+version = "0.2.19"
 description = "Drive Codex and Claude Code sessions on your own machines from Zulip topics"
 readme = "README.md"
 license = "MIT"
@@ -85,7 +85,8 @@ ignore = ["S101", "UP047"]
 [tool.ruff.lint.per-file-ignores]
 # The ban covers the admin server and the tests' two fake Zulips, whose long polls a stop
 # cancels. A test may bound its own waits with it: no one cancels a test. The bridge's, the
-# waker's and the tools' uses are #498.
+# waker's and the tools' uses stay: on Python 3.12, the floor since #774, `wait_for` is built on
+# `asyncio.timeout` and keeps a cancel (#498).
 "!{src/zab/admin/**,src/zab/testing/**,tests/admin/fake_realm.py}" = ["TID251"]
 
 [tool.ruff.lint.isort]

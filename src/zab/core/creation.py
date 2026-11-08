@@ -283,12 +283,14 @@ async def _create(
                 if getattr(args, k) is not None
             },
         )
+        session_id = str(uuid4())  # before create_session: ZAB_SESSION in the first turn (#655)
         spec = t.SessionSpec(
             cwd=prepared.cwd,
             name=message["subject"].removeprefix("✔ "),
             settings=settings,
             git_identity=bridge.git_identity,
             bot=bridge.bot.name,
+            session=session_id,
             context_prompt=context_prompt(bridge.config.bridge.multi_party),
         )
         info = None
@@ -315,7 +317,7 @@ async def _create(
                 spec = replace(spec, settings=settings)
         assert info is not None
         row = dict(
-            id=str(uuid4()),
+            id=session_id,
             bot=bridge.bot.name,
             backend=bridge.bot.backend,
             native_id=info.native_id,

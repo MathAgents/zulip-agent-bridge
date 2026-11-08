@@ -1134,9 +1134,9 @@ def test_a_dangling_current_counts_as_bootstrapped(rig):
 
 #: SERVICES' steps after the IMDS rule and Caddy (#348): the starter's socket, its service stopped
 #: so that the next request runs the new release; the archive check's socket (#374), whose
-#: instances each end with their connection: nothing to stop; the config helper's path unit
-#: (#418), whose oneshot runs only on a request; the bot; the collector and the console (#489);
-#: then the waker (after the bot, PR 9).
+#: instances each end with their connection: nothing to stop; the path units of the config
+#: helper (#418) and of the upgrade's plan helper (#569), whose oneshots run only on a request;
+#: the bot; the collector and the console (#489); then the waker (after the bot, PR 9).
 UNIT_STEPS = [
     "enable zab-admin-starter.socket",
     "restart zab-admin-starter.socket",
@@ -1145,6 +1145,10 @@ UNIT_STEPS = [
     "restart zab-archive-check.socket",
     "enable zab-admin-config.path",
     "restart zab-admin-config.path",
+    "enable zab-admin-upgrade-plan.path",
+    "restart zab-admin-upgrade-plan.path",
+    "enable zab-admin-upgrade.path",
+    "restart zab-admin-upgrade.path",
     "enable zab-admin-bot.service",
     "restart zab-admin-bot.service",
     "enable zab-admin-collector.service",
@@ -1177,6 +1181,40 @@ def test_the_units_are_enabled_at_bootstrap_and_restarted_on_upgrade(rig):
     result = rig.deploy("v0.3.1")
     assert result.returncode == 0, result.stderr
     assert log.read_text().splitlines() == [*steps, *UNIT_STEPS]
+
+
+def test_an_in_band_upgrade_records_its_plan_and_leaves_the_bot_to_restart_itself(server):
+    """#569: `!upgrade-server`'s apply helper runs the server half with `--in-band P-n`. The
+    plan goes into the record, which the bot copies into the audit log; every unit restarts but
+    the bots', which is enabled: the bot hosts that apply, and restarts itself after its result."""
+    log = systemctl_log(server)
+    server.release("v0.3.1")
+    flags = ["--base", "v0.3.0", "--diff-sha256", "a" * 64, "--in-band", "P-12"]
+    result = server_half(server, "v0.3.1", *flags)
+    assert result.returncode == 0, result.stderr
+    assert server.current().endswith("v0.3.1")
+    steps = ["restart zab-admin-imds.service", "enable caddy.service", "restart caddy.service"]
+    others = [step for step in UNIT_STEPS if step != "restart zab-admin-bot.service"]
+    assert log.read_text().splitlines() == [*steps, *others]
+    record = server.records()[-1]
+    assert (record["event"], record["from"], record["plan"]) == ("upgrade", "v0.3.0", "P-12")
+    assert "plan" not in server.records()[0]  # the bootstrap's, over SSH
+
+
+@pytest.mark.parametrize(
+    ("flags", "why"),
+    [
+        (["--in-band", "P-0"], "bad arguments"),
+        (["--in-band", "12"], "bad arguments"),
+        (["--in-band", "P-1;id"], "bad arguments"),
+        (["--in-band", "P-1", "--bootstrap"], "--in-band is an upgrade's alone"),
+        (["--in-band", "P-1", "--wheel", "x.whl", "--wheel-sha256", "a" * 64], "upgrade's alone"),
+    ],
+)
+def test_in_band_names_a_plan_and_goes_with_an_upgrade_alone(server, flags, why):
+    server.release("v0.3.1")
+    refused(server_half(server, "v0.3.1", *flags), why)
+    assert server.current().endswith("v0.3.0") and len(server.records()) == 1
 
 
 def test_an_aborted_deploy_touches_no_unit(server):
@@ -1613,6 +1651,19 @@ def test_the_review_prints_no_tag_command_without_one_version(released, edit):
     no = f'No tag command: {commit}\'s pyproject.toml has no single version = "X.Y.Z" line\n'
     assert done.stderr.endswith(f"\n{no}"), done.stderr
     assert "tag -s" not in done.stderr
+
+
+def test_an_exported_cdpath_changes_no_directory(released):
+    """#798's N8: with CDPATH exported, a `cd` to a relative name could go to a directory of the
+    same name elsewhere, and print it into what the script reads: deploy.sh unsets it."""
+    decoy = released.tmp / "decoy" / "workshop" / "adminserver"
+    decoy.mkdir(parents=True)
+    commit = released.git("rev-parse", "HEAD")
+    env = dict(released.env, CDPATH=str(released.tmp / "decoy"))
+    argv = ["bash", "workshop/adminserver/deploy.sh", "--etc", released.etc, "--review", commit]
+    done = call([str(a) for a in argv], env=env, cwd=released.repo, capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert f"No tag command: {released.repo} already has a tag v0.3.0\n" in done.stderr
 
 
 def test_the_review_prints_no_tag_command_for_a_tag_that_exists(released):
@@ -2104,17 +2155,607 @@ def test_a_fleet_wheel_is_built_with_the_pinned_backend_and_placed(server):
     assert server.current().endswith("v0.3.0")  # the server's own release is untouched
 
 
-def test_a_backend_that_fails_its_hash_is_refused(released):
-    def bad_hash(repo):
-        text = (repo / "build-constraints.txt").read_text()
-        flip = lambda m: "sha256:" + ("1" if m.group(1) == "0" else "0")  # noqa: E731
-        bad = re.sub("sha256:(.)", flip, text)
-        assert bad != text
-        (repo / "build-constraints.txt").write_text(bad)
+def test_the_server_half_builds_the_wheel_for_an_in_band_upgrade_once(server):
+    """#569: `--build-wheel` builds the release's fleet wheel on the server, as zab-build, from
+    the wheel's own files with the pinned backend, and places it for !rollout; nothing else of
+    the server changes. A wheel already there is kept, and not built again."""
+    server.release("v0.3.1")
+    result = server_half(server, "v0.3.1", "--build-wheel")
+    assert result.returncode == 0, result.stderr
+    wheel = server.prefix / WHEELS / "zulip_agent_bridge-0.3.1-py3-none-any.whl"
+    built_in = zipfile.ZipFile(wheel).read("zab_fake_wheel.txt").decode().split()
+    assert built_in == ["README.md", "build-constraints.txt", "pyproject.toml", "src"]
+    record = server.records()[-1]
+    assert (record["event"], record["version"], record["wheel"]) == ("wheel", "v0.3.1", wheel.name)
+    sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    assert record["sha256"] == sha
+    assert f"Placed {wheel.name} for !rollout: SHA-256 {sha}." in result.stderr  # #901's N4
+    assert server.current().endswith("v0.3.0") and server.releases() == ["v0.3.0"]
+    assert not (server.opt / "wheel-build").exists()  # the build's directory goes with the run
+    shutil.rmtree(server.tmp / "payload-v0.3.1")  # server_half's, made afresh
+    again = server_half(server, "v0.3.1", "--build-wheel")
+    assert again.returncode == 0, again.stderr
+    assert f"{wheel.name} is already there, not built again: SHA-256 {sha}." in again.stderr
+    assert len(server.records()) == 2
 
-    released.release("v0.3.1", edit=bad_hash)
+
+def stand_in(rig, tool: str, after: str = "") -> pathlib.Path:
+    """`tool`, first on the rig's PATH, which deploy.sh's server half and every `as_user` it
+    runs find: it logs each argument list to the file it returns, runs the real `tool`, then
+    `after` (sh), with `$out` the argument after `-o` or `-C` (#901's review, N1 to N3)."""
+    real = shutil.which(tool)
+    assert real, tool
+    log = rig.tmp / f"{tool}.calls"
+    log.touch()
+    script = rig.tmp / "bin" / tool
+    script.write_text(
+        f'#!/bin/sh\nprintf "%s\\n" "$*" >>{log}\n{real} "$@" || exit $?\n'
+        'out= prev=\nfor a; do [ "$prev" = -o ] || [ "$prev" = -C ] && out=$a; prev=$a; done\n'
+        f"{after}\n"
+    )
+    script.chmod(0o755)
+    return log
+
+
+#: What a build may leave as its wheel (#901's review, B1): a link to a file root alone may
+#: read, say the deploy key; bytes that are no zip; or a zip from `fake_wheel` (below).
+LEFT = {
+    "link": 'ln -sf "$SECRET" "$out/zulip_agent_bridge-0.3.1-py3-none-any.whl"',
+    "garbage": 'printf "not a zip" >"$out/zulip_agent_bridge-0.3.1-py3-none-any.whl"',
+}
+#: Zips under 0.3.1's name that `WHEEL_CHECK` refuses, each for one of its tests (#901's
+#: re-review, N1): (dist-info version, METADATA's Name, its Version, a member corrupted).
+ZIPS = {
+    "another": ("0.3.0", "zulip-agent-bridge", "0.3.0", False),
+    "version": ("0.3.1", "zulip-agent-bridge", "0.3.0", False),
+    "package": ("0.3.1", "another-package", "0.3.1", False),
+    "corrupt": ("0.3.1", "zulip-agent-bridge", "0.3.1", True),
+}
+
+
+def fake_wheel(path: pathlib.Path, info_version: str, name: str, version: str, corrupt: bool):
+    """A stored (uncompressed) zip with a wheel's dist-info, and a member whose bytes, with
+    `corrupt`, no longer match its CRC: METADATA and WHEEL still read, `testzip()` doesn't."""
+    marker = b"zab: the member a corrupt wheel spoils\n"
+    with zipfile.ZipFile(path, "w") as zf:
+        info = f"zulip_agent_bridge-{info_version}.dist-info"
+        zf.writestr(f"{info}/METADATA", f"Name: {name}\nVersion: {version}\n")
+        zf.writestr(f"{info}/WHEEL", "Tag: py3-none-any\n")
+        zf.writestr("zab/__init__.py", marker)
+    if corrupt:
+        data = path.read_bytes()
+        at = data.index(marker)
+        path.write_bytes(data[:at] + b"Z" + data[at + 1 :])
+
+
+@pytest.mark.parametrize(
+    ("left", "why"),
+    [("link", "zulip_agent_bridge-0.3.1-py3-none-any.whl, as built, is not a regular file"),
+     *((case, "as built, is not a wheel of zulip-agent-bridge 0.3.1")
+       for case in ("garbage", *ZIPS))],
+)  # fmt: skip
+def test_root_places_only_a_wheel_it_copied_out_as_zab_build(server, left, why):
+    """#901's review, B1: root never opens what the build wrote. The build's own output is
+    copied out by zab-build, which can't read a root file a link points to, then checked a wheel
+    of this release; here each is refused, and nothing reaches releases/wheels."""
+    secret = server.tmp / "release-key"
+    secret.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY----- not for the fleet\n")
+    other = server.tmp / "other.whl"
+    if left in ZIPS:
+        fake_wheel(other, *ZIPS[left])
+    shell = LEFT.get(left, 'cp "$OTHER" "$out/zulip_agent_bridge-0.3.1-py3-none-any.whl"')
+    after = 'case " $* " in *" build "*) ;; *) exit 0 ;; esac\n' + shell
+    after = after.replace("$SECRET", str(secret)).replace("$OTHER", str(other))
+    stand_in(server, "uv", after)
+    server.release("v0.3.1")
+    refused(server_half(server, "v0.3.1", "--build-wheel"), why)
+    assert not (server.prefix / WHEELS / "zulip_agent_bridge-0.3.1-py3-none-any.whl").exists()
+    assert len(server.records()) == 1 and not (server.opt / "wheel-build").exists()
+    placed = [p for p in (server.prefix / "var/lib/zab-admin").rglob("*") if p.is_file()]
+    assert not any(b"not for the fleet" in p.read_bytes() for p in placed)
+
+
+def test_the_good_fake_wheel_passes_the_wheel_check(server):
+    """The control for ZIPS: `fake_wheel` of 0.3.1, uncorrupted, is a wheel WHEEL_CHECK takes."""
+    check = DEPLOY.read_text().split("\nWHEEL_CHECK='", 1)[1].split("'\n", 1)[0]
+    good = server.tmp / "good.whl"
+    fake_wheel(good, "0.3.1", "zulip-agent-bridge", "0.3.1", False)
+    argv = [sys.executable, "-I", "-S", "-c", check, "0.3.1"]
+    assert subprocess.run(argv, input=good.read_bytes(), check=False).returncode == 0  # noqa: S603
+    for case, made in ZIPS.items():
+        fake_wheel(good, *made)
+        done = subprocess.run(argv, input=good.read_bytes(), capture_output=True, check=False)  # noqa: S603
+        assert done.returncode != 0, case
+
+
+def test_root_places_its_own_copy_not_the_build_directorys_file(server):
+    """#901's re-review, N2: everything runs as one user here, so a test can't show zab-build's
+    rights at work; it can show which file root places. A `cat` stand-in changes the build
+    directory's wheel right after zab-build has copied it out: the bytes placed, and recorded,
+    are the copy's, never what the build directory holds by then."""
+    saved = server.tmp / "copied.whl"
+    after = (
+        "for f; do case $f in */wheel-build/dist/*.whl)\n"
+        f'  cp "$f" {saved}; printf "changed after the copy" >"$f" ;;\nesac; done'
+    )
+    stand_in(server, "cat", after)
+    server.release("v0.3.1")
+    result = server_half(server, "v0.3.1", "--build-wheel")
+    assert result.returncode == 0, result.stderr
+    placed = (server.prefix / WHEELS / "zulip_agent_bridge-0.3.1-py3-none-any.whl").read_bytes()
+    assert saved.exists() and placed == saved.read_bytes() != b"changed after the copy"
+    assert server.records()[-1]["sha256"] == hashlib.sha256(placed).hexdigest()
+
+
+def test_the_server_build_requires_every_constraint_hashed(server):
+    """#901's review, N2: `--require-hashes` on the server's build, as on the laptop's: a
+    backend pinned without a hash is refused, never installed as the index has it."""
+    server.release("v0.3.1", edit=lambda repo: (repo / "build-constraints.txt").write_text(
+        "fakebackend==1.0\n"))  # fmt: skip
+    refused(server_half(server, "v0.3.1", "--build-wheel"), "did not build with the pinned backend")
+    assert not (server.prefix / WHEELS / "zulip_agent_bridge-0.3.1-py3-none-any.whl").exists()
+
+
+def test_the_server_build_runs_on_the_blobs_alone(server):
+    """#901's review, N3: the wheel's tree, unpacked as zab-build, is checked against the
+    commit's blobs before the backend runs (check_tree): here an unpacking that changed a file."""
+    stand_in(
+        server,
+        "tar",
+        'case $out in */wheel-build/src) echo "# changed" >>"$out/pyproject.toml" ;; esac',
+    )
+    server.release("v0.3.1")
+    refused(
+        server_half(server, "v0.3.1", "--build-wheel"),
+        "the wheel build's tree differs from v0.3.1's",
+    )
+    assert not (server.prefix / WHEELS / "zulip_agent_bridge-0.3.1-py3-none-any.whl").exists()
+
+
+@pytest.mark.parametrize("flags", [["--build-wheel"], ["--base", "v0.3.0"]])
+def test_no_build_runs_without_the_imds_rule(server, flags):
+    """#901's Codex round 1: zab-build runs third-party code (the wheel's backend; the venv's
+    install), which the IMDS rule keeps off the role: neither build starts while the rule is
+    not loaded (here a stand-in says so, ZAB_DEPLOY_IMDS)."""
+    stub = server.tmp / "bin" / "imds-not-loaded"
+    stub.write_text("#!/bin/sh\nexit 1\n")
+    stub.chmod(0o755)
+    server.env["ZAB_DEPLOY_IMDS"] = str(stub)
+    calls = stand_in(server, "uv")
+    server.release("v0.3.1")
+    refused(server_half(server, "v0.3.1", *flags), "zab-admin-imds.service is not active")
+    assert calls.read_text() == ""  # #901's review, N1: uv never ran, so no build started
+    assert not (server.prefix / WHEELS / "zulip_agent_bridge-0.3.1-py3-none-any.whl").exists()
+    assert server.current().endswith("v0.3.0") and server.releases() == ["v0.3.0"]
+    assert len(server.records()) == 1
+    del server.env["ZAB_DEPLOY_IMDS"]  # the control: with the rule, the same run builds
+    shutil.rmtree(server.tmp / "payload-v0.3.1")
+    assert server_half(server, "v0.3.1", *flags).returncode == 0
+    assert re.search(r"^(build|venv|pip) ", calls.read_text(), re.M), calls.read_text()
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [["--build-wheel", "--downgrade"], ["--build-wheel", "--in-band", "P-1"],
+     ["--build-wheel", "--base", "v0.3.0"], ["--build-wheel", "--bootstrap"]],
+)  # fmt: skip
+def test_the_server_halfs_wheel_build_goes_alone(server, flags):
+    server.release("v0.3.1")
+    refused(server_half(server, "v0.3.1", *flags), "--build-wheel goes alone")
+    assert len(server.records()) == 1
+
+
+@pytest.mark.parametrize("edit", ["hook", "hash"])
+def test_the_server_builds_no_wheel_its_checks_refuse(server, edit):
+    """#569: on the server as on the laptop, build_config refuses a build hook, and the backend
+    must match its pinned hash."""
+    hook = '\n[tool.hatch.build.hooks.custom]\npath = "src/zab/hook.py"\n'
+    change = (
+        (
+            lambda repo: (repo / "pyproject.toml").write_text(
+                (repo / "pyproject.toml").read_text() + hook
+            )
+        )
+        if edit == "hook"
+        else bad_backend_hash
+    )
+    server.release("v0.3.1", edit=change)  # fmt: skip
+    why = "configures the build beyond" if edit == "hook" else "did not build with the pinned"
+    refused(server_half(server, "v0.3.1", "--build-wheel"), why)
+    assert not (server.prefix / WHEELS / "zulip_agent_bridge-0.3.1-py3-none-any.whl").exists()
+    assert len(server.records()) == 1 and not (server.opt / "wheel-build").exists()
+
+
+def bad_backend_hash(repo):
+    """An edit: build-constraints.txt pins the backend with a hash it doesn't have."""
+    text = (repo / "build-constraints.txt").read_text()
+    flip = lambda m: "sha256:" + ("1" if m.group(1) == "0" else "0")  # noqa: E731
+    bad = re.sub("sha256:(.)", flip, text)
+    assert bad != text
+    (repo / "build-constraints.txt").write_text(bad)
+
+
+def test_a_backend_that_fails_its_hash_is_refused(released):
+    released.release("v0.3.1", edit=bad_backend_hash)
     refused(released.deploy("v0.3.1", "--wheel"), "did not build with the pinned backend")
     assert not (released.prefix / "var/lib/zab-admin").exists()  # refused on the laptop
+
+
+# --- the deploy's own options for the upgrade driver (#772) -------------------------------------
+
+WHEELS = pathlib.Path("var/lib/zab-admin/releases/wheels")
+
+
+def reviewed_sha256(rig, version, since=None, extra=()) -> str:
+    """The SHA-256 that `--review` prints for the signed `version`'s commit (since `since`)."""
+    commit = rig.git("rev-parse", f"{version}^{{commit}}")
+    where = ["--repo", rig.repo, "--etc", rig.etc, "--out", rig.tmp / "out", "--review", commit]
+    done = rig.run("bash", DEPLOY, *where, *(["--since", since] if since else []), *extra)
+    assert done.returncode == 0, done.stderr
+    return re.search(r"SHA-256 ([0-9a-f]{64}); release tree", done.stderr).group(1)
+
+
+def staging_left(rig) -> list[str]:
+    """The deploy's temporary directories still on the server."""
+    return sorted(p.name for p in (rig.prefix / "tmp").glob("zab-deploy.*"))
+
+
+def test_an_upgrade_with_its_wheel_takes_one_confirmation(server):
+    """#674's one confirmation: the wheel is built before the prompt, which names it, and
+    placed after the deploy, from a payload of its own; each run's directory is removed."""
+    server.release("v0.3.1")
+    result = server.deploy("v0.3.1", "--with-wheel")  # one line of input: the version, once
+    assert result.returncode == 0, result.stderr
+    prompt = "Type v0.3.1 to deploy it to admin.test, which runs v0.3.0, and place its wheel for "
+    assert result.stderr.count("Type v0.3.1 to ") == 1 and prompt + "!rollout: " in result.stderr
+    built = result.stderr.index("Built zulip_agent_bridge-0.3.1-py3-none-any.whl with the pinned")
+    assert built < result.stderr.index(prompt)
+    assert server.current().endswith("v0.3.1")
+    upgrade, wheel = server.records()[-2:]
+    assert upgrade["event"] == "upgrade" and upgrade["version"] == "v0.3.1"
+    placed = server.prefix / WHEELS / "zulip_agent_bridge-0.3.1-py3-none-any.whl"
+    assert wheel["event"] == "wheel" and wheel["version"] == "v0.3.1"
+    assert wheel["sha256"] == hashlib.sha256(placed.read_bytes()).hexdigest()
+    assert f"SHA-256 {wheel['sha256']}." in result.stderr
+    assert staging_left(server) == []
+
+
+def test_a_wheel_that_does_not_build_stops_the_deploy_before_its_prompt(server):
+    server.release("v0.3.1", edit=bad_backend_hash)
+    result = server.deploy("v0.3.1", "--with-wheel")
+    refused(result, "did not build with the pinned backend")
+    assert "Type v0.3.1" not in result.stderr
+    assert server.current().endswith("v0.3.0")
+    assert [r["event"] for r in server.records()] == ["bootstrap"]
+
+
+def pasted(rig, stderr: str, answer: str) -> subprocess.CompletedProcess:
+    """The command deploy.sh printed to paste, on the line after `paste:`, run as printed, in a
+    directory that holds no clone, typing `answer` at its prompt."""
+    line = stderr.split("paste:\n", 1)[1].splitlines()[0].strip()
+    assert line.endswith(" --wheel v0.3.1"), line
+    return call(["bash", "-c", line], env=rig.env, cwd=rig.tmp / "out", input=answer,
+                capture_output=True, text=True)  # fmt: skip
+
+
+def test_a_deploy_that_fails_before_the_switch_places_no_wheel(server):
+    """#798's N6: what the server runs may still change, as after an interrupt, while its deploy
+    ends: the run says so, and gives the command for a rerun that finds the release current."""
+    rule = pathlib.Path("workshop/adminserver/nftables-stop-imds.nft")
+    server.release("v0.3.1", edit=lambda repo: (repo / rule).unlink())  # install_system fails
+    result = server.deploy("v0.3.1", "--with-wheel")
+    refused(result, "When this run ended, admin.test did not run v0.3.1, and its wheel was not pl")
+    assert "let it end. Then run the same\ndeploy again, which places both;" in result.stderr
+    assert "if it says admin.test already runs v0.3.1, paste:\n" in result.stderr
+    line = result.stderr.split("paste:\n", 1)[1].splitlines()[0].strip()
+    assert line.endswith(" --wheel v0.3.1"), line  # the command itself, after the lead-in
+    assert server.current().endswith("v0.3.0")
+    assert not (server.prefix / WHEELS / "zulip_agent_bridge-0.3.1-py3-none-any.whl").exists()
+    assert [r["event"] for r in server.records()] == ["bootstrap"]
+    assert staging_left(server) == []
+
+
+def test_a_deploy_that_fails_after_the_switch_says_how_to_place_its_wheel(server):
+    """A unit that doesn't start: v0.3.1 is current, and the printed command places its wheel."""
+    stub = server.tmp / "bin" / "systemctl-stub"
+    stub.write_text('#!/bin/sh\n[ "$*" != "restart caddy.service" ]\n')
+    stub.chmod(0o755)
+    server.env["ZAB_DEPLOY_SYSTEMCTL"] = str(stub)
+    server.release("v0.3.1")
+    result = server.deploy("v0.3.1", "--with-wheel")
+    refused(result, "v0.3.1 is current on admin.test, but its deploy did not finish, and its wh")
+    assert server.current().endswith("v0.3.1")
+    assert [r["event"] for r in server.records()] == ["bootstrap", "upgrade"]
+    wheel = server.prefix / WHEELS / "zulip_agent_bridge-0.3.1-py3-none-any.whl"
+    assert not wheel.exists() and staging_left(server) == []
+    done = pasted(server, result.stderr, "v0.3.1\n")
+    assert done.returncode == 0, done.stderr
+    assert wheel.exists() and server.records()[-1]["event"] == "wheel"
+
+
+def test_a_good_deploy_whose_wheel_is_refused_says_it_is_deployed(server):
+    """The server refuses a wheel of that version with other bytes: the deploy itself stands."""
+    server.release("v0.3.1")
+    other = server.prefix / WHEELS / "zulip_agent_bridge-0.3.1-py3-none-any.whl"
+    other.write_bytes(b"not this build\n")
+    result = server.deploy("v0.3.1", "--with-wheel")
+    refused(result, "is there with other content")
+    deployed = "v0.3.1 is deployed on admin.test; only its wheel, zulip_agent_bridge-0.3.1-py3-"
+    assert deployed in result.stderr and "paste:\n" in result.stderr
+    assert server.current().endswith("v0.3.1")
+    assert [r["event"] for r in server.records()] == ["bootstrap", "upgrade"]
+    assert other.read_bytes() == b"not this build\n" and staging_left(server) == []
+    assert pasted(server, result.stderr, "v0.3.1\n").returncode != 0  # still the other bytes
+
+
+def test_the_reviewed_diff_is_deployed_without_a_second_paging(server):
+    server.release("v0.3.1")
+    sha = reviewed_sha256(server, "v0.3.1", since="v0.3.0")
+    result = server.deploy("v0.3.1", "--expect-diff-sha256", sha)
+    assert result.returncode == 0, result.stderr
+    assert "zab admin release review" not in result.stdout  # written, not shown
+    assert (
+        "zab admin release review"
+        in (server.tmp / "out/zab-admin-v0.3.0..v0.3.1.review").read_text()
+    )
+    assert "It is the diff you reviewed (--expect-diff-sha256)" in result.stderr
+    assert server.records()[-1]["diff_sha256"] == sha
+
+
+def test_another_diff_than_the_reviewed_one_is_refused_before_the_prompt(server):
+    """As when the review was made against another base than the release the server runs. With
+    --with-wheel too, the diff is compared before the wheel is built."""
+    server.release("v0.3.1")
+    server.release("v0.3.2")
+    sha = reviewed_sha256(server, "v0.3.2", since="v0.3.1")  # the server runs v0.3.0
+    result = server.deploy("v0.3.2", "--expect-diff-sha256", sha, "--with-wheel")
+    refused(result, f"this deploy's diff has SHA-256 [0-9a-f]{{64}}, not {sha}, the one you rev")
+    assert "Type v0.3.2" not in result.stderr and "Built zulip_agent_bridge" not in result.stderr
+    assert server.current().endswith("v0.3.0")
+    assert [r["event"] for r in server.records()] == ["bootstrap"]
+
+
+def test_the_expected_diff_runs_from_since_when_given(server):
+    """--since's base, whatever the server runs: the record names it."""
+    server.release("v0.3.1")
+    server.release("v0.3.2")
+    sha = reviewed_sha256(server, "v0.3.2", since="v0.3.1")  # the server runs v0.3.0
+    result = server.deploy("v0.3.2", "--since", "v0.3.1", "--expect-diff-sha256", sha)
+    assert result.returncode == 0, result.stderr
+    record = server.records()[-1]
+    assert (record["from"], record["base"], record["diff_sha256"]) == ("v0.3.0", "v0.3.1", sha)
+
+
+def test_a_bootstrap_takes_both_options(rig):
+    rig.release("v0.3.0")
+    sha = reviewed_sha256(rig, "v0.3.0")  # from the empty tree, as BOOTSTRAP §9 reviews it
+    result = rig.deploy("v0.3.0", "--bootstrap", "--expect-diff-sha256", sha, "--with-wheel")
+    assert result.returncode == 0, result.stderr
+    assert [r["event"] for r in rig.records()] == ["bootstrap", "wheel"]
+    assert rig.records()[0]["diff_sha256"] == sha
+    assert (rig.prefix / WHEELS / "zulip_agent_bridge-0.3.0-py3-none-any.whl").exists()
+    assert staging_left(rig) == []
+
+
+@pytest.mark.parametrize(
+    ("flags", "reason"),
+    [
+        (["--review", "HEAD", "--with-wheel"], "go with a deploy, not --review"),
+        (["--review", "HEAD", "--expect-diff-sha256", "0" * 64], "go with a deploy, not --review"),
+        (["--host", "admin.test", "--wheel", "--with-wheel", "v0.3.0"], "--wheel goes alone"),
+        (["--host", "admin.test", "--wheel", "--expect-diff-sha256", "0" * 64, "v0.3.0"], "alone"),
+        (["--expect-diff-sha256", "0" * 63, "v0.3.0"], "not a SHA-256 \\(64 hex digits\\)"),
+        (["--expect-diff-sha256", "0" * 63 + "G", "v0.3.0"], "not a SHA-256"),
+        (["--expect-diff-sha256"], "--expect-diff-sha256 needs a value"),
+    ],
+)
+def test_the_new_options_are_refused_where_they_mean_nothing(released, flags, reason):
+    """Each refused on the laptop, before any build or connection."""
+    where = ["--repo", released.repo, "--etc", released.etc, "--out", released.tmp / "out"]
+    refused(released.run("bash", DEPLOY, *where, *flags), reason)
+    assert not (released.prefix / "var/lib/zab-admin").exists()
+
+
+#: The laptop half's options that take a value, from the case arm that requires one.
+VALUED = re.search(
+    r"^\s+((?:--[a-z0-9-]+ \| )*--[a-z0-9-]+)\) if \[ \$# -lt 2 \]", DEPLOY.read_text(), re.M
+)[1].split(" | ")
+
+
+@pytest.mark.parametrize("option", VALUED)
+def test_an_empty_value_is_refused_for_every_option_that_takes_one(released, option):
+    """An empty value is never taken as the option left out (#798's review, B1): an empty
+    --expect-diff-sha256 would turn its check off, an empty --since or --repo fall back to a
+    default, an empty --review deploy instead."""
+    assert {"--expect-diff-sha256", "--since", "--review", "--repo"} <= set(VALUED)
+    where = ["--repo", released.repo, "--etc", released.etc, "--out", released.tmp / "out"]
+    flags = [*where, option, "", "--host", "admin.test", "v0.3.0"]
+    refused(
+        released.run("bash", DEPLOY, *flags), f"(?m)^deploy.sh: {re.escape(option)} needs a value$"
+    )
+    assert not (released.prefix / "var/lib/zab-admin").exists()
+
+
+# --- a deployer key replaced: the base's retired signers (#587) -------------------------------
+
+
+def replaced_key(rig) -> pathlib.Path:
+    """BOOTSTRAP §17 on the rig: `drew`'s key replaced by `drew2` in --etc's allowed_signers and
+    the server's (steps 3 and 4), and the retired key's line kept apart, as --base-signers takes
+    it. Its file."""
+    rig.keys["drew2"] = rig.keygen("drew2")
+    (rig.etc / "allowed_signers").write_text(rig.signers_line("drew2"))
+    (rig.prefix / "etc/zab-admin/allowed_signers").write_text(rig.signers_line("drew2"))
+    retired = rig.tmp / "retired_signers"
+    retired.write_text(rig.signers_line("drew"))
+    return retired
+
+
+def test_after_a_key_change_the_running_release_is_refused_as_the_base(server):
+    """#587's gap: the base, signed by the retired key, no longer verifies without the option."""
+    replaced_key(server)
+    server.release("v0.3.1", signer="drew2")
+    refused(server.deploy("v0.3.1"), r"v0\.3\.0: not signed by a key in \S+/etc/allowed_signers")
+    assert server.current().endswith("v0.3.0")
+
+
+def base_review(rig, version, retired, since="v0.3.0"):
+    """`--review` of the signed `version`'s commit since `since`, with --base-signers and the
+    host, as BOOTSTRAP §17 step 9 runs it. The run and the commit."""
+    commit = rig.git("rev-parse", f"{version}^{{commit}}")
+    where = ["--repo", rig.repo, "--etc", rig.etc, "--out", rig.tmp / "out", "--review", commit]
+    argv = [*where, "--since", since, "--base-signers", retired, "--host", "admin.test"]
+    return rig.run("bash", DEPLOY, *argv), commit
+
+
+def plant_a_fake_base(rig) -> None:
+    """What a retired key, which may have leaked, can sign: a tag of the running release's name
+    (v0.3.0) on another commit, here with a planted module that v0.3.1, made on top of it, holds
+    too. A clone without the real tag, such as a new machine's, takes it."""
+    rig.git("tag", "-d", "v0.3.0")
+    plant = lambda repo: (repo / "src/zab/admin/planted.py").write_text("PLANTED = 1\n")  # noqa: E731
+    rig.release("v0.3.0", signer="drew", edit=plant)  # the retired key, another commit
+    rig.release("v0.3.1", signer="drew2")
+
+
+def test_base_signers_take_the_retired_key_for_the_base(server):
+    retired = replaced_key(server)
+    server.release("v0.3.1", signer="drew2")
+    review, _ = base_review(server, "v0.3.1", retired)
+    assert review.returncode == 0, review.stderr
+    base = server.records()[0]["commit"]
+    assert f"--base-signers: the base, v0.3.0, is {base}, the commit admin.test's" in review.stderr
+    assert "Sign it once reviewed" not in review.stderr  # the tag exists: signed already here
+    sha = re.search(r"SHA-256 ([0-9a-f]{64}); release tree", review.stderr).group(1)
+    result = server.deploy("v0.3.1", "--base-signers", retired, "--expect-diff-sha256", sha)
+    assert result.returncode == 0, result.stderr
+    record = server.records()[-1]
+    assert (record["event"], record["base"], record["diff_sha256"]) == ("upgrade", "v0.3.0", sha)
+    assert server.current().endswith("v0.3.1")
+
+
+def test_a_release_signed_by_a_retired_key_is_refused_even_with_base_signers(server):
+    """The release deployed verifies against --etc's allowed_signers alone, never the retired."""
+    retired = replaced_key(server)
+    server.release("v0.3.1", signer="drew")  # the retired key
+    result = server.deploy("v0.3.1", "--base-signers", retired, "--expect-diff-sha256", "0" * 64)
+    refused(result, r"deploy.sh: v0\.3\.1: not signed by a key in \S+/etc/allowed_signers: ")
+    assert "Type v0.3.1" not in result.stderr
+    assert server.current().endswith("v0.3.0")
+
+
+FAKE_BASE = (
+    r"--base-signers: v0\.3\.0 is [0-9a-f]{40} here, ([0-9a-f]{40}) in admin\.test's deploy record"
+)
+
+
+def test_a_review_on_a_base_the_server_does_not_run_is_refused_before_anything_is_signed(server):
+    """#810's review, B1: the review that leads to the signature checks its base first. Its
+    diff from the fake base would not show the planted module, so it shows nothing, writes no
+    diff and prints no tag command: nothing is signed from it."""
+    retired = replaced_key(server)
+    plant_a_fake_base(server)
+    review, commit = base_review(server, "v0.3.1", retired)
+    refused(review, FAKE_BASE)
+    assert re.search(FAKE_BASE, review.stderr)[1] == server.records()[0]["commit"]
+    assert "zab admin release review" not in review.stdout and "git -C" not in review.stderr
+    assert not list((server.tmp / "out").glob(f"zab-admin-v0.3.0..{commit[:12]}.*"))
+
+
+def test_a_deploy_on_a_base_the_server_does_not_run_is_refused(server):
+    """The same base at the deploy, checked again before its diff is made."""
+    retired = replaced_key(server)
+    plant_a_fake_base(server)
+    result = server.deploy("v0.3.1", "--base-signers", retired, "--expect-diff-sha256", "0" * 64)
+    refused(result, FAKE_BASE)
+    assert "Type v0.3.1" not in result.stderr
+    assert server.current().endswith("v0.3.0")
+
+
+def test_base_signers_take_no_other_base_than_the_running_release(server):
+    retired = replaced_key(server)
+    server.release("v0.3.1", signer="drew2")
+    server.release("v0.3.2", signer="drew2")
+    reason = "--base-signers: the base must be v0.3.0, which admin.test runs, not v0.3.1"
+    refused(base_review(server, "v0.3.2", retired, since="v0.3.1")[0], reason)
+    flags = ["--since", "v0.3.1", "--base-signers", retired, "--expect-diff-sha256", "0" * 64]
+    refused(server.deploy("v0.3.2", *flags), reason)
+    assert server.current().endswith("v0.3.0")
+
+
+def test_a_base_the_deploy_record_does_not_name_is_refused(server):
+    """#810's review, N1: a record without the running release's commit."""
+    retired = replaced_key(server)
+    server.release("v0.3.1", signer="drew2")
+    (server.opt / "deploys.jsonl").write_text("")
+    review, _ = base_review(server, "v0.3.1", retired)
+    refused(review, "--base-signers: admin.test's deploy record names no commit for v0.3.0")
+
+
+def test_a_deploy_record_that_cannot_be_read_says_so(server):
+    """#810's review, N2: ssh failing on the record is said as such, and still refused."""
+    retired = replaced_key(server)
+    server.release("v0.3.1", signer="drew2")
+    failing = server.tmp / "bin" / "ssh-no-record"
+    failing.write_text(
+        FAKE_SSH.replace(
+            'exec sh -c "$1"', 'case $1 in *deploys.jsonl*) exit 255 ;; esac\nexec sh -c "$1"'
+        )
+    )
+    failing.chmod(0o755)
+    server.env["ZAB_DEPLOY_SSH"] = str(failing)
+    review, _ = base_review(server, "v0.3.1", retired)
+    refused(
+        review, r"--base-signers: could not read admin\.test's deploy record, \S+/deploys\.jsonl"
+    )
+
+
+def test_a_review_refuses_a_current_outside_the_releases(server):
+    """#810's round 2, N2: the review reads `current` as the deploy does, and takes only a path
+    under releases/; its last part alone would name v0.3.0, whose record matches."""
+    retired = replaced_key(server)
+    server.release("v0.3.1", signer="drew2")
+    current = server.opt / "current"
+    current.unlink()
+    current.symlink_to(server.opt / "elsewhere" / "v0.3.0")
+    review, _ = base_review(server, "v0.3.1", retired)
+    refused(
+        review, r"(?m)^deploy\.sh: admin\.test: current is \S+/opt/zab-admin/elsewhere/v0\.3\.0$"
+    )
+    assert "--base-signers: the base" not in review.stderr
+
+
+EXPECT = ("--expect-diff-sha256", "0" * 64)
+
+
+@pytest.mark.parametrize(
+    ("flags", "reason"),
+    [
+        (["--host", "admin.test", "--base-signers", "RETIRED", "v0.3.0"], "needs --expect-diff"),
+        (["--review", "HEAD", "--base-signers", "RETIRED"], "a review's base is --since's"),
+        (
+            ["--review", "HEAD", "--since", "v0.3.0", "--base-signers", "RETIRED"],
+            "a review takes --host HOST, to check its base",
+        ),
+        (["--review", "HEAD", "--host", "admin.test"], "--review takes a commit, not a release or"),
+        (["--host", "admin.test", "--wheel", "--base-signers", "RETIRED", "v0.3.0"], "alone"),
+        (
+            ["--host", "admin.test", "--bootstrap", "--base-signers", "RETIRED", *EXPECT, "v0.3.0"],
+            "--base-signers: a bootstrap has no base",
+        ),
+        (["--base-signers", "MISSING", "v0.3.0"], "no such file, or empty"),
+        (["--base-signers", "EMPTY", "v0.3.0"], "no such file, or empty"),
+    ],
+)
+def test_base_signers_are_refused_where_there_is_no_base_to_check(released, flags, reason):
+    files = {"RETIRED": released.tmp / "retired", "MISSING": released.tmp / "missing"}
+    files["EMPTY"] = released.tmp / "empty"
+    files["RETIRED"].write_text(released.signers_line("drew"))
+    files["EMPTY"].write_text("")
+    where = ["--repo", released.repo, "--etc", released.etc, "--out", released.tmp / "out"]
+    argv = [files.get(f, f) for f in flags]
+    refused(released.run("bash", DEPLOY, *where, *argv), reason)
+    assert not (released.prefix / "var/lib/zab-admin").exists()
 
 
 HOOK_CONFIG = {
@@ -2508,8 +3149,9 @@ def test_the_privileged_paths():
     installs, render_policy.py, both lists), the root helper's code, and what decides the code
     that runs on the laptop (`--wheel`'s build) and in the venv; each is a release path. Every
     module the helper runs as root (HELPER_IMPORTS, which test_admin_imports pins by running the
-    unit's command, #438) is privileged, but the two packages' __init__.py."""
-    from admin.test_admin_imports import HELPER_IMPORTS
+    unit's command, #438) is privileged, but the two packages' __init__.py; so is every module
+    the upgrade helpers run as root (UPGRADE_IMPORTS, #569)."""
+    from admin.test_admin_imports import HELPERS, UPGRADE_IMPORTS
 
     privileged = listed(PRIVILEGED)
     assert privileged == [
@@ -2517,19 +3159,24 @@ def test_the_privileged_paths():
         "src/zab/admin/confighelper.py",
         "src/zab/admin/config.py",
         "src/zab/admin/checks.py",
+        "src/zab/admin/upgradehelper.py",
         "pyproject.toml",
         "build-constraints.txt",
         "uv.lock",
     ]
     for path in privileged:
         assert covered(path, RELEASE_PATHS), path
-    unit = (ROOT / "workshop/adminserver/zab-admin-config.service").read_text()
-    (start,) = [line for line in unit.splitlines() if line.startswith("ExecStart=")]
-    assert start.startswith('ExecStart=/usr/bin/python3 -I -B -S -c "')
-    assert "from zab.admin.confighelper import main" in start
-    for module in sorted(HELPER_IMPORTS - {"zab", "zab.admin"}):
+    for name, (helper, imports, _) in HELPERS.items():
+        unit = (ROOT / "workshop/adminserver" / name).read_text()
+        (start,) = [line for line in unit.splitlines() if line.startswith("ExecStart=")]
+        assert start.startswith('ExecStart=/usr/bin/python3 -I -B -S -c "')
+        assert f"from {helper} import main" in start
+        for module in sorted(imports - {"zab", "zab.admin"}):
+            path = "src/" + module.replace(".", "/") + ".py"
+            assert covered(path, privileged), f"{path}: root runs it in {name} (D32)"
+    for module in sorted(UPGRADE_IMPORTS - {"zab", "zab.admin"}):
         path = "src/" + module.replace(".", "/") + ".py"
-        assert covered(path, privileged), f"{path}: root runs it in the helper (D32)"
+        assert covered(path, privileged), f"{path}: root runs it in the upgrade helpers"
     import ast
 
     for package in ("src/zab/__init__.py", "src/zab/admin/__init__.py"):  # constants alone

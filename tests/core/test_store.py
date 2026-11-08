@@ -1,3 +1,5 @@
+import importlib.util
+import pathlib
 import sqlite3
 
 import pytest
@@ -123,6 +125,80 @@ def test_two_stores_opening_an_old_database_add_the_column_once(tmp_path, monkey
     columns = [r[1] for r in store.db.execute("PRAGMA table_info(sessions)")]
     assert columns.count("parent_session_id") == 1
     store.close()
+
+
+def test_message_edits_is_added_to_a_database_of_the_last_schema(tmp_path):
+    """#757: a database as 0.2.18 left it, its rows kept, gets the table of each message's
+    edits in place, `user_version` still 1, so that an older zab still opens it (a rollback)."""
+    from zab.core.store import _migration_1
+
+    db = sqlite3.connect(tmp_path / "zab.db")
+    _migration_1(db)
+    db.execute("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT")  # 0.2.18's schema
+    db.execute(OLD_ROW, ("old", "n", 1, "t"))
+    db.execute("INSERT INTO kv VALUES ('last_event_id:b', '34')")
+    db.commit()
+    db.close()
+    store = Store(tmp_path)
+    assert [r["id"] for r in store.rows("sessions")] == ["old"]
+    assert store.get("last_event_id:b") == 34 and store.edit_counts("b") == []
+    assert store.db.execute("PRAGMA user_version").fetchone()[0] == 1
+    store.keep_edit_count("b", 10, 3, 1000.0)
+    store.keep_edit_count("b", 11, 1, 900.0)
+    store.keep_edit_count("b", 10, 4, 1100.0, final=True)
+    store.keep_edit_count("other", 10, 1, 1000.0)
+    store.close()
+    again = Store(tmp_path)  # opened again: nothing left to add, nothing lost
+    assert again.db.total_changes == 0
+    least_recent_first = [(11, 1, 900.0, False), (10, 4, 1100.0, True)]
+    assert again.edit_counts("b") == least_recent_first
+    again.forget_edit_counts("b", (10, 12))
+    assert again.edit_counts("b") == [(11, 1, 900.0, False)] and again.edit_counts("other")
+    again.close()
+    # what an older zab does with it: never names the table
+    db = sqlite3.connect(tmp_path / "zab.db")
+    db.execute(OLD_ROW, ("older", "o", 3, "u"))
+    db.commit()
+    assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+    db.close()
+
+
+def store_757():
+    """`zab.core.store` as #757 shipped it (PR #795), verbatim: what a rollback to it runs."""
+    path = pathlib.Path(__file__).parents[1] / "fixtures" / "store" / "store_757.py"
+    spec = importlib.util.spec_from_file_location("store_757", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_a_rollback_to_757_still_keeps_edit_counts(tmp_path):
+    """Codex round 1 on #813: the final marks (#806) are a table of their own. #757's zab writes
+    `message_edits` rows by position, four values: a fifth column there failed every edit-count
+    write after a rollback, and so every edit. Upgrade, roll back, upgrade again."""
+    old = store_757()
+    old.Store(tmp_path).close()  # #757's schema
+    store = Store(tmp_path)
+    columns = [r[1] for r in store.db.execute("PRAGMA table_info(message_edits)")]
+    assert columns == ["bot", "message_id", "edits", "edited_at"]  # #757's, untouched
+    store.keep_edit_count("b", 10, 20, 1000.0, final=True)
+    store.keep_edit_count("b", 11, 3, 1010.0)
+    store.close()
+    rolled_back = old.Store(tmp_path)
+    rolled_back.keep_edit_count("b", 12, 1, 1020.0)  # an edit, as #757's `EditBounds` keeps it
+    rolled_back.keep_edit_count("b", 11, 4, 1030.0)
+    rolled_back.forget_edit_counts("b", (10,))  # its turn delivered
+    assert rolled_back.edit_counts("b") == [(12, 1, 1020.0), (11, 4, 1030.0)]
+    rolled_back.close()
+    again = Store(tmp_path)  # the final mark #757 left behind is gone
+    assert again.edit_counts("b") == [(12, 1, 1020.0, False), (11, 4, 1030.0, False)]
+    assert again.rows("message_finals") == []
+    again.keep_edit_count("b", 11, 5, 1040.0, final=True)
+    assert again.edit_counts("b")[-1] == (11, 5, 1040.0, True)
+    again.forget_edit_counts("b", (11,))
+    assert again.rows("message_finals") == []
+    assert again.db.execute("PRAGMA user_version").fetchone()[0] == 1
+    again.close()
 
 
 def test_lock_exclusion_and_release(tmp_path):

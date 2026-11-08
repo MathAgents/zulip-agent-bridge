@@ -203,8 +203,9 @@ def _failure_reason(output: str, code: str) -> str:
     if code:
         text = text.replace(code, "")
     m = _FAILED.search(text)
-    # redacted before the cut, which can leave too little of a secret for its rule (#661)
-    return redact_secrets(m.group(1).replace("\x00", "")).strip()[:200] if m else ""
+    # redacted before the cut, which can leave too little of a secret for its rule (#661), and
+    # after the strip, which can make a zuliprc line whole after another line end (#666)
+    return redact_secrets(m.group(1).replace("\x00", "").strip())[:200] if m else ""
 
 
 async def _wait(proc: asyncio.subprocess.Process, timeout_s: float) -> int | None:

@@ -20,9 +20,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 import sys
+import time
 from collections.abc import Callable
 
 from e2e.harness.secret_files import described
+from e2e.harness.startup import Timeline, steady_ssh
 
 #: Scenario 4's Zulip block: every OUTPUT rule tagged with the comment `zab-e2e`, in iptables
 #: and ip6tables, deleted as iptables itself prints them; and any `# zab-e2e` line in
@@ -93,11 +95,19 @@ async def undo(
             await asyncio.sleep(pause)
 
 
-async def vm_up(ec2, instance_id: str, vm, *, tries: int = 30, pause: float = 10.0) -> None:
-    """The VM running and answering SSH: started if it is stopped or stopping, then waited for;
-    TimeoutError when SSH does not answer within `tries * pause` seconds. A stopping VM may
-    read `pending` next, when the test waker starts it again: only a `stopped` one is started
-    (#305)."""
+async def vm_up(
+    ec2,
+    instance_id: str,
+    vm,
+    *,
+    timeline: Timeline | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """The VM running and answering SSH steadily (`startup.steady_ssh`, #804, as #690): started
+    if it is stopped or stopping, then waited for; TimeoutError when SSH isn't steady within
+    SSH_WAIT_S. A stopping VM may read `pending` next, when the test waker starts it again:
+    only a `stopped` one is started (#305). The probes run in a thread, with `sleep`'s pauses,
+    and print their timeline (the run's console, the scenario's log)."""
     state = ec2.state(instance_id)
     if state == "stopping":
         state = ec2.wait_while(instance_id, "stopping", timeout=300)
@@ -105,8 +115,4 @@ async def vm_up(ec2, instance_id: str, vm, *, tries: int = 30, pause: float = 10
         ec2.start(instance_id)
     if state != "running":
         ec2.wait_state(instance_id, "running", timeout=600)
-    for _ in range(tries):
-        if vm.reachable():
-            return
-        await asyncio.sleep(pause)
-    raise TimeoutError(f"no SSH to the VM within {tries * pause:.0f} s")
+    await asyncio.to_thread(steady_ssh, vm, vm.host, timeline or Timeline(), sleep)

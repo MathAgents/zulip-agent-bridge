@@ -81,6 +81,7 @@ async def recover(bridge: BotBridge) -> None:
                 settings=t.SessionSettings(**json.loads(latest["settings_json"])),
                 git_identity=getattr(bridge, "git_identity", None),
                 bot=bridge.bot.name,
+                session=latest["id"],
             )
         )
         try:

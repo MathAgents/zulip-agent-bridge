@@ -6,6 +6,7 @@ seen by both."""
 
 import asyncio
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,7 +15,15 @@ from test_bridge import bridge as bridge
 from test_bridge import user_message
 
 from zab.core import types as t
-from zab.core.commands import BTW_NO_SESSION, FORK_NO_SESSION
+from zab.core.commands import (
+    BTW_NO_SESSION,
+    FORK_NO_SESSION,
+    NO_TURN,
+    NO_TURN_NOR_SUBAGENT,
+    SUBAGENTS_UNCHECKED,
+    TURN_ELSEWHERE,
+    stopped_subagents,
+)
 from zab.core.router import HANDOVER_NAMED, NO_SESSION, Router
 from zab.core.store import Store
 
@@ -345,15 +354,19 @@ def test_an_expired_message_is_each_bots_input(pair):
 # ------------------------------------------------------------ the bridge: siblings, sign-in
 
 
-def sibling(user_id, signed_in, name="claude", allowlist=frozenset({OWNER})):
+def sibling(user_id, signed_in, name="claude", allowlist=frozenset({OWNER}), stops=False):
     """Another bridge of the process, whose agent's sign-in is `signed_in` (an exception:
-    the hook failed)."""
+    the hook failed); `stops`: its backend stops sub-agents left running (#847)."""
     hook = AsyncMock(side_effect=signed_in) if isinstance(signed_in, Exception) else None
     hook = hook or AsyncMock(return_value=signed_in)
+    capabilities = t.Capabilities(
+        steer=True, approvals=False, live_attach=False, rename=False, stop_subagents=stops
+    )
     return SimpleNamespace(
         router=SimpleNamespace(user_id=user_id, allowlist=allowlist),
-        backend=SimpleNamespace(kind="claude", signed_in=hook),
+        backend=SimpleNamespace(kind="claude", signed_in=hook, capabilities=capabilities),
         bot=SimpleNamespace(name=name),
+        ensure_location=AsyncMock(),  # its cards, which a rule `last` lookup confirms (#878)
     )
 
 
@@ -538,7 +551,7 @@ async def test_this_bots_own_agent_is_waited_for_longer(bridge, monkeypatch):
 
     b, fake, backend = bridge
     monkeypatch.setattr(vm, "SIGNED_IN_WAIT_S", 0.05)
-    monkeypatch.setattr(vm, "SIGNED_IN_OWN_WAIT_S", 2.0)
+    monkeypatch.setattr(vm, "SIGNED_IN_OWN_WAIT_S", 10.0)  # the 0.2 s answer can't miss it (#745)
     await other_bot(b, fake, True)
 
     async def connecting():
@@ -546,6 +559,7 @@ async def test_this_bots_own_agent_is_waited_for_longer(bridge, monkeypatch):
         return False
 
     backend.signed_in = connecting
+    b.own_wait_from = time.monotonic()  # the bridge just started, whatever the setup took
     assert await b.siblings(message(), False) is None
 
 
@@ -557,24 +571,45 @@ def hanging():
     return hook
 
 
+def own_waits(monkeypatch, backend):
+    """The waits `siblings` asks `vm.signed_in` for, for this bot's own agent, in order: what
+    the bridge decides (#745). `SIGNED_IN_WAIT_S` is a constant, which no slow runner
+    changes; a wait within `SIGNED_IN_OWN_WAIT_S` of the start is what remains of it, which a
+    slow setup shortens, so the tests assert only the former (#805). `vm.signed_in` applying
+    them: `test_vm.py`."""
+    from zab.core import vm
+
+    waits, signed_in = [], vm.signed_in
+
+    async def recording(other, wait=None):
+        if other is backend:
+            waits.append(wait)
+        return await signed_in(other, wait)
+
+    monkeypatch.setattr(vm, "signed_in", recording)
+    return waits
+
+
 async def test_after_a_timed_out_wait_the_own_agent_gets_the_short_wait(bridge, monkeypatch):
     """Review round 2 of #688: a startup whose own agent's sign-in timed out (a broken Codex
-    daemon) waits for it at most once: the next message's check takes `SIGNED_IN_WAIT_S`."""
+    daemon) waits for it at most once: the next message's check takes `SIGNED_IN_WAIT_S`.
+    #745: the long wait ends `SIGNED_IN_OWN_WAIT_S` after the start, and is measured from the
+    start: a slow setup before the first message shortens the wait, not the measurement."""
     from zab.core import vm
 
     b, fake, backend = bridge
     monkeypatch.setattr(vm, "SIGNED_IN_WAIT_S", 0.05)
     monkeypatch.setattr(vm, "SIGNED_IN_OWN_WAIT_S", 0.4)
     monkeypatch.setattr(vm, "SIGNED_IN_CACHE_S", 0.0)  # each call asks
-    b.own_wait_from = time.monotonic()  # the bridge just started
+    waits = own_waits(monkeypatch, backend)
+    b.own_wait_from = start = time.monotonic()  # the bridge just started
     await other_bot(b, fake, True)
     backend.signed_in = hanging()
-    began = time.monotonic()
     assert await b.siblings(message(), False) == ("Claude · X",)  # unknown: it takes part
-    assert time.monotonic() - began >= 0.3
-    began = time.monotonic()
+    assert time.monotonic() - start >= vm.SIGNED_IN_OWN_WAIT_S  # never before its deadline
+    assert b.own_wait_from is None and len(waits) == 1
     assert await b.siblings(message(topic="other"), False) == ("Claude · X",)
-    assert time.monotonic() - began < 0.25
+    assert waits[1] == vm.SIGNED_IN_WAIT_S
 
 
 async def test_long_after_the_start_the_own_agent_gets_the_short_wait(bridge, monkeypatch):
@@ -585,12 +620,12 @@ async def test_long_after_the_start_the_own_agent_gets_the_short_wait(bridge, mo
     b, fake, backend = bridge
     monkeypatch.setattr(vm, "SIGNED_IN_WAIT_S", 0.05)
     monkeypatch.setattr(vm, "SIGNED_IN_OWN_WAIT_S", 0.5)
+    waits = own_waits(monkeypatch, backend)
     b.own_wait_from = time.monotonic() - 3600
     await other_bot(b, fake, True)
     backend.signed_in = hanging()
-    began = time.monotonic()
     assert await b.siblings(message(), False) == ("Claude · X",)
-    assert time.monotonic() - began < 0.4
+    assert waits == [vm.SIGNED_IN_WAIT_S]
 
 
 async def test_an_unmentioned_message_starts_a_session_with_the_note(bridge):
@@ -651,7 +686,7 @@ def replies(fake, after, sent):
     return [m["content"] for mid, m in fake.messages.items() if mid > after and mid not in sent]
 
 
-async def test_an_idle_stop_and_an_unknown_value_are_quiet_without_a_mention(bridge):
+async def test_an_unknown_value_is_quiet_without_a_mention(bridge):
     b, fake, backend = bridge
     actor = await started(b, fake, backend)
     await actor.event(
@@ -660,11 +695,137 @@ async def test_an_idle_stop_and_an_unknown_value_are_quiet_without_a_mention(bri
     await actor.inbox.join()
     backend.update_settings.side_effect = t.InvalidSetting("model", "opus", ["gpt-5"])
     mark = max(fake.messages)
-    sent = [await user_message(b, fake, text) for text in ("!stop", "!model opus", "!new more")]
+    sent = [await user_message(b, fake, text) for text in ("!model opus", "!new more")]
     assert replies(fake, mark, sent) == []
-    backend.interrupt.assert_not_awaited()
     sent.append(await user_message(b, fake, "@**Test Bot** !model opus"))  # named: as before
     assert any("Unknown model" in r for r in replies(fake, mark, sent))
+
+
+async def idle(b, fake, backend):
+    """This bot's session in "topic" after its turn ended, Claude beside it (`started`)."""
+    actor = await started(b, fake, backend)
+    await actor.event(
+        t.TurnCompleted(session_id="native", turn_id="turn1", status=t.TurnStatus.COMPLETED)
+    )
+    await actor.inbox.join()
+    return max(fake.messages)
+
+
+async def zed(b, fake, stops=False, name="Zed · X", key="zed"):
+    """Another bot of the VM, by default "Zed · X", after this one by name, with a session in
+    the topic; `stops`: its backend stops sub-agents left running (#847)."""
+    fake.members.append(dict(user_id=41, full_name=name, is_bot=True))
+    fake.subscribers[1].append(41)
+    b.subscribers.clear()  # the channel's members, read again (`channel_members`)
+    await b.refresh_users()
+    b.all_bridges.append(sibling(41, True, name=key, stops=stops))
+    session_of(b, key, card=52)
+
+
+async def test_an_idle_stop_answers_once_with_or_without_a_mention(bridge):
+    """#847: with no turn running, a named `!stop` answered "Unknown command", and an unmentioned
+    one nothing. Both answer "No turn is running": unmentioned, from the first by name of the
+    topic's bots with a session (Claude, once it has one here), so once."""
+    b, fake, backend = bridge
+    mark = await idle(b, fake, backend)
+    sent = [await user_message(b, fake, "!stop")]  # only this bot has a session here
+    assert replies(fake, mark, sent) == [NO_TURN]
+    sent.append(await user_message(b, fake, "@**Test Bot** !stop"))
+    assert replies(fake, mark, sent) == [NO_TURN] * 2
+    session_of(b, "claude", card=51)  # Claude's answers for both now: this bot says nothing
+    sent.append(await user_message(b, fake, "!stop"))
+    assert replies(fake, mark, sent) == [NO_TURN] * 2
+    backend.interrupt.assert_not_awaited()
+
+
+async def test_an_idle_stop_leaves_the_answer_to_a_running_turn_here(bridge):
+    """Unmentioned, where another bot's turn runs in the topic, that bot stops it, and this
+    one, idle, says nothing, though it comes first by name."""
+    b, fake, backend = bridge
+    mark = await idle(b, fake, backend)
+    await zed(b, fake)
+    b.store.insert("turns", session_id="zed-topic", trigger_msg_ids="[]", state="running",
+                   started_at=time.time())  # fmt: skip
+    b.store.update("sessions", {"id": "zed-topic"}, state="running")
+    sent = [await user_message(b, fake, "!stop")]
+    assert replies(fake, mark, sent) == []
+    b.store.update("turns", {"session_id": "zed-topic"}, state="completed")
+    sent.append(await user_message(b, fake, "!stop"))
+    assert replies(fake, mark, sent) == [NO_TURN]  # "Test Bot" < "Zed · X"
+
+
+@pytest.mark.parametrize("named", [False, True])
+async def test_an_idle_stop_reports_the_subagents_it_stopped(bridge, named):
+    """A backend that can stop the sub-agents ended turns left running (Codex) does, and the
+    bot says how many, or that none ran, or that one may still run when it couldn't stop or
+    check them all (Codex round 2 on #851), or that a turn started elsewhere runs there. Claude
+    has a session here too, and comes first by name: this bot still gives the topic's one
+    line, unmentioned too, since only it knows what it found (review of #851)."""
+    b, fake, backend = bridge
+    mark = await idle(b, fake, backend)
+    backend.capabilities = replace(backend.capabilities, stop_subagents=True)
+    results = [t.SubagentStop(2), t.SubagentStop(0), t.SubagentStop(0, unseen=True)]
+    failures = [t.BackendUnavailable("down"), t.TurnElsewhere("native")]
+    backend.stop_subagents = AsyncMock(side_effect=[*results, *failures])
+    session_of(b, "claude", card=51)
+    stop = "@**Test Bot** !stop" if named else "!stop"
+    sent = [await user_message(b, fake, stop) for _ in range(5)]
+    stopped = "No turn is running; stopped 2 sub-agents that an earlier turn left running."
+    unseen = stopped_subagents(0, unseen=True)  # not "no sub-agent was" (Codex round 3)
+    expected = [stopped, NO_TURN_NOR_SUBAGENT, unseen, SUBAGENTS_UNCHECKED, TURN_ELSEWHERE]
+    assert replies(fake, mark, sent) == expected
+    assert unseen.startswith("No turn is running, and no sub-agent the bridge saw start")
+    assert [c.args for c in backend.stop_subagents.await_args_list] == [("native",)] * 5
+    backend.interrupt.assert_not_awaited()
+
+
+async def test_an_idle_stop_leaves_the_topics_answer_to_the_bot_that_stops_subagents(bridge):
+    """The other side of the review's B1: this bot can't stop sub-agents (Claude) and comes
+    first by name, but another bot with a session here can (Codex): that one answers for the
+    topic, so this one says nothing unmentioned. Named, it answers for itself."""
+    b, fake, backend = bridge
+    mark = await idle(b, fake, backend)
+    await zed(b, fake, stops=True)
+    sent = [await user_message(b, fake, "!stop")]
+    assert replies(fake, mark, sent) == []
+    sent.append(await user_message(b, fake, "@**Test Bot** !stop"))
+    assert replies(fake, mark, sent) == [NO_TURN]
+
+
+async def test_a_failed_idle_stop_warns_though_another_bot_answers_for_the_topic(bridge):
+    """Codex round 2 on #851: where another bot answers for the topic, this one's warning that
+    a sub-agent may still run was hidden (quiet, not first), and the topic heard only that no
+    turn runs. No other bot knows it, so it is said. Here both bots' backends stop sub-agents
+    and the other comes first by name: this one's zero says nothing, its count is said."""
+    b, fake, backend = bridge
+    mark = await idle(b, fake, backend)
+    await zed(b, fake, stops=True, name="Alpha · X", key="alpha")
+    backend.capabilities = replace(backend.capabilities, stop_subagents=True)
+    results = [t.SubagentStop(0), t.SubagentStop(2)]
+    backend.stop_subagents = AsyncMock(side_effect=[t.BackendUnavailable("down"), *results])
+    sent = [await user_message(b, fake, "!stop") for _ in range(3)]
+    stopped = "No turn is running; stopped 2 sub-agents that an earlier turn left running."
+    assert replies(fake, mark, sent) == [SUBAGENTS_UNCHECKED, stopped]
+
+
+async def test_an_unseen_zero_beside_a_running_turn_says_nothing(bridge):
+    """Review round 3 of #851, B1: after a restart every Codex session is `unseen`, and its
+    zero was posted before the quiet gate, so an unmentioned `!stop` meant for another bot's
+    running turn got this bot's line beside that turn's ⏹. It is gated as any zero: quiet
+    there; once no turn of the topic runs, the topic's one line (this bot ranks first, with
+    the hook), and said when named."""
+    b, fake, backend = bridge
+    mark = await idle(b, fake, backend)
+    backend.capabilities = replace(backend.capabilities, stop_subagents=True)
+    backend.stop_subagents = AsyncMock(return_value=t.SubagentStop(0, unseen=True))
+    await zed(b, fake)
+    b.store.insert("turns", session_id="zed-topic", trigger_msg_ids="[]", state="running",
+                   started_at=time.time())  # fmt: skip
+    sent = [await user_message(b, fake, "!stop")]
+    assert replies(fake, mark, sent) == []
+    b.store.update("turns", {"session_id": "zed-topic"}, state="completed")
+    sent += [await user_message(b, fake, x) for x in ("!stop", "@**Test Bot** !stop")]
+    assert replies(fake, mark, sent) == [stopped_subagents(0, unseen=True)] * 2
 
 
 async def test_an_unmentioned_model_this_backend_knows_is_set(bridge):

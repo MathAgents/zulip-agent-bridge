@@ -117,6 +117,13 @@ def connect_failure(result: Result, host: str) -> str:
     return causes[0]
 
 
+def connect_line(line: str, host: str) -> bool:
+    """Whether `line` is ssh's own line for a TCP connect to `host` that failed (`ssh: connect to
+    host <host> port 22: Connection timed out`, …): the command never ran. For a line another
+    program kept of ssh's stderr, such as a failure in push_config's table (#690)."""
+    return bool(_failure_forms(host)[0].fullmatch(line.strip()))
+
+
 def say(line: str) -> None:
     """A connect failure's line (`Vm.call`) on stderr: the runner's console, or the test's
     captured output."""
@@ -129,6 +136,10 @@ _USER_ENV = (
     "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
 )
 AGENT = "agent"
+#: Where a command run as `agent` starts: SSH lands in ubuntu's home, which `agent` can't
+#: enter, and `find -exec` then fails before it runs anything ("Failed to restore initial
+#: working directory", scenario 17's first live run).
+AGENT_HOME = "/home/agent"
 UNIT = "zab.service"
 _SIGNALS = frozenset({"STOP", "CONT", "TERM", "KILL"})
 #: The units of a time span as `systemctl show` prints one (`5min`, `1min 30s`, `100ms`).
@@ -244,9 +255,13 @@ class Vm:
         argv = [*(["sudo"] if sudo else []), "bash", "-c", literal, "bash", *args]
         return self.run(argv, timeout=timeout)
 
+    def probe(self) -> Result:
+        """One connection that runs `true`, never retried: its callers poll it, with
+        their own pauses, and its stderr says why it failed."""
+        return self.run(["true"], timeout=30, check=False, tries=1)
+
     def reachable(self) -> bool:
-        """One probe, never retried: its callers poll it, with their own pauses."""
-        return self.run(["true"], timeout=30, check=False, tries=1).ok
+        return self.probe().ok
 
     # ------------------------------------------------------------------ the bridge's unit
 
@@ -256,10 +271,11 @@ class Vm:
         return self._uid
 
     def as_agent(self, *argv: str) -> list[str]:
-        """`argv` run as `agent` with its user manager reachable (`systemctl --user`)."""
+        """`argv` run as `agent` with its user manager reachable (`systemctl --user`), from
+        `AGENT_HOME`."""
         uid = self.agent_uid()
         env = [e.format(uid=uid) for e in _USER_ENV]
-        return ["sudo", "-u", AGENT, "-H", "env", *env, *argv]
+        return ["sudo", "-u", AGENT, "-H", "env", "-C", AGENT_HOME, *env, *argv]
 
     def unit(self, name: str = UNIT) -> dict[str, str]:
         """`MainPID`, `NRestarts`, `ActiveState` and `SubState` of the agent's user unit."""

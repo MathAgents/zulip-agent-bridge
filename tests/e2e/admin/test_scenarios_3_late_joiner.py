@@ -33,7 +33,7 @@ hold and its power-off; and `Codex · zab-test-d` answers `zab-tester`'s `!statu
 as the row's bots, for its participant.
 
 **Fixed rows, as `zab-test-a` and `zab-test-b` are:** every run reuses `zab-test-d`'s two bots,
-which nothing deactivates (Zulip reactivates no bot without an organization administrator, §7),
+which nothing deactivates (no verb reactivates a bot, only its owner or an administrator, §7),
 and its repository `MathAgents/zab-test-d`, which the chain's `provision_repos.py` creates on the
 first run. The rig's GitHub token must be able to create it, or Drew creates it once. The last
 part also clears `zab-test-e`, the row of the stopped spare's refusal before #715, which an

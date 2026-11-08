@@ -1,12 +1,12 @@
 """Launch one workshop VM per roster row, plus spares (README.md, "launch.py").
 
     uv run --with boto3 python workshop/aws/launch.py --roster roster.csv --ami ami-… \\
-        --security-group-id sg-… [--key-name NAME] [--region us-west-2] \\
+        --security-group-id sg-… [--key-name NAME] --region REGION \\
         [--instance-type m7a.2xlarge] [--subnet-id subnet-…] [--spares N] [--only SLUG …] \\
-        [--admin-key FILE.pub …] [--tag KEY=VALUE …] [--ssh-from CIDR …] [--protect] \\
+        [--admin-key FILE.pub …] --tag KEY=VALUE [--tag …] [--ssh-from CIDR …] [--protect] \\
         [--spares-file FILE] [--dry-run]
 
-Standalone script (boto3 is not a zab dependency), run by Drew from a machine with AWS
+Standalone script (boto3 is not a zab dependency), run by the admin bot or a deployer with AWS
 credentials; agents run it only for test infrastructure, with `--tag zab-role=test` among the
 scope tags. Idempotent: a row whose `participant` tag already has a live
 instance in this workshop is not launched again (its Elastic IP is reconciled instead). The
@@ -44,7 +44,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aws_common import (
-    WORKSHOP_TAG,
     Ec2,
     Scope,
     add_tag_argument,
@@ -85,18 +84,17 @@ Tag = Scope
 
 
 def workshop_of(opts: argparse.Namespace) -> dict[str, str]:
-    """The scope tags from `--tag` (repeatable), or the default workshop tag (README.md,
-    "The VMs")."""
+    """The scope tags from `--tag` (repeatable, required: README.md, "The VMs")."""
     return parse_tags(getattr(opts, "tag", None))
 
 
-def participant_tags(name: str, workshop: Tag = WORKSHOP_TAG) -> dict[str, str]:
+def participant_tags(name: str, workshop: Tag) -> dict[str, str]:
     """The tags on a participant's instance, volume and Elastic IP (README.md, "The VMs"): every
     scope tag."""
     return {"Name": f"ws-{name}", **scope_tags(workshop), "participant": name}
 
 
-def lookup_tags(name: str, workshop: Tag = WORKSHOP_TAG) -> dict[str, str]:
+def lookup_tags(name: str, workshop: Tag) -> dict[str, str]:
     """What existing resources must carry to count as this participant's in THIS workshop.
 
     Filtering on `participant` alone would adopt (or attach) another event's resources; the
@@ -145,7 +143,7 @@ def ensure_elastic_ip(
     name: str,
     instance_id: str,
     *,
-    workshop: Tag = WORKSHOP_TAG,
+    workshop: Tag,
     dry_run: bool = False,
     log: Callable[[str], None] = print,
 ) -> str:
@@ -513,7 +511,7 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="a group with inbound TCP 22 only (never the VPC default; see README)",
     )
-    parser.add_argument("--region", default="us-west-2")
+    parser.add_argument("--region", required=True, help="the workshop's region")
     parser.add_argument("--instance-type", default=INSTANCE_TYPE)
     parser.add_argument("--key-name", help="EC2 key pair for the ubuntu user (admin access)")
     parser.add_argument("--subnet-id")
@@ -647,7 +645,7 @@ def record_spares(
     spares: list[dict[str, str]],
     path: pathlib.Path,
     region: str,
-    workshop: str = WORKSHOP_TAG[1],
+    workshop: str,
     log: Callable[[str], None] = print,
 ) -> list[str]:
     """Merge every spare with an address into `path` (0600, written atomically); the keys.

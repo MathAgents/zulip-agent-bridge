@@ -18,7 +18,8 @@ import pytest
 
 from e2e.harness import files, github, installed
 from e2e.harness.cleanup import VM_STOPPED, WARM_DISABLED, undo, vm_up
-from e2e.harness.flows import WORKING_S, Chat, answer, echo, topic_name
+from e2e.harness.flows import DONE, WORKING_S, Chat, answer, echo, topic_name
+from e2e.harness.vm import AGENT_HOME
 from e2e.harness.zulip_user import topic_narrow
 
 pytestmark = pytest.mark.e2e
@@ -152,7 +153,9 @@ def work(rig) -> str:
 
 
 def as_agent(*argv: str) -> list[str]:
-    return ["sudo", "-u", "agent", "-H", "env", AGENT_PATH, *argv]
+    """`argv` run as `agent`, from its home (`vm.AGENT_HOME`): SSH lands in ubuntu's, which
+    `agent` can't enter, and `find -exec` fails there before it runs anything."""
+    return ["sudo", "-u", "agent", "-H", "env", "-C", AGENT_HOME, AGENT_PATH, *argv]
 
 
 def megabytes(vm, path: str) -> int:
@@ -694,7 +697,7 @@ async def test_fork(kind, chat: Chat, rig, vm, scenario, nonce):
     assert found["id"] < ended["id"], "the fork answered only after the parent's turn ended"
     statuses = await chat.statuses(running)
     assert len(statuses) == 1, f"{len(statuses)} turns ran in the parent; the fork started one"
-    assert statuses[0]["content"].startswith("✅ **Done**"), statuses[0]["content"][:200]
+    await chat.user.settled(statuses[0], DONE)  # Zulip may serve an older version (#877)
 
 
 #: A fork's card in its topic (#202), the first fork's or one that joined it (#712).
@@ -857,7 +860,7 @@ async def test_btw(kind, chat: Chat, rig, vm, scenario, nonce):
     assert found["id"] < ended["id"], "the side answer came only after the running turn ended"
     statuses = await chat.statuses(running)
     assert len(statuses) == 1, f"{len(statuses)} turns ran; the side question started one"
-    assert statuses[0]["content"].startswith("✅ **Done**"), statuses[0]["content"][:200]
+    await chat.user.settled(statuses[0], DONE)  # Zulip may serve an older version (#877)
 
     follow = await chat.say(
         kind,

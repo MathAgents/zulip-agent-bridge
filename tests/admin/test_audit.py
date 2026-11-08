@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import stat
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -14,6 +17,8 @@ import pytest
 from zab.admin import __main__ as cli
 from zab.admin.audit import GENESIS, AuditError, AuditLog, Head, line_hash, verify
 from zab.admin.scrub import REDACTED, Scrubber
+
+from .botkit import audit_text
 
 SECRET = "Zq7Wm2Kp9Lx4Vb6Nc8Rt1Ys3Uh5Jd0Fg"  # noqa: S105 - made up
 N = 6
@@ -173,6 +178,35 @@ def test_concurrent_writers_keep_one_chain(tmp_path: Path) -> None:
     assert all(p.wait(timeout=60) == 0 for p in procs)
     result = verify(path)
     assert result.ok and result.records == 160
+
+
+# ------------------------------------------------------------------ reading beside an append
+
+
+def test_the_tests_reader_waits_for_an_append_under_way(written: tuple[Path, list[Head]]) -> None:
+    """#874: `botkit.audit_text`, which the admin tests read the log with while a plan runs,
+    takes the shared lock as `verify` does. While an append holds the lock with half its line
+    written, the read waits; then it has whole lines only. An unlocked read gets the half line,
+    whose JSON is unterminated (the flake of `test_admin_month_end_runs`)."""
+    path, _ = written
+    before = path.read_text()
+    line = json.dumps({"seq": N + 1, "event": "apply_end", "rows": "x" * 2500}) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    fcntl.flock(fd, fcntl.LOCK_EX)  # as `AuditLog.append` holds it while it writes
+    pool = ThreadPoolExecutor(1)
+    try:
+        os.write(fd, line[:1200].encode())
+        read = pool.submit(audit_text, path)
+        with pytest.raises(TimeoutError):  # waiting for the lock, not returning half a line
+            read.result(timeout=0.5)
+        os.write(fd, line[1200:].encode())
+    finally:
+        os.close(fd)  # and with it the lock
+        pool.shutdown()
+    text = read.result()
+    assert text == before + line
+    assert [json.loads(row)["seq"] for row in text.splitlines()] == list(range(1, N + 2))
+    assert audit_text(path.with_name("none.jsonl")) == ""  # no log yet
 
 
 # ------------------------------------------------------------------------- tampering: detect

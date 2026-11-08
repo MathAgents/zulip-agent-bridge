@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -17,18 +18,30 @@ from zab.core.addressing import (
     without_typed_address,
 )
 from zab.core.command_text import as_command
-from zab.core.commands import BTW_NO_SESSION, FORK_NO_SESSION, HANDOVER
+from zab.core.commands import BTW_NO_SESSION, DETACH, FORK_NO_SESSION, HANDOVER
 from zab.core.store import Store
+from zab.core.unmentioned import addressees as recorded
+from zab.core.unmentioned import follow, record
 
 #: Rule 7's reply to a command other than `!new` in a topic without a session of this bot.
 NO_SESSION = "No session here: write a prompt to start one; !help lists the commands."
 #: The commands whose answer is the VM's, the same from each bot: one bot gives it (§4.6).
 VM_WIDE = ("!help", "!vm", "!tools")
+#: A topic's `!unmentioned`, whose pointer to a DM no session changes either (#878).
+UNMENTIONED = "!unmentioned"
 #: The answer to an unmentioned `!handover` where both agents have a session (§4.6).
 HANDOVER_NAMED = (
     "Both agents have a session here, and would write HANDOVER.md in the same worktree: name "
     "one, `@claude !handover` or `@codex !handover`."
 )
+#: A topic's `!unmentioned`: the VM's setting, which a direct message changes (§4.6, #878).
+UNMENTIONED_DM = "Send !unmentioned to me in a direct message: it is for all of your agents."
+
+
+def actor_text(normalized: str, pattern: re.Pattern[str]) -> str:
+    """A topic message's text as the actor of the bot whose mention is `pattern` reads it
+    (`Route.text`): `normalized` without that bot's mentions."""
+    return without_mention(normalized, pattern).strip()
 
 
 @dataclass(frozen=True)
@@ -67,8 +80,9 @@ class Router:
 
     def unmentioned(self, text: str, other_bot_names: Iterable[str] = ()) -> bool:
         """Whether a channel message `text` names no bot, completed or typed, and is no aside:
-        one that rule 6.2 sends to all of the VM's bots (SPEC §4.5, #713). Only for such a
-        message does the bridge work out the router's `siblings`, asking for sign-ins."""
+        one that rule 6.2 sends to all of the VM's bots (SPEC §4.5, #713), or under `last` to
+        the recorded ones (#878). Only for such a message does the bridge work out the router's
+        `addressees` and `siblings`, asking for sign-ins."""
         visible = visible_text(text)
         return not (
             typed_kinds(visible)
@@ -76,6 +90,14 @@ class Router:
             or any(mention(name).search(visible) for name in other_bot_names)
             or text.lstrip().startswith("//")
         )
+
+    def detaching(self, text: str, other_bot_names: Iterable[str] = ()) -> bool:
+        """Whether a channel message `text` is a `!detach` by its verb, which amends the topic's
+        record from the entry before it (`_record`): the bridge first has the other bots confirm
+        their cards in the topic, as before a message without a mention under `last` (#891)."""
+        patterns = [self.mention, *(mention(name) for name in other_bot_names), *TYPED_ADDRESSES]
+        normalized, _ = unaddressed(text, patterns)
+        return as_command(normalized).split(maxsplit=1)[:1] == [DETACH]
 
     def route(
         self,
@@ -92,12 +114,20 @@ class Router:
         history_only: bool = False,
         siblings: tuple[str, ...] | None = None,
         sibling_kinds: dict[str, str] | None = None,
+        addressees: tuple[str, ...] | None = None,
+        answerers: tuple[str, ...] | None = None,
     ) -> Route:
         """`siblings`: the full names of the VM's other bots, which a message without a mention
         also goes to (rule 6.2); None where it doesn't go to this bot (`BotBridge.siblings`: a
-        multi-party channel, `multi_party` off without a session here, its agent signed out).
-        `sibling_kinds`: the VM's other bots that allow the sender, by full name, with their
-        kinds, which a typed mention names (#713)."""
+        multi-party channel, `multi_party` off without a session here, its agent signed out, a
+        bot the topic's addressee record leaves out). `sibling_kinds`: the VM's other bots that
+        allow the sender, by full name, with their kinds, which a typed mention names (#713).
+        `addressees`: under the rule `last`, the VM's bots that the record names, which a
+        message without a mention goes to (`BotBridge.addressees`, #878); None under `all` or
+        without a record. `answerers`: for a message without a mention, the VM's bots, by full
+        name, that it reaches by their allowlists and the channel, whatever their sessions
+        (`BotBridge.answerers`, #899): the first by name answers a command whose answer is the
+        VM's; None with `bridge.multi_party` off, where `siblings` decides who does."""
         with self.store.transaction():
             route = self._route(
                 message,
@@ -111,6 +141,8 @@ class Router:
                 history_only=history_only,
                 siblings=siblings,
                 sibling_kinds=sibling_kinds,
+                addressees=addressees,
+                answerers=answerers,
             )
             if route.action in ("deliver", "new") or (
                 route.action == "command" and route.session and route.text == "!handover"
@@ -144,6 +176,8 @@ class Router:
         history_only: bool = False,
         siblings: tuple[str, ...] | None = None,
         sibling_kinds: dict[str, str] | None = None,
+        addressees: tuple[str, ...] | None = None,
+        answerers: tuple[str, ...] | None = None,
     ) -> Route:
         stream = message.get("stream_id")
         topic = message.get("subject", "")
@@ -206,6 +240,9 @@ class Router:
                 | {replacements[key] for key in corrected if replacements.get(key)}
             )
         )
+        unnamed = not (multi_party or explicitly_addressed or self.mention.search(visible))
+        self._record(message["id"], stream, topic, normalized, mentioned, others, unnamed,
+                     sibling_kinds, addressees)  # fmt: skip
         if not private and not self.allow_public:
             return (
                 self._once(stream, topic, "public", "sessions are disabled in public channels")
@@ -215,29 +252,50 @@ class Router:
         if normalized.startswith("//"):
             return Route("ignore")
         quiet = False
-        if (
-            siblings is not None
-            and (session or not sessions)  # after `!detach`, a mention is needed (§4.6)
-            and not (multi_party or explicitly_addressed or self.mention.search(visible))
-        ):
-            # A message that names no bot goes to each of the VM's bots, whatever earlier
-            # messages in the topic addressed, as if it mentioned them all (SPEC §4.5, #713).
+        if unnamed and addressees is not None and self.full_name not in addressees:
+            # Under `last`, it is the recorded bots', as a mention of them (#878).
+            others = tuple(sorted(addressees))
+        elif siblings is not None and (session or not sessions) and unnamed:
+            # A message that names no bot goes to each of the VM's bots it reaches (#713), or
+            # under `last` to those the topic's record names (#878), as if it mentioned them
+            # all (SPEC §4.5): `siblings`, from the bridge, says which. After `!detach`, a
+            # mention is needed (§4.6).
             mentioned, others, quiet = True, tuple(sorted(siblings)), bool(siblings)
         peers = others if mentioned or not multi_party else ()
         self.store.set(
             f"message_audience:{self.bot}:{message['id']}",
             dict(addressed=mentioned, peers=peers, stream_id=stream, topic=topic),
         )
+        command = normalized.startswith("!")
+        verb = normalized.split(maxsplit=1)[0] if command else ""
+        if (
+            unnamed
+            and answerers is not None
+            and verb in (*VM_WIDE, UNMENTIONED)
+            and topic
+            and not history_only
+        ):
+            # The VM's answer, from the first by name of the bots that the message reaches by
+            # their allowlists and the channel (`answerers`), whatever their sessions, so that each
+            # bot finds the same one in whichever order they read it and a `!detach` (#899). A
+            # topic without a name, where no session is, and an expired message, as before.
+            if self.full_name != min(answerers, default=None):
+                return Route("ignore")
+            return (
+                Route("reply", UNMENTIONED_DM)
+                if verb == UNMENTIONED
+                else Route("command", normalized)
+            )
         if not mentioned:
             return Route("ignore")
         if history_only:
             deliverable = not session or session["state"] != "readonly"
             return Route("expired" if deliverable else "ignore")
-        command = normalized.startswith("!")
-        verb = normalized.split(maxsplit=1)[0] if command else ""
         lead = not quiet or self.full_name < min(peers)
-        if verb in VM_WIDE and not lead:
+        if verb in VM_WIDE and not lead:  # without `answerers`: `bridge.multi_party` off
             return Route("ignore")  # the first of the VM's bots answers it, by name
+        if verb == UNMENTIONED:
+            return Route("reply", UNMENTIONED_DM) if lead else Route("ignore")
         if verb == "!login":
             return Route("reply", "Send !login to me in a direct message.")
         if session:
@@ -246,7 +304,7 @@ class Router:
             if quiet and verb == "!handover" and self._others_here(stream, topic):
                 return Route("reply", HANDOVER_NAMED) if lead else Route("ignore")
             action = "command" if command else "deliver"
-            text = without_mention(normalized, self.mention).strip()
+            text = actor_text(normalized, self.mention)
             return Route(action, text, session, peers, quiet)
         if not topic:
             return self._once(stream, topic, "empty", "Please use a named topic for a session.")
@@ -259,7 +317,49 @@ class Router:
                 return Route("ignore")
             replies = {"!fork": FORK_NO_SESSION, "!btw": BTW_NO_SESSION}  # §7.11, §7.13
             return Route("reply", replies.get(verb, NO_SESSION))
-        return Route("new", without_mention(normalized, self.mention).strip(), peers=peers)
+        return Route("new", actor_text(normalized, self.mention), peers=peers)
+
+    def _record(
+        self,
+        message_id: int,
+        stream: Any,
+        topic: str,
+        normalized: str,
+        mentioned: bool,
+        others: tuple[str, ...],
+        unnamed: bool,
+        sibling_kinds: dict[str, str] | None,
+        addressees: tuple[str, ...] | None,
+    ) -> None:
+        """The topic's addressee record, for the rule `last` (#878), from what each of the VM's
+        bots reads the same in the message, whichever reads it first: its text and position.
+        Before the public-channel rule, whose channel state may change between two bots' reads
+        (a public topic's routing reads no record), and an expired message's too.
+
+        A prompt (neither a command nor an aside; `!new` included) records the VM's bots it
+        names: whom the participant talks to, not whom they send a command. A `!detach` is the
+        one command that amends it, by removal: under its own id, the newest entry before it
+        without the bots it detaches, so that every bot reads the same after it, in any order.
+        Those are the bots it reaches (named, in a multi-party channel too; without a mention, in
+        a single-human one, the recorded ones or else all) for which it is exactly `!detach`
+        without their completed mentions (`actor_text`), as their actors read it, or would, a bot
+        without a session included: `@claude !detach now` detaches nothing, and amends nothing.
+        A mention of the bot's name with another user's ID counts as the bot's here, though not
+        for its actor (Zulip writes the ID only for two users of one name)."""
+        verb = normalized.split(maxsplit=1)[0] if normalized.startswith("!") else ""
+        named = ({self.full_name} if mentioned else set()) | (
+            set(others) & set(sibling_kinds or ())
+        )
+        if normalized.startswith("//"):
+            return  # an aside
+        if named and verb in ("", "!new"):
+            record(self.store, stream, topic, message_id, named)
+        elif verb == DETACH:
+            everyone = (self.full_name, *(sibling_kinds or ()))
+            reached = named or (set(addressees or everyone) if unnamed else set())
+            reached = {name for name in reached if actor_text(normalized, mention(name)) == DETACH}
+            if reached and (before := recorded(self.store, stream, topic, message_id)):
+                record(self.store, stream, topic, message_id, set(before) - reached)
 
     def _others_here(self, stream: int | None, topic: str) -> bool:
         """Whether another bot of the VM (the store's) has a session in the topic."""
@@ -274,6 +374,25 @@ class Router:
             return Route("ignore")
         self.store.set(key, True)
         return Route("note", text)  # a reply to a plain mention: posted marked (#677)
+
+    def follow_cards(self, event: dict[str, Any]) -> None:
+        """A move of messages that takes a session card of any of the VM's bots takes the
+        card's topic's addressee record with it (`unmentioned.follow`, SPEC §4.5, #878). Each
+        bot does so on the move's event, from the move's source (Zulip's `stream_id` and
+        `orig_subject`, as the card's row may have moved already), so that the record is there
+        for whichever bot reads the destination's next message first."""
+        ids = set(event.get("message_ids", [])) | {event.get("message_id")}
+        for row in self.store.rows("sessions"):
+            if row["card_message_id"] in ids and row["state"] != "detached":
+                source = (
+                    event.get("stream_id", row["stream_id"]),
+                    event.get("orig_subject", row["topic"]),
+                )
+                destination = (
+                    event.get("new_stream_id", source[0]),
+                    event.get("subject", source[1]),
+                )
+                follow(self.store, source, destination)
 
     def move_card(self, event: dict[str, Any], *, private: bool) -> list[dict[str, Any]]:
         """Card location is authoritative, including partial topic moves (§4.4)."""
@@ -311,6 +430,9 @@ class Router:
                 if occupied:
                     # The existing binding wins; never keep routing via a stale location.
                     values["state"] = "detached"
+                # The record goes with the card, a move found by a card's check included (#878)
+                source = (session["stream_id"], session["topic"])
+                follow(self.store, source, (destination["stream_id"], destination["topic"]))
                 self.store.update("sessions", {"id": session["id"]}, **values)
                 changed.append(session | values)
         return changed

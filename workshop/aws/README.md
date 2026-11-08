@@ -28,9 +28,8 @@ first one, at a bootstrap.
 deployer runs the same scripts from a laptop, with an AWS profile for the fleets' account, and
 with the bot's settings, so that the VMs stay ones the bot can manage: `<ws>`, `<SCOPE>`,
 `<region>`, `<ami>`, `<sg>` and `<type>` (the first of its `instance_types`) are the workshop's
-entry in the server's `admin.toml` (BOOTSTRAP §7.2). The commands below are that fallback's. Pass `--tag` and `--region` every time: without
-them, a script's scope is `workshop=nt-agents-2026` and its region `us-west-2`, the defaults left
-by the maintainer's first workshop, which match nothing of yours.
+entry in the server's `admin.toml` (BOOTSTRAP §7.2). The commands below are that fallback's. Every script takes `--tag` and `--region`, and
+refuses to run without them (#808): there is no default workshop or region.
 
 ```bash
 AWS_PROFILE=<aws-profile> uv run --with boto3 python workshop/aws/launch.py --roster roster.csv \
@@ -69,8 +68,12 @@ another credential.
 
 - **Instance:** `m7a.2xlarge` (DECISIONS D23), `--instance-type`: 8 vCPUs, each a physical Zen 4
   core with AVX-512, and 32 GiB of memory. Every process that imports Mathlib holds about
-  7.3 GB, mostly shared pages, and two agents' Lean servers plus a comparator run is the
-  realistic peak, with Sage and Magma on top. Where the region's vCPU quota is short,
+  7.3 GB, mostly shared pages. Each agent runs up to 10 turns at once (`max_concurrent_turns`,
+  #919), and a turn that uses Lean starts a Lean server of its own, about 1.3 GB idle with one
+  small file open: with every turn in Lean at once, those and the agents' other processes fill
+  the VM's usable memory and run into the 8 GiB swap (SPEC §7.10). The common case, turns that
+  wait on the model, needs much less; Sage, Magma and comparator runs come on top. Where the
+  region's vCPU quota is short,
   `--instance-type r7a.xlarge` keeps the 32 GiB on 4 vCPUs: the image is the same (x86-64), and
   `build_ami.py --smoke-only <ami> --smoke-instance-type r7a.xlarge` checks it on that type.
 - **Root volume:** gp3, 200 GiB (#205), deleted on termination.
@@ -219,8 +222,8 @@ run there alone. A fleet split over two regions is managed by hand, and needs, i
 3. `region` written in the rows that go there, before their first launch, and only in rows
    without a VM yet (empty `host`);
 4. a launch there with a credential allowed in that region: `launch.py --region <region> --ami
-   <its image> --security-group-id <its group>`, with the same `--key-name` and `--admin-key` as
-   the first region's launch. It launches that region's rows and leaves the others alone, as the
+   <its image> --security-group-id <its group>`, with the same `--key-name`, `--admin-key` and
+   scope `--tag`s as the first region's launch. It launches that region's rows and leaves the others alone, as the
    first region's runs leave these alone.
 
 The admin scripts after the launch (`scan_hosts`, `zulip_provision`, `provision_repos`,
@@ -261,8 +264,8 @@ uv run --with boto3 python workshop/aws/power.py --roster roster.csv "${S[@]}" -
   spare's own tag. Only instances with every scope tag **and** a `participant` tag, and no
   `zab-admin` tag, are candidates, so the admin server is never started or stopped. An
   instance tagged as another participant is refused (a typo in `ip`).
-- **The region.** `--region`, or else the roster's one region (an empty `region` cell means
-  `us-west-2`, the scripts' default: pass `--region`).
+- **The region.** `--region`, required (#808). A row with a VM and an empty `region` cell is one
+  launched before `launch.py` recorded it, in `us-west-2`, as `status.py` reads it.
 - **Idempotent.** It prints one line per target and a summary. A VM moving the other way
   (`stopping` for `--start`) fails and the others still run; the exit code is then 1.
   `--dry-run` reads EC2 and prints the same lines with "would". A failed EC2 lookup (an

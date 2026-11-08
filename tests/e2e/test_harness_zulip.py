@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl
 import httpx
 import pytest
 
+from e2e.harness.rig_failure import RigTimeout
 from e2e.harness.zulip_user import (
     PostingRefused,
     TestUser,
@@ -78,6 +79,9 @@ class Zulip:
             newer = [m for m in found if m["id"] > int(params["anchor"])]
             count = int(params["num_after"])
             body = {"messages": newer[:count], "found_newest": len(newer) <= count}
+        elif path.endswith("/history"):  # one version, from the epoch
+            content = self.messages[int(path.split("/")[1])]["content"]
+            body = {"message_history": [{"content": content, "timestamp": 0}]}
         elif path.startswith("messages/"):
             body = {"message": self.messages[int(path.split("/")[1])]}
         return httpx.Response(200, json={"result": "success", **body})
@@ -210,8 +214,13 @@ async def test_transient_errors_are_retried_until_the_deadline(caplog):
     with pytest.raises(ZulipError):
         await tester.wait_reply(dm_narrow(BOT), after_id=mid, senders=[BOT], pattern="PONG",
                                 within=600)  # fmt: skip
-    fake.failures = [502] * 50
-    with pytest.raises(ZulipError):  # the deadline passes: the last error is raised
+    fake.failures = [502] * 200
+    # the deadline passes while Zulip fails, and it fails on: the rig couldn't look (#877)
+    with pytest.raises(
+        RigTimeout,
+        match=r"\(HTTP 502\)\), still at its end, the edit history "
+        r"unread \(ZulipError\): the rig couldn't look; no reply matching 'PONG'",
+    ):
         await tester.wait_reply(dm_narrow(BOT), after_id=mid, senders=[BOT], pattern="PONG",
                                 within=20)  # fmt: skip
     await tester.close()

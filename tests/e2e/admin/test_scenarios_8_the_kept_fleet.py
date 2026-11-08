@@ -15,7 +15,7 @@ after; a rollout; O6, `move_bots.py`'s dry run (VERIFY V15) and the provisioner'
 bots are deactivated. The run's teardown terminates the VM, as every test workshop's instance,
 and checks it (`run.teardown`).
 
-It runs after A9, or A7's stop, so that at most three instances run (§7): with more of the
+It runs after A9 and A17, or A7's stop, so that at most three instances run (§7): with more of the
 rig's VMs running, the first part skips, naming them, and the others with it. A previous run's
 bots, deactivated at its end, are first reactivated by their owner, zab-tester
 (`kept.restore_bots`), and a sandbox zab-tester can't see is renamed out of its way

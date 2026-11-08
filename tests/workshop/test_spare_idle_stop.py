@@ -14,6 +14,8 @@ import push_config as pc
 import pytest
 import spare_idle_stop as sis
 
+from .scope import with_scope
+
 W = {"workshop": "nt-agents-2026"}
 SCOPE = ac.parse_tags(["workshop=nt-agents-2026"])
 ROSTER = "slug,email,host,ip,region\nalice,alice@example.org,ws-alice,203.0.113.1,us-west-2\n"
@@ -249,8 +251,8 @@ def test_started_is_a_flag_of_the_command_line(tmp_path, monkeypatch):
     spares.write_text(json.dumps(SPARES))
     argv = ["--roster", str(roster), "--minutes", "10", "--only", "zab-spare-1"]
     argv += ["--spares-file", str(spares)]
-    assert sis.main(argv) == 0 and seen["started"] is False
-    assert sis.main([*argv, "--started"]) == 0 and seen["started"] is True
+    assert with_scope(sis.main, argv) == 0 and seen["started"] is False
+    assert with_scope(sis.main, [*argv, "--started"]) == 0 and seen["started"] is True
 
 
 def test_a_spare_without_host_keys_is_refused_before_any_ssh():
@@ -348,7 +350,7 @@ def test_the_command_line_is_checked(tmp_path, argv, error, capsys):
     roster = tmp_path / "roster.csv"
     roster.write_text(ROSTER)
     with pytest.raises(SystemExit):
-        sis.main(["--roster", str(roster), *argv])
+        with_scope(sis.main, ["--roster", str(roster), *argv])
     assert error in capsys.readouterr().err
 
 
@@ -356,5 +358,5 @@ def test_a_missing_spares_file_is_refused(tmp_path, capsys):
     roster = tmp_path / "roster.csv"
     roster.write_text(ROSTER)
     argv = ["--roster", str(roster), "--minutes", "10", "--only", "zab-spare-1"]
-    assert sis.main([*argv, "--spares-file", str(tmp_path / "none.json")]) == 1
+    assert with_scope(sis.main, [*argv, "--spares-file", str(tmp_path / "none.json")]) == 1
     assert "refusing:" in capsys.readouterr().err

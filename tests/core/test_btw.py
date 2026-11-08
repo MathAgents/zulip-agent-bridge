@@ -6,6 +6,7 @@ context or in a fork's answer."""
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -71,6 +72,18 @@ async def answered(rig, mid, topic="topic"):
     )
 
 
+async def ended(bridge):
+    """The bridge's background runs, its `!btw` answers among them, have ended and left
+    `bridge.background` (#782). An answer is seen as soon as the fake Zulip has it, from the
+    poster's worker: the answer's task resumes after that, takes its entry out of
+    `side_questions` and ends, and asyncio runs the done callback that takes the task out of
+    `background` on a later turn of the loop still. A check right after `answered` can fall
+    in either gap."""
+    async with asyncio.timeout(30):
+        while bridge.background:  # noqa: ASYNC110 - done callbacks, on later turns of the loop
+            await asyncio.sleep(0.01)
+
+
 async def warned(rig, text, topic="topic"):
     note = rig.bridge.note(text)
     await rig.until(lambda: note in rig.posts(topic), text)
@@ -97,7 +110,8 @@ async def test_btw_answers_and_leaves_no_trace(make_rig, kind):
     assert inbound["disposition"] == "side_question" and inbound["session_id"] == row["id"]
     reactions = {r["emoji_name"] for r in rig.fake.messages[mid]["reactions"]}
     assert reactions == {"eyes"}
-    assert not rig.bridge.side_questions and not rig.bridge.background
+    await ended(rig.bridge)  # #782: the answer's task ended, and out of `background`
+    assert not rig.bridge.side_questions
     if kind == "claude":
         call = rig.calls()[-1]
         assert call["stdin"] == cb.SIDE_QUESTION_FRAME + "what was the word?"
@@ -113,6 +127,29 @@ async def test_btw_answers_and_leaves_no_trace(make_rig, kind):
         await rig.until(lambda: rig.server.responses, "the declined approval")
         (declined,) = rig.server.responses.values()
         assert declined["result"] == {"decision": "decline"}
+
+
+async def test_an_ended_answer_leaves_background_a_turn_of_the_loop_later():
+    """#782: the gap `ended` waits out, deterministically. `btw.start`'s task is taken out of
+    `bridge.background` by its done callback, which asyncio runs on the turn of the loop after
+    the one the task ends in: a check in between sees an ended task still there."""
+    send = AsyncMock()
+    bridge = SimpleNamespace(
+        background=set(),
+        bot=SimpleNamespace(name="bot"),
+        note=lambda text: text,
+        poster=SimpleNamespace(send=send),
+        renderer=SimpleNamespace(render_inline=lambda text: text),
+    )
+    message = dict(id=7, stream_id=1, subject="topic", sender_id=OWNER)
+    btw.start(bridge, message, "!btw", {"full_name": "Owner"})  # no question: the usage line
+    (task,) = bridge.background
+    while not task.done():  # noqa: ASYNC110 - one turn of the loop at a time
+        await asyncio.sleep(0)
+    assert task in bridge.background  # ended, and not yet taken out: #782's failure
+    await ended(bridge)
+    assert not bridge.background
+    send.assert_awaited_once_with(1, "topic", btw.USAGE)
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -166,6 +203,7 @@ async def test_a_second_btw_waits_for_the_first(make_rig, kind, monkeypatch):
     assert one.startswith(MARK.format(first)) and two.startswith(MARK.format(second))
     reactions = {r["emoji_name"] for r in rig.fake.messages[second]["reactions"]}
     assert reactions == {"hourglass", "eyes"}
+    await ended(rig.bridge)  # #782: the second answer's task may not have resumed yet
     assert not rig.bridge.side_questions
 
 

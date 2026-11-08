@@ -47,7 +47,7 @@ KEEP_SESSIONS = 500  # the newest sessions kept in the file
 
 def model_family(model: str | None) -> str | None:
     """`claude-fable-5-1` → `Fable`, `claude-opus-5-5[1m]` → `Opus`, `claude-3-opus-…` → `Opus`."""
-    m = re.match(r"claude-(?:\d+(?:[-.]\d+)*-)?([a-z]+)", (model or "").lower())
+    m = re.match(r"claude-(?:\d+(?:[-.]\d+)*+-)?([a-z]+)", (model or "").lower())
     return m.group(1).capitalize() if m else None
 
 

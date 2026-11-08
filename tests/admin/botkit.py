@@ -4,6 +4,7 @@ organizers, the `[global]` bot, and a fake realm with their people (docs/ADMIN.m
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
 import re
 from collections.abc import Callable
@@ -222,6 +223,20 @@ def incoming(
     name = (NAMES | BOTS)[sender]
     recipients = frozenset() if stream is not None else frozenset({sender, *to})
     return Incoming(mid, sender, name, stream, topic, content, frozenset(flags), recipients)
+
+
+def audit_text(path: Path) -> str:
+    """The audit log's text, read under its shared lock as the product's readers take it
+    (`audit.verify`, the backup's copy): an append holds the lock exclusively while it writes,
+    so a test that reads the log beside a running plan never gets a half-written line (#874).
+    "" while there is no log."""
+    try:
+        f = path.open("rb")
+    except FileNotFoundError:
+        return ""
+    with f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+        return f.read().decode("utf-8")
 
 
 async def until(check: Callable[[], bool], seconds: float = 30.0) -> None:

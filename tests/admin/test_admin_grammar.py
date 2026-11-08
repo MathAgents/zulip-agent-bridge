@@ -177,9 +177,12 @@ def test_steering_follows_push_config():
 def test_classes():
     """§2.2's class column: what reads, what changes, what approves."""
     kinds = {verb: spec.kind for verb, spec in SPECS.items()}
-    assert {v for v, k in kinds.items() if k == "approval"} == {"approve", "reject"}
+    # `!month-end cancel`: the schedule's veto, as `!reject` is a plan's (#570)
+    vetoes = {"approve", "reject", "month-end cancel"}
+    assert {v for v, k in kinds.items() if k == "approval"} == vetoes
     assert {v for v, k in kinds.items() if k == "read"} == {
-        "help", "version", "plans", "plan", "audit", "console", "status", "roster show"
+        "help", "version", "plans", "plan", "audit", "console", "status", "roster show",
+        "month-end show",
     }  # fmt: skip
     assert parse("!stop all", CTX).spec.kind == "change"
 

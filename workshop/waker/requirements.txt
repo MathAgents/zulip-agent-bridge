@@ -1,2 +1,6 @@
 # Install only in the central waker's virtualenv, alongside the zab wheel.
 boto3>=1.35,<2
+# botocore takes certifi's bundle when certifi is installed, as the wheel's httpx installs it. A
+# floor, so that installing this file again upgrades an older certifi: 2026.10.23 has no emSign
+# ECC Root CA - G3 (#671). Move it with uv.lock's (tests/workshop/test_trust_stores.py).
+certifi>=2026.10.23

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pathlib
 import sys
 
 import pytest
@@ -311,6 +312,131 @@ async def test_a_further_loop_disarms_the_idle_close():
     assert stream.open
 
 
+def tasks(*entries: tuple[str, str], **extra) -> dict:
+    """A `background_tasks_changed`: every live background task, (id, type) (2.1.283's schema)."""
+    listed = [{"task_id": i, "task_type": kind, "description": "d", **extra} for i, kind in entries]
+    return {"type": "system", "subtype": "background_tasks_changed", "tasks": listed}
+
+
+async def test_stdin_stays_open_while_a_background_subagent_runs():
+    """#660: the CLI waits for a background sub-agent after the `result` of the loop that started
+    it, and its notification starts a further loop; a message meanwhile gets a loop of its own.
+    stdin used to close at that first `result`, so the message was held until the end."""
+    stream, writer = cb.StreamInput("go", idle_close_s=0.05), Writer()
+    stream.attach(writer)
+    stream.observe(echo(stream.prompt_uuid))
+    stream.observe(tasks(("a1", "local_agent")))
+    stream.observe(RESULT)  # everything taken in, but the sub-agent runs on
+    assert stream.open and stream.agents == {"a1"}
+    await asyncio.sleep(0.2)  # the short idle close is not the sub-agent's
+    assert stream.open
+    uid = await stream.send("what's the status?")
+    stream.observe(INIT)
+    stream.observe(echo(uid))
+    stream.observe(RESULT)  # the steer's own loop
+    assert stream.open
+    stream.observe(tasks())  # the sub-agent is done; its notification's loop follows
+    stream.observe({"type": "system", "subtype": "task_notification", "task_id": "a1"})
+    stream.observe(INIT)
+    await asyncio.sleep(0.2)
+    assert stream.open
+    stream.observe(RESULT)
+    assert stream.closed and writer.closed and not stream.undelivered
+
+
+async def test_a_background_command_or_an_ambient_task_keeps_nothing_open():
+    """`-p` stops a background `local_bash` command about 5 s after stdin closes (#36): only a
+    sub-agent, which the CLI waits for, keeps stdin open. An `ambient` task is no activity."""
+    for listed in (tasks(("b1", "local_bash")), tasks(("a1", "local_agent"), ambient=True)):
+        stream, writer = cb.StreamInput("go"), Writer()
+        stream.attach(writer)
+        stream.observe(echo(stream.prompt_uuid))
+        stream.observe(listed)
+        stream.observe(RESULT)
+        assert stream.closed
+
+
+async def test_stdin_closes_when_the_subagent_outlives_its_wait():
+    """A sub-agent that never ends, the model idle: stdin closes `subagent_idle_close_s` after
+    the `result` (by default `SUBAGENT_IDLE_CLOSE_S`), and the CLI's own wait for it applies."""
+    stream = cb.StreamInput("go", idle_close_s=0.05, subagent_idle_close_s=0.3)
+    stream.attach(Writer())
+    assert cb.StreamInput("x").subagent_idle_close_s == cb.SUBAGENT_IDLE_CLOSE_S == 600.0
+    stream.observe(echo(stream.prompt_uuid))
+    stream.observe(tasks(("a1", "local_agent")))
+    stream.observe(RESULT)
+    await asyncio.sleep(0.15)
+    assert stream.open
+    await asyncio.sleep(0.4)
+    assert stream.closed and stream.agents == {"a1"}
+    with pytest.raises(SteerRejected):
+        await stream.send("held for the next turn")
+
+
+async def test_task_list_updates_never_lengthen_the_subagents_wait():
+    """Codex on #814: the wait runs from the last `result`. Updates about other tasks (a
+    background command of the sub-agent's, an ambient watcher) used to restart it each time, so
+    a stuck sub-agent could hold stdin open for ever, and the CLI's own wait never began. The
+    last sub-agent's end shortens it to `idle_close_s`, and never lengthens it either."""
+    stream = cb.StreamInput("go", idle_close_s=5.0, subagent_idle_close_s=1.0)
+    stream.attach(Writer())
+    stream.observe(echo(stream.prompt_uuid))
+    stream.observe(tasks(("a1", "local_agent")))
+    stream.observe(RESULT)
+    for listed in (("b1", "local_bash"), ("m1", "monitor"), ("b2", "local_bash")):
+        await asyncio.sleep(0.3)  # at 0.3, 0.6 and 0.9 s, before the 1 s deadline
+        stream.observe(tasks(("a1", "local_agent"), listed))
+    assert stream.open
+    await asyncio.sleep(0.4)  # 1.3 s after the `result`
+    assert stream.closed  # restarted at 0.9 s, it would close at 1.9 s
+    # the sub-agent's end 0.2 s before a 0.5 s deadline: no new 5 s wait
+    stream = cb.StreamInput("go", idle_close_s=5.0, subagent_idle_close_s=0.5)
+    stream.attach(Writer())
+    stream.observe(echo(stream.prompt_uuid))
+    stream.observe(tasks(("a1", "local_agent")))
+    stream.observe(RESULT)
+    await asyncio.sleep(0.3)
+    stream.observe(tasks())
+    await asyncio.sleep(0.5)
+    assert stream.closed
+
+
+async def test_stdin_closes_when_no_loop_follows_the_subagents_end():
+    """A sub-agent gone after the `result` (stopped, say) with no notification's loop after it:
+    stdin closes `idle_close_s` later, as for a line no loop takes in."""
+    stream = cb.StreamInput("go", idle_close_s=0.05, subagent_idle_close_s=60)
+    stream.attach(Writer())
+    stream.observe(echo(stream.prompt_uuid))
+    stream.observe(tasks(("a1", "local_agent")))
+    stream.observe(RESULT)
+    stream.observe(tasks())
+    assert stream.open
+    await asyncio.sleep(0.2)
+    assert stream.closed
+
+
+def test_a_running_subagent_adds_no_background_note():
+    """The note that `-p` stopped a background job at the turn's end (#36) is not about a
+    sub-agent, which the CLI waits for: the turn's last `result` comes after it (#660)."""
+    sid = "11111111-2222-4333-8444-555555555555"
+    parser = cs.StreamParser(sid, cb.new_turn_id(sid), multi_result=True)
+    text = {
+        "type": "assistant",
+        "message": {"id": "m1", "content": [{"type": "text", "text": "ok"}]},
+    }
+    stream = [
+        {"type": "system", "subtype": "init", "session_id": sid, "model": "m"},
+        tasks(("a1", "local_agent")),
+        text,
+        {**RESULT, "result": "Started it."},
+    ]
+    (done,) = completions([e for obj in stream for e in parser.feed(obj)])
+    assert done.final_text == "Started it."
+    parser.feed(tasks(("a1", "local_agent"), ("b1", "local_bash")))
+    (done,) = completions(parser.feed({**RESULT, "result": "And a command."}))
+    assert done.final_text.endswith(cs.BACKGROUND_NOTE)  # the command's, as before
+
+
 # ------------------------------------------------------------------- the backend, end to end
 
 
@@ -320,7 +446,8 @@ def integration(test):
 
 
 async def started(home, fixture, monkeypatch, *, steer=True, text="go"):
-    monkeypatch.setenv("ZAB_FAKE_CLAUDE_FIXTURE", str(FIXTURES / f"{fixture}.jsonl"))
+    path = fixture if isinstance(fixture, pathlib.Path) else FIXTURES / f"{fixture}.jsonl"
+    monkeypatch.setenv("ZAB_FAKE_CLAUDE_FIXTURE", str(path))
     backend = make_backend(home, steer=steer)
     await backend.start()
     await backend._events.get()
@@ -476,4 +603,214 @@ async def test_a_steer_before_the_prompt_is_written_is_held(home, monkeypatch):
     with pytest.raises(SteerRejected):
         await backend.steer(sid, "another-turn", UserInput(text="x", client_id="c3"))
     await drain(backend, extra=1)
+    await backend.close()
+
+
+# ---------------------------------------------------- a background sub-agent (#660), end to end
+
+STARTED = "I started a sub-agent in the background."
+STATUS = "Status: the sub-agent is still running."
+FINISHED = "The sub-agent finished; it replied: done."
+
+
+def subagent_fixture(path: pathlib.Path, *, steer: bool = False, never_ends: bool = False):
+    """A turn whose background sub-agent outlives its first `result`, in 2.1.283's shapes (the
+    2026-10-25 rows of DECISIONS and the CLI's schemas; no recording yet: `zab dev record-claude
+    --scenario subagent_background` makes one). With `steer`, the fake waits after that `result`
+    for a line, which gets a loop of its own; `never_ends` stops the replay there for a signal.
+    Otherwise the sub-agent ends, and its notification starts the last loop."""
+    agent = {"task_id": "a1", "task_type": "local_agent", "description": "sleep, then done"}
+    call = {
+        "type": "tool_use",
+        "id": "tu1",
+        "name": "Agent",
+        "input": {"description": "sleep, then done", "prompt": "…", "run_in_background": True},
+    }
+    launched = {
+        "type": "tool_result",
+        "tool_use_id": "tu1",
+        "content": "Async agent launched successfully. You will be notified when it completes.",
+    }
+    ended = {"type": "system", "subtype": "task_notification", "status": "completed", **agent}
+
+    def out(t, data, **extra):
+        return {"kind": "stdout", "t": t, "data": {"session_id": "", **data}, **extra}
+
+    def result(t, text, num_turns, uid, **extra):
+        data = {**RESULT, "num_turns": num_turns, "result": text, "user_message_uuids": [uid]}
+        return out(t, {**data, "usage": {"input_tokens": 1, "output_tokens": 1}}, **extra)
+
+    def said(t, mid, text, **extra):
+        message = {"id": mid, "content": [{"type": "text", "text": text}]}
+        return out(
+            t, {"type": "assistant", "message": message, "parent_tool_use_id": None}, **extra
+        )
+
+    records = [
+        {"kind": "meta", "fixture": 1, "version": "2.1.283", "scenario": "subagent (synthetic)"},
+        {"kind": "stdin", "t": 0.0, "uuid": "p", "text": "go"},
+        out(0.5, INIT),
+        out(1.0, {**echo("p"), "parent_tool_use_id": None}),
+        out(2.0, {"type": "assistant", "message": {"id": "m1", "content": [call]}}),
+        out(2.1, tasks(("a1", "local_agent"))),
+        out(2.1, {"type": "system", "subtype": "task_started", "tool_use_id": "tu1", **agent}),
+        out(2.2, {"type": "user", "message": {"content": [launched]}}),
+        out(2.5, {"type": "assistant", "parent_tool_use_id": "tu1", "message": {"content": []}}),
+        said(3.0, "m2", STARTED),
+        result(3.9, STARTED, 2, "p"),
+    ]
+    if steer:
+        records += [
+            {"kind": "stdin", "t": 30.0, "uuid": "s", "text": "status?", "optional": True},
+            out(30.1, INIT, **{"for": "s"}),
+            out(30.2, {**echo("s"), "parent_tool_use_id": None}, **{"for": "s"}),
+            said(31.0, "m3", STATUS, **{"for": "s"}),
+            result(31.1, STATUS, 1, "s", **{"for": "s"}),
+        ]
+    if never_ends:
+        records.append({"kind": "hang"})
+    records += [
+        out(97.0, tasks()),
+        out(97.0, ended),
+        out(97.1, INIT),
+        out(97.2, {"type": "user", "message": {"role": "user", "content": "<task-notification>"}}),
+        said(98.1, "m4", FINISHED),
+        result(98.2, FINISHED, 1, "p"),
+        {"kind": "exit", "t": 98.2, "code": 0},
+    ]
+    path.write_text("".join(json.dumps(r) + "\n" for r in records))
+    return path
+
+
+async def after_first_result(backend, sid):
+    """Once the backend has read the first `result`: stdin kept open after it, or closed there
+    (as it was before #660, whose `StreamInput` has no `_after_result`)."""
+    async with asyncio.timeout(10):
+        while True:
+            stream = backend._sessions[sid].stdin
+            if stream is not None and (stream.closed or getattr(stream, "_after_result", False)):
+                return stream
+            await asyncio.sleep(0.01)
+
+
+@integration
+async def test_a_steer_while_a_background_subagent_runs_gets_its_own_loop(
+    home, monkeypatch, tmp_path
+):
+    """#660, case 1: the parent ended its loop while its sub-agent runs. stdin used to close at
+    that first `result`, so the message was refused and held (⏳) until the sub-agent was done.
+    Now it is written, taken in by a loop of its own, and answered before the sub-agent's end."""
+    fixture = subagent_fixture(tmp_path / "subagent.jsonl", steer=True)
+    backend, sid, tid = await started(home, fixture, monkeypatch)
+    stream = await after_first_result(backend, sid)
+    assert stream.open
+    await backend.steer(sid, tid, UserInput(text="what's the status?", client_id="c2"))
+    events = await asyncio.wait_for(drain(backend, extra=1), 30)
+    (done,) = completions(events)
+    assert done.status is TurnStatus.COMPLETED
+    assert done.final_text == "\n\n".join((STARTED, STATUS, FINISHED))
+    (taken,) = steer_echoes(events)
+    assert taken.item.client_id == "c2"
+    steers = [entry["steer"] for entry in calls(home) if "steer" in entry]
+    assert [s["message"]["content"] for s in steers] == ["what's the status?"]
+    assert backend._sessions[sid].stdin is None
+    await backend.close()
+
+
+async def test_the_quick_subagent_recording_keeps_stdin_open_until_its_last_loop():
+    """`subagent_background_quick`, recorded live with 2.1.283 and #660's `StreamInput`: the CLI
+    lists the `local_agent` before the first `result`; it leaves the list before its
+    `task_notification`; and its notification starts a further loop by itself, stdin open
+    (the assumption of DECISIONS' 2026-11-05 row, now seen). stdin closes at that loop's
+    `result`, though the sub-agent's own background `local_bash` still runs: `-p` stops it."""
+    objects = stdout(load("subagent_background_quick"))
+    kinds = [(o.get("type"), o.get("subtype")) for o in objects]
+    first, last = [i for i, k in enumerate(kinds) if k[0] == "result"]
+    listings = [
+        (i, {task["task_type"] for task in o["tasks"]})
+        for i, o in enumerate(objects)
+        if o.get("subtype") == "background_tasks_changed"
+    ]
+    assert any(i < first and "local_agent" in types for i, types in listings)
+    gone = next(i for i, types in listings if i > first and "local_agent" not in types)
+    notified = next(i for i, k in enumerate(kinds) if k == ("system", "task_notification"))
+    loop = next(i for i, k in enumerate(kinds) if i > first and k == ("system", "init"))
+    assert first < gone < notified < loop < last
+    prompt = load("subagent_background_quick")[1]  # the `stdin` record of the prompt
+    stream, writer = cb.StreamInput(prompt["text"]), Writer()
+    stream.pending = {prompt["uuid"]}  # the recorded uuid, which the CLI echoes
+    stream.attach(writer)
+    seen = []
+    for i, obj in enumerate(objects):
+        stream.observe(obj)
+        if i in (first, loop, last):
+            seen.append(stream.open)
+    assert seen == [True, True, False] and writer.closed
+    assert "local_bash" in [types for i, types in listings if i < last][-1]  # still running
+
+
+@integration
+async def test_the_quick_subagent_recording_end_to_end(home, monkeypatch):
+    """The recording replayed through the backend: both results, in order, and the note that
+    a background job (the sub-agent's own `local_bash`, stopped 5 s after stdin closed) was
+    stopped."""
+    backend, _sid, _tid = await started(home, "subagent_background_quick", monkeypatch)
+    (done,) = completions(await asyncio.wait_for(drain(backend, extra=1), 30))
+    texts = [r["result"] for r in results("subagent_background_quick")]
+    assert done.status is TurnStatus.COMPLETED
+    assert done.final_text == "\n\n".join([*texts, cs.BACKGROUND_NOTE])
+    await backend.close()
+
+
+@integration
+async def test_a_background_subagent_turn_ends_after_its_notification(home, monkeypatch, tmp_path):
+    """No message meanwhile: stdin closes at the `result` of the sub-agent's notification loop,
+    and the turn posts both results, without the note of a stopped background job."""
+    fixture = subagent_fixture(tmp_path / "subagent.jsonl")
+    backend, _sid, _tid = await started(home, fixture, monkeypatch)
+    (done,) = completions(await asyncio.wait_for(drain(backend, extra=1), 30))
+    assert done.status is TurnStatus.COMPLETED
+    assert done.final_text == STARTED + "\n\n" + FINISHED
+    await backend.close()
+
+
+@integration
+async def test_a_stop_while_a_subagent_never_ends_interrupts_the_turn(home, monkeypatch, tmp_path):
+    """A sub-agent that never ends: `!stop` closes stdin and signals the turn's process group,
+    which holds the sub-agent too (DECISIONS, 2026-10-26), and the turn is `INTERRUPTED`, not
+    completed with the first `result`'s text and a note that a background job was stopped."""
+    fixture = subagent_fixture(tmp_path / "subagent.jsonl", never_ends=True)
+    backend, sid, tid = await started(home, fixture, monkeypatch)
+    await after_first_result(backend, sid)
+    turn = backend._sessions[sid].turn
+    await backend.interrupt(sid)
+    with pytest.raises(SteerRejected):
+        await backend.steer(sid, tid, UserInput(text="after the stop", client_id="c3"))
+    (done,) = completions(await asyncio.wait_for(drain(backend, extra=1), 30))
+    assert done.status is TurnStatus.INTERRUPTED
+    assert done.final_text == STARTED
+    assert not turn.group_alive()
+    await backend.close()
+
+
+@integration
+async def test_stdin_closes_after_the_subagent_wait_and_the_cli_goes_on(
+    home, monkeypatch, tmp_path
+):
+    """The sub-agent's wait with the model idle ends (`SUBAGENT_IDLE_CLOSE_S`, shortened here):
+    stdin closes, a later message is held for the next turn, and the CLI still runs the
+    sub-agent's notification loop and its `result` (the fake skips the line it never got)."""
+    monkeypatch.setattr(cb, "SUBAGENT_IDLE_CLOSE_S", 0.3)
+    fixture = subagent_fixture(tmp_path / "subagent.jsonl", steer=True)
+    backend, sid, tid = await started(home, fixture, monkeypatch)
+    stream = await after_first_result(backend, sid)
+    assert stream.open
+    await asyncio.sleep(1.0)  # past the wait: closed by its timer
+    assert stream.closed
+    with pytest.raises(SteerRejected):
+        await backend.steer(sid, tid, UserInput(text="too late", client_id="c2"))
+    (done,) = completions(await asyncio.wait_for(drain(backend, extra=1), 30))
+    assert done.status is TurnStatus.COMPLETED
+    assert done.final_text == STARTED + "\n\n" + FINISHED
+    assert not [entry for entry in calls(home) if "steer" in entry]
     await backend.close()

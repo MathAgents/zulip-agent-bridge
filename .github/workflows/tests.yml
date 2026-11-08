@@ -8,32 +8,81 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04  # what zab runs on: the VMs, the image, the admin server
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       matrix:
         python: ['3.12', '3.13', '3.14']
     env:
       UV_PYTHON: ${{ matrix.python }}
+      # the IMDS rule's nftables tests fail here, not skip, if they can't run (#785)
+      ZAB_REQUIRE_NFT: '1'
     steps:
+      # Each step that reaches the network has its own bound, inside the job's, so that a
+      # stalled mirror fails the step in minutes instead of holding the job for its whole 30
+      # (#900). The two actions retry inside themselves; the commands below retry once, and
+      # their exit status is the last attempt's (124: timed out).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        timeout-minutes: 5
         with:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        timeout-minutes: 5
         with:
           python-version: ${{ matrix.python }}
-      # age and age-keygen, which the backup tests run rather than skip (#419, #473)
-      - run: sudo apt-get -q update && sudo apt-get -q -y install age
-      - run: python -m pip install uv
-      - run: uv sync --locked
+      # age and age-keygen, which the backup tests run rather than skip (#419, #473), and nft.
+      # `apt-get update` stalled here twice for the job's whole 30 minutes (#900), past apt's
+      # own timeouts. So each command has 150 seconds, and a failed or timed-out attempt is
+      # retried once, within the step's 11 minutes (2 x 2 x 160 s). In the 150 runs to Nov 6
+      # (450 steps) a green step took 10 seconds at the median, 57 at the 95th percentile and
+      # up to 198, the slow ones nearly all in downloading age's 1.6 MB from a mirror at 7 to
+      # 35 kB/s: a transfer that keeps moving, so apt's timeouts let it finish, and a limit
+      # much below 150 seconds would cut it off.
+      - name: Install age and nftables
+        timeout-minutes: 11
+        run: |
+          opts=(-q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          for attempt in 1 2; do
+            sudo timeout -k 10 150 apt-get "${opts[@]}" update &&
+              sudo timeout -k 10 150 apt-get "${opts[@]}" -y install age nftables &&
+              exit 0 || status=$?
+            echo "::warning::apt-get, attempt $attempt: exit status $status"
+          done
+          exit "$status"
+      # The nftables tests run nft as root of an unprivileged user and network namespace
+      # (`unshare -rn`). Ubuntu 24.04's AppArmor gives such a namespace no capabilities unless
+      # the program that makes it has a profile allowing `userns`, as Ubuntu's own
+      # `lxc-unshare` has: this one is for `unshare` alone. The rule's `reject` needs
+      # nft_reject_inet, loaded here (#785).
+      - run: |
+          printf '%s\n' 'abi <abi/4.0>,' 'include <tunables/global>' \
+            'profile zab-test-unshare /usr/bin/unshare flags=(unconfined) {' '  userns,' '}' \
+            | sudo tee /etc/apparmor.d/zab-test-unshare
+          sudo apparmor_parser -r /etc/apparmor.d/zab-test-unshare
+          sudo modprobe nft_reject_inet
+      # pip and uv time out and retry on their own; this bound and retry are for a stall
+      # beneath theirs, as apt's was (#900). pip has taken up to 14 seconds, uv sync up to 5.
+      - name: Install uv and the locked environment
+        timeout-minutes: 5
+        run: |
+          for attempt in 1 2; do
+            timeout -k 10 60 python -m pip install uv &&
+              timeout -k 10 60 uv sync --locked &&
+              exit 0 || status=$?
+            echo "::warning::installing uv and the environment, attempt $attempt: exit status $status"
+          done
+          exit "$status"
       # In parallel (pytest-xdist). A pull request leaves out the tests marked `slow`
       # (pyproject.toml); a push to main runs them all. The step's own timeout ends a hung
       # run while the runner can still upload its log, which the job's would lose (#473).
+      # By Nov 5 the run took 9 to 11 minutes on a pull request and 8 to 12 on main (the slow
+      # tests are few, but long), at the old 12-minute limit; so 20 and 25 (#845), inside the
+      # job's 30.
       # The tests marked `timing` run in the job below.
       - if: github.event_name == 'pull_request'
-        timeout-minutes: 12
+        timeout-minutes: 20
         run: uv run pytest -n auto -m "not slow and not timing" -rs --durations=20
       - if: github.event_name != 'pull_request'
-        timeout-minutes: 12
+        timeout-minutes: 25
         run: uv run pytest -n auto -m "not timing" -rs --durations=20
       - run: uv run ruff check
       - run: uv run ruff format --check
@@ -51,14 +100,25 @@ jobs:
     env:
       UV_PYTHON: ${{ matrix.python }}
     steps:
+      # The network steps are bounded and retried as in the job above (#900).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        timeout-minutes: 5
         with:
           persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        timeout-minutes: 5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install uv
-      - run: uv sync --locked
+      - name: Install uv and the locked environment
+        timeout-minutes: 5
+        run: |
+          for attempt in 1 2; do
+            timeout -k 10 60 python -m pip install uv &&
+              timeout -k 10 60 uv sync --locked &&
+              exit 0 || status=$?
+            echo "::warning::installing uv and the environment, attempt $attempt: exit status $status"
+          done
+          exit "$status"
       - if: github.event_name == 'pull_request'
         timeout-minutes: 12
         run: uv run pytest -p no:xdist -m "timing and not slow" -rs --durations=10

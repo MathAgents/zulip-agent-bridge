@@ -9,13 +9,14 @@ files (the roster, the audit log) is scrubbed and fenced (`Scrubber.block`, §2.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from zab.admin import fleet
+from zab.admin import fleet, monthend
 from zab.admin.actions import Fleet
 from zab.admin.approvals import Approvals
 from zab.admin.audit import Head
@@ -24,7 +25,10 @@ from zab.admin.grammar import LATER, SPECS, Command
 if TYPE_CHECKING:
     from zab.admin.bot import AdminBot, AdminServer, Incoming
 
+LOG = logging.getLogger("zab.admin.reads")
 AUDIT_DEFAULT = 10
+#: Kept free in a read's answer for its audit footer (`planning.FOOTER_ROOM`'s size).
+FOOTER_ROOM = 64
 #: `!roster show`'s columns, and their headings.
 COLUMNS = (
     ("slug", "slug"),
@@ -35,6 +39,7 @@ COLUMNS = (
     ("ip", "ip"),
     ("zulip", "zulip"),
     ("repo_status", "repo"),
+    ("keep_until", "kept until"),  # a kept VM's end, UTC: !keep-until's (#570)
     ("excluded", "excluded"),  # !roster remove's mark (#627)
 )
 
@@ -210,6 +215,25 @@ def _cell(row: dict[str, str], key: str) -> str:
     return row.get(key) or "-"
 
 
+async def month_end(
+    server: AdminServer, bot: AdminBot, m: Incoming, c: Command, fl: Fleet | None
+) -> str:
+    """`!month-end show` (§11.5, #570): the workshop's schedule, from `state.db`. One that
+    doesn't fit a message is cut, with the whole of it attached, scrubbed (Codex round 2 on
+    #824), as `!status` is; room is kept for the audit footer."""
+    assert server.store is not None and fl is not None  # a workshop's verb: its bot has a fleet
+    limit = bot.client.limits.get("max_message_length", 10000) - FOOTER_ROOM
+    text, whole = monthend.show(server.store.db, fl, limit)
+    if whole is None:
+        return text
+    try:
+        url = await bot.client.upload("month-end.txt", server.scrub(whole).encode("utf-8"))
+    except Exception as exc:  # its type alone: never the text
+        LOG.warning("!month-end show: the attachment failed (%s)", type(exc).__name__)
+        return text.replace(monthend.ATTACH, "its attachment failed.")
+    return text.replace(monthend.ATTACH, f"[month-end.txt]({url}).")
+
+
 async def _name(server: AdminServer, bot: AdminBot, user_id: int) -> str:
     user = await server.user(bot, user_id)
     name = user.get("full_name") if user else None
@@ -223,4 +247,5 @@ READS: dict[str, Read] = {
     "plan": plan,
     "audit": audit,
     "roster show": roster,
+    "month-end show": month_end,
 }

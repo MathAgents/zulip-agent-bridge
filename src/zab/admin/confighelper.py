@@ -133,10 +133,11 @@ class Request:
         return self.entry["name"]
 
 
-def take(paths: Paths, owner: int) -> bytes | None:
-    """The request's bytes, None when there is none; the request is gone afterwards. Its
-    directory and the file must be `owner`'s (`zab-admin`), the file a regular one with one link,
-    neither reached through a symbolic link."""
+def take(paths: Any, owner: int, name: str = REQUEST) -> bytes | None:
+    """The request `name` in `paths.requests`: its bytes, None when there is none; the request
+    is gone afterwards. Its directory and the file must be `owner`'s (`zab-admin`), the file a
+    regular one with one link, neither reached through a symbolic link. The upgrade helpers take
+    theirs the same way (`zab.admin.upgradehelper`, #569)."""
     try:
         folder = os.open(paths.requests, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except FileNotFoundError:
@@ -146,36 +147,36 @@ def take(paths: Paths, owner: int) -> bytes | None:
     try:
         st = os.fstat(folder)
         if st.st_uid != owner or st.st_mode & 0o022:
-            _remove(REQUEST, folder)  # unread, but gone: the path unit fires once
+            _remove(name, folder)  # unread, but gone: the path unit fires once
             raise Refused(f"{paths.requests} is not {USER}'s alone")
         # Claimed by a rename, never opened in place: its writer withdraws an unanswered request
         # the same way (new_workshop.py), and of two renames of one name exactly one succeeds,
         # so a request is either taken here, whole, or withdrawn, never both (review of #423).
-        claimed = f"{REQUEST}.{os.getpid()}.taken"
+        claimed = f"{name}.{os.getpid()}.taken"
         try:
-            os.rename(REQUEST, claimed, src_dir_fd=folder, dst_dir_fd=folder)
+            os.rename(name, claimed, src_dir_fd=folder, dst_dir_fd=folder)
         except FileNotFoundError:
             return None  # none, or withdrawn
         except OSError as exc:
-            _remove(REQUEST, folder)
-            raise Refused(f"{REQUEST}: {exc.strerror}") from None
+            _remove(name, folder)
+            raise Refused(f"{name}: {exc.strerror}") from None
         try:
             fd = os.open(claimed, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
         except OSError as exc:  # a symbolic link, say: removed all the same
             _remove(claimed, folder)
-            raise Refused(f"{REQUEST}: {exc.strerror}") from None
+            raise Refused(f"{name}: {exc.strerror}") from None
         try:
             st = os.fstat(fd)  # before the unlink: one link, its only name the claimed one
             _remove(claimed, folder)  # first: whatever follows, it doesn't linger
             if not stat.S_ISREG(st.st_mode) or st.st_uid != owner or st.st_nlink != 1:
-                raise Refused(f"{REQUEST} is not a regular file of {USER}'s")
+                raise Refused(f"{name} is not a regular file of {USER}'s")
             data = os.read(fd, MAX_REQUEST + 1)
         finally:
             os.close(fd)
     finally:
         os.close(folder)
     if len(data) > MAX_REQUEST:
-        raise Refused(f"{REQUEST} is over {MAX_REQUEST} bytes")
+        raise Refused(f"{name} is over {MAX_REQUEST} bytes")
     return data
 
 

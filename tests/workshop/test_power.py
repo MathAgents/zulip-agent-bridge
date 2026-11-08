@@ -11,6 +11,8 @@ import aws_common as ac
 import power
 import pytest
 
+from .scope import with_tag
+
 ROSTER = """slug,email,host,ip,region
 alice,alice@example.org,ws-alice,203.0.113.1,us-west-2
 bob,bob@example.org,ws-bob,203.0.113.2,us-west-2
@@ -164,7 +166,7 @@ SPARE_SKIPS = ["skip zab-spare-2: adopted by erin: name that participant"]
 
 def test_all_and_spares_stop_the_fleet_and_never_the_server(setup, capsys):
     argv, ec2, regions, _, _ = setup
-    assert power.main([*argv, "--stop", "--all", "--spares"]) == 0
+    assert with_tag(power.main, [*argv, "--stop", "--all", "--spares"]) == 0
     assert lines(capsys) == [
         "scope: workshop=nt-agents-2026; region us-west-2",
         *ROW_SKIPS,
@@ -182,14 +184,14 @@ def test_all_and_spares_stop_the_fleet_and_never_the_server(setup, capsys):
 def test_all_never_includes_the_spares_and_spares_never_the_rows(setup, capsys):
     """ADMIN §2.2: `all` means every participant row and never the spares."""
     argv, ec2, _, _, _ = setup
-    assert power.main([*argv, "--stop", "--all"]) == 0
+    assert with_tag(power.main, [*argv, "--stop", "--all"]) == 0
     assert lines(capsys)[1:] == [
         *ROW_SKIPS,
         "alice i-alice (running): stop requested",
         "bob i-bob (stopped): unchanged",
         "stop 1, unchanged 1, failed 0",
     ]
-    assert power.main([*argv, "--stop", "--spares"]) == 0
+    assert with_tag(power.main, [*argv, "--stop", "--spares"]) == 0
     assert lines(capsys)[1:] == [
         *SPARE_SKIPS,
         "zab-spare-1 i-spare1 (running): stop requested",
@@ -204,7 +206,7 @@ def test_all_leaves_out_a_row_whose_teardown_cleared_its_ip(setup, capsys):
     passes `--all` even with rows retired, once none of them keeps an ip (`_build_power`)."""
     argv, ec2, _, roster, _ = setup
     roster.write_text(ROSTER.replace("ws-alice,203.0.113.1,", "ws-alice,,"))
-    assert power.main([*argv, "--stop", "--all"]) == 0
+    assert with_tag(power.main, [*argv, "--stop", "--all"]) == 0
     assert lines(capsys)[1:] == [
         "skip alice: no ip in the roster (no VM yet)",
         *ROW_SKIPS,
@@ -219,7 +221,7 @@ def test_no_selection_or_only_with_all_is_a_usage_error(setup, capsys, extra):
     """There is no implicit "everyone" (ADMIN §2.2), and `--only` stands alone."""
     argv, ec2, regions, _, _ = setup
     with pytest.raises(SystemExit) as exc:
-        power.main([*argv, "--stop", *extra])
+        with_tag(power.main, [*argv, "--stop", *extra])
     assert exc.value.code == 2 and regions == [] and ec2.calls == []
     assert "--all" in capsys.readouterr().err
 
@@ -227,7 +229,7 @@ def test_no_selection_or_only_with_all_is_a_usage_error(setup, capsys, extra):
 def test_a_dry_run_prints_the_same_lines_and_changes_nothing(setup, capsys):
     argv, ec2, _, _, _ = setup
     ec2.dry = True
-    assert power.main([*argv, "--stop", "--all", "--spares", "--wait", "--dry-run"]) == 0
+    assert with_tag(power.main, [*argv, "--stop", "--all", "--spares", "--wait", "--dry-run"]) == 0
     assert lines(capsys)[1:] == [
         *ROW_SKIPS,
         *SPARE_SKIPS,
@@ -237,7 +239,9 @@ def test_a_dry_run_prints_the_same_lines_and_changes_nothing(setup, capsys):
         "would stop 2, unchanged 1, failed 0",
         "dry run: nothing changed",
     ]
-    assert power.main([*argv, "--start", "--all", "--wait", "--dry-run"]) == 0  # no SSH wait
+    assert (
+        with_tag(power.main, [*argv, "--start", "--all", "--wait", "--dry-run"]) == 0
+    )  # no SSH wait
     assert lines(capsys)[-3:] == [
         "bob i-bob (stopped): would start",
         "would start 1, unchanged 1, failed 0",
@@ -249,7 +253,9 @@ def test_a_dry_run_prints_the_same_lines_and_changes_nothing(setup, capsys):
 def test_only_is_repeatable_and_takes_spares(setup, capsys):
     argv, ec2, _, _, _ = setup
     ec2.instances[2]["State"]["Name"] = "stopped"
-    rc = power.main([*argv, "--start", "--only", "zab-spare-1", "--only", "bob", "--wait"])
+    rc = with_tag(
+        power.main, [*argv, "--start", "--only", "zab-spare-1", "--only", "bob", "--wait"]
+    )
     assert rc == 0
     assert lines(capsys)[1:] == [
         "zab-spare-1 i-spare1 (stopped): start requested",
@@ -270,7 +276,9 @@ def test_start_wait_needs_ssh_and_covers_a_vm_already_on_its_way(setup, capsys):
     argv, ec2, _, _, _ = setup
     ec2.instances[0]["State"]["Name"] = "pending"
     ec2.no_ssh.add("203.0.113.1")
-    assert power.main([*argv, "--start", "--only", "alice", "--only", "bob", "--wait"]) == 1
+    assert (
+        with_tag(power.main, [*argv, "--start", "--only", "alice", "--only", "bob", "--wait"]) == 1
+    )
     assert lines(capsys)[1:] == [
         "alice i-alice (pending): unchanged",
         "bob i-bob (stopped): start requested",
@@ -298,7 +306,7 @@ def test_start_wait_needs_ssh_and_covers_a_vm_already_on_its_way(setup, capsys):
 def test_a_bad_only_is_refused_before_any_aws_call(setup, capsys, only, message):
     argv, ec2, regions, _, _ = setup
     extra = [arg for name in only for arg in ("--only", name)]
-    assert power.main([*argv, "--stop", *extra]) == 1
+    assert with_tag(power.main, [*argv, "--stop", *extra]) == 1
     assert message in capsys.readouterr().err
     assert regions == [] and ec2.calls == []
 
@@ -306,9 +314,9 @@ def test_a_bad_only_is_refused_before_any_aws_call(setup, capsys, only, message)
 def test_a_spares_json_entry_that_is_not_a_spare_name_is_never_a_spare(setup, capsys):
     argv, ec2, regions, _, spares = setup
     spares.write_text(json.dumps({"nt-agents-2026/us-west-2/frank": {"ip": "203.0.113.1"}}))
-    assert power.main([*argv, "--stop", "--only", "frank"]) == 1
+    assert with_tag(power.main, [*argv, "--stop", "--only", "frank"]) == 1
     assert "frank: no such roster row, nor a spare" in capsys.readouterr().err
-    assert power.main([*argv, "--stop", "--spares"]) == 0
+    assert with_tag(power.main, [*argv, "--stop", "--spares"]) == 0
     assert lines(capsys)[1:] == [
         "skip frank: no such roster row, nor a spare nt-agents-2026/us-west-2/frank in spares.json",
         "nothing to do",
@@ -321,16 +329,16 @@ def test_a_spare_whose_address_a_row_uses_is_refused(setup, capsys):
     `zab-spare-1` would stop alice's VM, so it must be named as alice."""
     argv, ec2, regions, roster, _ = setup
     roster.write_text(ROSTER.replace("ws-alice,203.0.113.1", "ws-alice,203.0.113.11"))
-    assert power.main([*argv, "--stop", "--only", "zab-spare-1"]) == 1
+    assert with_tag(power.main, [*argv, "--stop", "--only", "zab-spare-1"]) == 1
     assert "zab-spare-1: its address is alice's now (handed over): name alice" in (
         capsys.readouterr().err
     )
     assert regions == [] and ec2.calls == []
-    assert power.main([*argv, "--stop", "--spares"]) == 0
+    assert with_tag(power.main, [*argv, "--stop", "--spares"]) == 0
     assert "skip zab-spare-1: its address is alice's now (handed over): name alice" in (
         lines(capsys)
     )
-    assert power.main([*argv, "--stop", "--all"]) == 0
+    assert with_tag(power.main, [*argv, "--stop", "--all"]) == 0
     assert "alice i-spare1 (running): stop requested" in lines(capsys)
     assert ec2.changes() == [("stop", ["i-spare1"])]
 
@@ -341,10 +349,10 @@ def test_two_rows_with_one_ip_are_refused_or_failed(setup, capsys):
     argv, ec2, regions, roster, _ = setup
     shared = ROSTER.replace("ws-alice,203.0.113.1", "ws-alice,203.0.113.11")
     roster.write_text(shared + "erin,erin@example.org,ws-erin,203.0.113.11,us-west-2\n")
-    assert power.main([*argv, "--stop", "--only", "alice"]) == 1
+    assert with_tag(power.main, [*argv, "--stop", "--only", "alice"]) == 1
     assert "alice: its ip 203.0.113.11 is also erin's: fix the roster" in capsys.readouterr().err
     assert regions == [] and ec2.calls == []
-    assert power.main([*argv, "--stop", "--all"]) == 1
+    assert with_tag(power.main, [*argv, "--stop", "--all"]) == 1
     assert lines(capsys)[1:] == [
         "skip alice: its ip 203.0.113.11 is also erin's: fix the roster",
         *ROW_SKIPS,
@@ -358,36 +366,40 @@ def test_two_rows_with_one_ip_are_refused_or_failed(setup, capsys):
         "alice,alice@example.org,ws-alice,203.0.113.11,us-west-2\n"
         "erin,erin@example.org,ws-erin,203.0.113.11,us-west-2\n"
     )
-    assert power.main([*argv, "--stop", "--all"]) == 1  # nothing else to do: still a failure
+    assert (
+        with_tag(power.main, [*argv, "--stop", "--all"]) == 1
+    )  # nothing else to do: still a failure
     assert lines(capsys)[-1] == "nothing to do" and regions == ["us-west-2"]
 
 
-def test_the_region_comes_from_the_roster_or_is_refused(setup, capsys):
+def test_the_region_is_required_and_a_row_without_one_is_an_early_one(setup, capsys):
+    """#808: `--region` is required; the script no longer takes it from the roster, where an
+    empty region column read as us-west-2. A row with a VM and no region recorded is one
+    launched before launch.py recorded it, in us-west-2, as status.py reads it."""
     argv, _, regions, roster, _ = setup
-    argv = argv[:-2]  # no --region
-    assert power.main([*argv, "--stop", "--all"]) == 1
-    err = capsys.readouterr().err
-    assert "give --region: the roster's VMs are in us-east-2, us-west-2" in err
+    with pytest.raises(SystemExit):
+        with_tag(power.main, [*argv[:-2], "--stop", "--all"])
+    assert "the following arguments are required: --region" in capsys.readouterr().err
     assert regions == []
     without_dave = "".join(ROSTER.splitlines(keepends=True)[:4])
     roster.write_text(without_dave.replace("203.0.113.1,us-west-2", "203.0.113.1,"))
-    assert power.main([*argv, "--stop", "--all", "--dry-run"]) == 0
-    assert regions == ["us-west-2"]  # an empty region column is us-west-2, as in status.py
-    roster.write_text("slug,email\ncarol,carol@example.org\n")
-    assert power.main([*argv, "--stop", "--all"]) == 1
-    assert "no row has an ip" in capsys.readouterr().err
+    assert with_tag(power.main, [*argv, "--stop", "--all", "--dry-run"]) == 0
+    assert regions == ["us-west-2"] and power.UNRECORDED_REGION == "us-west-2"
+    assert "alice" in capsys.readouterr().out
 
 
 def test_a_missing_spares_file_is_an_error_only_when_named(setup, capsys):
     argv, ec2, regions, roster, spares = setup
     spares.unlink()
     for selection in (["--spares"], ["--all", "--spares"], ["--only", "zab-spare-1"]):
-        assert power.main([*argv, "--stop", *selection]) == 1
+        assert with_tag(power.main, [*argv, "--stop", *selection]) == 1
         assert f"--spares-file {spares} not found" in capsys.readouterr().err
         assert regions == []
     default = [arg for arg in argv if arg not in ("--spares-file", str(spares))]
     roster.write_text("slug,email\ncarol,carol@example.org\n")
-    assert power.main([*default, "--start", "--all", "--spares"]) == 0  # none launched yet
+    assert (
+        with_tag(power.main, [*default, "--start", "--all", "--spares"]) == 0
+    )  # none launched yet
     assert lines(capsys)[1:] == ["skip carol: no ip in the roster (no VM yet)", "nothing to do"]
     assert regions == [] and ec2.calls == []
 
@@ -399,7 +411,9 @@ def test_rows_alone_need_no_spares_file(setup, capsys, selection):
     (#333)."""
     argv, _, regions, _, spares = setup
     spares.unlink()
-    assert power.main([*argv, "--stop", *selection, "--dry-run"]) == 0, capsys.readouterr().err
+    assert with_tag(power.main, [*argv, "--stop", *selection, "--dry-run"]) == 0, (
+        capsys.readouterr().err
+    )
     assert regions == ["us-west-2"]
     assert any(line.startswith(("alice ", "bob ")) for line in lines(capsys))
 
@@ -418,7 +432,9 @@ def test_the_server_is_never_selected_even_at_a_roster_address(setup, capsys):
     data["nt-agents-2026/us-west-2/zab-spare-1"] = {"name": "zab-spare-1", "ip": "203.0.113.98"}
     spares.write_text(json.dumps(data))
     ec2.instances[1]["Tags"] = ac.tag_list({**vm("bob"), "participant": " "})
-    rc = power.main([*argv, "--start", "--only", "alice", "--only", "zab-spare-1", "--only", "bob"])
+    rc = with_tag(
+        power.main, [*argv, "--start", "--only", "alice", "--only", "zab-spare-1", "--only", "bob"]
+    )
     assert rc == 1
     assert lines(capsys)[1:] == [
         f"alice 203.0.113.99: {NO_VM}",
@@ -436,7 +452,7 @@ def test_the_server_is_never_selected_even_tagged_as_a_participant(setup, capsys
     any case, as in the bot's own rule (`starter.fleet_vm`; the review of #354)."""
     argv, ec2, _, _, _ = setup
     ec2.instances[0]["Tags"] = ac.tag_list(vm("alice", **{key: "nt"}))
-    assert power.main([*argv, "--stop", "--only", "alice"]) == 1
+    assert with_tag(power.main, [*argv, "--stop", "--only", "alice"]) == 1
     assert lines(capsys)[1] == f"alice 203.0.113.1: {NO_VM}"
     assert ec2.changes() == [] and ec2.state("i-alice") == "running"
 
@@ -444,7 +460,7 @@ def test_the_server_is_never_selected_even_tagged_as_a_participant(setup, capsys
 def test_another_workshops_vm_is_never_matched(setup, capsys):
     argv, ec2, _, _, _ = setup
     ec2.instances[0]["Tags"] = ac.tag_list({**vm("alice"), "workshop": "another-event"})
-    assert power.main([*argv, "--stop", "--only", "alice"]) == 1
+    assert with_tag(power.main, [*argv, "--stop", "--only", "alice"]) == 1
     assert lines(capsys)[1] == f"alice 203.0.113.1: {NO_VM}"
     assert ec2.changes() == []
 
@@ -460,7 +476,7 @@ def test_a_two_tag_scope_needs_both_tags(setup, capsys):
     key = f"{ac.scope_label(rig)}/us-west-2/zab-spare-1"
     spares.write_text(json.dumps({key: {"name": "zab-spare-1", "ip": "203.0.113.11"}}))
     tags = ["--tag", "zab-role=test", "--tag", "workshop=zab-test"]
-    assert power.main([*argv, *tags, "--stop", "--all", "--spares"]) == 1
+    assert with_tag(power.main, [*argv, *tags, "--stop", "--all", "--spares"]) == 1
     assert lines(capsys)[3:] == [
         "alice i-alice (running): stop requested",
         "bob 203.0.113.2: FAILED: no live instance with zab-role=test, workshop=zab-test and a "
@@ -478,7 +494,7 @@ def test_a_wrong_ip_never_stops_another_participant(setup, capsys):
     ec2.add("i-frank", "203.0.113.50", "running", vm("frank"))  # not in this roster
     roster.write_text(ROSTER.replace("ws-alice,203.0.113.1", "ws-alice,203.0.113.50"))
     ec2.instances[2]["Tags"] = ac.tag_list(vm("zab-spare-4"))  # not spare-1's VM
-    assert power.main([*argv, "--stop", "--only", "alice", "--only", "zab-spare-1"]) == 1
+    assert with_tag(power.main, [*argv, "--stop", "--only", "alice", "--only", "zab-spare-1"]) == 1
     assert lines(capsys)[1:3] == [
         "alice i-frank (running): FAILED: the VM at 203.0.113.50 is tagged participant=frank, "
         "not alice",
@@ -496,7 +512,7 @@ def test_a_spare_handed_over_by_hand_and_a_tag_from_before_slugs_are_accepted(se
         )
     )
     ec2.instances[1]["Tags"] = ac.tag_list(vm("Bob"))
-    assert power.main([*argv, "--start", "--only", "alice", "--only", "bob"]) == 0
+    assert with_tag(power.main, [*argv, "--start", "--only", "alice", "--only", "bob"]) == 0
     assert lines(capsys)[1:3] == [
         "alice i-spare1 (running): unchanged",  # the spare she was given, tagged zab-spare-1
         "bob i-bob (stopped): start requested",  # tagged Bob, as his `host` records
@@ -511,7 +527,7 @@ def test_a_spare_handed_over_by_hand_and_a_tag_from_before_slugs_are_accepted(se
 def test_a_vm_on_its_way_there_is_left_alone(setup, capsys, start, state):
     argv, ec2, _, _, _ = setup
     ec2.instances[0]["State"]["Name"] = state
-    assert power.main([*argv, "--start" if start else "--stop", "--only", "alice"]) == 0
+    assert with_tag(power.main, [*argv, "--start" if start else "--stop", "--only", "alice"]) == 0
     assert lines(capsys)[1] == f"alice i-alice ({state}): unchanged"
     assert ec2.changes() == []
 
@@ -519,14 +535,14 @@ def test_a_vm_on_its_way_there_is_left_alone(setup, capsys, start, state):
 def test_a_vm_on_its_way_to_the_other_state_fails_and_the_others_still_run(setup, capsys):
     argv, ec2, _, _, _ = setup
     ec2.instances[0]["State"]["Name"] = "stopping"
-    assert power.main([*argv, "--start", "--only", "alice", "--only", "bob"]) == 1
+    assert with_tag(power.main, [*argv, "--start", "--only", "alice", "--only", "bob"]) == 1
     assert lines(capsys)[1:] == [
         "alice i-alice (stopping): FAILED: it is stopping: rerun once it is stopped",
         "bob i-bob (stopped): start requested",
         "start 1, unchanged 0, failed 1",
     ]
     ec2.calls.clear()
-    assert power.main([*argv, "--stop", "--only", "bob"]) == 1  # now pending
+    assert with_tag(power.main, [*argv, "--stop", "--only", "bob"]) == 1  # now pending
     want = "bob i-bob (pending): FAILED: it is pending: rerun once it is running"
     assert lines(capsys)[1] == want
     assert ec2.changes() == []
@@ -535,7 +551,7 @@ def test_a_vm_on_its_way_to_the_other_state_fails_and_the_others_still_run(setup
 def test_an_api_error_is_reported_and_only_the_vms_served_are_waited_for(setup, capsys):
     argv, ec2, _, _, _ = setup
     ec2.broken.add("i-alice")
-    assert power.main([*argv, "--stop", "--all", "--spares", "--wait"]) == 1
+    assert with_tag(power.main, [*argv, "--stop", "--all", "--spares", "--wait"]) == 1
     assert lines(capsys)[4:] == [
         "alice i-alice (running): FAILED: RuntimeError: IncorrectInstanceState: not now",
         "bob i-bob (stopped): unchanged",
@@ -563,7 +579,7 @@ def test_a_failed_wait_is_counted_as_failed_only(setup, capsys, verb, after, why
     ec2.slow.add(iid)
     if after:
         ec2.after[iid] = after
-    assert power.main([*argv, verb, "--only", "alice", "--only", "bob", "--wait"]) == 1
+    assert with_tag(power.main, [*argv, verb, "--only", "alice", "--only", "bob", "--wait"]) == 1
     out = lines(capsys)
     (line,) = [line for line in out if "FAILED" in line]
     assert line.startswith(f"{iid[2:]} {iid}: FAILED waiting: {why}")
@@ -575,7 +591,7 @@ def test_a_failed_wait_is_counted_as_failed_only(setup, capsys, verb, after, why
 def test_a_failed_lookup_while_waiting_fails_each_vm_left(setup, capsys):
     argv, ec2, _, _, _ = setup
     ec2.down, ec2.down_after = True, 1
-    assert power.main([*argv, "--stop", "--all", "--spares", "--wait"]) == 1
+    assert with_tag(power.main, [*argv, "--stop", "--all", "--spares", "--wait"]) == 1
     expired = "RuntimeError: ExpiredToken: the security token included in the request"
     assert lines(capsys)[-4:] == [
         f"alice i-alice: FAILED waiting: the EC2 lookup: {expired}",
@@ -707,7 +723,7 @@ def test_ssh_answers_is_one_tcp_try_at_port_22():
 def test_a_failed_lookup_is_one_line_not_a_traceback(setup, capsys):
     argv, ec2, _, _, _ = setup
     ec2.down = True
-    assert power.main([*argv, "--stop", "--all"]) == 1
+    assert with_tag(power.main, [*argv, "--stop", "--all"]) == 1
     assert lines(capsys)[-1] == (
         "FAILED: the EC2 lookup: RuntimeError: ExpiredToken: the security token included in the "
         "request"
@@ -720,7 +736,7 @@ def test_one_vm_at_two_addresses_is_acted_on_once(setup, capsys):
     nic = {"Association": {"PublicIp": "203.0.113.21"}}
     ec2.instances[0]["NetworkInterfaces"] = [nic]
     roster.write_text(ROSTER + "alice2,alice2@example.org,ws-alice,203.0.113.21,us-west-2\n")
-    assert power.main([*argv, "--stop", "--only", "alice", "--only", "alice2"]) == 0
+    assert with_tag(power.main, [*argv, "--stop", "--only", "alice", "--only", "alice2"]) == 0
     assert lines(capsys)[1:3] == [
         "alice i-alice (running): stop requested",
         "alice2 i-alice: the same VM as alice, above",
@@ -878,9 +894,9 @@ def test_the_admin_bots_lists_run_on_a_fleet_launched_without_spares(tmp_path, m
         step = actions.build(Command(verb, selection=selection), fleet).steps[0]
         assert step.argv[5].endswith("/workshop/aws/power.py")  # python -E -s -B -u <script>
         ec2.dry = True
-        assert power.main(list(step.dry_run[6:])) == 0, capsys.readouterr().err
+        assert with_tag(power.main, list(step.dry_run[6:])) == 0, capsys.readouterr().err
         ec2.dry = False
-        assert power.main(list(step.argv[6:])) == 0, capsys.readouterr().err
+        assert with_tag(power.main, list(step.argv[6:])) == 0, capsys.readouterr().err
     assert ec2.changes() == [("stop", ["i-alice"]), ("start", ["i-bob"])]
     with pytest.raises(actions.ActionError, match="selects nothing"):
         actions.build(Command("stop", selection=Selection(spares=True)), fleet)

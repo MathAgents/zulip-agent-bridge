@@ -63,6 +63,8 @@ SAMPLES = {
     "YOUR_USER_ID": "101",
     "ORGANIZER_USER_ID": "102",
     "HOST": "admin.example.org",
+    "RELEASE_OWNER": "ExampleOrg",  # release_repo, !upgrade-server's (#569)
+    "RELEASE_REPO": "zulip-agent-bridge",
     "SCOPE": "example",
     "WR": "us-west-2",
     "WS": "first-workshop",
@@ -501,7 +503,8 @@ def deploy_options() -> tuple[set[str], set[str]]:
     text = DEPLOY.read_text(encoding="utf-8")
     body = re.search(r"^laptop_main\(\) \{\n(.*?)^\}", text, re.S | re.M)
     assert body, "deploy.sh has no laptop_main"
-    arms = re.findall(r"^\s+((?:--[a-z-]+)(?:\s*\|\s*--[a-z-]+)*)\)(.*)$", body[1], re.M)
+    # digits too: --expect-diff-sha256 (#772)
+    arms = re.findall(r"^\s+((?:--[a-z0-9-]+)(?:\s*\|\s*--[a-z0-9-]+)*)\)(.*)$", body[1], re.M)
     every, valued = set(), set()
     for names, rest in arms:
         flags = {n.strip() for n in names.split("|")}
@@ -510,6 +513,7 @@ def deploy_options() -> tuple[set[str], set[str]]:
             valued |= flags
     assert {"--bootstrap", "--wheel", "--host", "--etc", "--secrets", "--review"} <= every
     assert valued >= {"--host", "--etc", "--secrets", "--review", "--since", "--out"}
+    assert {"--with-wheel", "--expect-diff-sha256"} <= every and "--expect-diff-sha256" in valued
     return every, valued
 
 
@@ -640,14 +644,17 @@ def test_every_deploy_command_uses_options_deploy_accepts():
             assert {"--host", "--etc"} <= used and positional == ["$V"], args
             assert "--bootstrap" not in used or "--secrets" in used, args
             whole |= used & {"--bootstrap", "--wheel"}
+        elif "--review" in used:  # a host only with --base-signers, which checks the base (#587)
+            assert "--etc" in used and positional == [], args
+            assert "--host" not in used or "--base-signers" in used, args
+            assert "--secrets" not in used, args
+            whole.add("--review")
         elif "--host" in used:  # an upgrade (§17's first after a key change)
             assert "--etc" in used and positional == ["$V"], args
-            assert not used & {"--secrets", "--review"}, args
+            assert "--secrets" not in used, args
             whole.add("upgrade")
         else:
-            assert "--review" in used, f"{args}: a block quotes a bootstrap, a wheel or a review"
-            assert "--etc" in used and positional == [], args
-            whole.add("--review")
+            pytest.fail(f"{args}: a block quotes a bootstrap, a wheel, a review or an upgrade")
     assert whole == {"--bootstrap", "--wheel", "--review", "upgrade"}
 
 
@@ -687,13 +694,26 @@ NAMES = frozenset(
 )
 
 
+#: The server's `[global]` bot, for its verbs (§13.4's `!upgrade-server`).
+GLOBAL = Context(902, "Workshop admin", re.compile(config.RELEASE_PATTERNS["final"]), None)
+#: A span's placeholders, as a deployer fills them in: a release, and their review's SHA-256.
+FILLED = (
+    (re.compile(r"\bvX\.Y\.Z\b"), "v1.2.3"),
+    (re.compile(r"sha256=<[^>]*>"), "sha256=" + "0" * 64),
+)
+
+
 def test_every_bot_command_parses():
     spans = [s for s, _ in code_texts() if s.startswith("!") and "\n" not in s]
     assert {"!help", "!version", "!status all", "!roster show", "!plans"} <= set(spans)
     for span in spans:
         if span in NAMES:
             continue
-        assert isinstance(parse(span, CTX), Command), span
+        verb = span[1:].split()[0]
+        context = GLOBAL if verb in SPECS and SPECS[verb].only_global else CTX
+        for placeholder, value in FILLED:
+            span = placeholder.sub(value, span)
+        assert isinstance(parse(span, context), Command), span
 
 
 # ---------------------------------------------------------------------- the ID reader

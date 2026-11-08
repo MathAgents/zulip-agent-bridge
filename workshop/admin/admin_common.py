@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import configparser
+import datetime
 import hashlib
 import ipaddress
 import os
@@ -49,6 +50,7 @@ from aws_common import (  # noqa: E402  - path set up above
 __all__ = [
     "ALLOWLIST_PENDING",
     "DEFAULT_KNOWN_HOSTS",
+    "KEEP_UNTIL_HOUR",
     "REFSERVE_URL",
     "ROSTER_COLUMNS",
     "RunResult",
@@ -61,6 +63,7 @@ __all__ = [
     "git_identity",
     "host_key_fingerprint",
     "host_of",
+    "keep_until_value",
     "keys_dir",
     "load_roster",
     "load_zuliprc",
@@ -458,6 +461,30 @@ def select_rows(rows: list[dict[str, str]], only: list[str] | None) -> list[dict
     if missing:
         raise ValueError(f"not in the roster: {', '.join(missing)}")
     return [r for r in rows if slug_of(r) in wanted]
+
+
+#: A kept VM's end in the roster's `keep_until` (docs/ADMIN.md §11.5): a date, at `KEEP_UNTIL_HOUR`
+#: UTC that day, or a date and a time in UTC; `t` is read as `T`. The admin bot's grammar reads
+#: `!keep-until`'s the same way (`zab.admin.grammar.keep_until_value`, `END_HOUR`): a test keeps
+#: the two equal.
+KEEP_UNTIL_HOUR = 15
+_KEEP_UNTIL_RE = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})(?:[Tt]([0-9]{2}):([0-9]{2}))?", re.ASCII
+)
+
+
+def keep_until_value(text: str) -> str | None:
+    """`text` as the roster's `keep_until` holds it, `2026-11-30` or `2026-11-30T15:00`, when it
+    names a real date and time; None otherwise."""
+    match = _KEEP_UNTIL_RE.fullmatch(text)
+    if match is None:
+        return None
+    year, month, day, hour, minute = match.groups()
+    try:
+        datetime.datetime(int(year), int(month), int(day), int(hour or 0), int(minute or 0))
+    except ValueError:
+        return None
+    return f"{year}-{month}-{day}" + (f"T{hour}:{minute}" if hour else "")
 
 
 def read_keep(path: str) -> list[str]:

@@ -4,6 +4,7 @@ collector's golden snapshot: escaped, with no inline script or style, problems f
 import copy
 import json
 import re
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -218,6 +219,22 @@ def test_the_sentinel_of_each_vm(snapshot):
         assert f"<tr><td>Sentinel</td><td>{shown}</td></tr>" in html, value
     del status["sentinel"]
     assert pages.sentinel(status) == "?"
+
+
+@pytest.mark.parametrize("tail", ["", "x"])
+def test_a_long_sentinel_value_costs_bounded_memory(tail):
+    """#833: the VM's text is matched against the states; their greedy repeat kept a frame of
+    `re` per state, 25 MB on a megabyte. It is possessive now."""
+    value = "down" + ", down" * 170_000 + tail
+    tracemalloc.start()
+    try:
+        base = tracemalloc.get_traced_memory()[0]
+        shown = pages.sentinel({"sentinel": value})
+        peak = tracemalloc.get_traced_memory()[1] - base
+    finally:
+        tracemalloc.stop()
+    assert shown == (value if not tail else "?")
+    assert peak < 16_000_000, f"{peak / 1e6:.0f} MB"
 
 
 def test_the_admin_side_knows_every_state_the_sentinel_has():

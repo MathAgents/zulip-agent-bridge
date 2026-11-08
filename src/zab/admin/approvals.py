@@ -8,7 +8,8 @@
   `!teardown`, `!deactivate-bots` (stage 3) and `!retire` (#559), and identity rebinds, one
   row per plan, take `destructive_approvals` distinct approvers and a phrase: `teardown
   <count>`, with `unsynced` after it when the command tears down rows that no `!final-sync`
-  pushed (§3, action 7); `retire <count>`, and `unsynced` likewise. A row a `!retire` ended
+  pushed (§3, action 7); `retire <count>`, and `unsynced` likewise; `month-end <count>` for a
+  `!month-end schedule` (§11.5, #570). A row a `!retire` ended
   never counts in the fleet (#559). The rebind verb comes later, as do the deploy and server
   classes of the `[global]` bot with stages 6 and 7: the rules are here, and tested, before
   any verb reaches them. `Approvals.post` is the one way to post a plan, and it classes the
@@ -52,7 +53,9 @@ CHANGE, ABOVE_HALF, DESTRUCTIVE, REBIND = "change", "above-half", "destructive",
 DEPLOY, SERVER = "deploy", "server"  # the [global] bot's !upgrade-server and !new-workshop
 #: Above half the fleet, these verbs' plans take the phrase `<verb> <count>` (§2.5, §1.5).
 PHRASE_ABOVE_HALF = frozenset({"stop", "rollout", "idle-stop", "uninstall"})
-DESTRUCTIVE_VERBS = frozenset({"teardown", "deactivate-bots", "retire"})
+DESTRUCTIVE_VERBS = frozenset({"teardown", "deactivate-bots", "retire", "month-end schedule"})
+#: A destructive verb's first word in the phrase, where it isn't the verb (§11.5, #570).
+PHRASE_WORD = {"month-end schedule": "month-end"}
 #: The answer to the approval that completes a plan of several approvers, by the rule that
 #: completed it (#558).
 BY_ADMIN, BY_COUNT = "a global admin's approval", "{} distinct approvers"
@@ -95,7 +98,7 @@ def requirement(
     if verb in DESTRUCTIVE_VERBS:  # `unsynced` is said again, where work may be lost
         lose = verb in ("teardown", "retire") and "unsynced" in action.args
         said = ("unsynced",) if lose else ()
-        return Requirement(DESTRUCTIVE, many, (verb, count, *said))
+        return Requirement(DESTRUCTIVE, many, (PHRASE_WORD.get(verb, verb), count, *said))
     # the fleet: rows with a VM, never one a !retire ended (#559)
     vms = sum(1 for row in fleet.rows if row.ip and fleet.present(row.slug))
     if verb in PHRASE_ABOVE_HALF and 2 * len(action.targets) > vms:

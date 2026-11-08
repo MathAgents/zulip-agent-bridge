@@ -2,7 +2,10 @@
 # hashes, into venv-requirements.txt, which build.sh installs with --require-hashes:
 #   cd workshop/ami/files && uv pip compile -q --python-version 3.12 \
 #     --python-platform x86_64-manylinux_2_39 --exclude-newer 2026-10-17T00:00:00Z \
+#     --exclude-newer-package certifi=2026-10-24T00:00:00Z \
 #     --generate-hashes venv-requirements.in -o venv-requirements.txt
+# certifi has a later cutoff than the rest, for 2026.10.23, whose cacert.pem has no emSign ECC
+# Root CA - G3 (#671). Move certifi with uv.lock's (tests/workshop/test_trust_stores.py).
 # PyX, the one sdist, builds with setuptools from venv-build-constraints.txt (hashes, same pin).
 # The image's first five, unpinned until issue #474:
 numpy

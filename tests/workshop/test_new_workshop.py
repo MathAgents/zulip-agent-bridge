@@ -460,13 +460,17 @@ def test_another_plans_request_is_never_left_withdrawn(server, monkeypatch, caps
     def swapped(seconds):
         (requests / "request.json").write_text(json.dumps(other))
 
-    def no_link(src, dst):
-        raise OSError(17, "File exists")
+    real = nw.rename_noreplace
+
+    def no_put_back(src, dst):  # the put-back alone: one link always (#898's Codex round 1)
+        if str(src).endswith(".withdrawn"):
+            raise FileExistsError(17, "File exists")
+        real(src, dst)
 
     monkeypatch.setattr(nw, "WAIT", 0.01)
     monkeypatch.setattr(nw.time, "sleep", swapped)
     if link_fails:
-        monkeypatch.setattr(nw.os, "link", no_link)
+        monkeypatch.setattr(nw, "rename_noreplace", no_put_back)
     assert nw.main(argv(server)) == 1
     out = capsys.readouterr().out
     assert not [p for p in requests.iterdir() if p.name.endswith(".withdrawn")]

@@ -1,5 +1,551 @@
 # Changelog
 
+## 0.2.19 — 2026-11-07
+
+What is new since 0.2.18: the admin server's in-band upgrade, `!upgrade-server`, for the releases
+after this one (#569), and `upgrade.py`, which reviews, signs, verifies and pushes a release on the
+deployer's machine (#772); the automated month-end of the kept VMs (#570, #883); `!unmentioned
+last` (#878); answers at once after a Zulip outage (#964); 10 turns of each agent at once on the
+workshop VMs (#919), and their `apt-get update` repaired by the rollout and the trust fix (#947);
+releases from the public repository (#958); Codex sessions reopened without loading their threads
+(#632); sub-agents across a turn's end and `!stop` (#660, #847, #858), and the agents' notes while
+one works (#668); a Codex identity record that vouches only within its app-server's run (#830);
+trust stores without emSign ECC Root CA - G3, with a fix for VMs launched from an older image, and
+Claude Code on the system store (#671, #816, #882); the edit bounds kept across restarts (#757,
+#806); redaction and regular-expression memory (#666, #821, #833, #836); each `!retire` step on the
+audit log as it ends (#837, #855); the export check's hard links and ambiguous archive headers
+(#819, #888); two options of `deploy.sh` and a base signed by a retired key (#772, #587); the
+workshop scripts' required scope and region (#808); images built from pinned releases of
+Macaulay2's packages and PARI's data (#945); and documentation. Each change cites its issue and
+then its pull request.
+
+**Upgrade notes.**
+
+- **This release is the last one deployed by hand** with `deploy.sh` from a deployer's machine,
+  as before (#569). Its deploy installs and starts `!upgrade-server`'s two root helpers' path
+  units (`zab-admin-upgrade-plan.path`, `zab-admin-upgrade.path`) and their state directory
+  (`/var/lib/zab-admin-upgrade`); `admin.toml` needs no new key for the deploy. Then, once, over
+  SSH (BOOTSTRAP §13.4): make the server's deploy key, add its public half to the release
+  repository as a read-only deploy key, and set `release_repo` in `admin.toml`, on the server and
+  in your copy, only after this release is deployed, since 0.2.18's loader refuses the key.
+  Until then `!upgrade-server` is refused. From the next release on, a deployer reviews with
+  the running release's `deploy.sh --review`, and sends
+  `!upgrade-server vX.Y.Z sha256=<the review's SHA-256>` to the global admin bot once the
+  release's signed tag is in `release_repo`. For the public repository's owner, `release_repo`
+  is that repository, `MathAgents/zulip-agent-bridge`, whose published tags the server fetches
+  (#958). The running release's tag there must name the commit the server's `deploys.jsonl`
+  records, so a server running a release deployed from another repository's commit first takes
+  one hand deploy of a published release: BOOTSTRAP §13.4, *Onto the public repository's
+  commits*, with a check that ties the published commit to the one reviewed. For anyone else,
+  `release_repo` is a private repository of their own holding the release tags (§13.4 makes
+  it). BOOTSTRAP §13.4 also gives the commands for what still needs `deploy.sh`.
+- **Roll the release out with `restart-codex`:** `!rollout vX.Y.Z all restart-codex`, or
+  `workshop/admin/push_config.py … --restart-codex` (#830). A VM where a Codex turn was running
+  keeps its daemon, and its row's note says `codex daemon NOT restarted: N Codex turn(s) running;
+  rerun with --restart-codex when idle`: send the same line with that VM's slug in place of `all`,
+  a minute or more after its Codex turns have ended. That rerun may report the same note, since
+  the bridge's store counts such a turn as running until its topic reopens: the daemon's restart
+  is then no longer needed. Two other notes, `codex daemon NOT restarted: zab status unreadable;
+  rerun later` and `codex daemon NOT restarted: the bridge didn't stop (…)`, and `codex daemon
+  restart failed: …`, call for the same rerun, a few minutes later. Without the restart, each
+  Codex topic the old bridge had loaded holds its next message under "This session needs
+  recovery; use !status to retry."
+  until the app-server unloads its thread, a minute after the old bridge stopped, or after the
+  topic's turn ended if one was running then; a `!status` there, or the bridge's next restart,
+  then reopens it. Claude topics are not affected. The rollout also writes
+  `max_concurrent_turns = 10` (#919), and repairs `apt-get update` on VMs from the Oct 19
+  image (#947): their rows note `apt: removed …; held …`. A row's `apt: kept …` names a VM whose
+  Macaulay2 source the rollout left alone, since it names other sources too, isn't a regular
+  file, or is too large to be a sources file: look at that file and fix it by hand (`workshop/admin/README.md` §2.2).
+- **The admin server.** Before deploying, check that workshops sharing a `refserve_url` share
+  their `github_org`: the loader now refuses a file where they don't (#771), and the deploy's
+  self-check stops there. The first deploy of this release replaces the server's uv with 0.13.7
+  (#816). The deployer's machine needs `python3` 3.12 or newer (#781).
+- **Trust stores** (#671, #816, #882). The admin server's venv gets certifi 2026.10.23 at its
+  deploy. A rollout installs the bridge with the newest certifi, unhashed, through the VM's own
+  uv. A VM launched from an image built before this release keeps the certifi of its other
+  environments, which holds the root, and, on an image built before 2026-10-20, a uv older than
+  0.13.4, which holds it too: `workshop/admin/trust_fix.py` (its README's §10) fixes them, and
+  sets `CLAUDE_CODE_CERT_STORE=system` in Claude Code's managed settings (#882), a dry run
+  first, then `--apply`, once per workshop. Run it after the admin server's deploy and before
+  the rollout, so that the rollout's install goes through the fixed uv. On a VM of the Oct 19
+  image whose `ca-certificates` is older, it first repairs that image's expired apt source, which
+  would fail its `apt-get update` (#947). Each machine's system
+  store needs `ca-certificates` 20260816ubuntu0.24.04.1 or newer, which unattended upgrades
+  install. A waker installed by `workshop/admin/push_waker.py` gets certifi 2026.10.23 or newer
+  at its next `--apply`. An image built with this release's `build.sh` holds none of these.
+- **The audit log** (#837, #855): each step of a `!retire`'s row, and of a month-end run's, is a
+  `retire_step` record, written as the step ends. A tool of your own that reads `audit.jsonl`
+  sees two new events: `retire_step`, and `month_end` for the schedule's own events (#570; ADMIN
+  §2.8).
+- **Codex sessions reopen lazily** (#632): after the upgrade, and after each boot or wake, a Codex
+  topic's thread loads at that topic's next message. Nothing to do.
+- **Hand runs of the workshop scripts** need `--tag` (the workshop's scope) and, where they take
+  one, `--region`; `build_ami.py` needs `--name` to build (#808). The admin bot passes them
+  already.
+
+**Changes since 0.2.18**
+
+**The bridge, on the participants' VMs and your own machines**
+
+- **After a Zulip outage longer than ten minutes, the answers come at once** (#964, PR #965;
+  SPEC §7.8.2, §4.4). Zulip drops an event queue nobody polled for about ten minutes. The
+  bridge's recovery used to confirm every session's card and reconcile every recent topic before
+  anything else: a request or two per session against the bot's 150 a minute. Only then did it
+  retry the answers Zulip had refused and read the messages sent meanwhile. Now it confirms only
+  the cards of sessions with work in flight, then catches up the gap, retries the answers, and
+  leaves the rest to the background housekeeping, as start-up has done since #443. On the test
+  VM, end-to-end scenario 4's answer after the block had grown with the sessions, from 3 s on
+  Oct 19 to 547 s on Nov 6, and missed its 600 s bound twice at v0.2.19's candidate; with the
+  fix it came 6.3 s after the block. A follow-up for the Codex backend's shutdown in spawn mode
+  is #967.
+- **`!unmentioned last`: a message without a mention can stay with the last agent named** (#878,
+  PRs #879, #881, #897; SPEC §4.5, "The rule `last`"; §4.6). A participant sends `!unmentioned
+  last` to either bot in a direct message, and a message that names no bot then goes to the
+  agent or agents that the topic's last prompt with a mention named, completed or typed, and to
+  both where none has been named yet, or where none of those can take it; a command with a
+  mention, such as `@codex !usage`, changes nothing, except `!new`, with or without a prompt,
+  which records the agents it names as a prompt does, and a `!detach`, which takes the agents
+  it detaches out of the record. `!unmentioned all`, the default, is #713's rule. One setting
+  for all of the VM's agents, in every channel, kept across a restart, a stop and a wake;
+  `bridge.unmentioned` in `config.toml` gives the default. An unmentioned `!stop` under `last`
+  stops the named agents' turns only. The topic's record of who was named follows a moved
+  session card, and a `!fork` starts its topic's record with the agents that forked, so a
+  follow-up there stays with them. `!unmentioned` alone says which rule is in force, a DM
+  `!status` shows it, and a topic's `!session` says where a message without a mention goes
+  there. Multi-party channels and `bridge.multi_party=false` keep their rules; with the latter,
+  `!unmentioned` says that the setting has no effect. The waker is unchanged: under `last` both
+  bots still react ⏰ to an unmentioned message that wakes a VM, and the agent the record leaves
+  out then stays silent. The old per-bot record (`topic_addressing:…`, unread since #713) is not
+  used: the new one is the VM's, `topic_addressees:<stream>:<topic>`, written under both rules.
+- **One answer to `!help`, `!vm` or `!tools` without a mention next to a `!detach`** (#899, PR
+  #909; SPEC §4.6). They came from both agents, or from neither, when a `!detach` of one agent
+  came just after them, or just before them, and one bot read both messages before the other, as
+  at a wake. Now the first by name of the agents that the channel and their allowlists let them
+  reach answers (under `!unmentioned last`, of those the topic's last mention named), whatever
+  the agents' sessions in the topic, a `!detach` there or their sign-ins: an agent that waits
+  for a mention after `!detach` still answers them. A topic's `!unmentioned` too. Who gets a
+  message without a mention is unchanged. `!stop` with no turn running, and "No session here",
+  still depend on the topic's sessions, and can still come from both agents, or from neither,
+  next to a `!detach`.
+- **Workshop VMs run 10 turns of each agent at once, not 4** (#919, PR #921; SPEC §7.10,
+  ORGANIZERS §4.1): an agent's eleventh turn waits with ⏳, where its fifth did. It takes effect
+  at the next `!rollout`, which writes `max_concurrent_turns = 10`. The schema's default (3), which
+  `zab init`'s default profile leaves in force, and `zab init --profile workshop`'s 2 are
+  unchanged.
+- **The agents note progress while a sub-agent works** (#668, PR #922; the agents' instructions,
+  *Sub-agents*). While a background sub-agent runs, the instructions tell each agent to keep
+  reading the sub-agent's log every 30 to 50 seconds until it is done, and to write a one-line
+  note right after each check's result, before the next check, never two checks in a row
+  without one: how long it has run and what its log shows. The rule is the instructions', not
+  the bridge's (0.2.11's *Known limits*). Claude Code's message on starting a background sub-agent
+  says to report nothing of its results before it finishes, and with v0.2.11's text Claude
+  sometimes chained log checks with no note between them, up to 130 seconds without one
+  (0.2.11's *Known limits*). The instructions now say that this warning is about the
+  sub-agent's findings, not its progress: the notes are still due, a status question still
+  gets an answer from the log, and only a guess at what it will find is left out. Codex gets
+  the same text. The VMs get it at their next `!rollout`.
+  - *Measured for Claude on the test VM*, in one run; Codex wasn't measured with this text
+    (end-to-end scenario 17's new part: three topics at once, each
+    with Claude waiting on a background sub-agent doing thinking work, from the session
+    transcripts; DECISIONS, verification log, 2026-11-07): with this text, the longest gaps
+    between notes were 42.8, 43.2 and 42.1 seconds, with no two checks in a row without a note.
+    Before the sentence "Write the note right after each check's result, before the next
+    check" was added, they were 43, 88 and 127 seconds, two of the three topics running two or
+    three checks back to back. The participant sees the notes in the status message, whose
+    notes are refreshed about every 5 minutes (#754).
+  - The new part requires every gap to be at most 65 seconds, a target rather than a bound in
+    a release candidate's run (`run.py --require rc`).
+- **Each agent's tool processes get `ZAB_SESSION`** (#655, PR #927): the zab session's id, next
+  to `ZAB_BOT` (SPEC §5.6), for the background jobs #655 will record; nothing reads it yet, and
+  like `ZAB_BOT` it grants nothing. A contract change, backward compatible: `SessionSpec.session`,
+  empty by default, which unsets an inherited one.
+
+- **A Codex identity record vouches only within its app-server's run** (#830, PR #854; SPEC §5.5,
+  §7.3, §8.6, §8.7). The record of the git identity the bridge applied to a Codex thread now
+  names the app-server's run: the boot, the process and its start time. After a boot, or a
+  restart of the daemon alone, a thread that a terminal's client loaded before the bridge reopened
+  it is refused rather than trusted on the earlier run's record, as is `!attach` of a detached
+  session whose thread another client loaded since. A session in error whose turn is still running
+  answers a message with "⚠️ **Bridge** (not Codex): This session needs recovery; use !status to
+  retry.", not with ⏳ alone.
+- **Codex sessions reopen without loading their threads** (#632, PR #818; SPEC §5.5, §7.8.1,
+  §8.6). At its start the bridge resumes only the threads the app-server holds loaded; the others
+  open from a snapshot of their turns and load at their first turn, `!fork`, `!btw`, `!model` or
+  `!effort`. On a test VM after a boot, the `lean-lsp-mcp` processes went from 491 (25.9 GB) to
+  none, and memory used from 30.5 GB to under 1 GB.
+- **Sub-agents across a turn's end** (#660).
+  - **Claude** (PR #814; SPEC §9.6, §9.7): while a background sub-agent runs, the bridge keeps
+    Claude's input open after a result, so a message sent then gets ↪️ and a loop of its own,
+    not ⏳ until the sub-agent ends; it closes at the latest 10 minutes after the last result. A
+    turn `!stop`ped after one of its results ends ⏹, interrupted, not completed.
+  - **Codex, a turn that ends with a sub-agent running** (PR #822; SPEC §8.5) says so: "⚠️
+    **Bridge** (not Codex): A sub-agent was still running when this turn ended. Its answer won't
+    be posted here: ask Codex about it in a new message, or send !stop to stop it."
+  - **`!stop` stops a Codex thread's sub-agents** (PR #825; SPEC §8.4), at any depth up to 8,
+    then the thread's own turn. A sub-agent attached as a session of its own in another topic is
+    left to that topic's `!stop`.
+  - **`!stop` with no turn running** (#847, PR #851; SPEC §4.6, §7.7, §9.6) no longer answers
+    "Unknown command": Codex stops the sub-agents that ended turns left running ("No turn is
+    running; stopped N sub-agent(s) that an earlier turn left running."), and both agents say
+    when nothing runs. A contract change: `Capabilities.stop_subagents`, `Backend.stop_subagents`.
+  - **Codex's sub-agents are found among the daemon's loaded threads** (#858, PR #861; SPEC
+    §7.7), since `thread/list` lists none on Codex 0.157.1: so a `!stop` finds one left running
+    across a bridge restart. The bridge logs each look at the loaded threads as
+    `subagent_loaded`.
+- **Each message's edit count and last edit are kept across restarts** (#757, PR #795; SPEC §4.9,
+  §6.2), in `zab.db`, so a bridge that restarts again and again can't refresh a status message
+  every few seconds.
+- **A repeated summary waits for its gap, and `zab.service` restarts back off** (#806, PR #813;
+  SPEC §4.9, §6.2, §13.3). A summary goes at once only the first time for its message; a repeat,
+  as at each start of a bridge that crashes delivering it, waits the 60 s gap. The unit restarts
+  after 5 s, then longer, up to 120 s, with no start limit; meanwhile `!vm` says "bridge
+  starting", and `!restart` starts it at once. A rollout's `zab service install` installs the
+  unit; on your own machine, run `zab service install` again.
+- **Redaction** (#666, PR #801; #821, PR #828; SPEC §11.6). A key's match runs to the end of its
+  token, so two keys glued together are one placeholder; a JWT glued behind a key takes every
+  dot-joined segment after it; Claude's error, sign-in and title texts are stripped before they
+  are redacted.
+- **Bounded memory in regular expressions** (#833, PR #834; #836, PR #857): the patterns for math,
+  code spans, the console's sentinel, regions and paths are possessive, with the same matches,
+  so a 1 MB input no longer takes up to 147 MB. A test reads every pattern compiled at import
+  under `src/zab`, `workshop/admin` and `workshop/adminserver`.
+
+**The admin server and its bots**
+
+- **`!upgrade-server vX.Y.Z sha256=<SHA-256>`, the admin server's in-band upgrade** (#569, PRs
+  #889, #893, #894, #898, #901, #902; ADMIN §1.6, §2.2; BOOTSTRAP §13.4): requested and approved
+  by one deployer on the global admin bot, as a server plan holding every workshop's lock, from
+  the release after this one. A compromised bot can have only a correctly signed release of the
+  `release` pattern installed, newer than the running one: the in-band upgrade only goes
+  forward, and a rollback is `deploy.sh --downgrade` from a deployer's machine (`downgrade` is
+  refused, with that pointer). The `sha256=` check makes a deployer's request install only the
+  diff they reviewed, but it is no secret (a refused plan shows it), so it binds an honest
+  request, not a compromised bot:
+  - **the plan helper** (`zab.admin.upgradehelper`, root, sandboxed: it reads only the deploy
+    key of `secrets/`, and no IMDS) fetches exactly the release's tag and the running one from
+    `release_repo` with the server's own read-only deploy key and GitHub's pinned host keys,
+    makes `deploy.sh`'s checks again, checks the running tag against `deploys.jsonl`, and has the
+    running release's `deploy.sh --review` the release since it. The plan is refused unless the
+    review's SHA-256 is the deployer's `sha256=`. It shows both tags (object, commit, signer and
+    key fingerprint), the SHA-256, the privileged diff, whether `render_policy.py` changed, and
+    the release's CHANGELOG section. A tag the server has taken is never moved to another commit.
+  - **the apply helper** holds the request to the plan helper's record, checks again on the
+    server's own copies of the tags, and runs the release's own `deploy.sh` with a bundle of its
+    tag: `--build-wheel`, which builds the release's fleet wheel as `zab-build` and places it for
+    `!rollout`, then `--server … --in-band P-n`, which installs it as an SSH deploy does and
+    records the plan in `deploys.jsonl`. The result shows the fleet wheel's SHA-256. The bots
+    post the result and then restart themselves into the new release.
+  - **`admin.toml`'s `release_repo`** (`git@github.com:OWNER/REPO.git`), optional: unset, the
+    in-band upgrade is off.
+  - **End-to-end scenario A10b** runs it on the admin rig, with A10's refusals in-band.
+- **`new_workshop.py` puts its request in place without ever giving it two names**
+  (`renameat2(RENAME_NOREPLACE)`, #569, PR #898), as `upgrade_server.py` does.
+- **The automated month-end** (#570: PRs #817, #841, #829, #835, #839; ADMIN §11.5, ORGANIZERS
+  §5.7). A kept VM ends at its date by itself, once a schedule is approved.
+  - **`!keep-until DATE|none SEL`** (PR #817) sets a row's end in the roster's new `keep_until`
+    column: `2026-11-30`, which ends at 15:00 UTC, `2026-11-30T18:00` in UTC, or `none`. `!roster
+    import` takes the column, and `!roster show` lists it as `kept until`. Its plan says how its
+    rows end, from the schedule as the plan finds it (#868, PR #871; ORGANIZERS §5.2, §5.7): with
+    no row scheduled, that nothing ends on its own; the rows the schedule holds at that end
+    already, with their warnings; a row in the month-end run applying, as ending now; a row in a
+    run cut short, which a later look resumes unless this plan applies first and drops it out
+    (`!month-end cancel` stops either); and the rows the schedule won't end then, which only a new
+    `!month-end schedule` or a `!retire` ends.
+  - **`!month-end schedule`** (PR #841), destructive, with the phrase `month-end <n>`, covers
+    every row in service with a `keep_until`; `!month-end show` lists the schedule, and
+    `!month-end cancel SEL` takes rows out at once, from an approver of the workshop.
+  - **The warnings** (PR #829): the workshop's bot sends each participant a DM 7 days before the
+    end, or at once when the schedule is approved later, and a reminder a day before, unless the
+    notice went within 36 hours of the end; each a new message, never sent twice. A row with no
+    Zulip ID, or whose DM Zulip refused, still ends: the schedule's topic names it, for the
+    organizers to tell. A row whose `keep_until`, Zulip ID or bots changed since the approval
+    drops out.
+  - **The runs** (PR #835): at its end, each row runs `!retire`'s steps, as a plan of the bot's
+    own in the schedule's topic, each teardown at least 5 minutes after its row's protection
+    came off. A run that a restart interrupts resumes at the bot's next look, each row at its
+    first unfinished step. A notice cut short by the bot's downtime names an end a day after
+    the notice, and the row runs then (#840, PR #852).
+  - **End-to-end scenario A17** (PRs #839, #863) runs it on the admin rig.
+- **A month-end warning that Zulip refused stops its row** (#883, PRs #908, #912; ADMIN §11.5,
+  ORGANIZERS §5.7). A notice or a reminder refused at every try (3, a minute apart) no longer
+  counts as given: its row stops before any step, its VM in service, and the schedule's topic
+  says so, with `!retire <row>`, or `!keep-until`, then `!month-end schedule`, which tries it
+  again (a reminder only until the end: still refused then, it keeps its row stopped). A row
+  with no Zulip ID still ends at its date without a warning: the schedule's plan now names
+  every such row in its first note, which says first that approving it ends them.
+- **Each step of a `!retire` is on the audit log as it ends** (#837, PR #849; #855, PR #860;
+  ADMIN §2.4, §2.8). A `retire_step` record per row and step, from which the ledger marks the row
+  uninstalled, synced or retired in place, so that a hard stop loses none of it; a month-end run
+  writes them too. After a restart, a cut `!retire` says what it did to each row and what to
+  send.
+- **A stopped `!retire` row's advice keeps the plan's words** (#820, PR #827; ORGANIZERS §5.3,
+  §5.6): `export` until its archive is in, `unsynced` when the plan had it, and the way back into
+  service first when its participant must change what the export refused.
+- **Roster plans apply one at a time on the server** (#646, PR #793; ADMIN §2.4), so that two
+  workshops approving at once can't both take one free slug: the second waits, then goes stale.
+- **`!status` keeps room for the lines under its table** (#767, PR #787): an answer at Zulip's
+  limit keeps its footer.
+- **`admin.toml`: one organization per files host** (#771, PR #789; ADMIN §2.1). Workshops that
+  share a `refserve_url` must share their `github_org`, compared ignoring case.
+- **The server's uv is 0.13.7** (#816, PR #853; DECISIONS *Pins*). uv 0.11.24's built-in roots
+  hold emSign ECC Root CA - G3. The server's uv installs only hash-checked wheels, so what it
+  installed was never at stake; VERIFY V9 holds with 0.13.7. `deploy.sh` refuses a binary whose
+  version isn't the pin, and `--wheel` notes a laptop uv other than 0.13.7.
+
+- **The export check matches hard links by their exact name** (#819, PR #887; ORGANIZERS §5.6).
+  A tree with names that differ only in case (`a.md`, `A.md`), one of them with a second name (a
+  hard link), was refused when the export listed the second name first and `a.md` before
+  `A.md`: `a.md` was then the hard link, and `A.md` lay at its name regardless of case. The
+  export lists the VM's directory order, so a retry was refused again (#802). Every order now
+  passes, re-packed as before. A member at or under an earlier symbolic link's name in another
+  case is still refused.
+- **The export check refuses a name or link target that tar readers read two ways** (#888, PR
+  #892). A crafted archive can give a member's name or a link's target twice, as a GNU long name
+  or long link record and a PAX attribute, or in two headers of one kind, which GNU tar and
+  Python's `tarfile` choose between differently; or a header's `prefix` field, which `tarfile`
+  joins to the name and GNU tar, without POSIX's magic, doesn't. Such a member is now refused,
+  with its name. GNU tar, `tarfile` and libarchive (bsdtar) write none, except GNU tar's
+  incremental archives (`--listed-incremental`), whose names `tarfile` misreads: those are
+  refused too. `export.sh` doesn't make them. If a Python update ever hides the headers from the
+  check, every archive is refused, and `deploy.sh`'s self-check of the archive check fails.
+
+**Trust stores** (#671, PR #815; #816, PRs #853, #856; SPEC §12.1)
+
+- **certifi 2026.10.23 wherever zab pins it:** `uv.lock`, the image's `venv-requirements.txt` and
+  `certbot-requirements.txt`, lean-lsp-mcp's environment, and a floor in
+  `workshop/waker/requirements.txt`. An offline test requires every requirements, constraints,
+  lock, `.in` and `pyproject.toml` file that names certifi to pin that release, or bound it from
+  below there.
+- **The image's trust stores are checked** (`workshop/ami/README.md`, *Smoke test*):
+  `files/bin/trust_stores.py` fails on a bundle that holds a distrusted root. `build.sh` runs it
+  on `/etc/ssl/certs` after the system packages, and its smoke test on that and on the certifi of
+  every Python environment it creates, on a uv-managed CPython's, if one is installed, and, with
+  Sage, on the bundles that conda's certifi and pip's vendored certifi return in each of
+  miniforge's environments. With Sage, miniforge's environments get `ca-certificates` and
+  certifi 2026.10.23 or newer, and pip 26.2.2 or newer. The smoke test fails a uv older than
+  0.13.4.
+- **`workshop/admin/trust_fix.py`, new** (PR #856; `workshop/admin/README.md` §10): a VM's
+  trust stores brought to a new image's, over SSH with the host key pinned, a dry run unless
+  `--apply`. It changes only what is older: `ca-certificates`, uv (to `deploy.sh`'s pin),
+  certifi in `~/venv`, `/opt/certbot` and each uv tool's environment, by `uv.lock`'s hashes,
+  conda's two environments with Sage (where conda also updates openssl, and its solver may move
+  other packages of `sage`), then the image's check. A step that would download through
+  a store still holding the root is blocked. Software an agent installed that holds the root is
+  reported as left. One run at a time on a VM, and each `--apply` holds off its idle stop.
+- **The trust fix repairs the apt source first** (#947, PR #957; `workshop/admin/README.md`
+  §10). Where its `--apply` will run `apt-get update` (`ca-certificates` older than the fix's
+  floor), it first runs the release's `apt_repair.py` as a rollout does, sent inside its remote
+  half, from a directory of root's own: on a VM of the Oct 19 image, the expired Macaulay2
+  source would otherwise fail the update, and the rollout that removes it comes after the trust
+  fix. Its line comes under the table, but for `apt: nothing to repair`; a failed repair asks for
+  a rerun. Whatever it says, the update runs, and one that still fails stops that step as before.
+  The look under the table covers the repair's processes too.
+- **Claude Code's own CA list on the system store** (#882, PR #885; `workshop/ami/README.md`,
+  `workshop/admin/README.md` §10). The image's managed settings, written by `build.sh` and the
+  first boot, set `CLAUDE_CODE_CERT_STORE=system`, every other key of the file kept. The
+  requests that take Claude Code's own CA list then trust the system store alone, not also
+  Claude Code's bundled roots. On 2.1.283 those requests were seen to include the messages API
+  and its settings fetches. A request without that list, such as a plain `fetch`, still gets
+  the bundled roots (*Known limits*). For VMs already running, `trust_fix.py` has a fifth step,
+  `claude store`, which merges the key into the file where it isn't `system`, and leaves a file
+  that isn't a JSON object as it is; where there is no file, `--apply` writes one holding that
+  key alone (`absent -> system`), and the run prints the command that puts the image's file,
+  with its other keys, in its place. The smoke tests and `trust_fix.py`'s
+  check require the key, and a certificate that `agent` reads from the system store: with the
+  store empty or unreadable, Claude Code falls back to its bundled roots.
+- **A guard on CA variables** (#882, PR #885). Both smoke tests fail, naming the variable, when
+  `SSL_CERT_FILE` or `CODEX_CA_CERTIFICATE` is set for `agent`: in its login shell, its user
+  manager's environment, which `zab.service` inherits, or `zab.service`'s own `Environment=`
+  (`files/bin/ca_env.py`). Either variable adds roots to the system store's, and Codex 0.157.1
+  then also trusts reqwest's built-in roots, emSign ECC Root CA - G3 among them (#859).
+
+**Deploying**
+
+- **`deploy.sh --expect-diff-sha256 SHA` and `--with-wheel`** (#772, PR #798; ADMIN §1.6,
+  `workshop/adminserver/README.md`): a deploy refuses, before its prompt, a diff whose SHA-256
+  isn't the one you reviewed, and doesn't page it again; `--with-wheel` builds the fleet wheel
+  before the prompt and places it after the deploy, under one confirmation. Every option that
+  takes a value refuses an empty one.
+- **`--base-signers FILE`, after a deployer key is replaced** (#587, PR #810, PR #823; BOOTSTRAP
+  §17): the base may be signed by a retired key, never the release deployed, and must then be
+  the release the server runs, at the commit its deploy record names.
+- **The deployer's machine needs `python3` 3.12 or newer** (#781, PR #797; BOOTSTRAP §1), the
+  package's own floor.
+- **`deploy.sh --build-wheel`** (#569, PR #901; DECISIONS D26, amended): the server builds a
+  release's fleet wheel itself, for `!upgrade-server`'s apply, as `zab-build`, which holds no key,
+  after the IMDS rule's check, with the hash-pinned backend of a deployer's `--wheel`. Root
+  places only its own copy, checked to be a wheel of the release: its name, version and tag, and
+  the zip's integrity. A laptop's `--wheel` still places one built elsewhere.
+- **`workshop/adminserver/upgrade.py`: a release reviewed, signed, verified and pushed** (#772,
+  PRs #884, #886, #907, #914, #929; the adminserver README). It reaches no server. The deploy
+  upgrades the server from the copy it makes, `~/zab-vN`. `!upgrade-server`, from the next
+  release on, never reads that copy: it fetches the release's tags from `release_repo`, so the
+  tag `upgrade.py` pushes to origin serves it where origin is `release_repo`. Run on the deployer's machine, from the signed copy
+  of the release the server runs, with `python3 -I`: `--setup` once per machine, then
+  `upgrade.py vN --commit C --review-sha256 SHA`. It refuses any other copy, with the lines that
+  make the right one; fetches origin's tags beside the clone's own, never over them; reviews C
+  with that copy's `deploy.sh` and compares the review's SHA-256 with the release message's, on
+  every run (paged until vN is signed); signs vN through an agent that holds the dedicated key
+  alone, once you type the version; checks the tag itself, never git's exit status (git 2.43
+  exits 0 after a failed signature); pushes it with your terminal's own agent, unless origin has
+  another tag of C, such as the public repository's, whose signer it names (BOOTSTRAP §9): one
+  with no fingerprint to check, with no SSH signature or one that doesn't check, it calls an
+  anomaly to investigate in a repository you tag yourself (#895, #910); and makes `~/zab-vN`. A
+  vN of another commit, origin's or the clone's, stops it before the review. Each phase checks
+  first whether it is done, so a rerun goes on. It uses its own agent once that accepts
+  connections, and its fetch starts no git maintenance, which from git 2.54 on prunes worktrees
+  in the background and could make its `git worktree add` of `~/zab-vN` fail (#920).
+  It signs and pushes the tag in the repository the release was made in; with `release_repo` the
+  public repository, the tag the server fetches is the one the release's publication signs, which
+  `upgrade.py` doesn't make yet (#960).
+- **Releases from the public repository** (#958, PR #961; BOOTSTRAP §13.4, ADMIN §1.6).
+  `release_repo` may be the public repository, `MathAgents/zulip-agent-bridge`, for its owner's
+  server, with a read-only deploy key there; nothing is pushed for the server. BOOTSTRAP §13.4's
+  *Onto the public repository's commits* deploys a published release by hand on a server whose
+  running release came from another repository's commit: the review where the running release's
+  tag is, a deploy clone of the public repository with that tag and the reviewed commit fetched
+  in, a check that the published commit names the reviewed one as its source and is its tree
+  with files removed and none the server installs or builds from, then
+  `deploy.sh --expect-diff-sha256 <the review's SHA-256> --with-wheel`. The reviewed diff covers
+  the release paths alone, never commits, so the same SHA-256 holds across the two histories;
+  the check covers the fleet wheel's other inputs. `deploy.sh`, the upgrade helper and the loader
+  are unchanged, and `release_repo` unset still turns the in-band upgrade off.
+- **`ssh-rule.sh --group-name NAME`** (#772, PR #880; BOOTSTRAP §3.1) finds the admin server's
+  group by another name than `zab-admin`, still by its `zab-admin` tag key. After an interrupt
+  or a dropped connection, `deploy.sh`'s note on the fleet wheel says to let a deploy that may
+  still be running end, and gives the `--wheel` command; the adminserver README lists the four
+  outcomes.
+
+**Workshop scripts**
+
+- **These scripts no longer default to the first deployment** (#808, PR #831): `launch.py`,
+  `teardown.py`, `protect.py`, `power.py`, `grow_disk.py`, `spare_idle_stop.py`, `adopt_spare.py`,
+  `import_key_pair.py`, `status.py`, `roster_import.py` and `roster_sync.py` require `--tag`, and
+  all but `status.py` `--region` too; `build_ami.py` requires `--tag`, `--region` and, to build,
+  `--name`. A roster row with a VM and an empty `region` cell still reads as `us-west-2`.
+  `push_waker.py` keeps its defaults, `nt-agents-2026` and `us-west-2`, which the admin bot
+  overrides with `--workshop` and `--region`.
+- **A rollout repairs `apt-get update` on VMs from the Oct 19 image** (#947, PRs #949, #956;
+  `workshop/admin/README.md` §2.2). That image left `/etc/apt/sources.list.d/macaulay2.sources`
+  on Launchpad's snapshot of the Macaulay2 PPA, which Launchpad no longer serves, so every
+  `apt-get update` there exits 100 and an `apt-get update && apt-get install …` fails with it
+  (#945). Each release rollout now runs `apt_repair.py` as root. It reads that file as apt
+  does, and where its sources are the expired snapshot and nothing else, it holds the installed
+  macaulay2, macaulay2-common, gfan, msolve and libmsolve3 (`apt-mark hold`), then removes the
+  file; their packages stay as they are. A hold that fails, or a `dpkg-query` that can't read
+  dpkg's database, keeps the file for the next rollout and is a failure in the row. A file
+  naming the snapshot beside other sources, a link or another kind of file is left alone and
+  noted (`apt: kept …`); any other file, or none, is left quietly. The trust fix runs the same
+  repair before its own `apt-get update` (PR #957, under *Trust stores*). A new image carries no
+  such source (*Building an image*, below).
+- **Building an image: Macaulay2's packages and PARI's data from pinned releases** (#945, PRs
+  #946, #950, #951, #952; `workshop/ami/README.md`, *Macaulay2's packages* and *PARI's data
+  packages*). Launchpad stops serving a snapshot of the Macaulay2 PPA about 16 days after the PPA
+  publishes again (DECISIONS, verification log, 2026-11-07), so `build.sh`'s pin of Oct 18 failed
+  every build from Nov 7; PR #946 re-pinned it to `20261106T000000Z` in the interim. A new image
+  installs macaulay2 and macaulay2-common 1.26.06+ds-5 (packaging changes only, against the
+  Oct 18 image's -2), and gfan and msolve as before, from the GitHub release
+  `deps/macaulay2-1.26.06+ds-5`, every file checked by its SHA-256
+  (`workshop/ami/files/apt/macaulay2-debs.sha256`); it holds them, keeps their source packages
+  in `/usr/src/macaulay2-ppa`, and keeps no apt source for the PPA (PR #950).
+  `workshop/ami/m2_debs.py capture` takes a new set from Launchpad into such a release (PR #951).
+  PARI's five data packages, which PARI's site keeps under no versioned name, come from the
+  release `deps/pari-data-20261107`, with PARI's signatures, and `build.sh` downloads from PARI's
+  site only one that is missing or doesn't match its pin (PR #952). `build_ami.py` fetches both
+  with the deployer's `gh` before anything is created in AWS, from the repository its checkout's
+  `origin` names (`--deps-release`, `--deps-dir`, `--pari-data-release`, `--pari-data-dir`): check
+  `gh auth status` first. The public repository holds no such release yet, so a build from a
+  public checkout stops at that fetch, before anything is made in AWS: name a repository that
+  holds them, `--deps-release OWNER/REPO@deps/macaulay2-1.26.06+ds-5` and
+  `--pari-data-release OWNER/REPO@deps/pari-data-20261107`, or pass their files with
+  `--deps-dir` and `--pari-data-dir` (`workshop/ami/README.md`).
+- **Building an image: PARI's fallback and the host key** (#945, PR #948; #953, PR #954).
+  `build.sh` fetches a PARI/GP release that a newer one has replaced from `pub/pari/OLD/<major.minor>/`, where PARI keeps it; the
+  fallback looked in `unix/OLD/`, which doesn't exist, so a build would have failed once the
+  pinned release left `unix/`. `build_ami.py` scans a fresh instance's host key every 5 seconds
+  for up to 2 minutes, since its port 22 can accept before its first boot serves the key, and
+  says how long it tried when it gives up.
+- `provision_repos.py` reports an invitation's transport failure in its row, and a launch's
+  first boot no longer adds a second `/swapfile` line to `/etc/fstab` where the first is separated
+  by a tab (#799, PR #812).
+
+**Docs**
+
+- A bot's owner can reactivate it, and ADMIN §3.3 gives a retired row's way back (#762, PR #790;
+  #799, PR #812). ORGANIZERS §5.6 explains the archive check's refusal of case twins (#802, PR
+  #809). The files host's update keeps its AWS profile apart from the share probe's directory,
+  and ORGANIZERS §3.4 says what a failed invitation does (#768, PR #794). Six of the docs audit's
+  last findings (#691, PR #807), and the rest of it (#808, PR #831): README says which part of
+  each release's notes concerns your own machines.
+- `build-constraints.txt`'s regeneration command names Python 3.12 (#799, PR #848); no pin
+  moves.
+- BOOTSTRAP §13.4: the in-band upgrade's deploy key, `release_repo`, each release's commands,
+  and when `deploy.sh` is still the way (#569, PR #902).
+- SPEC and ADMIN describe v0.2.19; ADMIN lists the month-end and `!upgrade-server` as built.
+
+**Tests and CI**
+
+- End-to-end scenario 17, sub-agents across a turn's end (#660, PR #838), with parts for `!stop`
+  with no turn (PR #851) and after a bridge restart (PR #861).
+- The end-to-end runners wait for steady SSH before deploying, and rerun a connection that fails
+  (#690, PR #800; #804, PR #826).
+- The IMDS rule's nftables tests run on CI (#785, PR #796); the live AT-8 tests skip, their
+  channel archived (#672, PR #792); flaky waits made robust (#782, PR #791; #745, PR #788; #805,
+  PR #811; #843, PR #844); CI's full run gets 25 minutes on `main` and 20 on a pull request
+  (#845, PR #846).
+- The end-to-end harness names a Codex turn that OpenAI refused with a 429, and runs that part
+  once more (#842, PR #866); the admin tests read the audit log under its lock (#874, PR #875).
+- CI bounds and retries its apt, pip and uv steps (#900, PR #903); test children and fakes wait
+  for a signal in 10 ms sleeps, never one of 30 s (#890, PR #905; #910, PR #913); the
+  end-to-end waits tell a rig-side Zulip failure from the bridge's (#877, PR #906); probes of
+  background jobs as transient user units (#655, PRs #925, #931, #937).
+- The admin end-to-end suite models releases from the public repository (#958, PR #961): A10
+  reviews its good rc in the rig's repository and deploys its exported commit from a deploy
+  clone, and A10b's tags are exported commits with signed tags; offline, the hand deploy across
+  the two histories, the bundle the server gets (the public history alone) and BOOTSTRAP's steps
+  themselves are tested.
+
+**Known limits**
+
+- **The agent CLIs' trust stores** (#816, #859; DECISIONS, verification log, 2026-11-06).
+  Claude Code 2.1.283, the image's pin, trusts its bundled roots, among them emSign ECC
+  Root CA - G3, as well as the system store, for the API connections checked; 2.1.304 is its
+  first release without G3. Codex 0.157.1, as the image configures it, trusts the system store
+  alone on the API connections checked, though G3 is among its built-in roots, which
+  `SSL_CERT_FILE` or `CODEX_CA_CERTIFICATE` would bring in; and, from its source, not run, its MCP
+  HTTP client retries with them after a TLS protocol-version alert, which isn't authenticated.
+  0.164.0 is its first release without G3. Since #882, where the managed settings set
+  `CLAUDE_CODE_CERT_STORE=system` (an image built since, or after `trust_fix.py --apply`) and
+  the system store isn't empty, Claude Code's requests that take its own CA list trust the
+  system store alone; a request without that list, such as a plain `fetch`, still gets the
+  bundled roots.
+- **`trust_fix.py` reaches only roster rows:** a spare launched from an older image gets the fix
+  after its `!adopt-spare`, whose own rollout still went through the spare's old uv.
+- **Lazy reopen** (#632): a terminal's Codex turn on a thread the bridge hasn't loaded since its
+  start reaches no topic, and a topic whose thread a terminal loaded first is refused until that
+  terminal quits (`!status` says what to do).
+- **The identity record within one run** (#830): if the bridge is away for longer than the
+  app-server's unload delay, a minute, and another client loads the thread meanwhile, the record
+  still vouches for it. Codex 0.157.1 reports neither a load's time nor its client.
+- **Codex sub-agents** (#660): an interrupted sub-agent's commands keep running, and the answer
+  of a sub-agent that ends after its parent's turn isn't posted (#655). The agents' instructions
+  still say that `!stop` doesn't end a Codex sub-agent (#668).
+- **The month-end:** the schedule makes no archive (`!retire <row> export` does), and it lives in
+  the server's `state.db`, which the backups leave out: a rebuilt server has no schedule, and the
+  organizers approve one again.
+
+**Corrections to earlier notes**
+
+- **0.2.10, retired rows** (#762: #790, #799). The notes said a retired row's bots stay
+  deactivated "since only a Zulip organization administrator can reactivate them". A bot's owner
+  can too, and the bots a `!retire` deactivates are the provisioner's, whose key is on the admin
+  server: a deployer reactivates them there, after clearing the row's `host` and `ip` and before
+  its `!launch` or `!adopt-spare` (ADMIN §3.3). No command of the admin bot reactivates a bot. A
+  reactivated bot keeps its key, so every copy of that key works again, the server's backups'
+  included; `zulip_provision.py --no-rebind --regenerate-keys --only <slug>` replaces it when
+  that isn't wanted (ADMIN §3.3).
+
 ## 0.2.18 — 2026-11-04
 
 0.2.18 is the first release published in the public repository, `MathAgents/zulip-agent-bridge`.

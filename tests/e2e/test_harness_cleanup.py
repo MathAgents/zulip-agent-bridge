@@ -9,6 +9,8 @@ import pytest
 
 from e2e.harness import cleanup
 from e2e.harness.cleanup import IDLE_STOP_LEFT, PAUSE_S, Leftover, undo, vm_up
+from e2e.harness.startup import PROBE_PAUSE_S, SSH_WAIT_S, STEADY_GAP_S, Timeline
+from e2e.harness.vm import Result
 
 
 @pytest.fixture
@@ -109,31 +111,68 @@ def ec2(state: str, after: str = "stopped") -> SimpleNamespace:
                            wait_while=wait_while, calls=calls)  # fmt: skip
 
 
-def vm(answers_after: int) -> SimpleNamespace:
-    """SSH that answers from try `answers_after + 1` on."""
+def vm(answers_after: int, clock: list[float] | None = None) -> SimpleNamespace:
+    """SSH that answers from probe `answers_after + 1` on, each probe taking 1 s on `clock`;
+    cloud-init done."""
     tries: list[int] = []
-    return SimpleNamespace(tries=tries, reachable=lambda: tries.append(1) or
-                           len(tries) > answers_after)  # fmt: skip
+    clock = [0.0] if clock is None else clock
+
+    def probe():
+        tries.append(1)
+        clock[0] += 1.0
+        return Result(0, "", "") if len(tries) > answers_after else Result(255, "", REFUSED)
+
+    def run(argv, timeout=None, check=True):
+        assert argv == ["cloud-init", "status", "--wait"] and not check
+        return Result(0, "status: done\n", "")
+
+    return SimpleNamespace(host="198.51.100.4", tries=tries, probe=probe, run=run, clock=clock)
 
 
-async def test_vm_up_waits_for_ssh_also_on_a_running_vm(pauses):
+REFUSED = "ssh: connect to host 198.51.100.4 port 22: Connection refused\n"
+
+
+def quiet(ssh) -> dict:
+    """vm_up's timeline and pauses on the fake VM's clock, printing nothing."""
+    slept: list[float] = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        ssh.clock[0] += seconds
+
+    timeline = Timeline(lambda: ssh.clock[0], lambda: 0.0, lambda line: None)
+    return {"timeline": timeline, "sleep": sleep, "slept": slept}
+
+
+async def test_vm_up_waits_for_steady_ssh_also_on_a_running_vm():
     """SSH is checked on a running VM too, a precaution: not #517's cause, as there SSH had
-    answered push_config's owner check just before. A stopping VM is started again."""
+    answered push_config's owner check just before. #804: three answers in a row, as the
+    runner's start (`startup.steady_ssh`). A stopping VM is started again."""
     aws, ssh = ec2("running"), vm(answers_after=2)
-    await vm_up(aws, "i-test", ssh)
-    assert aws.calls == [] and len(ssh.tries) == 3 and pauses == [10.0, 10.0]
-    aws, ssh = ec2("stopping"), vm(answers_after=99)
-    with pytest.raises(TimeoutError, match="no SSH to the VM within 30 s"):
-        await vm_up(aws, "i-test", ssh, tries=3)
-    assert aws.calls == ["not stopping", "start", "running"] and len(ssh.tries) == 3
+    up = quiet(ssh)
+    await vm_up(aws, "i-test", ssh, timeline=up["timeline"], sleep=up["sleep"])
+    assert aws.calls == [] and len(ssh.tries) == 5
+    assert up["slept"] == [PROBE_PAUSE_S] * 2 + [STEADY_GAP_S] * 2
+    assert [line.split(": ", 1)[1] for line in up["timeline"].lines][2:4] == [
+        "SSH answered in 1.0 s (1 of 3)",
+        "cloud-init status: done (exit 0), after 0.0 s",
+    ]
+    aws, ssh = ec2("stopping"), vm(answers_after=10**6)
+    up = quiet(ssh)
+    with pytest.raises(TimeoutError, match=r"198\.51\.100\.4: SSH not steady 600 s after"):
+        await vm_up(aws, "i-test", ssh, timeline=up["timeline"], sleep=up["sleep"])
+    assert aws.calls == ["not stopping", "start", "running"]
+    assert ssh.clock[0] <= SSH_WAIT_S + 1  # one probe past
 
 
-async def test_vm_up_takes_a_vm_the_waker_started_again_as_it_is(pauses):
+async def test_vm_up_takes_a_vm_the_waker_started_again_as_it_is():
     """#305: a VM stopping may read `pending` next, its `stopped` missed by the polls, when the
     test waker starts it again. It is waited for, never started a second time."""
     aws, ssh = ec2("stopping", after="pending"), vm(answers_after=0)
-    await vm_up(aws, "i-test", ssh)
-    assert aws.calls == ["not stopping", "running"] and len(ssh.tries) == 1
-    aws = ec2("stopping", after="running")
-    await vm_up(aws, "i-test", vm(answers_after=0))
+    up = quiet(ssh)
+    await vm_up(aws, "i-test", ssh, timeline=up["timeline"], sleep=up["sleep"])
+    assert aws.calls == ["not stopping", "running"] and len(ssh.tries) == 3
+    aws, ssh = ec2("stopping", after="running"), vm(answers_after=0)
+    up = quiet(ssh)
+    await vm_up(aws, "i-test", ssh, timeline=up["timeline"], sleep=up["sleep"])
     assert aws.calls == ["not stopping"]

@@ -8,6 +8,20 @@
 #   deploy.sh --host HOST --etc DIR [--since TAG] [--downgrade] vX.Y.Z      an upgrade
 #   deploy.sh --host HOST --etc DIR --wheel vX.Y.Z      a fleet wheel for !rollout, built here
 #
+# A deploy, the first install or an upgrade, also takes two options (#772). --expect-diff-sha256
+# SHA is the reviewed diff's SHA-256, the one you read: the deploy is refused before its prompt
+# if its own diff (from its base: --since's, or the running release) has another, and its review
+# is written but not paged again. --with-wheel builds the release's fleet wheel before the prompt
+# and places it after the deploy, under the same confirmation; a run that ends before the wheel
+# is placed says whether the release was deployed, and prints the --wheel command to paste.
+#
+# After a deployer key is replaced (docs/BOOTSTRAP.md §17), --base-signers FILE holds the retired
+# keys' allowed_signers lines, which the base may be signed by, never the release deployed (#587).
+# The base must then be the release the server runs, at the commit its own deploy record names,
+# checked before the review (which then takes --host too) and again at the deploy, whose diff must
+# be the one you reviewed (--expect-diff-sha256): a retired key may have leaked, and a base it
+# signed could hide code from the review.
+#
 # --etc DIR holds your copies of the server's admin.toml, allowed_signers, backup_recipients and
 # break-glass/*.pub; --secrets DIR, its secrets. --repo DIR is the clone with the tags (default:
 # the one this script is in), --out DIR where the reviewed diff and its review are written
@@ -18,9 +32,16 @@
 # pattern, and it is not older than the running release unless --downgrade says so. The server
 # half (`--server`) is this script as the tag holds it, run by root through sudo; it installs
 # the release at its final path, built by `zab-build`, and switches `current` atomically.
-# ZAB_DEPLOY_SSH, ZAB_DEPLOY_PREFIX and ZAB_DEPLOY_SYSTEMCTL exist for the offline tests (README).
+# `!upgrade-server`'s apply helper runs that server half too, as root, with `--in-band P-n` (ADMIN
+# §1.6, #569): the plan goes into the record, and the bots' unit is enabled but not restarted,
+# since the bot hosts that apply and restarts itself once it has posted the result. Before it,
+# that helper runs it with `--build-wheel`: the release's fleet wheel, built here as zab-build
+# with the pinned backend and placed for !rollout, unless one is there already.
+# ZAB_DEPLOY_SSH, ZAB_DEPLOY_PREFIX, ZAB_DEPLOY_SYSTEMCTL and ZAB_DEPLOY_IMDS exist for the offline
+# tests (README).
 set -euo pipefail
 export LC_ALL=C
+unset CDPATH # every `cd` here names a directory, never one CDPATH would find elsewhere (#772)
 umask 077
 
 SERVER_DIR=workshop/adminserver # its files are what root runs and installs
@@ -35,20 +56,24 @@ FILE_RE='^[A-Za-z0-9_.][A-Za-z0-9._@+-]*(/[A-Za-z0-9_.][A-Za-z0-9._@+-]*)*$' # e
 HEX_RE='^[0-9a-f]{40}([0-9a-f]{24})?$'
 SHA_RE='^[0-9a-f]{64}$'
 HOST_RE='^[A-Za-z0-9_][A-Za-z0-9._@-]*$'
-# uv on the server, the version VERIFY V9 was checked with: its release tarballs' SHA-256.
-UV_VERSION=0.11.24
-UV_SHA256_aarch64=e22c66d36a0098b17cff80a8647e0b8c58202af899d4e9eb820fc7ad126435a1
-UV_SHA256_x86_64=5ce1ad074a78f96c5c8122088bb85a12eb282195bc1453151a48762e4fc31fed
+# uv on the server, the version VERIFY V9 was checked with: its release tarballs' SHA-256. Its
+# built-in roots lack emSign ECC Root CA - G3, which 0.13.3 and earlier hold (#816).
+UV_VERSION=0.13.7
+UV_SHA256_aarch64=71279f8d3c67241e807b9d8db872d1bf541579fb9f08b7d1eb1682196d1e57dc
+UV_SHA256_x86_64=c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83
 PACKAGES=(python3 git caddy openssh-client age nftables curl)
 # The units this release runs: every deploy enables and restarts them, in this order. The
 # sockets first: the starter's service, socket-activated, is stopped, so that the next request
 # starts the new release's (`restart`); the archive check's (#374) starts an instance per
 # connection, which ends with it, so the next one runs the new release with nothing to stop.
-# Then the config helper's path unit (ADMIN §2.9), whose oneshot runs only on a request; the bot,
-# which hosts the runner (PR 10); the console's collector and the console (ADMIN §4, #489); and
-# the waker after the bot (#348).
-SERVICES=(zab-admin-starter.socket zab-archive-check.socket zab-admin-config.path zab-admin-bot.service
-  zab-admin-collector.service zab-console.service zab-waker.service)
+# Then the path units of the config helper (ADMIN §2.9) and of the upgrade's two helpers (§1.6,
+# #569), whose oneshots run only on a request (restarting a path unit leaves the service it
+# started running: an in-band upgrade restarts its own); the bot, which hosts the runner (PR
+# 10); the console's collector and the console (ADMIN §4, #489); and the waker after the bot
+# (#348).
+SERVICES=(zab-admin-starter.socket zab-archive-check.socket zab-admin-config.path
+  zab-admin-upgrade-plan.path zab-admin-upgrade.path zab-admin-bot.service zab-admin-collector.service
+  zab-console.service zab-waker.service)
 PER_CONNECTION=" zab-archive-check.socket " # Accept=yes: no service of its own to stop
 
 die() {
@@ -295,7 +320,7 @@ binary() {
 }
 
 # uv.lock's packages, for a reader: each changed one, its versions and source, with what a reader
-# would check flagged (display only; python3 3.11 or newer, for tomllib). Every name, version,
+# would check flagged (display only; python3 3.12 or newer, BOOTSTRAP §1). Every name, version,
 # source and field from the lock is printed as JSON, so that none can make a line of its own.
 LOCK_PY='import json, sys, tomllib
 def load(path):  # the lock-level fields, and each name with every entry of it (a lock may hold
@@ -476,10 +501,58 @@ review() {
 
 remote() { "$SSH" -- "$HOST" "$1"; }
 
+# base_is_running BASE BASE_COMMIT RUNNING: with --base-signers, a base a retired key may have
+# signed is only the release HOST runs, RUNNING, at the commit HOST's own deploy record names for
+# it (its last bootstrap or upgrade to it). Any other could hide code from the review (#587).
+base_is_running() {
+  local text recorded
+  [ "$1" = "$3" ] || die "--base-signers: the base must be $3, which $HOST runs, not $1"
+  text=$(remote "cat $RP/opt/zab-admin/deploys.jsonl") ||
+    die "--base-signers: could not read $HOST's deploy record, $RP/opt/zab-admin/deploys.jsonl"
+  recorded=$(grep -E '"event":"(bootstrap|upgrade)"' <<<"$text" | grep -F "\"version\":\"$3\"" |
+    tail -n 1 | sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p') || true
+  [[ $recorded =~ $HEX_RE ]] || die "--base-signers: $HOST's deploy record names no commit for $3"
+  [ "$recorded" = "$2" ] ||
+    die "--base-signers: $3 is $2 here, $recorded in $HOST's deploy record: not the release it runs"
+  note "--base-signers: the base, $3, is $2, the commit $HOST's deploy record names for it."
+}
+
 # REMOTE_TMP is set only once it has matched remote_tmp_ok: no other value ever reaches `rm`.
-laptop_cleanup() {
+# remote_cleanup removes the last run_server's, before another run or at the exit.
+remote_cleanup() {
   if [ -n "${REMOTE_TMP:-}" ] && remote_tmp_ok "$REMOTE_TMP"; then remote "rm -rf -- $REMOTE_TMP" || true; fi
+  REMOTE_TMP=
+}
+laptop_cleanup() {
+  [ "${WHEEL_DUE:-0}" = 0 ] || wheel_left
+  remote_cleanup
   rm -rf -- "${TMP:-/nonexistent}"
+}
+# wheel_left: --with-wheel's wheel was not placed (the run ended before it, or its placement
+# failed): whether the deploy itself happened, and the command to paste (WHEEL_CMD). After an
+# interrupt or a dropped connection, the server half may still be running, so what HOST runs
+# may change after it is read here, and nothing above may say why: the case where HOST does not
+# run V says to let that deploy end. The command printed in every case takes the server's
+# deploy lock, as a rerun does, so none runs beside a deploy that still runs (#772).
+wheel_left() {
+  local now
+  if [ "$DEPLOYED" = 1 ]; then
+    note "$V is deployed on $HOST; only its wheel, $WHEEL, was not placed. Once fixed, paste:"
+  else
+    now=$(remote "if [ -L $RP/opt/zab-admin/current ]; then readlink $RP/opt/zab-admin/current; else echo none; fi" \
+      2>/dev/null) || now='?'
+    if [ "${now##*/}" = "$V" ]; then
+      note "$V is current on $HOST, but its deploy did not finish, and its wheel, $WHEEL, was not"
+      note "placed. Once its units run, paste:"
+    elif [ "$now" != '?' ]; then
+      note "When this run ended, $HOST did not run $V, and its wheel was not placed. If its deploy may"
+      note "still be running there (an interrupt, a dropped connection), let it end. Then run the same"
+      note "deploy again, which places both; if it says $HOST already runs $V, paste:"
+    else
+      note "$WHEEL was not placed, and $HOST did not say what it runs. If it runs $V, paste:"
+    fi
+  fi
+  note "  $WHEEL_CMD"
 }
 # The server's temporary directory: exactly what `mktemp -d /tmp/zab-deploy.XXXXXXXXXX` makes.
 remote_tmp_ok() {
@@ -488,9 +561,10 @@ remote_tmp_ok() {
 }
 
 # present_diff BASE_NAME BASE_COMMIT NAME: write and hash the reviewed diff, then show the review
-# made from it, which is written beside it as shown. The review shows every file of the diff.
+# made from it, which is written beside it as shown. The review shows every file of the diff. It
+# is written but not shown when PAGE is 0 (--expect-diff-sha256: a diff read already).
 present_diff() {
-  local file=$OUT/zab-admin-${1:-empty}..$3.diff f n m
+  local file=$OUT/zab-admin-${1:-empty}..$3.diff f n m how
   reviewed_diff "$2" "$COMMIT" >"$file"
   DIFF_SHA=$(sha256 <"$file")
   MANIFEST=$(tree_of | sha256)
@@ -502,7 +576,9 @@ present_diff() {
   [[ $((n)) == "$SECTIONS" && $((m)) == "$SHOWN" ]] ||
     die "the review lists $SECTIONS of the diff's $((n)) file sections, and shows $((m)) of $SHOWN"
   sanitize <"$TMP/review" >"${file%.diff}.review"
-  if [ -t 1 ] && command -v less >/dev/null; then
+  if [ "$PAGE" = 0 ]; then
+    : # laptop_main compares its SHA-256 with the one expected instead
+  elif [ -t 1 ] && command -v less >/dev/null; then
     # No input preprocessor (a lesspipe in LESSOPEN), shell escape or editor: secure mode.
     env -u LESSOPEN -u LESSCLOSE LESSSECURE=1 LESS='' less -- "${file%.diff}.review" ||
       true # quitting the pager early is not a refusal
@@ -511,7 +587,9 @@ present_diff() {
   fi
   note "The reviewed diff, ${1:-the empty tree}..$3, is $file"
   note "  SHA-256 $DIFF_SHA; release tree $MANIFEST (${#PATHS[@]} paths of $LIST)"
-  note "  The review, as shown, is ${file%.diff}.review: ${#F_PATH[@]} files, ${#CHANGED_PRIV[@]} privileged"
+  how="as shown"
+  [ "$PAGE" = 1 ] || how="not paged"
+  note "  The review, $how, is ${file%.diff}.review: ${#F_PATH[@]} files, ${#CHANGED_PRIV[@]} privileged"
   for f in ${CHANGED_PRIV[@]+"${CHANGED_PRIV[@]}"}; do note "    P $f"; done
   [ ${#NEWLY[@]} -eq 0 ] || note "  Newly privileged, shown whole once: ${NEWLY[*]}"
 }
@@ -551,12 +629,14 @@ bad += [] if b.get("build-backend") == "hatchling.build" else ["build-system.bui
 bad += ["project.dynamic"] if "dynamic" in p else []
 bad += [] if h in (None, {"build": {"targets": {"wheel": {"packages": ["src/zab"]}}}}) else ["tool.hatch"]
 bad += ["tool.uv"] if "uv" in d.get("tool", {}) else []  # [tool.uv.sources] would steer the build
-print(" ".join(bad))' 2>&1) || die "--wheel checks pyproject.toml with python3 3.11 or newer: $out"
+print(" ".join(bad))' 2>&1) || die "--wheel checks pyproject.toml with python3 3.12 or newer: $out"
   [ -z "$out" ] || die "$V: pyproject.toml configures the build beyond hatchling's own: $out"
 }
 
+# build_wheel DEST: COMMIT's fleet wheel, built here with the pinned backend, copied into DEST as
+# WHEEL; its SHA-256 into WHEEL_SHA.
 build_wheel() {
-  local src=$TMP/src dist=$TMP/dist var f
+  local dest=$1 src=$TMP/src dist=$TMP/dist var f
   local -a pass=() tree=(pyproject.toml build-constraints.txt src/zab)
   mkdir "$src" "$dist" "$TMP/tmp"
   case $(uv --version 2>/dev/null) in
@@ -580,18 +660,21 @@ build_wheel() {
   WHEEL=zulip_agent_bridge-${V#v}-py3-none-any.whl
   set -- "$dist"/*.whl
   [[ $# -eq 1 && $1 == "$dist/$WHEEL" ]] || die "expected $WHEEL, got: ${*##*/}"
-  cp "$dist/$WHEEL" "$TMP/payload/$WHEEL"
+  cp "$dist/$WHEEL" "$dest/$WHEEL"
+  WHEEL_SHA=$(sha256 <"$dest/$WHEEL")
+  note "Built $WHEEL with the pinned hatchling: SHA-256 $WHEEL_SHA."
 }
 
 laptop_main() {
   local review='' since='' etc='' secrets='' bootstrap=0 downgrade=0 wheel=0 running base=''
-  local base_commit='' f
-  OUT=. HOST='' REPO='' V='' TMP='' REMOTE_TMP=''
+  local base_commit='' f expect='' with_wheel=0 what base_signers='' signers
+  OUT=. HOST='' REPO='' V='' TMP='' REMOTE_TMP='' PAGE=1 WHEEL_SHA='' WHEEL_DUE=0 DEPLOYED=0 WHEEL_CMD=''
   SSH=${ZAB_DEPLOY_SSH:-ssh}
   RP=${ZAB_DEPLOY_PREFIX:-} # tests only: the server's paths under a temporary root
   while [ $# -gt 0 ]; do
     case $1 in
-      --review | --since | --etc | --secrets | --host | --repo | --out) [ $# -ge 2 ] || die "$1 needs a value" ;;
+      # an empty value is none: never an option silently left as its default (#772)
+      --review | --since | --etc | --secrets | --host | --repo | --out | --expect-diff-sha256 | --base-signers) if [ $# -lt 2 ] || [ -z "$2" ]; then die "$1 needs a value"; fi ;;
     esac
     case $1 in
       --review) review=$2 && shift ;;
@@ -604,6 +687,12 @@ laptop_main() {
       --bootstrap) bootstrap=1 ;;
       --downgrade) downgrade=1 ;;
       --wheel) wheel=1 ;;
+      --expect-diff-sha256)
+        [[ $2 =~ $SHA_RE ]] || die "--expect-diff-sha256: not a SHA-256 (64 hex digits): $2"
+        expect=$2 && shift
+        ;;
+      --with-wheel) with_wheel=1 ;;
+      --base-signers) base_signers=$2 && shift ;;
       -*) die "unknown option $1" ;;
       *) [ -z "$V" ] || die "one release at a time" && V=$1 ;;
     esac
@@ -619,13 +708,33 @@ laptop_main() {
   [ -z "$secrets" ] || [ ! -d "$secrets" ] || secrets=$(cd "$secrets" && pwd)
   TMP=$(mktemp -d)
   trap laptop_cleanup EXIT
+  # The base's signers: --etc's, and the retired ones too with --base-signers (#587). The release
+  # deployed is verified against --etc's alone, here and on the server.
+  signers=$etc/allowed_signers
+  if [ -n "$base_signers" ]; then
+    [[ -f $base_signers && -s $base_signers ]] || die "--base-signers $base_signers: no such file, or empty"
+    { cat -- "$etc/allowed_signers" && printf '\n' && cat -- "$base_signers"; } >"$TMP/base_signers"
+    signers=$TMP/base_signers
+  fi
   if [ -n "$review" ]; then
-    [ -z "$V$HOST" ] || die "--review takes a commit, not a release or a host"
+    # A host only with --base-signers, whose base the review checks against what HOST runs
+    [[ -z $V && (-z $HOST || -n $base_signers) ]] || die "--review takes a commit, not a release or a host"
+    [[ -z $expect && $with_wheel == 0 ]] ||
+      die "--expect-diff-sha256 and --with-wheel go with a deploy, not --review"
     base_commit=
+    [ -z "$base_signers" ] || [ -n "$since" ] || die "--base-signers: a review's base is --since's"
+    if [ -n "$base_signers" ]; then
+      # Checked before you read and sign: a base a retired key signed could hide code (#587).
+      [[ $HOST =~ $HOST_RE ]] || die "--base-signers: a review takes --host HOST, to check its base"
+      running=$(remote "readlink $RP/opt/zab-admin/current") || die "$HOST: unreachable, or it runs no release"
+      [[ $running == "$RP/opt/zab-admin/releases/"* ]] || die "$HOST: current is $running"
+      running=${running##*/}
+    fi
     if [ -n "$since" ]; then
-      verify_tag "$since" "$etc/allowed_signers"
+      verify_tag "$since" "$signers"
       base_commit=$COMMIT
     fi
+    [ -z "$base_signers" ] || base_is_running "$since" "$base_commit" "$running"
     COMMIT=$(g rev-parse --verify --quiet "$review^{commit}") || die "$review: no such commit"
     present_diff "$since" "$base_commit" "${COMMIT:0:12}"
     # The commands to paste, in any directory (#468): the tag is the version of the commit's
@@ -646,6 +755,8 @@ laptop_main() {
     return
   fi
   [ -n "$V" ] || die "name the release: deploy.sh --host HOST --etc DIR vX.Y.Z"
+  [ -z "$base_signers" ] || [ "$wheel" = 1 ] || [ -n "$expect" ] ||
+    die "--base-signers needs --expect-diff-sha256, the SHA-256 of the review you read"
   [[ $HOST =~ $HOST_RE ]] || die "--host HOST"
   local kind commit
   kind=$(release_kind "$etc/admin.toml")
@@ -658,14 +769,12 @@ laptop_main() {
   g show "$commit:workshop/adminserver/deploy.sh" >"$TMP/payload/deploy.sh"
   g bundle create -q "$TMP/payload/release.bundle" "refs/tags/$V"
   if [ "$wheel" = 1 ]; then
-    [[ $bootstrap$downgrade == 00 && -z $since ]] || die "--wheel goes alone"
-    build_wheel
+    [[ $bootstrap$downgrade$with_wheel == 000 && -z $since$expect$base_signers ]] || die "--wheel goes alone"
+    build_wheel "$TMP/payload"
     MANIFEST=$(tree_of | sha256)
-    DIFF_SHA=$(sha256 <"$TMP/payload/$WHEEL")
-    note "Built $WHEEL with the pinned hatchling: SHA-256 $DIFF_SHA."
     confirm "place it on $HOST for !rollout"
     run_server "$TMP/payload" --version "$V" --commit "$commit" --manifest "$MANIFEST" \
-      --wheel "$WHEEL" --wheel-sha256 "$DIFF_SHA"
+      --wheel "$WHEEL" --wheel-sha256 "$WHEEL_SHA"
     return
   fi
   running=$(remote "if [ -L $RP/opt/zab-admin/current ]; then readlink $RP/opt/zab-admin/current; else echo none; fi") ||
@@ -673,6 +782,7 @@ laptop_main() {
   if [ "$running" = none ]; then
     running=
     [ "$bootstrap" = 1 ] || die "$HOST runs no release: --bootstrap first"
+    [ -z "$base_signers" ] || die "--base-signers: a bootstrap has no base"
     [[ -n $secrets && -d $secrets ]] || die "--bootstrap needs --secrets DIR"
     [ -f "$etc/backup_recipients" ] || die "$etc/backup_recipients: the deployers' backup keys (§1.7)"
   else
@@ -685,11 +795,28 @@ laptop_main() {
   fi
   base=${since:-$running}
   if [ -n "$base" ]; then
-    verify_tag "$base" "$etc/allowed_signers"
+    verify_tag "$base" "$signers"
     base_commit=$COMMIT
   fi
+  [ -z "$base_signers" ] || base_is_running "$base" "$base_commit" "$running"
   COMMIT=$commit
-  present_diff "$base" "$base_commit" "$V"
+  # Both before the prompt. With --expect-diff-sha256, nothing to read: the diff is compared
+  # first, then the wheel built. Without, the wheel is built first, so that a build that fails
+  # stops the deploy before its review is read.
+  if [ -n "$expect" ]; then
+    PAGE=0
+    present_diff "$base" "$base_commit" "$V"
+    [ "$DIFF_SHA" = "$expect" ] ||
+      die "this deploy's diff has SHA-256 $DIFF_SHA, not $expect, the one you reviewed: nothing was deployed"
+    note "  It is the diff you reviewed (--expect-diff-sha256): its review was not paged again."
+  fi
+  if [ "$with_wheel" = 1 ]; then
+    # Its own payload, which never holds the bootstrap's etc/ or secrets/.
+    mkdir "$TMP/wheel"
+    cp "$TMP/payload/deploy.sh" "$TMP/payload/release.bundle" "$TMP/wheel/"
+    build_wheel "$TMP/wheel"
+  fi
+  [ -n "$expect" ] || present_diff "$base" "$base_commit" "$V"
   if [ -n "$running" ]; then
     for f in admin.toml allowed_signers backup_recipients; do
       remote "cat $RP/etc/zab-admin/$f" >"$TMP/server-$f" 2>/dev/null || : >"$TMP/server-$f"
@@ -703,12 +830,25 @@ laptop_main() {
     [ ! -d "$etc/break-glass" ] || cp -R "$etc/break-glass/." "$TMP/payload/etc/break-glass/"
     cp -R "$secrets" "$TMP/payload/secrets"
   fi
-  confirm "deploy it to $HOST${running:+, which runs $running}"
+  what="deploy it to $HOST${running:+, which runs $running}"
+  [ "$with_wheel" = 0 ] || what+=", and place its wheel for !rollout"
+  confirm "$what"
   local -a flags=()
   [ "$bootstrap" = 0 ] || flags+=(--bootstrap)
   [ "$downgrade" = 0 ] || flags+=(--downgrade)
+  if [ "$with_wheel" = 1 ]; then # from here until it is placed, any exit says what to run for it
+    printf -v WHEEL_CMD '%q ' "$(cd "$(dirname "$0")" && pwd)/${0##*/}" --repo "$REPO" --host "$HOST" \
+      --etc "$etc" --wheel "$V"
+    WHEEL_DUE=1
+  fi
   run_server "$TMP/payload" --version "$V" --commit "$commit" --manifest "$MANIFEST" \
     --base "${base:--}" --diff-sha256 "$DIFF_SHA" ${flags[@]+"${flags[@]}"}
+  [ "$with_wheel" = 1 ] || return 0
+  DEPLOYED=1
+  remote_cleanup # the deploy's directory on the server, before the wheel's
+  run_server "$TMP/wheel" --version "$V" --commit "$commit" --manifest "$MANIFEST" \
+    --wheel "$WHEEL" --wheel-sha256 "$WHEEL_SHA"
+  WHEEL_DUE=0
 }
 
 # --- the server half (root) ------------------------------------------------------------------
@@ -748,11 +888,81 @@ end_build_processes() {
 }
 
 server_cleanup() {
-  if [ -n "${BUILDING:-}" ]; then
+  if [ -n "${BUILDING:-}" ] || [ -n "${WHEEL_BUILD:-}" ]; then
     end_build_processes
-    rm -rf -- "$BUILDING"
+    rm -rf -- "${BUILDING:-/nonexistent}" "${WHEEL_BUILD:-/nonexistent}"
   fi
   rm -rf -- "${WORK:-/nonexistent}"
+}
+
+# place_wheel NAME FILE SHA: the fleet wheel FILE into releases/wheels as NAME, for !rollout.
+# releases/wheels is zab-admin's: it places the wheel itself, and root never works there by
+# name. A version's wheel is never replaced.
+place_wheel() {
+  local name=$1 file=$2 sha=$3 f=$VAR/releases/wheels/$1
+  if as_user zab-admin test -e "$f" || as_user zab-admin test -L "$f"; then
+    as_user zab-admin cmp -s - "$f" <"$file" || die "$name is there with other content"
+    note "$name is already there: SHA-256 $sha."
+    return
+  fi
+  as_user zab-admin tee "$f.new" <"$file" >/dev/null
+  as_user zab-admin chmod 0640 "$f.new"
+  as_user zab-admin mv -f -T -- "$f.new" "$f"
+  record wheel ",\"wheel\":\"$name\",\"sha256\":\"$sha\""
+  note "Placed $name for !rollout: SHA-256 $sha."
+}
+
+# The fleet wheel the server built, on stdin: a zip whose every member reads back, holding
+# zulip-agent-bridge's dist-info for the version in argv[1], pure Python. Run as zab-build (it
+# parses what the build wrote), on root's copy (#901's review, B1).
+WHEEL_CHECK='import io, sys, zipfile
+v = sys.argv[1]
+info = f"zulip_agent_bridge-{v}.dist-info/"
+with zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())) as z:
+    meta = z.read(info + "METADATA").decode().splitlines()
+    wheel = z.read(info + "WHEEL").decode().splitlines()
+    bad = z.testzip()
+named = "Name: zulip-agent-bridge" in meta and f"Version: {v}" in meta
+sys.exit(bad is not None or not named or "Tag: py3-none-any" not in wheel)'
+
+# server_wheel NAME: COMMIT's fleet wheel NAME, built here as zab-build, for !upgrade-server's
+# apply (#569), as --wheel builds it on the laptop: from the wheel's own files alone, each
+# checked against its blob before anything runs, under build_config's rules, with the pinned
+# backend (build-constraints.txt, --require-hashes, --no-sources) and the server's own pinned
+# uv, in WHEEL_BUILD, which no other file of the server's is in. zab-build holds no key; the
+# wheel runs on the fleet's VMs, never here. It ends as root's WORK/NAME, checked a wheel.
+server_wheel() {
+  local name=$1 src dist f
+  local -a tree=(pyproject.toml build-constraints.txt src/zab)
+  g cat-file -e "$COMMIT:build-constraints.txt" 2>/dev/null || die "$V has no build-constraints.txt"
+  build_config
+  for f in README.md LICENSE .gitignore; do ! g cat-file -e "$COMMIT:$f" 2>/dev/null || tree+=("$f"); done
+  end_build_processes
+  WHEEL_BUILD=$OPT/wheel-build src=$OPT/wheel-build/src dist=$OPT/wheel-build/dist
+  rm -rf -- "$WHEEL_BUILD"
+  install -d -m 0755 "$OPT"
+  mkdir -m 0755 "$WHEEL_BUILD"
+  own zab-build:zab-build "$WHEEL_BUILD"
+  as_user zab-build mkdir "$src" "$dist" "$WHEEL_BUILD/tmp" "$WHEEL_BUILD/cache"
+  g archive --format=tar "$COMMIT" -- "${tree[@]}" |
+    as_user zab-build tar -xf - -C "$src" --no-same-owner --no-same-permissions
+  end_build_processes
+  check_tree "wheel build's" "$src" "${tree[@]}"
+  as_user zab-build env UV_NO_CONFIG=1 UV_PYTHON_DOWNLOADS=never UV_CACHE_DIR="$WHEEL_BUILD/cache" \
+    TMPDIR="$WHEEL_BUILD/tmp" "$UV" build -q --wheel --no-sources --python "$PYTHON" \
+    --build-constraints "$src/build-constraints.txt" --require-hashes -o "$dist" "$src" ||
+    die "$V: the wheel did not build with the pinned backend"
+  end_build_processes
+  set -- "$dist"/*.whl
+  [[ $# -eq 1 && $1 == "$dist/$name" ]] || die "expected $name, got: ${*##*/}"
+  # Root never opens a path of zab-build's (#901's review, B1): a link the build left there would
+  # have root read its target, a key say, and place it for the fleet. zab-build copies the wheel
+  # into root's WORK, so a link to what zab-build can't read fails; then it must be a wheel.
+  [[ -f $1 && ! -L $1 ]] || die "$name, as built, is not a regular file"
+  as_user zab-build cat -- "$1" >"$WORK/$name" || die "$name could not be read as zab-build"
+  as_user zab-build "$PYTHON" -I -S -c "$WHEEL_CHECK" "${V#v}" <"$WORK/$name" 2>/dev/null ||
+    die "$name, as built, is not a wheel of zulip-agent-bridge ${V#v}"
+  end_build_processes
 }
 
 # uv, pinned by version and by its tarball's SHA-256, reinstalled whenever either changes.
@@ -775,6 +985,10 @@ install_uv() {
   tar -xzf "$t/uv.tar.gz" -C "$t" --no-same-owner
   install -d -m 0755 "$OPT" "$OPT/uv"
   install -m 0755 "$t/uv-$arch-unknown-linux-gnu/uv" "$UV.new"
+  case $("$UV.new" --version 2>/dev/null) in # a version paired with another release's hashes
+    "uv $UV_VERSION "*) ;;
+    *) rm -f -- "$UV.new" || :; die "uv $UV_VERSION: the pinned tarball holds another version" ;;
+  esac
   mv -f -T -- "$UV.new" "$UV"
   printf '%s\n' "$sum" >"$OPT/uv/tarball.sha256"
   chmod 0644 "$OPT/uv/tarball.sha256"
@@ -880,10 +1094,13 @@ units_failed() {
 }
 
 imds_active() {
-  [ -z "$PREFIX" ] || return 0
-  if ! systemctl is-active --quiet zab-admin-imds.service || ! nft list table inet zab_imds >/dev/null; then
-    die "zab-admin-imds.service is not active: the console and Caddy could reach the role"
+  local loaded=1
+  if [ -n "$PREFIX" ]; then # the tests: a stand-in says whether it is loaded (ZAB_DEPLOY_IMDS)
+    [ -z "${ZAB_DEPLOY_IMDS:-}" ] || "$ZAB_DEPLOY_IMDS" || loaded=0
+  elif ! systemctl is-active --quiet zab-admin-imds.service || ! nft list table inet zab_imds >/dev/null; then
+    loaded=0
   fi
+  [ "$loaded" = 1 ] || die "zab-admin-imds.service is not active: the console, Caddy and zab-build could reach the role"
 }
 
 # build REL: the release at its final path, as zab-build: the tree from git, checked against the
@@ -1047,6 +1264,10 @@ restart() {
   [ -z "$CONSOLE_HOST" ] || units+=(caddy.service)
   units+=("${SERVICES[@]}")
   for s in "${units[@]}"; do
+    if [ -n "$IN_BAND" ] && [ "$s" = zab-admin-bot.service ]; then
+      unit_ctl enable "$s" || failed+=("$s") # in-band: the bot restarts itself (#569)
+      continue
+    fi
     if { [ "$s" = zab-admin-imds.service ] || unit_ctl enable "$s"; } && unit_ctl restart "$s" &&
       { ! stops_service "$s" || unit_ctl stop "${s%.socket}.service"; }; then
       continue
@@ -1074,12 +1295,14 @@ record() {
 
 server_main() {
   local commit='' manifest='' base=- diff=- bootstrap=0 downgrade=0 wheel='' wheel_sha='' running=''
+  local build_wheel=0
   local kind f
-  V='' PAYLOAD='' BUILDING='' WORK='' CONSOLE_HOST='' REL=''
+  V='' PAYLOAD='' BUILDING='' WORK='' CONSOLE_HOST='' REL='' IN_BAND='' WHEEL_BUILD=''
   while [ $# -gt 0 ]; do
     case $1 in
       --bootstrap) bootstrap=1 && shift && continue ;;
       --downgrade) downgrade=1 && shift && continue ;;
+      --build-wheel) build_wheel=1 && shift && continue ;; # !upgrade-server's (#569)
     esac
     [ $# -ge 2 ] || die "$1 needs a value"
     case $1 in
@@ -1091,12 +1314,17 @@ server_main() {
       --diff-sha256) diff=$2 ;;
       --wheel) wheel=$2 ;;
       --wheel-sha256) wheel_sha=$2 ;;
+      --in-band) IN_BAND=$2 ;; # !upgrade-server's plan, from its apply helper (#569)
       *) die "unknown option $1" ;;
     esac
     shift 2
   done
   [[ $V =~ $VERSION_RE && $commit =~ $HEX_RE && $manifest =~ $SHA_RE ]] || die "bad arguments"
   [[ ($base == - || $base =~ $VERSION_RE) && ($diff == - || $diff =~ $SHA_RE) ]] || die "bad arguments"
+  [[ -z $IN_BAND || $IN_BAND =~ ^P-[1-9][0-9]{0,8}$ ]] || die "bad arguments"
+  [[ -z $IN_BAND || ($bootstrap == 0 && -z $wheel) ]] || die "--in-band is an upgrade's alone"
+  [[ $build_wheel == 0 || ($bootstrap$downgrade == 00 && -z $wheel$IN_BAND && $base$diff == --) ]] ||
+    die "--build-wheel goes alone"
   [[ -d $PAYLOAD && -f $PAYLOAD/release.bundle ]] || die "no payload"
   PAYLOAD=$(cd "$PAYLOAD" && pwd) # absolute: the server half works from "/"
   PREFIX=${ZAB_DEPLOY_PREFIX:-}
@@ -1151,19 +1379,20 @@ server_main() {
   if [ -n "$wheel" ]; then
     [[ $wheel == "zulip_agent_bridge-${V#v}-py3-none-any.whl" && $wheel_sha =~ $SHA_RE ]] || die "bad wheel"
     [ "$(sha256 <"$PAYLOAD/$wheel")" = "$wheel_sha" ] || die "$wheel: wrong SHA-256"
-    # releases/wheels is zab-admin's: it places the wheel itself, and root never works there by
-    # name. A version's wheel is never replaced.
+    place_wheel "$wheel" "$PAYLOAD/$wheel" "$wheel_sha"
+    return
+  fi
+  if [ "$build_wheel" = 1 ]; then # !upgrade-server's (#569): the wheel built here, if none is there
+    wheel=zulip_agent_bridge-${V#v}-py3-none-any.whl
     f=$VAR/releases/wheels/$wheel
     if as_user zab-admin test -e "$f" || as_user zab-admin test -L "$f"; then
-      as_user zab-admin cmp -s - "$f" <"$PAYLOAD/$wheel" || die "$wheel is there with other content"
-      note "$wheel is already there."
+      note "$wheel is already there, not built again: SHA-256 $(as_user zab-admin cat -- "$f" | sha256)."
       return
     fi
-    as_user zab-admin tee "$f.new" <"$PAYLOAD/$wheel" >/dev/null
-    as_user zab-admin chmod 0640 "$f.new"
-    as_user zab-admin mv -f -T -- "$f.new" "$f"
-    record wheel ",\"wheel\":\"$wheel\",\"sha256\":\"$wheel_sha\""
-    note "Placed $wheel for !rollout."
+    [ -n "$PREFIX" ] || install_uv
+    imds_active # zab-build runs the backend, and the rule keeps it off the role (#901, Codex)
+    server_wheel "$wheel"
+    place_wheel "$wheel" "$WORK/$wheel" "$(sha256 <"$WORK/$wheel")"
     return
   fi
   [ -n "$PREFIX" ] || install_uv
@@ -1202,7 +1431,7 @@ server_main() {
   # The record goes with the switch, before the restart: it always names the release `current`
   # points to. A unit that then fails to start is an operational fault, retried by hand (#338).
   record "$([ "$bootstrap" = 1 ] && echo bootstrap || echo upgrade)" \
-    ",\"from\":\"${running:--}\",\"base\":\"$base\",\"diff_sha256\":\"$diff\",\"downgrade\":$([ "$downgrade" = 1 ] && echo true || echo false)"
+    ",\"from\":\"${running:--}\",\"base\":\"$base\",\"diff_sha256\":\"$diff\",\"downgrade\":$([ "$downgrade" = 1 ] && echo true || echo false)${IN_BAND:+,\"plan\":\"$IN_BAND\"}"
   install_units "$REL/workshop/adminserver" || units_failed "$REL/workshop/adminserver"
   restart
 }

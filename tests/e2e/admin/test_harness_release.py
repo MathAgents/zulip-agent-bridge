@@ -1,5 +1,6 @@
 """Test releases, offline with real git and ssh-keygen (issue #356): version commits, signed
-and unsigned tags, a renamed ref, the version order, and how deploy.sh is called."""
+and unsigned tags, a renamed ref, the version order, and how deploy.sh is called; the public
+repository's exported releases and the deploy clone (#958)."""
 
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from e2e.admin.harness import rig as rigs
 from e2e.admin.harness.gate import Gate
 from e2e.admin.harness.release import (
     Releases,
+    dropped,
     ensure_keys,
     key,
     local,
@@ -88,6 +90,73 @@ def test_the_bad_tags_of_a10(made):
     assert "\ntag v0.2.4rc1\n" in "\n" + rel.git("cat-file", "tag", "v0.2.4rc2")
 
 
+def test_a_public_release_is_the_export_of_the_private_one(made):
+    """#958: the public commit is the private tree less the export's DROP, one commit on the
+    public main with its Exported-from trailer, tagged in the public repository; the public
+    repository holds no private commit."""
+    rel, base, signers = made
+    checkout = rel.checkout
+    (checkout / "tools" / "publish").mkdir(parents=True)
+    (checkout / "tools" / "publish" / "export.py").write_text(
+        '"""The tool."""\n\nDROP = (\n    "notes/",  # a directory\n    "AGENTS.md",\n)\n'
+    )
+    (checkout / "notes").mkdir()
+    (checkout / "notes" / "private.md").write_text("private\n")
+    (checkout / "AGENTS.md").write_text("private\n")
+    git(checkout, "add", "-A")
+    git(checkout, "commit", "-q", "-m", "with private files")
+    rel.ensure_repo()
+    rel.git("fetch", "-q", str(checkout), "HEAD:refs/heads/main")
+    base = rel.commit_of("HEAD")
+    first = rel.release(base, "v0.2.4rc1")
+    p1 = rel.export("v0.2.4rc1", first)
+    second = rel.release(base, "v0.2.4rc2")
+    p2 = rel.export("v0.2.4rc2", second, signer=None)
+    files = rel.public_git("ls-tree", "-r", "--name-only", p2).split()
+    assert "notes/private.md" not in files and "AGENTS.md" not in files
+    assert "tools/publish/export.py" in files  # this tool's own DROP isn't the fixture's
+    assert rel.git("diff", "--name-only", second, p2).split() == ["AGENTS.md", "notes/private.md"]
+    assert rel.public_git("rev-list", "--all").split() == [p2, p1]  # public history alone
+    assert rel.public_git("log", "-1", "--format=%B", p2).strip() == (
+        f"zab v0.2.4rc2\n\nExported-from: {second}"
+    )
+    assert rel.public_git("rev-parse", "refs/heads/main") == p2
+    good = git(rel.public, "-c", f"gpg.ssh.allowedSignersFile={signers}", "verify-tag",
+               "v0.2.4rc1", check=False)  # fmt: skip
+    assert good.returncode == 0, good.stderr
+    assert "BEGIN SSH SIGNATURE" not in rel.public_git("cat-file", "tag", "v0.2.4rc2")
+    assert rel.has_public_tag("v0.2.4rc1") and not rel.has_public_tag("v0.2.4rc3")
+    assert git(checkout, "tag").stdout == ""  # no test tag in the zab repository
+    clone = rel.deploy_clone("v0.2.4rc1", rel.rig.repo.parent / "clone")
+    assert git(clone, "remote").stdout == ""  # nothing is ever pushed from it
+    tags = git(clone, "for-each-ref", "--format=%(refname:short) %(*objectname)", "refs/tags")
+    assert sorted(tags.stdout.split("\n")[:-1]) == sorted(
+        [f"v0.2.4rc1 {first}", f"v0.2.4rc2 {p2}"]  # the private base, and the public tags
+    ), tags.stdout
+
+
+def test_an_unsigned_tag_stays_unsigned_whatever_the_users_git_config(made, monkeypatch):
+    """#961's review, N4: with `tag.gpgSign` on in the user's configuration, `tag -a` would sign
+    with the user's own key, a deployer's, and A10b would push that tag to the test release
+    repository; `--no-sign` keeps the unsigned case unsigned, and no other key than the rig's
+    is ever named."""
+    rel, base, _ = made
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "tag.gpgSign")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    monkeypatch.setenv("GIT_CONFIG_KEY_1", "user.signingkey")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_1", "/nonexistent/the-users-own-key")
+    commit = rel.release(base, "v0.2.4rc1", signer=None)
+    assert "BEGIN" not in rel.git("cat-file", "tag", "v0.2.4rc1")
+    rel.export("v0.2.4rc1", commit, signer=None)
+    assert "BEGIN" not in rel.public_git("cat-file", "tag", "v0.2.4rc1")
+
+
+def test_the_drop_list_is_read_without_running_the_tool():
+    assert dropped('DROP = ("a/", "b.md")  # comment\nOTHER = ("c",)\n') == ("a/", "b.md")
+    assert dropped("import os\nX = 1\n") == ()
+
+
 def test_versions_follow_deploy_sh_order():
     assert key("v0.2.4rc9") < key("v0.2.4") < key("v0.2.5rc1")
     assert next_version("0.2.3", "v0.2.4rc1") == "v0.2.4rc2"
@@ -123,6 +192,9 @@ def test_deploy_sh_is_called_as_a_deployer_would(tmp_path):
     assert kw["env"]["ZAB_DEPLOY_SSH"] == str(rig.ssh_wrapper)
     assert done.diff_sha256 == "a" * 64 and not done.ok
     assert done.why() == "deploy.sh: v0.2.4rc1: not signed with an SSH key"
+    rel.deploy(tmp_path / "deploy.sh", "v0.2.4rc1", out=tmp_path, repo=tmp_path / "clone")
+    argv, _ = calls[1]
+    assert argv[argv.index("--repo") + 1] == str(tmp_path / "clone")  # a deploy clone (#958)
 
 
 def test_the_ssh_config_pins_the_server(tmp_path):

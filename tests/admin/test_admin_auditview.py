@@ -172,3 +172,15 @@ def test_an_approved_plan_stays_until_its_apply_may_no_longer_begin(tmp_path):
     view.follow(path)
     [plan] = view.plans("harvard", noon + 30 * 60)
     assert (plan["state"], plan["expires_at"]) == ("applying", None)
+
+
+def test_a_retires_steps_are_left_out_of_the_view(tmp_path):
+    """#837: a `!retire`'s `retire_step` records, one per row and step, would push every other
+    record out of the view; its `apply_start` and `apply_end` stand for it."""
+    path = tmp_path / "audit.jsonl"
+    steps = [{**record(n, "retire_step"), "row": "alice", "stage": "uninstall", "cell": "ok"}
+             for n in range(2, KEEP + 2)]  # fmt: skip
+    path.write_bytes(lines(record(1, "read"), *steps, record(KEEP + 2, "read")))
+    view = View(600)
+    view.follow(path)
+    assert [r["seq"] for r in view.records()] == [1, KEEP + 2]

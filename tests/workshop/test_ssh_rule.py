@@ -54,7 +54,10 @@ command = argv[5]
 groups = state["groups"]
 
 if command == "describe-security-groups" and "--filters" in argv:
-    print("\t".join(g for g, v in groups.items() if v["name"] == "zab-admin" and v["tagged"]))
+    filters = argv[argv.index("--filters") + 1 : argv.index("--query")]
+    assert filters[1] == "Name=tag-key,Values=zab-admin", filters  # whatever the name (#772)
+    name = filters[0].removeprefix("Name=group-name,Values=")
+    print("\t".join(g for g, v in groups.items() if v["name"] == name and v["tagged"]))
 elif command == "describe-security-groups":
     rules = groups[opt("--group-ids")]["rules"]
     perms = {}
@@ -312,12 +315,40 @@ def test_the_script_names_no_deployment():
              ["--record-home", "--profile", "p"], ["--record-home", "--key", "k"],
              ["--record-home", "--home-unknown"], ["--save-defaults", "--files-host"],
              ["--save-defaults", "--dry-run"], ["--save-defaults", "--profile", "p"],
-             ["--save-defaults", "--close"], ["--close", "--home-unknown"]],
+             ["--save-defaults", "--close"], ["--close", "--home-unknown"],
+             ["--group-name", "a b"], ["--group-name", "-x"], ["--group-name"],
+             ["--group-name", "g", "--files-host"], ["--record-home", "--group-name", "g"],
+             ["--save-defaults", "--profile", "p", "--region", "eu-west-2", "--key", "k",
+              "--group-name", "g"]],
 )  # fmt: skip
 def test_a_usage_error_changes_nothing(laptop, args):
     done = laptop.run(*args)
     assert done.returncode == 2 and done.stderr.startswith("ssh-rule.sh: "), said(done)
     assert laptop.calls() == []
+
+
+@pytest.mark.parametrize("close", [False, True])
+def test_another_group_name_is_looked_up_with_the_same_tag(laptop, close):
+    """#772: a test server's group, by its own name, carrying the `zab-admin` tag as the
+    server's does; a group of that name without the tag is never found."""
+    test_sg = "sg-0e2e"
+    laptop.state["groups"][test_sg] = {"name": "zab-test-admin-server", "tagged": True,
+                                       "rules": [*WEB, *OLD_22]}  # fmt: skip
+    laptop.state["groups"]["sg-0bad"] = {"name": "zab-test-admin-server", "tagged": False,
+                                         "rules": []}  # fmt: skip
+    done = laptop.run("--group-name", "zab-test-admin-server", *(["--close"] if close else []))
+    assert done.returncode == 0, said(done)
+    found = f"group: {test_sg}, the admin server's group zab-test-admin-server (profile"
+    assert found in done.stdout
+    lookup = laptop.calls("describe-security-groups")[0]
+    assert "Name=group-name,Values=zab-test-admin-server" in lookup
+    assert "Name=tag-key,Values=zab-admin" in lookup
+    assert len(laptop.ports_22(test_sg)) == (0 if close else 1)
+    assert len(laptop.ports_22()) == 2  # zab-admin's group untouched
+    laptop.state["groups"].pop(test_sg)
+    done = laptop.run("--group-name", "zab-test-admin-server")
+    assert done.returncode == 1 and laptop.changes() == [], said(done)
+    assert "not one group for the admin server's group zab-test-admin-server: ''" in done.stderr
 
 
 def test_the_files_host_is_found_through_its_instance(laptop):
@@ -336,9 +367,10 @@ def test_the_files_host_is_found_through_its_instance(laptop):
 # ------------------------------------------------------------------------------- refusing
 
 
-def test_home_is_refused_before_any_aws_call(laptop):
+@pytest.mark.parametrize("args", [[], ["--group-name", "zab-test-admin-server"]])
+def test_home_is_refused_before_any_aws_call(laptop, args):
     laptop.record_home(HERE_ADDR + "/32")
-    done = laptop.run()
+    done = laptop.run(*args)
     assert done.returncode == 1 and laptop.calls() == []
     assert "stopped: this network is home's, a network an agent machine shares." in done.stderr
     assert HERE_ADDR not in said(done)  # this address is home's: not printed either
@@ -618,7 +650,8 @@ def test_every_command_in_the_docs_uses_options_it_accepts():
     text = SCRIPT.read_text()
     cases = re.findall(r"^  (-[-a-z |]+)\)", text, re.M)
     accepted = {option for alternatives in cases for option in alternatives.split(" | ")}
-    assert {"--files-host", "--close", "--dry-run", "--record-home", "--key"} <= accepted
+    used = {"--files-host", "--close", "--dry-run", "--record-home", "--key", "--group-name"}
+    assert used <= accepted
     newest = [(ROOT / "CHANGELOG.md").read_text().split("\n## ", 2)[1]]
     runbooks = ROOT / "docs" / "runbooks" / "upgrades.md"
     if runbooks.exists():

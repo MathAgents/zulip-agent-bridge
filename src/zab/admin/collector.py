@@ -83,7 +83,7 @@ STATUS_KEYS = (
 MAX_ITEMS = 20  # list items kept of a VM's values
 MAX_CHARS = 300  # characters kept of a VM's string
 _TYPE = re.compile(r"[a-z0-9][a-z0-9.-]{0,40}", re.ASCII)  # an instance type, as named
-_REGION = re.compile(r"[a-z]{2}(?:-[a-z]+)+-[0-9]{1,2}", re.ASCII)  # an AWS region, as named
+_REGION = re.compile(r"[a-z]{2}(?:-[a-z]+)++-[0-9]{1,2}", re.ASCII)  # an AWS region, as named
 _FEED = threading.Lock()
 
 

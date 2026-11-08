@@ -56,14 +56,23 @@ _ORG = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", re.ASCII)
 _TAG_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/+@-]{0,127}", re.ASCII)
 _TAG_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/+@-]{0,255}", re.ASCII)
 _HTTPS = re.compile(r"https://[a-z0-9.-]+(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/-]*)?", re.ASCII)
-_PATH = re.compile(r"(?:/[A-Za-z0-9_][A-Za-z0-9._-]*)+", re.ASCII)  # absolute; no . or ..
-_PUBLIC_KEY_FILE = re.compile(_PATH.pattern + r"\.pub", re.ASCII)
-_REGION = re.compile(r"[a-z]{2}(?:-[a-z]+)+-[0-9]{1,2}", re.ASCII)
+_SEGMENT = r"(?:/[A-Za-z0-9_][A-Za-z0-9._-]*)"
+_PATH = re.compile(_SEGMENT + "++", re.ASCII)  # absolute; no . or ..
+# not possessive: the last segment must give `.pub` back
+_PUBLIC_KEY_FILE = re.compile(_SEGMENT + r"+\.pub", re.ASCII)
+_REGION = re.compile(r"[a-z]{2}(?:-[a-z]+)++-[0-9]{1,2}", re.ASCII)
 _AMI = re.compile(r"ami-[0-9a-f]{8,17}", re.ASCII)
 _SECURITY_GROUP = re.compile(r"sg-[0-9a-f]{8,17}", re.ASCII)
 _INSTANCE_TYPE = re.compile(r"[a-z][a-z0-9-]*\.[a-z0-9]+", re.ASCII)
 _KEY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", re.ASCII)
 _EMAIL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}@[A-Za-z0-9.-]{1,253}", re.ASCII)
+#: `release_repo` (#569): where `!upgrade-server`'s helper fetches the signed tags, with its
+#: deploy key. GitHub over SSH only, since the helper pins GitHub's host keys.
+RELEASE_REPO = re.compile(
+    r"git@github\.com:[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+    r"/[A-Za-z0-9_][A-Za-z0-9._-]{0,99}\.git",
+    re.ASCII,
+)
 #: `gifts_step` (#709): one line, no control characters, neither starting with whitespace or `-`
 #: nor ending with whitespace, at most `GIFTS_STEP_BYTES` in UTF-8; zulip_provision.py's rule.
 _NOT_TEXT = r"\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff"
@@ -163,6 +172,9 @@ class AdminConfig:
     scope_tags: tuple[tuple[str, str], ...]
     regions: tuple[str, ...]
     instance_types: tuple[str, ...]
+    #: The repository `!upgrade-server` fetches releases from (§1.6, #569), or "": the in-band
+    #: upgrade is then refused, and a deployer deploys with deploy.sh.
+    release_repo: str = ""
 
     def workshop(self, name: str) -> Workshop | None:
         return next((ws for ws in self.workshops if ws.name == name), None)
@@ -279,6 +291,7 @@ def _config(top: _Table, roots: Roots) -> AdminConfig:
         release=release,
         release_pattern=re.compile(RELEASE_PATTERNS[release], re.ASCII),
         console_url=top.text("console_url", _HTTPS, ""),
+        release_repo=top.text("release_repo", RELEASE_REPO, ""),
         global_bot=global_bot,
         workshops=tuple(
             _workshop(top.table(f"workshop[{i}]", entry), roots, scope)
@@ -415,7 +428,8 @@ def _check_workshops(config: AdminConfig) -> None:
     channel (`channel`, #627) is its own too, and neither of those: its subscribers become its
     roster. A workshop can complete every plan when a global admin can approve it, whose
     approval alone completes one (#558), or when its approvers are `destructive_approvals` at
-    least."""
+    least. A files host serves one GitHub organization (#693), so workshops that share a
+    `refserve_url` share their `github_org`, compared ignoring case (#771)."""
     bots = [ws.bot for ws in config.workshops]
     if config.global_bot:
         bots.append(config.global_bot)
@@ -448,6 +462,15 @@ def _check_workshops(config: AdminConfig) -> None:
     for bot in bots:
         if bot.user_id in people:
             raise AdminConfigError(f"user {bot.user_id} is an admin bot and on an allowlist")
+    hosts: dict[str, Workshop] = {}
+    for ws in config.workshops:
+        first = hosts.setdefault(ws.refserve_url.rstrip("/"), ws)
+        if first.github_org.lower() != ws.github_org.lower():
+            raise AdminConfigError(
+                f"workshops {first.name} (refserve_url {first.refserve_url}, github_org "
+                f"{first.github_org}) and {ws.name} (refserve_url {ws.refserve_url}, github_org "
+                f"{ws.github_org}) share a files host, which serves one GitHub organization"
+            )
     files = [(ws.roster, "roster") for ws in config.workshops]
     files += [(ws.out_dir, "out_dir") for ws in config.workshops]
     files += [(bot.zuliprc, "bot zuliprc") for bot in bots]

@@ -17,10 +17,13 @@ a fresh interpreter and compares `sys.modules`.
 
 import ast
 import json
+import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 SRC = Path(__file__).resolve().parents[2] / "src"
 
@@ -168,7 +171,18 @@ def test_importing_the_admin_package_loads_nothing_else():
 HELPER_IMPORTS = frozenset(
     {"zab", "zab.admin", "zab.admin.checks", "zab.admin.config", "zab.admin.confighelper"}
 )
-HELPER_UNIT = SRC.parent / "workshop" / "adminserver" / "zab-admin-config.service"
+#: What root imports in the upgrade helpers' units (#569): the config helper's set, whose `take`
+#: they use, and their own module.
+UPGRADE_IMPORTS = HELPER_IMPORTS | {"zab.admin.upgradehelper"}
+UNITS = SRC.parent / "workshop" / "adminserver"
+HELPER_UNIT = UNITS / "zab-admin-config.service"
+#: Each root helper's unit → its module, its imports and its program's name (`--help`).
+UPGRADE = ("zab.admin.upgradehelper", UPGRADE_IMPORTS, "zab-admin-upgrade")
+HELPERS = {
+    "zab-admin-config.service": ("zab.admin.confighelper", HELPER_IMPORTS, "zab-admin-config"),
+    "zab-admin-upgrade-plan.service": UPGRADE,
+    "zab-admin-upgrade.service": UPGRADE,
+}
 CURRENT = "/opt/zab-admin/current"
 #: The unit's code (argv[1]) run as `-c` runs it; at exit, what was imported, by name and file.
 HELPER_PROBE = """
@@ -193,37 +207,45 @@ exec(compile(code, "ExecStart", "exec"), {"__name__": "__main__"})
 """
 
 
-def test_the_helpers_closure_is_its_own():
-    """Statically, the imports inside functions included: from the helper, HELPER_IMPORTS, no
-    third-party package and no dynamic import."""
-    modules, third, dynamic = closure(SRC, "zab.admin", start=["zab.admin.confighelper"])
-    assert (modules, third, dynamic) == (HELPER_IMPORTS, set(), [])
+@pytest.mark.parametrize("unit", sorted(HELPERS))
+def test_the_helpers_closure_is_its_own(unit):
+    """Statically, the imports inside functions included: from each root helper, its imports
+    (HELPERS), no third-party package and no dynamic import."""
+    module, imports, _ = HELPERS[unit]
+    modules, third, dynamic = closure(SRC, "zab.admin", start=[module])
+    assert (modules, third, dynamic) == (imports, set(), [])
 
 
-def test_the_helpers_command_imports_only_its_closure():
+@pytest.mark.parametrize("unit", sorted(HELPERS))
+def test_the_helpers_command_imports_only_its_closure(unit):
     """The unit's own command, with `current` mapped to this checkout and `--help` added, run
-    by its own interpreter under its flags: it answers, and imported HELPER_IMPORTS from src/,
+    by its own interpreter under its flags: it answers, and imported its HELPERS set from src/,
     the standard library from the stdlib's directories, and nothing else; no `site`, so no
     `.pth`; and its path is the stdlib's and src/ alone. A third-party import at import time
     fails here, since -S leaves every site-packages off the path. The interpreter is the
     system's, never the venv's, which zab-build builds while third-party code runs, and whose
     pyvenv.cfg would choose the stdlib (review of #438)."""
-    (line,) = [x for x in HELPER_UNIT.read_text().splitlines() if x.startswith("ExecStart=")]
+    module, imports, program = HELPERS[unit]
+    text = (UNITS / unit).read_text()
+    (line,) = [x for x in text.splitlines() if x.startswith("ExecStart=")]
     python, *flags, dash_c, code = shlex.split(line.removeprefix("ExecStart="))
     assert (python, flags, dash_c) == ("/usr/bin/python3", ["-I", "-B", "-S"], "-c")
+    assert f"from {module} import main" in code
     root = SRC.parent
-    argv = [python, *flags, "-c", HELPER_PROBE, code.replace(CURRENT, str(root))]
+    code = code.replace(CURRENT, str(root))
+    code = re.sub(r"main\(\[[^]]*\]\)", "main()", code)  # its action's argument: `--help` here
+    argv = [python, *flags, "-c", HELPER_PROBE, code]
     done = subprocess.run(  # noqa: S603
         [*argv, "--help"], capture_output=True, text=True, check=False, timeout=60
     )
     assert done.returncode == 0, done.stderr
     usage, report = done.stdout.rsplit("\n", 2)[0], json.loads(done.stdout.splitlines()[-1])
-    assert usage.startswith("usage: zab-admin-config")
+    assert usage.startswith(f"usage: {program}")
     assert report["flags"] == [1, 1, 1]
     modules = {k: v for k, v in report["modules"].items() if k != "__main__"}
     assert "site" not in modules and "sitecustomize" not in modules
     ours = {name for name in modules if name.split(".")[0] == "zab"}
-    assert ours == HELPER_IMPORTS
+    assert ours == imports
     assert all(Path(modules[name]).is_relative_to(SRC) for name in ours)
     others = {name: file for name, file in modules.items() if name not in ours}
     third = {name for name in others if name.split(".")[0] not in report["names"]}

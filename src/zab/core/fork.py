@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from zab.core import presentation as view
 from zab.core import types as t
+from zab.core import unmentioned
 from zab.core.creation import context_prompt, topic_lock, topic_worktree
 from zab.core.watchdog import waiting_lock
 from zab.zulip.poster import ACK
@@ -279,6 +280,7 @@ async def fork(
             # The parent's model, effort, approval, sandbox and account; its native bookkeeping
             # (`extra`) is its own. The backend lays these over the parent's effective settings.
             settings = replace(t.SessionSettings(**json.loads(parent["settings_json"])), extra={})
+            session_id = str(uuid4())  # before fork_session: ZAB_SESSION in its turns (#655)
             info = await bridge.backend.fork_session(
                 parent["native_id"],
                 t.SessionSpec(
@@ -287,12 +289,13 @@ async def fork(
                     settings=settings,
                     git_identity=bridge.git_identity,
                     bot=bridge.bot.name,
+                    session=session_id,
                     context_prompt=context_prompt(bridge.config.bridge.multi_party),
                 ),
             )
             now = time.time()
             row = dict(
-                id=str(uuid4()),
+                id=session_id,
                 bot=bridge.bot.name,
                 backend=bridge.bot.backend,
                 native_id=info.native_id,
@@ -330,6 +333,10 @@ async def fork(
                 bridge.store.insert("sessions", **row)
                 if joined is None:  # the fork the VM's other bots join (#712)
                     bridge.store.set(fork_of_message(message["id"]), row["id"])
+                # The fork topic's addressees start with the bots that forked (§4.5, #878).
+                unmentioned.record(
+                    bridge.store, stream_id, topic, message["id"], [bridge.router.full_name]
+                )
                 drop_pending_fork(bridge.store, bridge.bot.name, message["id"])  # if deferred
                 bridge.store.set(
                     key,

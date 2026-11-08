@@ -62,9 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--public-key", required=True, type=Path)
     add_tag_argument(parser)
     parser.add_argument("--dry-run", action="store_true")
-    opts = parser.parse_args(argv)
-    if not opts.tag:
-        parser.error("name the workshop's scope: --tag workshop=NAME (repeatable)")
+    opts = parser.parse_args(argv)  # --tag is required (`add_tag_argument`)
     try:
         tags = parse_tags(opts.tag)
         text = opts.public_key.read_text(encoding="ascii")

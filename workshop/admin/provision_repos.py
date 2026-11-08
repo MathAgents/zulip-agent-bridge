@@ -2,9 +2,10 @@
 """`provision_repos.py --roster roster.csv [--only SLUG] [--invites-only] [--dry-run]`
 (README.md §1b).
 
-For every participant row (identified by `slug`), on Drew's laptop with his GitHub token:
+For every participant row (identified by `slug`), with a GitHub token of the organization's (the
+admin server's, for the bot, or a deployer's own):
 
-1. create the private repository `MathAgents/<slug>` unless it exists, and push the workshop
+1. create the private repository `<org>/<slug>` (`--org`) unless it exists, and push the workshop
    template (`workshop/template/`) as its first commit when it is empty;
 2. on the participant's VM, over SSH as `ubuntu` with the host key pinned (`scan_hosts.py`),
    check that the VM says it belongs to this participant, then as `agent` generate the
@@ -768,8 +769,11 @@ def provision_row(
                 repo_exists=result.repo_action != "would create",
                 no_rebind=opts.no_rebind,
             )
-        except GitHubError as exc:  # the repository is ready either way: report, do not fail
-            result.invite, result.login = f"failed: {exc}", previous
+        except Exception as exc:  # the repository is ready either way: report, do not fail
+            # a transport failure too (URLError, a timeout), not GitHub's errors alone (#799),
+            # redacted as `run_invites`' `on_error` redacts it
+            why = str(exc) if isinstance(exc, GitHubError) else f"{type(exc).__name__}: {exc}"
+            result.invite, result.login = redact(f"failed: {why}"), previous
     return result
 
 

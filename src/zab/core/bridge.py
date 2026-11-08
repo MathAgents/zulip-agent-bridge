@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 
 from zab.config import BotConfig, Config, allowed_users
-from zab.core import btw
+from zab.core import btw, unmentioned
 from zab.core import presentation as view
 from zab.core import types as t
 from zab.core.attach import attach
@@ -104,6 +104,8 @@ class BotBridge:
         self.manager, self.renderer, self.slots = manager, renderer, slots
         self.client = client or ZulipClient.from_zuliprc(bot.zuliprc)
         self.client.metrics = Metrics(bot.name, bot.backend)
+        # Each message's edits, kept across restarts (#757): in whichever store the bridge has
+        self.client.edit_bounds.keep(lambda: self.store, bot.name)
         self.poster = Poster(self.client)
         self.actors: dict[str, SessionActor] = {}
         self.attaching: dict[str, list[t.BackendEvent]] = {}
@@ -212,12 +214,10 @@ class BotBridge:
         began = time.monotonic()
         catchup = Catchup(self)
         await catchup.initialize()
-        self.forget_channels()
-        self.unverify()
-        for row in self.store.rows("sessions", bot=self.bot.name):
-            if row["state"] != "detached" and self.has_work(row):
-                await self.verify_card(row["id"])
+        await self.confirm_working_cards()
         self.prepare_actors()
+        for message_id, content in self.client.edit_bounds.held_finals():
+            self.poster.resume(message_id, content)  # a summary an earlier run held back (#806)
         # Zulip failing here fails the start, as in the replay: the replay must not create
         # a topic's session from a later message (codex review on #533).
         await self.recover_pending_creations(interrupt=True)
@@ -233,11 +233,25 @@ class BotBridge:
         if self.metric_task is None:
             self.metric_task = asyncio.create_task(self.report_metrics())
 
+    async def confirm_working_cards(self) -> None:
+        """No card location is confirmed any more (`unverify`); those of the sessions that can
+        post before a message reaches them (a turn, held or pending input, an approval) are
+        confirmed now (§4.4): at start-up and after an event-queue loss (§7.1, §7.8.2). Every
+        other card is confirmed when a message reaches its topic (`ensure_location`) or its
+        session posts (`verify_card`), and the recent ones by the housekeeping after the
+        replay: their cost grows with the sessions, and no answer waits for it."""
+        self.forget_channels()
+        self.unverify()
+        for row in self.store.rows("sessions", bot=self.bot.name):
+            if row["state"] != "detached" and self.has_work(row):
+                await self.verify_card(row["id"])
+
     async def housekeep(self, catchup: Catchup) -> None:
-        """After the replay, in the background and within the budget's reserve
-        (`Poster.background`): confirm the cards of recent sessions, then reconcile their
-        topics (§7.8.2) from the boundary captured before the replay. Older sessions are
-        confirmed when a message reaches their topic (`ensure_location`)."""
+        """After the replay of a start-up or of an event-queue loss's recovery, in the
+        background and within the budget's reserve (`Poster.background`): confirm the cards of
+        recent sessions, then reconcile their topics (§7.8.2) from the boundary captured
+        before the replay. Older sessions are confirmed when a message reaches their topic
+        (`ensure_location`)."""
         log = logging.getLogger("zab.bridge")
         began, delay = time.monotonic(), 1
         while True:
@@ -264,11 +278,17 @@ class BotBridge:
         )
 
     async def stop_housekeeping(self) -> None:
-        if self.housekeeping and not self.housekeeping.done():
-            self.housekeeping.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.housekeeping
-        self.housekeeping = None
+        """Cancel the housekeeping and wait for its end. A cancel of the caller propagates:
+        under `suppress(CancelledError)` an `await` of the task swallowed it, so `close()`,
+        cancelling a listener that waited here at a queue loss, waited forever for a listener
+        that went on polling (review of #965). The reference stays until the task has ended,
+        so that a later call, `close()`'s own, waits for it too."""
+        task = self.housekeeping
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.wait({task})
+        if self.housekeeping is task:
+            self.housekeeping = None
 
     def recent_sessions(self) -> list[dict[str, Any]]:
         """The sessions reconciliation covers (§2 "active session"): a turn in flight, or
@@ -397,12 +417,41 @@ class BotBridge:
             )
         return result
 
-    async def siblings(self, message: dict[str, Any], multi_party: bool) -> tuple[str, ...] | None:
+    def first_here(self, message: dict[str, Any], peers: tuple[str, ...]) -> bool:
+        """Whether this bot comes first among the bots an unmentioned command reached (`peers`
+        and this one) that have a session in its topic: the one that answers for them where
+        none acts (SPEC §4.6, `Delivery.first`, #847). A bot whose backend stops sub-agents
+        left running (`stop_subagents`) comes before one whose doesn't, then by full name:
+        its answer to `!stop` with no turn says what it found, which only it knows, and the
+        topic gets that one line (review of #851)."""
+
+        def rank(bridge: BotBridge, name: str | None) -> tuple[bool, str]:
+            return not bridge.backend.capabilities.stop_subagents, name or ""
+
+        rows = self.store.rows("sessions", stream_id=message["stream_id"], topic=message["subject"])
+        here = {row["bot"] for row in rows if row["state"] != "detached"}
+        others = [
+            rank(p, name)
+            for p in self.all_bridges
+            if p is not self and p.router and p.bot.name in here
+            if (name := self.users.get(p.router.user_id, {}).get("full_name")) in peers
+        ]
+        mine = rank(self, self.router.full_name)
+        return all(mine < other for other in others)
+
+    async def siblings(
+        self,
+        message: dict[str, Any],
+        multi_party: bool,
+        addressees: tuple[str, ...] | None = None,
+    ) -> tuple[str, ...] | None:
         """The router's `siblings` (SPEC §4.5 rule 6.2, #713), for a channel message that names
         no bot (`Router.unmentioned`): the VM's other bots (this process's other bridges) that
-        allow its sender, which it goes to as well as this one. None where it doesn't go to this
+        allow its sender, which it goes to as well as this one; of them, under the rule `last`,
+        those the topic's record names (`addressees`, #878). None where it doesn't go to this
         bot: a multi-party channel or one of unknown membership, a sender this bot doesn't
-        allow, a topic where this bot's session was detached, which waits for a mention (§4.6).
+        allow, a topic where this bot's session was detached, which waits for a mention (§4.6),
+        a record that doesn't name it.
         A bot that isn't subscribed to the channel (`channel_members`) never gets the message:
         it is no sibling, and so no peer, nor the bot that answers for the VM.
         With `bridge.multi_party` off, it goes to the bots with a session in the topic and
@@ -431,6 +480,10 @@ class BotBridge:
         ]
         if not self.config.bridge.multi_party and self.bot.name not in live:
             return None
+        if addressees is not None:  # the sign-in rule below holds among them (#878)
+            if self.router.full_name not in addressees:
+                return None
+            bridges = [p for p in bridges if p is self or self.full_name_of(p) in addressees]
         # Only the bots in the channel get it (Codex rounds 1 and 2 on #730), the kill switch's
         # included: `multi_party` reads the membership only while the switch is on.
         members = await self.channel_members(message["stream_id"])
@@ -473,6 +526,116 @@ class BotBridge:
                 if name and p is not self and id(p) not in out
             )
         )
+
+    async def answerers(
+        self, message: dict[str, Any], recorded: tuple[str, ...] | None = None
+    ) -> tuple[str, ...] | None:
+        """For a message without a mention in a single-human channel: the full names of the VM's
+        bots (this process's bridges, this one's included) that it reaches by their allowlists
+        and the channel's members, whatever their sessions, a `!detach` or their agents'
+        sign-ins; under the rule `last`, those of them that the topic's record names before it
+        (`recorded`, `unmentioned.addressees`, not `addressees`, which reads a card found gone
+        as it is now), or all where it names none of them. The first by name answers a command
+        whose answer is the VM's (`!help`, `!vm`, `!tools`, a topic's `!unmentioned`) for all
+        of them (SPEC §4.6, #899): each bot finds the same one, in whichever order the bots read
+        the command and a `!detach`, and one that waits for a mention after `!detach` still
+        answers. None with `bridge.multi_party` off, whose rule reaches the bots with a session
+        in the topic (`siblings`, which then decides), and for a sender this bot doesn't
+        allow."""
+        sender = message["sender_id"]
+        if not self.config.bridge.multi_party or sender not in self.router.allowlist:
+            return None
+        members = await self.channel_members(message["stream_id"])
+        names = {
+            self.router.full_name if p is self else self.full_name_of(p)
+            for p in self.all_bridges
+            if p.router
+            and sender in p.router.allowlist
+            and (members is None or p.router.user_id in members)
+        }
+        names.discard(None)
+        return tuple(sorted(names & set(recorded or ()) or names))
+
+    def full_name_of(self, bridge: BotBridge) -> str | None:
+        return self.users.get(bridge.router.user_id, {}).get("full_name")
+
+    def last(self) -> bool:
+        """Whether the rule `last` routes a message without a mention (#878)."""
+        config = self.config.bridge
+        return config.multi_party and unmentioned.rule(self.store, config.unmentioned) == "last"
+
+    async def confirm_others(self, stream_id: int, topic: str) -> bool:
+        """Before a message without a mention is routed under `last`, and before a `!detach`
+        under either rule (#891): the VM's other bots' cards moved into the topic while the
+        bridge was down, found (`ensure_location`), bring their record (`Router.move_card`), so
+        that this bot reads the record they will (#878). False, logged, when Zulip refuses
+        another bot's request: a message without a mention is then routed as without a record,
+        to all, and a `!detach` as it is, amending from the entry it finds, rather than either
+        being dropped (a refused request skips the event). A transient failure is raised, so
+        the message is retried, as for this bot's own cards, and so is any other error, a bug's
+        included."""
+        for bridge in self.all_bridges:
+            if bridge is not self and bridge.router:
+                try:
+                    await bridge.ensure_location(stream_id, topic)
+                except (ZulipError, httpx.HTTPError) as exc:
+                    if zulip_unreachable(exc):
+                        raise
+                    logging.getLogger("zab.bridge").warning(
+                        "Another bot's cards unconfirmed (%s)",
+                        type(exc).__name__,
+                        extra={"bot": self.bot.name},
+                    )
+                    return False
+        return True
+
+    async def addressees(
+        self, stream_id: int, topic: str, before: int | None, sender: int | None = None
+    ) -> tuple[str, ...] | None:
+        """Under the rule `last` (#878), the VM's bots that the topic's newest prompt with a
+        mention before message `before` named (`unmentioned.addressees`), of those that can take
+        a message there: a message without a mention goes to them. A bot can't when the VM no
+        longer has it by that name (renamed), or it is detached in the topic, isn't in the
+        channel or doesn't allow `sender`, and when a card's check found its card in the topic
+        gone (`unmentioned.card_gone`), which detaches it without a message. A `!detach` takes
+        its bots out of the record by its position instead (`Router._route`). None under
+        `all`, where no bot that can is named, and with `bridge.multi_party` off, whose rule
+        stands under both (SPEC §4.5)."""
+        if not self.last():
+            return None
+        recorded = unmentioned.addressees(self.store, stream_id, topic, before)
+        if not recorded:
+            return None
+        # Only a detach that no message records: a `!detach` amends the record by its position
+        # instead (`Router._route`), so that it changes no lookup for a message before it.
+        rows = self.store.rows("sessions", stream_id=stream_id, topic=topic)
+        gone = {row["bot"] for row in rows if self.store.get(unmentioned.card_gone(row["id"]))}
+        detached = gone - {row["bot"] for row in rows if row["state"] != "detached"}
+        members = await self.channel_members(stream_id)
+        able = {
+            self.full_name_of(p)
+            for p in self.all_bridges
+            if p.router
+            and p.bot.name not in detached
+            and (members is None or p.router.user_id in members)
+            and (sender is None or sender in p.router.allowlist)
+        }
+        return tuple(name for name in recorded if name in able) or None
+
+    async def unmentioned_here(self, stream_id: int, topic: str) -> str:
+        """Where a message without a mention goes in the topic, for its `!session` (#878)."""
+        rule = unmentioned.rule(self.store, self.config.bridge.unmentioned)
+        if await self.multi_party(stream_id):
+            where = "to no agent: more than one person is in this channel, so name one"
+        elif not self.config.bridge.multi_party:
+            where = "to the agents with a session here"
+        elif rule == "last" and (names := await self.addressees(stream_id, topic, None)):
+            where = "to " + ", ".join(view.code(name) for name in names)
+            where += ", as the topic's last mention named"
+        else:
+            where = "to all of your agents"
+            where += ", until a mention here names some" if rule == "last" else ""
+        return f"Without a mention: {where} (`!unmentioned {rule}`, set in a direct message)"
 
     def forget_sign_in(self) -> None:
         """Drop every bridge's cached answer for this bot's agent (`siblings`): after a `!login`,
@@ -550,8 +713,9 @@ class BotBridge:
         return channel.get("invite_only") is True and not channel.get("is_web_public", False)
 
     async def refresh_cards(self) -> None:
-        """Confirm every session's card location, and its channel's privacy, now (§4.4;
-        §7.8.2 step 1)."""
+        """Confirm every session's card location, and its channel's privacy, now (§4.4). No
+        recovery does this any more: a request per session, before anything else, held up
+        the answers after an event-queue loss (`confirm_working_cards`)."""
         assert self.router
         self.forget_channels()
         self.unverify()
@@ -617,7 +781,9 @@ class BotBridge:
             if row["state"] == "detached":
                 return
             if card is None:
-                self.store.update("sessions", {"id": row["id"]}, state="detached")
+                with self.store.transaction():  # a detach no message records (#878)
+                    self.store.update("sessions", {"id": row["id"]}, state="detached")
+                    self.store.set(unmentioned.card_gone(row["id"]), True)
                 if actor := self.actors.get(row["native_id"]):
                     actor.row["state"] = "detached"
                     actor.ready = False
@@ -830,6 +996,7 @@ class BotBridge:
             git_identity=self.git_identity,
             confirm_location=self.verify_card,
             reopened=self.pending_forks_soon,
+            unmentioned_here=self.unmentioned_here,
         )
         self.actors[row["native_id"]] = actor
         for pending in self.store.pending_deliveries(self.bot.name):
@@ -905,18 +1072,27 @@ class BotBridge:
                         log.info("Registered a new Zulip event queue", extra=extra)
                     if not resume:  # a creation's retry costs no request per card
                         await self.refresh_users()
-                        await self.refresh_cards()
+                        # The card moves of the gap went with the queue: as at start-up, the
+                        # cards of sessions with work now, any other when something needs it.
+                        await self.confirm_working_cards()
                     resume = not await recover_creations()
                     if resume:
                         continue
                     catchup = catchup or Catchup(self, floor=seen)
                     # New topics and DMs too, as at startup (SPEC §7.8.2; e2e scenario 4).
-                    await self.reconcile_messages(catchup=catchup)
-                    catchup.reconciled()
                     count = await catchup.replay()
                     await self.reconcile_reactions()
+                    log.info(
+                        "Event-queue recovery caught up %d messages; housekeeping follows",
+                        count,
+                        extra=extra,
+                    )
+                    # The recent cards and topics in the background, as after a start-up's
+                    # replay: inline, a request or two per session held up the answers Zulip
+                    # had refused and the gap's messages, past ten minutes on the test VM's
+                    # hundreds of sessions (e2e scenario 4 at v0.2.19's candidate, #964).
+                    self.housekeeping = asyncio.create_task(self.housekeep(catchup))
                     recovering, catchup = False, None
-                    log.info("Event-queue recovery caught up %d messages", count, extra=extra)
                 # Answer at once: Zulip is back, or a creation's retry is due, whether or not
                 # events are waiting.
                 if probe or self.creations_interrupted:
@@ -983,10 +1159,10 @@ class BotBridge:
                     queue, recovering, probe = None, True, True
                     # Its subscription events are lost with it: read memberships again.
                     self.subscribers.clear()
-                    # Recovery confirms every card and reconciles inline, from the boundary
-                    # the startup housekeeping left, if it had not finished.
+                    # Recovery runs it again after its replay, from the boundary a start-up's
+                    # or an earlier recovery's housekeeping left, if it had not finished.
                     await self.stop_housekeeping()
-                    # Before topic reconciliation claims messages newer than a new topic or DM.
+                    # Before anything claims messages newer than a new topic or DM.
                     catchup = catchup or Catchup(self, floor=seen)
                 else:
                     if exc.status != 429:  # the client logs rate limits itself
@@ -1091,9 +1267,19 @@ class BotBridge:
             for u in self.users.values()
             if u.get("is_bot") and u["user_id"] != self.router.user_id
         }
-        unmentioned = message["type"] == "stream" and self.router.unmentioned(
+        unnamed = message["type"] == "stream" and self.router.unmentioned(
             message["content"], others
         )
+        addressees = recorded = None
+        if unnamed and self.last():
+            stream, topic = message["stream_id"], message["subject"]
+            if await self.confirm_others(stream, topic):
+                sender = message["sender_id"]
+                addressees = await self.addressees(stream, topic, message["id"], sender)
+                recorded = unmentioned.addressees(self.store, stream, topic, message["id"])
+        elif message["type"] == "stream" and self.router.detaching(message["content"], others):
+            # its amendment of the record reads the entry before it, under either rule (#891)
+            await self.confirm_others(message["stream_id"], message["subject"])
         return self.router.route(
             message,
             foreign_kind_mentions={
@@ -1106,9 +1292,13 @@ class BotBridge:
             sender_is_bot=user.get("is_bot") is not False,
             private=self.private(channel),
             multi_party=multi_party,
-            siblings=await self.siblings(message, multi_party) if unmentioned else None,
+            siblings=await self.siblings(message, multi_party, addressees) if unnamed else None,
             sibling_kinds=self.sibling_kinds(message["sender_id"]),
             other_bot_names=others,
+            addressees=addressees,
+            answerers=await self.answerers(message, recorded)
+            if unnamed and not multi_party
+            else None,
         )
 
     async def handle(self, event: dict[str, Any], *, cursor: int | None = None) -> None:
@@ -1179,11 +1369,18 @@ class BotBridge:
                 else:
                     await self.poster.send(message["stream_id"], message["subject"], text)
                 return
+            default, active = self.config.bridge.unmentioned, self.config.bridge.multi_party
+            if route.action == "dm" and (
+                answer := unmentioned.command(self.store, default, route.text.strip(), active)
+            ):
+                await self.login.send(uid, answer)  # the VM's setting, for each bot (#878)
+                return
             if route.action == "dm":
                 status = (
                     "Bridge running"
                     + identity_display(self.git_identity)
                     + await status_login_hint(self.backend)
+                    + f" · without a mention: `{unmentioned.rule(self.store, default)}`"
                     if route.text.strip() == "!status"
                     else ""
                 )
@@ -1262,7 +1459,12 @@ class BotBridge:
                                 None,
                                 None,
                                 Delivery(
-                                    message["id"], uid, user["full_name"], route.text, route.quiet
+                                    message["id"],
+                                    uid,
+                                    user["full_name"],
+                                    route.text,
+                                    route.quiet,
+                                    not route.quiet or self.first_here(message, route.peers),
                                 ),
                             )
                         )
@@ -1282,6 +1484,7 @@ class BotBridge:
                 if row["card_message_id"] in ids
             ]
             if "subject" in event or "new_stream_id" in event:
+                self.router.follow_cards(event)  # any bot's card: the record goes with it (#878)
                 for row in rows:
                     # A card fetch in flight is older than this move (verify_card).
                     card = row["card_message_id"]
@@ -1667,11 +1870,11 @@ class BotBridge:
                         self.store.set(key, True)
 
     async def close(self) -> None:
-        await self.stop_housekeeping()
-        if self.listener:
+        if self.listener:  # first: its recovery starts a housekeeping (`listen`)
             self.listener.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.listener
+        await self.stop_housekeeping()
         await self.login.close()
         for task in list(self.background):  # pending forks a reopen started, `!btw` answers
             task.cancel()

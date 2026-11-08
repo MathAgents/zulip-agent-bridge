@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`status.py --roster roster.csv [--csv out.csv]` (README.md §3).
+"""`status.py --roster roster.csv --tag K=V… [--csv out.csv]` (README.md §3).
 
 Gathers `~/.local/state/zab/preflight.json`, `zab doctor --service-env --json` (what
 `push_config.py` runs), `zab status --json` and the service state from every VM over SSH (as
@@ -28,8 +28,9 @@ they come with the doctor's read, which is `zab-monitor`'s where idle stop is se
 
 Kept VMs stop themselves when idle (issue #207), so EC2 is read first (`DescribeInstances` by
 the workshop tag, once per region in the `region` column of the rows that have an `ip`,
-us-west-2 when empty; the instance whose public address is the row's `ip`, the one SSH would
-try; a region that fails is said, and the others are still read). A VM that EC2 says is
+us-west-2 when empty, for a row launched before launch.py recorded it; the instance whose
+public address is the row's `ip`, the one SSH would try; a region that fails is said, and the
+others are still read). A VM that EC2 says is
 stopped, stopping or starting is reported from that state alone, with no SSH attempt, which would
 wait out `ConnectTimeout` or a shutdown (#439): its bridge column reads `stopped`, `stopping` or
 `starting`, and the summary counts those apart. The others are read over SSH; one that SSH can't
@@ -56,10 +57,10 @@ read it), with `?` as null and four things the table does not show: the zab vers
 last line of `/var/log/zab-idle-stop.log`, its last verdict), the last activity (`zab status
 --json`'s `last_activity`, newer than 0.2.3; null before), and the root file system's size, use
 and available space in bytes (`disk`, from the same `df -Pk /` line as the percentage, #552).
-`--tag KEY=VALUE` (repeatable) is the EC2 lookup's scope, as for the `workshop/aws/` scripts. A
-VM's owner controls what it answers: in the JSON, a value zab would not write (a name that is not
-a config name, an implausible time or number) is null, long lists are cut, and the output is
-strict JSON (no NaN).
+`--tag KEY=VALUE` (repeatable, required: #808) is the EC2 lookup's scope, as for the
+`workshop/aws/` scripts. A VM's owner controls what it answers: in the JSON, a value zab would
+not write (a name that is not a config name, an implausible time or number) is null, long lists
+are cut, and the output is strict JSON (no NaN).
 
 The remote command is a fixed literal; nothing from the roster reaches a shell.
 Standalone: `uv run python workshop/admin/status.py …`.
@@ -99,7 +100,6 @@ from admin_common import (
     subprocess_runner,
 )
 from aws_common import (  # on the path through admin_common
-    WORKSHOP_TAG,
     Ec2,
     Scope,
     add_tag_argument,
@@ -107,8 +107,11 @@ from aws_common import (  # on the path through admin_common
     scope_tags,
 )
 
-#: The region of a row without one: launch.py's default, and where the first fleet ran.
-DEFAULT_REGION = "us-west-2"
+#: The region of a row with a VM but no region recorded: one launched before launch.py
+#: recorded it, which the first fleet's were, in us-west-2. launch.py records it for every
+#: VM it makes (#808: no script takes it as the workshop's region any more). As the admin
+#: bot reads such a row (`zab.admin.actions`).
+UNRECORDED_REGION = "us-west-2"
 #: EC2 states that explain an unreachable VM, and how the bridge column shows them.
 EC2_LABELS = {"stopped": "stopped", "stopping": "stopping", "pending": "starting"}
 
@@ -434,7 +437,10 @@ def idle_stop_state(text: str) -> dict[str, Any] | None:
 
 #: A bot or backend name as zab's config allows it (`[A-Za-z0-9_-]+`, config.py), short.
 _NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
-#: --json lists at most this many running turns and doctor failures per VM.
+#: --json lists at most this many running turns and doctor failures per VM. It is the most
+#: turns a workshop VM runs, 10 per backend (push_config.py's `max_concurrent_turns`, #919):
+#: raise it with that, or `!status` silently lists fewer turns than run (planning's `MAX_TURNS`;
+#: `test_status_lists_every_turn_a_vm_may_run` ties them).
 MAX_ITEMS = 20
 
 
@@ -580,7 +586,7 @@ def gather_vm(
 
 
 def region_of(row: Mapping[str, str]) -> str:
-    return (row.get("region") or "").strip() or DEFAULT_REGION
+    return (row.get("region") or "").strip() or UNRECORDED_REGION
 
 
 def instance_ips(inst: Mapping[str, Any]) -> set[str]:
@@ -592,7 +598,7 @@ def instance_ips(inst: Mapping[str, Any]) -> set[str]:
 
 
 def ec2_states(
-    regions: set[str], make_ec2: Any = None, tag: Scope = WORKSHOP_TAG
+    regions: set[str], make_ec2: Any = None, *, tag: Scope
 ) -> tuple[dict[str, str], str]:
     """`{public ip: state}` for the workshop's instances, and "" or why the lookup failed (no
     boto3, no credential, no permission), in which case the result is partial: a region that

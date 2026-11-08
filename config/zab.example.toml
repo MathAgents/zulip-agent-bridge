@@ -16,6 +16,7 @@ projects_root = "~/src"            # where auto-cloned projects go
 default_project = ""               # used for channels with no [[projects]] entry (the workshop sets this)
 auto_clone = false                 # clone `repo: owner/name` from the channel description (§5.4)
 multi_party = true                # owner mentions trigger; shared-channel discussion is context (§4.5)
+unmentioned = "all"                # a message without a mention: all agents, or "last" named (§4.5)
 allow_public_channels = false      # sessions only in private channels (§4.3)
 mention_after_s = 120              # @-mention the owner when a turn ran at least this long (§4.8)
 status_edit_interval_s = 300       # seconds between status refreshes, at least 60 (§4.9)

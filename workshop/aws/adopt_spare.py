@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""`adopt_spare.py --roster roster.csv --slug <slug> --spare zab-spare-N [--region R]`
+"""`adopt_spare.py --roster roster.csv --slug <slug> --spare zab-spare-N --region R --tag K=V…`
 (ORGANIZERS §7.2).
 
 Gives a spare VM to a roster row that has no VM yet: a late joiner (PM on issue #36, Wed 21:20).
@@ -382,7 +382,7 @@ def main(argv: list[str] | None = None, *, runner: Runner | None = None) -> int:
     parser.add_argument("--roster", required=True)
     parser.add_argument("--slug", required=True, help="the participant's row")
     parser.add_argument("--spare", required=True, help="the spare's name, e.g. zab-spare-7")
-    parser.add_argument("--region", default="us-west-2")
+    parser.add_argument("--region", required=True, help="the workshop's region")
     parser.add_argument("--spares-file", default=str(SPARES_FILE))
     add_tag_argument(parser)
     parser.add_argument("--force", action="store_true", help="the row may already have a host")

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import configparser
+import itertools
 import json
 import logging
 import ssl
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
@@ -49,6 +51,33 @@ class EditRefused(Exception):
     """An edit a bound forbids; never sent. Not a `ZulipError`: nothing posts it anew instead."""
 
 
+class EditStore(Protocol):
+    """Where `EditBounds.keep` keeps the counts: the bridge's `Store` (`zab.core.store`), which
+    this module doesn't import, since the admin server runs it and none of the bridge (ADMIN
+    §1.6). The admin bot keeps its counts in memory."""
+
+    def edit_counts(self, bot: str) -> list[tuple[int, int, float, bool]]: ...
+
+    def keep_edit_count(
+        self,
+        bot: str,
+        message_id: int,
+        edits: int,
+        edited_at: float,
+        forget: tuple[int, ...] = (),
+        *,
+        final: bool = False,
+    ) -> None: ...
+
+    def forget_edit_counts(self, bot: str, message_ids: tuple[int, ...]) -> None: ...
+
+    def hold_final(self, bot: str, message_id: int, content: str) -> None: ...
+
+    def release_final(self, bot: str, message_id: int) -> None: ...
+
+    def held_finals(self, bot: str) -> list[tuple[int, str]]: ...
+
+
 class EditBounds:
     """Zulip keeps every earlier version of an edited message, and Zulip Cloud's guidance is to
     edit a message only for a change that matters, and to send programmatic updates about once
@@ -56,47 +85,183 @@ class EditBounds:
     within these bounds:
 
     - two edits of one message are at least `GAP` seconds apart. A *final* edit may go sooner:
-      a turn's summary, or the answer on an approval request. It is that message's last edit, so
-      it adds one at most, and holding it back would show a finished turn as running;
+      a turn's summary, or the answer on an approval request. It is meant as that message's last
+      edit, and holding it back would show a finished turn as running. Only the first may: once
+      one went out (`finals`, kept with the counts), a repeat waits for its gap like any other
+      edit, as a summary sent again at each start of a bridge that dies delivering its answer
+      (#806). The message shows it already, unless the first never landed: so a repeat held
+      back is kept in the store until it is sent (`hold_final`), and `Poster` sends it then,
+      tries it again a gap after a failure, and a start sends the ones an earlier run held;
     - a message gets at most `MAX_EDITS` edits, a final one included. The others stop one
       short, so that the final edit always has its slot.
 
     `Poster.edit` holds an edit back until its gap has passed, merged with any later one of the
     same message, and drops one past the cap; `ZulipClient.edit` refuses what still breaks a
-    bound. Kept in memory: a restart starts every message's count again."""
+    bound.
+
+    The counts are kept in memory, for the `KEPT` messages edited last, and in the bridge's
+    store too once `keep` names it, so that a restart begins none of them again (#757): a
+    bridge that restarts in a loop, its recovery refreshing a surviving turn's status message at
+    each start, still edits it at most once a gap and `MAX_EDITS` times. The store is written
+    once per edit sent, once more for one Zulip refused (`undo`), and never for one these bounds
+    refuse. It keeps the messages memory keeps, less those `forget` names, which won't be
+    edited again: the status message of a turn whose end the backend confirmed and whose answer
+    was delivered (not a stop that timed out, whose turn recovery may take up again). A write
+    that fails can leave a row memory no longer has: the message `record` trimmed from memory,
+    or the one an `undo` was to forget. So within a process the store holds at most `KEPT` rows
+    per bot plus one per failed write; `keep` trims them to `KEPT` at each start."""
 
     def __init__(self, budget: RequestBudget) -> None:
         self.budget = budget  # its clock: a test's, if set
         self.messages: dict[int, tuple[int, float]] = {}  # id -> edits, last; oldest first
+        self.finals: set[int] = set()  # those of `messages` whose final edit went out (#806)
+        self.pending: dict[int, str] = {}  # those with a repeat held back, kept until it is sent
+        self.forgotten: set[int] = set()  # `forget` named them while one was: forgotten when sent
+        self.store: Callable[[], EditStore] | None = None  # where they are kept too (`keep`)
+        self.bot = ""
+
+    def keep(self, store: Callable[[], EditStore], bot: str) -> None:
+        """Keep the counts in `store()` too, as `bot`'s, and take up those it kept (#757). A
+        last edit's time is kept on the wall clock and taken up on this process's monotonic one,
+        which a reboot starts again; one later than now, as a clock set back leaves it, counts as
+        now. Called before any edit, once the budget has the clock the edits will use."""
+        self.store, self.bot = store, bot
+        now, wall = self.budget._monotonic(), self.budget.wall()
+        rows = store().edit_counts(bot)
+        kept = {mid: (n, now - max(0.0, wall - at)) for mid, n, at, _ in rows}
+        self.messages = kept | self.messages
+        self.finals |= {mid for mid, _, _, final in rows if final}
+        self.pending |= dict(store().held_finals(bot))
+        if gone := self._trim():
+            store().forget_edit_counts(bot, gone)
+
+    def held_finals(self) -> list[tuple[int, str]]:
+        """The repeats of final edits an earlier run held back and never sent: (message id,
+        content), for `Poster.resume`."""
+        return self.store().held_finals(self.bot) if self.store else []
+
+    def hold_final(self, message_id: int, content: str) -> None:
+        """A repeat of `message_id`'s final edit is held back for its gap, or a newer final
+        edit takes its place: kept in the store until it is sent, so that neither a failure nor
+        a restart loses it (codex rounds 2 and 3 on #813). No write when it is the one kept
+        already. A store that can't keep it is logged: this process still sends it."""
+        if self.pending.get(message_id) == content:
+            return
+        self.pending[message_id] = content
+        if self.store:
+            try:
+                self.store().hold_final(self.bot, message_id, content)
+            except Exception as exc:
+                logging.getLogger("zab.zulip").warning(
+                    "Held final not kept: %s", type(exc).__name__
+                )
+
+    def release_final(self, message_id: int, sent: str | None = None) -> None:
+        """The held repeat was sent, or can never be (Zulip refused it, or the cap). A final
+        edit that landed (`sent`, its content) releases it only if it is the one held, not a
+        newer one held back since (review round 1 of #813). A store that can't say so is
+        logged: a start then sends it once more, within the bounds."""
+        if message_id not in self.pending or sent not in (None, self.pending[message_id]):
+            return
+        del self.pending[message_id]
+        try:
+            if self.store:
+                self.store().release_final(self.bot, message_id)
+                if message_id in self.forgotten:
+                    self.store().forget_edit_counts(self.bot, (message_id,))
+        except Exception as exc:
+            logging.getLogger("zab.zulip").warning(
+                "Held final not released: %s", type(exc).__name__
+            )
+        self.forgotten.discard(message_id)
 
     def edits(self, message_id: int) -> int:
         return self.messages.get(message_id, (0, 0.0))[0]
 
     def wait(self, message_id: int, *, final: bool = False) -> float | None:
-        """Seconds until an edit of `message_id` may be sent: 0 now, None never (the cap)."""
+        """Seconds until an edit of `message_id` may be sent: 0 now, None never (the cap). A
+        final edit goes at once unless one already went out (#806)."""
         if message_id not in self.messages:
             return 0.0
         edits, last = self.messages[message_id]
         if edits >= MAX_EDITS or (not final and edits >= MAX_EDITS - 1):
             return None
-        return 0.0 if final else max(0.0, last + GAP - self.budget._monotonic())
+        if final and message_id not in self.finals:
+            return 0.0
+        return max(0.0, last + GAP - self.budget._monotonic())
 
     def last_update(self, message_id: int) -> bool:
         """Whether the next edit is the last one before only a final edit is left."""
         return self.edits(message_id) == MAX_EDITS - 2
 
-    def record(self, message_id: int) -> tuple[int, float] | None:
-        """Count an edit about to be sent; what `undo` needs if it never lands."""
-        before = self.messages.pop(message_id, None)
-        self.messages[message_id] = ((before or (0, 0.0))[0] + 1, self.budget._monotonic())
-        while len(self.messages) > KEPT:
-            del self.messages[next(iter(self.messages))]
+    def record(
+        self, message_id: int, *, final: bool = False
+    ) -> tuple[tuple[int, float] | None, bool]:
+        """Count an edit about to be sent; what `undo` needs if it never lands. A store that
+        can't keep it stops the edit (its error), which stays counted here: on the safe side."""
+        before = self.messages.get(message_id), message_id in self.finals
+        self._count(message_id, (before[0] or (0, 0.0))[0] + 1, final or before[1])
         return before
 
-    def undo(self, message_id: int, before: tuple[int, float] | None) -> None:
+    def sent(self, message_id: int) -> None:
+        """`message_id` was posted with a final edit's content, as a summary is when its own
+        message can't take it (SPEC §4.9): that final went out, so a repeat waits for its gap,
+        as on any message (#806). No edit is counted. A store that can't keep it is logged:
+        across a restart, a repeat then goes at once, once."""
+        try:
+            self._count(message_id, self.edits(message_id), True)
+        except Exception as exc:
+            logging.getLogger("zab.zulip").warning("Final not kept: %s", type(exc).__name__)
+
+    def _count(self, message_id: int, edits: int, final: bool) -> None:
+        """`message_id`'s edits and whether its final went out, as of now: in memory, the most
+        recently edited, then in the store."""
         self.messages.pop(message_id, None)
-        if before is not None:
-            self.messages[message_id] = before
+        self.messages[message_id] = (edits, self.budget._monotonic())
+        if final:
+            self.finals.add(message_id)
+        gone = self._trim()
+        if self.store:
+            wall = self.budget.wall()
+            self.store().keep_edit_count(self.bot, message_id, edits, wall, gone, final=final)
+
+    def undo(self, message_id: int, before: tuple[tuple[int, float] | None, bool]) -> None:
+        counted, final = before
+        self.messages.pop(message_id, None)
+        self.finals.discard(message_id)
+        if counted is not None:
+            self.messages[message_id] = counted
+            if final:
+                self.finals.add(message_id)
+        if not self.store:
+            return
+        try:  # Zulip's error goes on, whatever the store does: a 429's is retried (`Poster`)
+            if counted is None:
+                self.store().forget_edit_counts(self.bot, (message_id,))
+            else:
+                at = self.budget.wall() - (self.budget._monotonic() - counted[1])
+                self.store().keep_edit_count(self.bot, message_id, counted[0], at, final=final)
+        except Exception as exc:  # the store keeps one edit more: on the safe side
+            logging.getLogger("zab.zulip").warning("Edit count not undone: %s", type(exc).__name__)
+
+    def forget(self, message_id: int | None) -> None:
+        """`message_id` won't be edited again: the store forgets its edits, which memory keeps
+        for this process. No write for a message this process doesn't count. One with a repeat
+        held back is forgotten once that is sent."""
+        if message_id in self.pending:
+            self.forgotten.add(message_id)
+        elif self.store and message_id in self.messages:
+            self.store().forget_edit_counts(self.bot, (message_id,))
+
+    def _trim(self) -> tuple[int, ...]:
+        """Forget the messages edited least recently, past `KEPT`: their ids."""
+        gone = tuple(itertools.islice(self.messages, max(0, len(self.messages) - KEPT)))
+        for message_id in gone:
+            del self.messages[message_id]
+            self.pending.pop(message_id, None)
+            for marks in (self.finals, self.forgotten):
+                marks.discard(message_id)
+        return gone
 
 
 def error_kind(exc: BaseException) -> str:
@@ -327,12 +492,12 @@ class ZulipClient:
             raise ValueError("message exceeds the server limit")
         if self.edit_bounds.wait(message_id, final=final) != 0:
             raise EditRefused(message_id)
-        counted: list[tuple[int, float] | None] = []
+        counted: list[tuple[tuple[int, float] | None, bool]] = []
 
         def sending() -> None:
             if self.edit_bounds.wait(message_id, final=final) != 0:
                 raise EditRefused(message_id)
-            counted.append(self.edit_bounds.record(message_id))
+            counted.append(self.edit_bounds.record(message_id, final=final))
 
         try:
             await self.request("PATCH", f"messages/{message_id}", _sending=sending, content=content)
@@ -340,3 +505,5 @@ class ZulipClient:
             if counted and 400 <= exc.status < 500:
                 self.edit_bounds.undo(message_id, counted[0])
             raise
+        if final:  # it landed: the repeat held back, if this is the one, is owed no more (#806)
+            self.edit_bounds.release_final(message_id, content)

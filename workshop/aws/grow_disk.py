@@ -2,7 +2,7 @@
 """Grow a participant's root volume, then its file system (issue #553; docs/ADMIN.md §3).
 
     uv run --with boto3 python workshop/aws/grow_disk.py --roster roster.csv --slug SLUG \\
-        --size GB [--tag KEY=VALUE …] [--region R] [--known-hosts FILE] [--dry-run]
+        --size GB --tag KEY=VALUE [--tag …] --region R [--known-hosts FILE] [--dry-run]
 
 Backs the admin bot's `!grow-disk SLUG NGB`; a deployer may run it by hand (ORGANIZERS §7.1).
 `--size` is the volume's new size in GB, as EBS counts them (GiB).
@@ -514,7 +514,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--size", required=True, type=int, help=f"the new size in GB, at most {MAX_GB}"
     )
-    parser.add_argument("--region", default="us-west-2")
+    parser.add_argument("--region", required=True, help="the workshop's region")
     parser.add_argument("--known-hosts", default=str(DEFAULT_KNOWN_HOSTS))
     add_tag_argument(parser)
     parser.add_argument("--dry-run", action="store_true")

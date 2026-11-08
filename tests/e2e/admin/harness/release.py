@@ -8,6 +8,14 @@ rig's **test-only** key. The tags live in the rig's own release repository, a `-
 of this checkout, so no test tag ever reaches the zab repository, and they are made fresh each
 run (the running release's tag aside: deploy.sh diffs from it).
 
+That repository plays the private one. The public one, `release_repo` (#958), holds exported
+commits (`tools/publish`): `public.git`, a bare repository beside it, gets a test release as
+`export` makes it, the private tree less what the export drops, one commit on the public
+repository's last, its tag signed there with the same test-only key. A10 reviews a release in
+the private repository and deploys its public commit from a clone of the public one into which
+only the running release's private tag is fetched (`deploy_clone`), as BOOTSTRAP §13.4's last
+hand deploy does; A10b's tags are public ones.
+
 The keys are made once, with `ssh-keygen`, under the rig's `keys/`: `signing` (the only key in
 the test server's `allowed_signers`), `unknown` (a signer it doesn't know, for A10) and `backup`
 (the deployer's backup key, in `backup_recipients`: §1.7). deploy.sh reaches the server through
@@ -16,6 +24,7 @@ the rig's ssh config (`ZAB_DEPLOY_SSH`, a wrapper for `ssh -F`), pinned to its h
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import os
 import re
@@ -31,13 +40,16 @@ from typing import Any
 from e2e.admin.harness.gate import Gate
 from e2e.admin.harness.rig import HOST_ALIAS, AdminRig
 from e2e.harness.config import CHECKOUT
-from e2e.harness.vm import Result
+from e2e.harness.vm import Result, connect_line
 
 KEYS = ("signing", "unknown", "backup")
 _VERSION = re.compile(r"^v(\d+)\.(\d+)\.(\d+)(?:rc(\d+))?$")
 _DIFF_SHA = re.compile(r"SHA-256 ([0-9a-f]{64}); release tree")
 AUTHOR, EMAIL = "zab admin e2e", "zab-admin-e2e@example.org"
 IDENTITY = ("-c", f"user.name={AUTHOR}", "-c", f"user.email={EMAIL}")
+#: The export's own list of the paths it leaves out of the public tree (its `DROP`), read from
+#: the commit exported; a commit without the tool, a public one, drops nothing.
+EXPORT_TOOL = "tools/publish/export.py"
 #: A local command: argument list, standard input, environment, timeout, a file for its output.
 Local = Callable[..., Result]
 #: A command that is typed an answer at its prompt (`typed`).
@@ -190,6 +202,20 @@ def older_version(running: str) -> str:
 # -------------------------------------------------------------------------------- keys
 
 
+def dropped(source: str) -> tuple[str, ...]:
+    """The paths of `DROP` in the export tool's source, read without running it; () for none."""
+    for node in ast.parse(source).body:
+        names = [t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)]
+        if isinstance(node, ast.Assign) and names == ["DROP"]:
+            return tuple(str(path) for path in ast.literal_eval(node.value))
+    return ()
+
+
+def under(path: str, drops: tuple[str, ...]) -> bool:
+    """`path` is one of `drops` or lies under one (a directory's, with or without its `/`)."""
+    return any(path == d.rstrip("/") or path.startswith(d.rstrip("/") + "/") for d in drops)
+
+
 def ensure_keys(gate: Gate, rig: AdminRig, run: Local = local) -> None:
     for which in KEYS:
         path = rig.keys / which
@@ -235,6 +261,48 @@ class Deployed:
         """deploy.sh's own last words: `deploy.sh: <reason>` on a refusal."""
         lines = [ln for ln in self.result.stderr.splitlines() if ln.startswith("deploy.sh: ")]
         return lines[-1] if lines else (self.result.stderr.strip().splitlines() or [""])[-1]
+
+
+#: deploy.sh's `die` when a `remote` call to its `--host` failed: the check of what the server
+#: runs, and `run_server`'s temporary directory and copy (`deploy.sh: <host>: <reason>`)
+CONNECT_DEATHS = ("unreachable", "no temporary directory", "could not copy the release")
+#: deploy.sh's confirmation (`confirm`), with no newline: what follows is on its line
+_PROMPT = re.compile(r"^Type v\S+ to [^:]*: ")
+
+
+def connect_failed(result: Result, ip: str, host: str = HOST_ALIAS) -> str:
+    """ssh's line when deploy.sh failed only because a connection to the server at `ip` was
+    never made (`vm.connect_line`: timed out, refused, no route, network unreachable), so that
+    no step of its server half ran and it may simply run again (#804); else "". deploy.sh's
+    `remote()` never retries a connect. Its stderr then ends, read without the prompt:
+    - with `deploy.sh: <host>: <reason>` for a reason of CONNECT_DEATHS, right after ssh's line;
+    - or, exit 255, with ssh's line right after the prompt: the `ssh … sudo bash deploy.sh
+      --server …` that would run the server's half never connected;
+    either perhaps followed by ssh's lines for its exit trap's `rm`, which never connected
+    either. Anything else ends the run: another `deploy.sh:` line, a line between ssh's and the
+    `die`, a session cut short, an authentication refused, another host's connect."""
+    if result.ok:
+        return ""
+    items: list[str | None] = []  # None: the prompt
+    for line in result.stderr.splitlines():
+        if prompt := _PROMPT.match(line):
+            items.append(None)
+            line = line[prompt.end() :]
+        if line.strip():
+            items.append(line.strip())
+
+    def ssh_line(item: str | None) -> bool:
+        return item is not None and connect_line(item, ip)
+
+    after: list[str | None] = []  # the exit trap's
+    while items and ssh_line(items[-1]):
+        after.insert(0, items.pop())
+    if items and items[-1] in {f"deploy.sh: {host}: {reason}" for reason in CONNECT_DEATHS}:
+        cause = items[-2] if len(items) > 1 else None
+        return cause if cause is not None and ssh_line(cause) else ""
+    if result.returncode == 255 and after and items and items[-1] is None:
+        return str(after[0])
+    return ""
 
 
 class Releases:
@@ -307,7 +375,7 @@ class Releases:
         (None: unsigned). The tag object's ID."""
         self.run(["git", "-C", str(self.rig.repo), "tag", "-d", version])  # an earlier run's
         if signer is None:
-            self.git(*IDENTITY, "tag", "-a", "-m", version, version, commit)
+            self.git(*IDENTITY, "tag", "-a", "--no-sign", "-m", version, version, commit)
         else:
             signing = ("-c", "gpg.format=ssh", "-c", f"user.signingkey={self.rig.keys / signer}")
             self.git(*IDENTITY, *signing, "tag", "-s", "-m", version, version, commit)
@@ -327,6 +395,81 @@ class Releases:
         self.tag(version, commit, signer)
         return commit
 
+    @property
+    def public(self) -> Path:
+        """The rig's public repository (#958): exported commits only, bare."""
+        return self.rig.repo.parent / "public.git"
+
+    def public_git(self, *args: str) -> str:
+        done = self.run(["git", "-C", str(self.public), *args])
+        if not done.ok:
+            raise RuntimeError(f"git {args[0]} (public): {done.stderr.strip()[:300]}")
+        return done.stdout.strip()
+
+    def has_public_tag(self, version: str) -> bool:
+        return (self.public / "HEAD").exists() and self.run(
+            ["git", "-C", str(self.public), "rev-parse", "--verify", "--quiet",
+             f"refs/tags/{version}"]
+        ).ok  # fmt: skip
+
+    def export(self, version: str, commit: str, signer: str | None = "signing") -> str:
+        """The public release of the test release `commit`, as `tools/publish` makes one: its
+        tree less the export's `DROP`, one commit on the public repository's `main` with an
+        `Exported-from:` trailer, pushed there (only it and the public history travel), then
+        tagged there afresh, signed with the rig's `signer` key (None: unsigned). The public
+        commit."""
+        if not (self.public / "HEAD").exists():
+            made = self.run(["git", "init", "-q", "--bare", "-b", "main", str(self.public)])
+            if not made.ok:
+                raise RuntimeError(f"the public repository: {made.stderr.strip()[:300]}")
+        tool = self.run(["git", "-C", str(self.rig.repo), "show", f"{commit}:{EXPORT_TOOL}"])
+        drops = dropped(tool.stdout) if tool.ok else ()
+        parent: list[str] = []
+        if self.run(["git", "-C", str(self.public), "rev-parse", "--verify", "--quiet",
+                     "refs/heads/main"]).ok:  # fmt: skip
+            # the public main, here too: the rig's repository may be newer than the public one
+            self.git(
+                "fetch", "-q", "--no-tags", str(self.public), "+refs/heads/main:refs/public/main"
+            )
+            parent = ["-p", "refs/public/main"]
+        with tempfile.TemporaryDirectory(prefix="ae2e-export-") as tmp:
+            env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
+            env |= {"GIT_AUTHOR_NAME": AUTHOR, "GIT_COMMITTER_NAME": AUTHOR}
+            env |= {"GIT_AUTHOR_EMAIL": EMAIL, "GIT_COMMITTER_EMAIL": EMAIL}
+            self.git("read-tree", commit, env=env)
+            names = self.git("ls-files", "-z", env=env).split("\0")
+            gone = [name for name in names if name and under(name, drops)]
+            if gone:
+                self.git("update-index", "--force-remove", "-z", "--stdin", env=env,
+                         input="".join(f"{name}\0" for name in gone))  # fmt: skip
+            tree = self.git("write-tree", env=env)
+            message = f"zab {version}\n\nExported-from: {commit}\n"
+            public = self.git("commit-tree", tree, *parent, "-m", message, env=env)
+        self.git("push", "-q", str(self.public), f"{public}:refs/heads/main")
+        self.run(["git", "-C", str(self.public), "tag", "-d", version])  # an earlier run's
+        if signer is None:
+            self.public_git(*IDENTITY, "tag", "-a", "--no-sign", "-m", version, version, public)
+        else:
+            signing = ("-c", "gpg.format=ssh", "-c", f"user.signingkey={self.rig.keys / signer}")
+            self.public_git(*IDENTITY, *signing, "tag", "-s", "-m", version, version, public)
+        return public
+
+    def deploy_clone(self, base: str, to: Path) -> Path:
+        """The deployer's clone of the public repository (BOOTSTRAP §13.4), at `to`, new: its
+        remote removed, so that nothing is ever pushed from it, and the private tag `base`, the
+        release the server runs and the review's base, fetched in alone, over a public tag of
+        that name if an earlier run's export left one."""
+        made = self.run(["git", "clone", "-q", str(self.public), str(to)])
+        if not made.ok:
+            raise RuntimeError(f"the deploy clone: {made.stderr.strip()[:300]}")
+        for args in (["remote", "remove", "origin"],
+                     ["fetch", "-q", "--no-tags", str(self.rig.repo),
+                      f"+refs/tags/{base}:refs/tags/{base}"]):  # fmt: skip
+            done = self.run(["git", "-C", str(to), *args])
+            if not done.ok:
+                raise RuntimeError(f"the deploy clone, git {args[0]}: {done.stderr.strip()[:300]}")
+        return to
+
     def extract(self, commit: str, path: str, to: Path) -> Path:
         """A file of `commit` (deploy.sh, render_policy.py), as the commit has it."""
         to.write_text(self.source("show", f"{commit}:{path}") + "\n", encoding="utf-8")
@@ -340,12 +483,13 @@ class Releases:
         out: Path,
         log: Path | None = None,
         confirm: str | None = None,
+        repo: Path | None = None,
     ) -> Deployed:
         """deploy.sh as a deployer runs it from the development machine (§7), typing the version
         when asked: `--bootstrap` (with the rig's secrets), `--wheel`, `--downgrade`, or an
-        upgrade."""
+        upgrade; from the rig's repository, or `repo` (a deploy clone, the public one)."""
         rig = self.rig
-        argv = ["bash", str(script), "--repo", str(rig.repo), "--etc", str(rig.etc)]
+        argv = ["bash", str(script), "--repo", str(repo or rig.repo), "--etc", str(rig.etc)]
         argv += ["--out", str(out), "--host", HOST_ALIAS, *flags]
         if "--bootstrap" in flags:
             argv += ["--secrets", str(rig.secrets)]

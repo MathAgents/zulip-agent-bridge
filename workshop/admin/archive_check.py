@@ -60,12 +60,19 @@ same rules (`_read`):
   and NULs, nothing else (`_canonical`), so that no reader can take a size or a type
   differently (`tarfile` reads `0o…` and stops at a NUL; GNU tar skips a leading NUL);
 - no NUL in a member's name or link name, no `GNU.sparse.*` attribute, no sparse member;
+- **no name or link target read two ways** (`_alike`, #888), since GNU tar and tarfile choose
+  differently among the headers that give one: before a member, at most one GNU `L` record,
+  one `K` record and one PAX header; no global PAX `path` or `linkpath`; a PAX `path` or
+  `linkpath` only as tarfile reads the name or target; and no `prefix` field that tarfile
+  joins to the name and GNU tar doesn't. `answer` first reads a built-in archive (`seen`), and
+  refuses every archive if tarfile didn't show `_Header` each of its headers;
 - at most `META` bytes of headers and metadata before each member, consecutive extension
   headers included; at most `GLOBAL_META` of global PAX attributes, which `tarfile` copies for
   every later member; at most `--budget` bytes decompressed in all;
 - **no member goes through a link** (`_through`): no name or hard link target is absolute or
-  has a `..` component, and none equals or lies under the name of an earlier link member,
-  symlink or hard link, names compared folded;
+  has a `..` component, and none equals or lies under the name of an earlier link member: of
+  a symlink, names compared folded; of a hard link, names compared as written, normalized only
+  as paths (#819);
 - **no name is a credential's** (`credential`): none matches `CREDENTIAL`, as written or as a
   path normalizes it, folded;
 - no name or link target of more than `MAX_DEPTH` components (`_through` costs their square);
@@ -200,12 +207,15 @@ class _Stream:
     skips each member's data rather than reading it: forward only; each `read` is a header or
     a header's metadata, and at most `META` of them before each member (`since`, which the loop
     resets); every header canonical; at most `budget` bytes decompressed in all, skips and the
-    end's zeros included. It keeps the last `TAIL` bytes, for the check of the archive's end.
+    end's zeros included. It keeps the last `TAIL` bytes, for the check of the archive's end,
+    and the type of each header tarfile has read since the loop's reset (`kinds`, `_Header`).
     A refusal is kept here too: some tarfile versions wrap it in a ReadError (3.13.16)."""
 
     def __init__(self, raw: BinaryIO, budget: int) -> None:
         self.raw, self.budget = raw, budget
         self.pos, self.since, self.tail = 0, 0, b""
+        self.kinds: list[bytes] = []
+        self.block = (-1, b"")  # the last block read, and where it starts (`_Header`)
         self.refused = ""
 
     def refuse(self, why: str) -> Refused:
@@ -224,9 +234,11 @@ class _Stream:
         if size < 0 or self.since + size > META:
             raise self.refuse(f"over {META >> 10} KB of headers and metadata before one member")
         self.since += size
-        data = self.take(size)
-        if len(data) == tarfile.BLOCKSIZE and not _canonical(data) and _header(data):
-            raise self.refuse("a header's numbers are not in canonical form")
+        at, data = self.pos, self.take(size)
+        if len(data) == tarfile.BLOCKSIZE:
+            if not _canonical(data) and _header(data):
+                raise self.refuse("a header's numbers are not in canonical form")
+            self.block = (at, data)
         return data
 
     def tell(self) -> int:
@@ -259,43 +271,144 @@ def _member(member: tarfile.TarInfo, extended: bool) -> str:
     return ""
 
 
+class _Header(tarfile.TarInfo):
+    """A member as tarfile reads it, with what `_alike` needs and tarfile keeps to itself.
+    `_proc_member`, the entry point tarfile leaves to a subclass, is called for each header
+    just after tarfile reads it (`_Stream.block`, which starts at the header's `offset`), and
+    notes:
+    - the header's type on the stream (`_Stream.kinds`), so the types of a member's headers,
+      first to last;
+    - `dropped`: the header has a `prefix` field, which tarfile joins to the name whatever the
+      magic, and a magic other than POSIX's (`ustar\\0`), without which GNU tar doesn't. It is
+      None when the block read last isn't the header's.
+    `seen` checks that tarfile still calls it so."""
+
+    dropped: bool | None = None
+
+    def _proc_member(self, tar: tarfile.TarFile) -> tarfile.TarInfo:
+        at, block = tar.fileobj.block  # type: ignore[attr-defined]
+        tar.fileobj.kinds.append(self.type)  # type: ignore[attr-defined]
+        if at == self.offset:
+            prefix = bool(block[345]) and self.type not in tarfile.GNU_TYPES  # tarfile joins it
+            self.dropped = prefix and block[257:263] != b"ustar\0"
+        return super()._proc_member(tar)  # type: ignore[misc]
+
+
+_PAX = (tarfile.XHDTYPE, tarfile.SOLARIS_XHDTYPE)  # a member's own PAX header, either type
+_RECORDS = (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK)  # GNU's `L` and `K`
+#: The refusals when tarfile doesn't show `_Header` its headers: `seen` failed, or it passed
+#: and a member's own header wasn't shown all the same (`_alike`)
+HIDES = "this Python's tarfile hides its headers from the check"
+HIDDEN = f"{HIDES} (its self-check failed)"
+
+
+def _alike(member: tarfile.TarInfo, kinds: list[bytes], attributes: dict[str, str]) -> str:
+    """Why GNU tar and tarfile may read this member's name or link target differently, or ""
+    (#888): `kinds`, the types of its headers (`_Header`); `attributes`, the global PAX ones so
+    far. Where each reads them from (GNU tar 1.35; the verification log, 2026-11-06):
+    - **GNU tar:** the member's PAX header (`path` unless empty), else the last global one,
+      else its `L` or `K` record, else its own header, whose `prefix` it joins to the name only
+      under POSIX's magic; of two PAX headers, two global ones or two records of a kind, it
+      reads only the last;
+    - **tarfile:** the first of its records and PAX headers to give one, else the global
+      headers so far, all of them, else its own header, its `prefix` joined whatever the magic.
+    So #360's two targets, a `K` record naming `a` and then a PAX `linkpath=c`, are `a` to
+    tarfile and `c` to GNU tar. An `L` record naming `x`, then a PAX `path=c`, name a symlink
+    `x` and `c`: a later hard link to `c` was a copy of a file for tarfile, and a link to that
+    symlink for GNU tar (the review of #892, B2).
+
+    So a member is refused with two `L` records, two `K` records or two PAX headers before it;
+    after a global PAX `path` or `linkpath`; with a PAX `path` that is empty or, trailing
+    slashes aside, not the name tarfile read, or a PAX `linkpath` other than the target it
+    read; or with a `prefix` that GNU tar drops (`_Header.dropped`) when its own header names
+    it. Then both take each name and target from the same place. Both take the type from the
+    header, so they see the same symlinks and hard links, with the same names and targets but
+    for trailing slashes, which `_through` normalizes away. So `_through`'s rules hold for GNU
+    tar's reading too: a hard link that it matches by its exact name (#819) is the same link to
+    either reader.
+
+    GNU tar, tarfile and libarchive (bsdtar) write one `L` and one `K` record at most in GNU
+    format, one PAX header in PAX format, and pass, in each format tried (the verification
+    log), but for GNU tar's incremental archives (`--incremental`, `--listed-incremental`):
+    their headers hold an access time where POSIX's hold `prefix`, which tarfile joins to every
+    name (`15273376256/work/a.md`), and they are refused. `export.sh` makes none."""
+    dropped = getattr(member, "dropped", None)  # `_Header`'s
+    if not kinds or kinds[-1] != member.type or dropped is None:  # not shown `_Header`
+        return f"{HIDES} (it couldn't see the headers of {shown(member.name)})"
+    twice = any(kinds.count(kind) > 1 for kind in _RECORDS) or sum(k in _PAX for k in kinds) > 1
+    path = member.pax_headers.get("path")
+    named = path is not None or tarfile.GNUTYPE_LONGNAME in kinds  # not by its own header
+    if (
+        twice
+        or "path" in attributes
+        or "linkpath" in attributes
+        or (path is not None and (path.rstrip("/") or None) != member.name)
+        or member.pax_headers.get("linkpath", member.linkname) != member.linkname
+        or (dropped and not named)
+    ):
+        what = "a name or link target that GNU tar and tarfile can read two ways"
+        return f"{what} ({shown(member.name)})"
+    return ""
+
+
 def _where(name: str) -> str:
-    """A name or link target as the link rule compares it: folded, then normalized."""
+    """A name or link target as the symlink rule compares it: folded, then normalized."""
     return posixpath.normpath(fold(name) or ".")
 
 
-def _through(member: tarfile.TarInfo, links: set[str]) -> str:
-    """Why this member breaks the claim's rule 1, or "", and the link members recorded in
-    `links`. The rule applies alike to the member's name and to a hard link's target:
+def _under(path: str, names: set[str]) -> bool:
+    """Whether `path` (normalized) is one of `names` or lies under one."""
+    parts = path.split("/")
+    return any("/".join(parts[:i]) in names for i in range(1, len(parts) + 1))
+
+
+def _through(member: tarfile.TarInfo, symlinks: set[str], hard: set[str]) -> str:
+    """Why this member breaks the claim's rule 1, or "", and the link members recorded: the
+    symlinks in `symlinks` (folded, `_where`), the hard links in `hard` (as written, `_normal`).
+    The rule applies alike to the member's name and to a hard link's target:
     - **absolute:** tarfile's filters and GNU tar strip the leading `/`, where `normpath`
       keeps it (the review of #360 at 162c432: a symlink `/work/l`, then a file `work/l`);
     - **`..`:** refused before any normalization, since extraction resolves
       `work/l/../zab/key` through the symlink `work/l`, where `normpath` reads `work/zab/key`
       (Codex round 5 on #360);
-    - **at or under an earlier link member**, symlink or hard link, folded: tarfile writes a
-      file at `work/l` through the symlink `work/l` (the approval of #360), and links `work/h`
-      to the symlink `work/l` when the target is `work/a/l` and `work/a` → `.` (Codex round 6
-      on #360), so a hard link to a link is refused too. A hard link counts as a link because
-      the readers may see two targets: a GNU `K` record naming `a` and a PAX `linkpath=c` make
-      `h` a link to the file `a` for tarfile and to the symlink `c` for GNU tar (the re-review
-      of #360 at 7d6801c). On a Mac, `work/L` is `work/l`.
+    - **at or under an earlier link member**, symlink or hard link: tarfile writes a file at
+      `work/l` through the symlink `work/l` (the approval of #360), and links `work/h` to the
+      symlink `work/l` when the target is `work/a/l` and `work/a` → `.` (Codex round 6 on
+      #360), so a hard link to a link is refused too. A hard link counts as a link because the
+      readers may see two targets: a GNU `K` record naming `a` and a PAX `linkpath=c` make `h`
+      a link to the file `a` for tarfile and to the symlink `c` for GNU tar (the re-review of
+      #360 at 7d6801c), a link `_alike` now refuses itself (#888). A symlink's name is
+      compared folded (on a Mac, `work/L` is `work/l`); a hard link's as written (#819).
     GNU tar's `--create` and tarfile's `add` make none of these from a tree (they strip the
     `/`, write no `..`, name each path once and link each hard link to the first, regular,
     member of its inode) but a hard link to a symlink, which needs two hard links to one
     symlink in the tree. Folding refuses an archive from a case-sensitive filesystem only if
-    a member lies at or under a link's name spelled in another case."""
+    a member lies at or under a symlink's name spelled in another case.
+
+    Why a hard link's name is not folded (#819): either writer links each later name of an
+    inode to the first one it meets, in directory order, so with case twins `a.md` and `A.md`
+    and a second name `h.md` of `a.md`, the order `h.md`, `a.md`, `A.md` put `A.md` at a hard
+    link's name, folded: refused, and refused again at a retry, which lists the same order
+    (#802). Folding protected nothing there: the participant's archive is read, never
+    extracted, and deleted (#374), and its re-pack, which holds no link, is the same plain files
+    in every order. Nor for an extraction of the participant's archive: no member there has a
+    name or link target that GNU tar reads otherwise (`_alike`, #888), so GNU tar sees the
+    symlinks and hard links this rule checks, and no hard link has a target at or under an
+    earlier symlink in any case. On a case-insensitive filesystem, a name under a hard link's
+    twin then never lies under a symlink."""
     paths = [member.name, member.linkname] if member.islnk() else [member.name]
     if any(path.startswith("/") for path in paths):
         return f"an absolute name or link target ({shown(member.name)})"
     if any(".." in path.split("/") for path in paths):
         return f"a `..` in a member's name ({shown(member.name)})"
     for at, path in enumerate(paths):
-        parts = _where(path).split("/")
-        if any("/".join(parts[:i]) in links for i in range(1, len(parts) + 1)):
+        if _under(_where(path), symlinks) or _under(_normal(path), hard):
             what = "a member written" if at == 0 else "a hard link to or"
             return f"{what} through an earlier symlink or hard link ({shown(member.name)})"
-    if member.issym() or member.islnk():
-        links.add(_where(member.name))
+    if member.issym():
+        symlinks.add(_where(member.name))
+    elif member.islnk():
+        hard.add(_normal(member.name))
     return ""
 
 
@@ -305,11 +418,12 @@ def _normal(name: str) -> str:
 
 
 class _Rules:
-    """The rules that span members: the symlink members so far (`_through`), and the re-pack's
+    """The rules that span members: the link members so far (`_through`), and the re-pack's
     own (`kept`)."""
 
     def __init__(self) -> None:
-        self.links: set[str] = set()  # the link members' names, as `_where` reads them
+        self.symlinks: set[str] = set()  # the symlinks' names, as `_where` reads them
+        self.hardlinks: set[str] = set()  # the hard links' names, as `_normal` reads them
         self.hard = self.link_bytes = 0  # hard links so far, and their targets' length
         self.manifest = 0  # bytes of symlink names and targets, and renamed names, so far
 
@@ -396,16 +510,17 @@ def _read(raw: BinaryIO, budget: int, each: Callable[[tarfile.TarInfo, _Stream],
     try:
         with gzip.GzipFile(fileobj=raw, mode="rb") as gz:
             stream = _Stream(gz, budget)  # type: ignore[arg-type]
-            with tarfile.open(fileobj=stream, mode="r:") as tar:  # type: ignore[call-overload]
+            with tarfile.open(fileobj=stream, mode="r:", tarinfo=_Header) as tar:  # type: ignore[call-overload]
                 while (member := tar.next()) is not None:
                     tar.members.clear()  # tarfile would keep every member read
                     extended = stream.since > tarfile.BLOCKSIZE  # extension headers came
-                    stream.since = 0
+                    kinds, stream.since, stream.kinds = stream.kinds, 0, []
                     if extended and _global_size(tar.pax_headers) > GLOBAL_META:
                         raise Refused(f"over {GLOBAL_META >> 10} KB of global PAX attributes")
                     if why := (
                         _member(member, extended)
-                        or _through(member, rules.links)
+                        or _alike(member, kinds, tar.pax_headers)
+                        or _through(member, rules.symlinks, rules.hardlinks)
                         or rules.kept(member)
                     ):
                         return why
@@ -664,12 +779,60 @@ class Repack:
         return _Exact(self.copier.read, size)
 
 
+#: The types `seen` requires `_Header` to note for its archive: a `K` record, a PAX header and
+#: an `L` record before a hard link
+SEEN = (tarfile.GNUTYPE_LONGLINK, tarfile.XHDTYPE, tarfile.GNUTYPE_LONGNAME, tarfile.LNKTYPE)
+
+
+def _extension(kind: bytes, data: bytes) -> bytes:
+    """An extension header of type `kind`, with `data`."""
+    info = tarfile.TarInfo("././@LongLink")
+    info.type, info.size = kind, len(data)
+    return info.tobuf(format=tarfile.GNU_FORMAT) + data + b"\0" * (-len(data) % tarfile.BLOCKSIZE)
+
+
+def seen() -> bool:
+    """Whether this Python's tarfile still shows `_Header` what `_alike` needs (#888; the review
+    of #892, B1). tarfile shows each header only to `_proc_member`, a method of its own, called
+    just after it reads the header. Should a tarfile stop calling it for each header, or read
+    in between, `_alike` would see too few headers and pass what it refuses. How tarfile reaches
+    that method has changed before: in 3.13, and in Ubuntu's security update of 3.12.3 for
+    CVE-2025-13462, which installs itself, without a deploy. So `answer` and `selfcheck` first
+    read a built-in archive, a `K` record (`a`), a PAX header and an `L` record (`h`) before a
+    hard link whose own header has GNU's magic and a `prefix`, and refuse every archive unless
+    `_Header` noted exactly those four headers (`SEEN`) and the dropped prefix, and tarfile
+    read `h` linked to `a`."""
+    link = tarfile.TarInfo("x")
+    link.type, link.linkname = tarfile.LNKTYPE, "z"
+    own = bytearray(link.tobuf(format=tarfile.GNU_FORMAT))
+    own[345] = ord("p")  # a prefix, under GNU's magic: tarfile joins it, GNU tar doesn't
+    own[148:156] = b"%06o\0 " % (sum(own) - sum(own[148:156]) + 8 * ord(" "))
+    raw = b"".join(
+        (
+            _extension(tarfile.GNUTYPE_LONGLINK, b"a\0"),
+            _extension(tarfile.XHDTYPE, b"13 comment=q\n"),
+            _extension(tarfile.GNUTYPE_LONGNAME, b"h\0"),
+            bytes(own),
+            b"\0" * 2 * tarfile.BLOCKSIZE,
+        )
+    )
+    try:
+        stream = _Stream(io.BytesIO(raw), len(raw))
+        with tarfile.open(fileobj=stream, mode="r:", tarinfo=_Header) as tar:  # type: ignore[call-overload]
+            member = tar.next()
+            got = (tuple(stream.kinds), member.name, member.linkname, member.dropped)
+    except Exception:  # whatever fails, the check can't see the headers
+        return False
+    return got == (SEEN, "h", "a", True)
+
+
 def answer(fresh: Callable[[], BinaryIO], budget: int, frames: Frames) -> int:
     """Both passes over the archive that `fresh()` reads, the answer in `frames`: 0 when the
     new archive was sent whole, 1 when the archive is refused. Whatever raises, but the reader's
-    going away, refuses it with a frame (the review of #383)."""
+    going away, refuses it with a frame (the review of #383). If tarfile no longer shows the
+    check its headers (`seen`), every archive is refused."""
     try:
-        why, targets = scan(fresh(), budget)
+        why, targets = scan(fresh(), budget) if seen() else (HIDDEN, set())
         if not why:
             repack = Repack(fresh, budget, targets, frames)
             if not (why := repack.run()):
@@ -786,7 +949,11 @@ REPACKED += [(MANIFEST, MANIFEST_HEAD + b"work/latest\ta.md\n")]
 
 def selfcheck() -> int:
     """Re-pack `SAMPLE` in memory and read the result back: what `deploy.sh` runs, as
-    `zab-build`, before a release is switched to. 0 if it holds `REPACKED`."""
+    `zab-build`, before a release is switched to. 0 if it holds `REPACKED`, and tarfile still
+    shows the check its headers (`seen`)."""
+    if not seen():
+        print(f"archive_check: selfcheck FAILED: {HIDDEN}")
+        return 1
     data = io.BytesIO()
     with tarfile.open(fileobj=data, mode="w:gz", format=tarfile.GNU_FORMAT) as tar:
         for name, kind, target, body in SAMPLE:

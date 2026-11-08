@@ -105,6 +105,7 @@ from aws_common import (
     tag_list,
 )
 from import_key_pair import import_key_pair
+from upgrade_server import rename_noreplace
 from zulip_provision import (
     ZulipAdmin,
     ZulipAdminError,
@@ -589,9 +590,6 @@ def send_request(ws: Workshop, entry: dict, zuliprc: str, folder: str, result: s
     """The helper's request (module doc, step 4), then its outcome for this plan: 0 when it
     added the entry."""
     target = pathlib.Path(folder) / "request.json"
-    if target.exists():
-        print(f"{target} is there already: the helper hasn't taken an earlier request")
-        return 1
     body = {"version": 1, "plan": ws.plan, "entry": entry, "zuliprc": zuliprc}
     earlier = _stamp(result)  # the helper replaces the file: an outcome must be a new one
     tmp = pathlib.Path(folder) / f"request.{os.getpid()}.new"
@@ -599,7 +597,13 @@ def send_request(ws: Workshop, entry: dict, zuliprc: str, folder: str, result: s
     try:  # it holds the bot's key: never left behind half-written (review of #423)
         with os.fdopen(fd, "w", encoding="ascii") as f:
             json.dump(body, f, ensure_ascii=True)
-        os.replace(tmp, target)
+        # in one step, never over another request, with one link always (#898's Codex round 1)
+        rename_noreplace(tmp, target)
+    except FileExistsError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        print(f"{target} is there already: the helper hasn't taken an earlier request")
+        return 1
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -663,15 +667,15 @@ def withdraw(ws: Workshop, target: pathlib.Path, result: str, earlier: Any) -> i
     except (OSError, ValueError, AttributeError):
         ours = False
     if not ours:  # never: the bot sends one request at a time; put back, never over another
-        try:
-            os.link(withdrawn, target)
+        try:  # one link always, as the helper requires (#898's Codex round 1)
+            rename_noreplace(withdrawn, target)
             fate = "put back, pending"
         except OSError as exc:  # never stranded as .withdrawn (review of #423, round 2)
             fate = f"not put back ({exc.strerror}), so dropped with its key: its run gets nothing"
-        try:
-            os.unlink(withdrawn)
-        except OSError as exc:
-            fate += f"; {withdrawn} is left ({exc.strerror}): a deployer removes it"
+            try:
+                os.unlink(withdrawn)
+            except OSError as gone:
+                fate += f"; {withdrawn} is left ({gone.strerror}): a deployer removes it"
         print(f"{target} was another plan's request: {fate}")
         return 1
     with contextlib.suppress(OSError):

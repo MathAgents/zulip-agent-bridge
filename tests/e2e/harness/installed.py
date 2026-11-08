@@ -56,6 +56,22 @@ SIDE_QUESTIONS = {
 LINE_ANCHORS = "import zab.render.links as l; print(hasattr(l, 'SERVED_LINE_EXT'))"
 #: `zab share` (#710): share links, which the file server serves once it is updated too.
 HAS_SHARE = "import importlib.util as u; print(u.find_spec('zab.tools.share') is not None)"
+#: Sub-agents across a turn's end (#660): Claude's stdin stays open while a background
+#: sub-agent runs (#814); a Codex turn that ends with one running says so (#822); and `!stop`
+#: stops a Codex thread's sub-agents (#825)
+CLAUDE_SUBAGENT_STDIN = (
+    "import zab.backends.claude as c; print(hasattr(c, 'SUBAGENT_IDLE_CLOSE_S'))"
+)
+CODEX_SUBAGENT_NOTE = "import zab.backends.codex_events as e; print(hasattr(e, 'subagent_note'))"
+CODEX_SUBAGENT_STOP = (
+    "from zab.backends.codex import CodexBackend as B; print(hasattr(B, '_stop_subagents'))"
+)
+#: `!stop` with no turn running stops the sub-agents an ended Codex turn left running (#851)
+#: ... and finds one among the daemon's loaded threads, across a bridge restart (#858)
+CODEX_LOADED_STOP = (
+    "from zab.backends.codex import CodexBackend as B; print(hasattr(B, '_loaded_subagents'))"
+)
+CODEX_IDLE_STOP = "from zab.core.session import SessionActor as A; print(hasattr(A, 'stop_idle'))"
 
 #: The agents' instructions, as push_config installs them with `agent_instructions.py`: the
 #: organizers' block of this file, between its markers (`START`, `END` there).
@@ -64,6 +80,9 @@ MANAGED = re.compile(r"<!-- zab:managed:start -->\n(.*?)<!-- zab:managed:end -->
 #: #448's line of `workshop/ami/files/agent-instructions.md`: files render on the file server,
 #: and a line can be linked
 FILES_RENDER = re.compile(r"Markdown renders as on GitHub.*?#L\d", re.S)
+#: #668's line: Claude Code's warning on a background sub-agent is about its findings, so the
+#: notes are still due while it runs
+NOTES_WHILE_WAITING = re.compile(r"That is about its findings, not its\s+progress")
 
 
 def ask(vm, snippet: str) -> str:

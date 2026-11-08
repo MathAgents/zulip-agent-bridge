@@ -927,6 +927,35 @@ def test_ten_megabytes_cost_a_bounded_time_and_memory(unit: str) -> None:
     assert peak < 250_000_000
 
 
+_AKIA = "AKIA" + "Q" * 16
+_N = MAX_SCRUB_CHARS - 1000  # all of it scrubbed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(_AKIA + "a" * _N, id="aws-tail"),
+        pytest.param(_AKIA + ".eyJa" + "." * _N, id="aws-dot-run"),
+        pytest.param("\x1b" + _AKIA + ".eyJa" + "." * _N, id="esc-aws-dot-run"),
+        pytest.param("ZULIP_API_KEY=" + ZULIP_KEY + "a" * _N, id="env-tail"),
+        pytest.param("-u x:" + ZULIP_KEY + ".eyJa" + ".a" * (_N // 2), id="curl-dot-segments"),
+    ],
+)
+def test_a_long_token_costs_bounded_memory(text: str) -> None:
+    """Review of #828: the §11.6 tails, matched here in each view and without their guards,
+    held a frame of `re` per character while they were greedy: 75 MB for a tail of a million
+    characters, 245 MB for the dot run of #821. What is left is the views' own, 8 bytes per
+    character of an index where a character was removed (the ESC)."""
+    tracemalloc.start()
+    try:
+        base = tracemalloc.get_traced_memory()[0]
+        Scrubber()(text)
+        peak = tracemalloc.get_traced_memory()[1] - base
+    finally:
+        tracemalloc.stop()
+    assert peak < 32_000_000, f"{peak / 1e6:.0f} MB"
+
+
 def test_a_long_text_is_cut_at_a_line_before_scrubbing() -> None:
     lines = [f"line {n} " + "x" * 90 for n in range(20_000)]  # about 2 MB
     lines[15_000] = f"far away {ZULIP_KEY}"

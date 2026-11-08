@@ -6,9 +6,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from types import SimpleNamespace
 
+import pytest
+
 from e2e import test_scenarios_features as features
+from e2e.harness.flows import Chat, answer
+from e2e.test_harness_zulip import BOT, Zulip, user
+from zab.core import btw
 
 
 class Vm:
@@ -64,3 +70,36 @@ def test_side_log_keeps_the_newest_line_of_each_event():
         "side_question_config": "config/read reported mcp_servers; off: …",
         "side_question_mcp": "lean-lsp=disabled, lmfdb=disabled",
     }
+
+
+@pytest.mark.parametrize("slow", [True, False])
+async def test_a_side_answer_quoting_the_done_word_is_not_the_running_turns_answer(slow):
+    """#843: Claude's side answer (message 637909298 of run `20261105T175825Z-811be8f4`) said
+    it hadn't sent the running turn's done word, quoting it, and the running turn's wait took
+    it for that turn's answer: both waits returned the same message. A side answer is never
+    a turn's answer (`flows.answer`); the side answer's own wait still finds it. The parts'
+    heads are `btw.post`'s: a slow answer mentions its asker in its first part only, a fast
+    one never (review of #844: a pattern needing the mention must fail here)."""
+    fake = Zulip()
+    chat = Chat(user(fake), {"claude": BOT}, {"claude": "Claude · zab-test"}, 5)
+    topic, done = "e2e-12-btw-claude-x", "DONE-130739-214f17"
+    running = await chat.say(
+        "claude", topic, f"Run the shell command `sleep 150`. Then reply with exactly `{done}`."
+    )
+    side = await chat.say("claude", topic, "!btw Which command runs?", mention_bot=False)
+    url = f"https://zulip.example/#narrow/channel/5/near/{side.message_id}"
+    heads = [btw.marker(url, "@**zab-tester|10**" if slow else ""), btw.marker(url)]
+    parts = [
+        f"The current turn runs `sleep 150`; I therefore haven't sent `{done}`.",
+        f"(2/2) Once it ends, it replies `{done}`.",  # a later part, cut from a long answer
+    ]
+    for i, part in enumerate(parts):
+        fake.add(BOT, heads[min(i, 1)] + " " + part, stream=5, topic=topic)
+        if i == 0:
+            pattern = features.BTW_ANSWER.format(side.message_id)
+            found, _ = await chat.reply(side, pattern, within=5)
+        with pytest.raises(TimeoutError):
+            await chat.reply(running, answer(re.escape(done)), within=5)
+    fake.add(BOT, done, stream=5, topic=topic)
+    ended, _ = await chat.reply(running, answer(re.escape(done)), within=5)
+    assert found["id"] < ended["id"] and ended["content"] == done

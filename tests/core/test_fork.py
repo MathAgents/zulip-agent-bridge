@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from zab.backends import claude as cb
+from zab.backends import codex_rpc
 from zab.config import BackendConfig, BotConfig, BridgeConfig, Config, RenderConfig
 from zab.core import presentation as view
 from zab.core import types as t
@@ -840,6 +841,8 @@ async def restarts(tmp_path, monkeypatch):
         server = None
         if kind == "codex":
             server = FakeAppServer(str(tmp_path))
+            # each `restart()` a new run of the app-server for the bridge (#830)
+            monkeypatch.setattr(codex_rpc, "app_server_instance", server.instance_of)
             serving = server.serve(str(tmp_path / "s.sock"))
             await serving.__aenter__()
             made.append(lambda: serving.__aexit__(None, None, None))

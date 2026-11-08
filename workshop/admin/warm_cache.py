@@ -116,7 +116,7 @@ _COMMENT = re.compile(r"/-|-/")
 
 def version_key(tag: str) -> tuple:
     """lean-project's: `v4.9.0` < `v4.34.1-rc2` < `v4.34.1`."""
-    m = re.fullmatch(r"v?(\d+(?:\.\d+)*)(?:-(.+))?", tag)
+    m = re.fullmatch(r"v?(\d+(?:\.\d+)*+)(?:-(.+))?", tag)
     if not m:
         return ((), 0, (tag,))
     pre = m.group(2) or ""

@@ -58,8 +58,10 @@ READ_S = 60.0
 PLAN_S = 900.0
 #: §2.4 step 5's apply timeouts, by verb, and a margin for the result's post: 30 min for the
 #: final sync, the export and the teardown (whose retries of a VM refused as protected, #378).
+#: A deployer's `!upgrade-server` (#569) has its recheck first, the plan helper again (within
+#: `upgrade_server.py`'s 1350 s), then its 1800 s apply (review of #902, N5).
 APPLY_S = {"launch": 3700.0, "rollout": 1900.0, "final-sync": 1900.0, "export": 1900.0,
-           "teardown": 1900.0}  # fmt: skip
+           "teardown": 1900.0, "upgrade-server": 1350.0 + 1800.0 + 100.0}  # fmt: skip
 APPLY_DEFAULT_S = 1000.0
 #: Beyond an apply's own deadline, for its result's post.
 POST_MARGIN_S = 100.0

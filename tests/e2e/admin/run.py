@@ -10,7 +10,9 @@ Run it from a checkout of the revision under test: its harness and scenarios are
 
 1. **Setup** (`harness/setup.py`): the rig's keys, bots, channels, groups, role and server,
    made or reused; a new signed rc of the commit under test deployed with its own `deploy.sh`
-   (`--bootstrap` the first time); the test workshops emptied; the fleet wheel placed.
+   (`--bootstrap` the first time), once SSH answers steadily, and again when it could not
+   connect (#804); the test workshops emptied; the fleet wheel placed. The report's
+   *Start-up* lists the server's start, each SSH probe and each deploy.sh run again.
 2. **The scenarios** selected (default `go`: A1 to A7, A10 and A12 to A15, ADMIN §8.2), run by
    pytest from this checkout's `tests/e2e/admin/`, with `ZAB_LIVE=admin-e2e`.
 3. **Teardown, always**, whatever ended the run (an error, Ctrl-C, SIGTERM or SIGHUP): every
@@ -46,6 +48,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # `e2e` as a script too
 
 from e2e.admin.harness import rig as rigs
+from e2e.admin.harness import upgrade
 from e2e.admin.harness.aws_rig import AwsRig
 from e2e.admin.harness.gate import Aws, Gate
 from e2e.admin.harness.release import Releases
@@ -168,6 +171,39 @@ def scenarios(parts: Parts, spec: str, state: Path, out: Path) -> report.Report:
     return ran
 
 
+#: A10b's number among ADMIN §7's scenarios (`rigs.SCENARIOS`).
+A10B = 110
+
+
+def swept_values(rig, a10b: bool = True) -> tuple[dict[str, str], list[str]]:
+    """Label → value of every secret pytest's output must not hold, and the run problems found
+    on the way. Always the rig's own (A12's list), whatever A10b's token file is, so that no
+    trouble with it turns off the rig's sweep (#902's review, B2). Then A10b's token for the
+    test release repository, labelled by its variable (#902's re-review, B1); or, when
+    `release_token` refuses it, every long word of the file (`raw_words`) and the variable's
+    own value, a token put there by mistake say (#902's Codex round 2; review, B1): a
+    traceback of that refusal could have printed them. That refusal is a run problem only for
+    a run that selects A10b (`a10b`), naming the file or saying it is no path, never quoting
+    the token. The file is read again after pytest ended: changed in between, it is swept for
+    its new content."""
+    values, problems = dict(secret_values(rig)), []
+    label = f"${upgrade.TOKEN_ENV}"
+    try:
+        token = upgrade.release_token()
+    except Exception as exc:
+        if a10b:
+            problems.append(f"A10b's token file was refused: {described(exc)}")
+        for n, word in enumerate(upgrade.raw_words(), 1):
+            values[f"{label} (word {n})"] = word.value
+        given = os.environ.get(upgrade.TOKEN_ENV, "").strip()
+        if len(given) >= 20:
+            values[f"{label} (its value)"] = given
+    else:
+        if token:
+            values[label] = token.value
+    return values, problems
+
+
 def sweep(log: Path, values: Mapping[str, str]) -> list[str]:
     """Each of the rig's secrets (A12's list) in pytest's output replaced by its label, as a
     run problem: a traceback prints its frames' arguments, a zuliprc's text among them."""
@@ -228,7 +264,8 @@ def main(argv: list[str] | None = None, *, make: Callable[..., Parts] = build) -
             signal.signal(s, handler)
         lock.close()
     try:  # written after A12 scanned the run's files: swept here (reviewer on #518)
-        result.problems += sweep(out / "pytest.log", secret_values(rig))
+        values, problems = swept_values(rig, A10B in rigs.select(args.scenarios))
+        result.problems += problems + sweep(out / "pytest.log", values)
     except Exception as exc:  # a malformed secrets file named, never quoted (#519)
         result.problems.append(f"pytest.log not swept for secrets: {described(exc)}")
     if args.dry_run:
@@ -274,6 +311,8 @@ def _run(parts: Parts, args: argparse.Namespace, result: report.Report, out: Pat
         finally:
             for s, handler in held.items():
                 signal.signal(s, handler)
+        timeline = getattr(parts.setup, "timeline", None)  # the server's start-up (#804)
+        result.boot = list(timeline.lines) if timeline is not None else []
         result.finished = f"{dt.datetime.now(dt.UTC):%Y-%m-%d %H:%M:%S}Z"
 
 

@@ -156,6 +156,17 @@ def test_a_note_is_redacted_before_it_is_put_on_one_line(sep):
     assert second == "> and [redacted private key] then"
 
 
+@pytest.mark.parametrize(
+    "text",
+    [f"curl -u\nbot@x.y:{KEY}", f"export ZULIP_API_KEY\n={KEY}", f"key\n= {KEY}", f"a\nkey={KEY}"],
+)
+def test_a_code_span_is_redacted_again_on_one_line(text):
+    """#666: `code` puts the text on one line, which can make a key's context whole that the
+    first redaction didn't see (`-u` and a newline before the user); it redacts again."""
+    out = view.code(text)
+    assert KEY not in out and "[redacted zulip api key]" in out and "\n" not in out
+
+
 def test_no_empty_quote_line_when_the_budget_drops_the_first_note():
     notes = ["first " * 40, "second", "third"]
     header = view.status("running", time.time(), [], R, 10000).splitlines()[0]

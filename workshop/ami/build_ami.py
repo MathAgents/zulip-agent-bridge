@@ -1,19 +1,27 @@
 """Build the workshop AMI: one builder, `build.sh`, the image, terminate; `--smoke` (README.md).
 
-    uv run --with boto3 python workshop/ami/build_ami.py --profile workshop --region us-west-2 \\
-        --name nt-agents-2026-v1 --zab-wheel dist/zulip_agent_bridge-0.0.2-py3-none-any.whl \\
-        --magma-dir /opt/magma --magma-passfile <licence file> \\
-        [--magma-licence-setup <the deployer's licence setup script>] --with-sage \\
-        [--ssh-public-key ~/.ssh/id_ed25519.pub] [--smoke] [--dry-run]
-    uv run --with boto3 python workshop/ami/build_ami.py --profile workshop --smoke-only ami-…
+    uv run --with boto3 python workshop/ami/build_ami.py --profile P --account-id ACCOUNT \\
+        --region REGION --name zab-workshop-YYYYMMDD --tag zab-build=ami --zab-tag vX.Y.Z \\
+        [--magma-dir /opt/magma --magma-passfile <licence file>] \\
+        [--magma-licence-setup <your licence setup script>] [--with-sage] \\
+        [--ssh-public-key ~/.ssh/id_ed25519.pub] [--deps-release OWNER/REPO@TAG] \\
+        [--smoke] [--dry-run]
+    uv run --with boto3 python workshop/ami/build_ami.py --profile P --account-id ACCOUNT \\
+        --region REGION --tag zab-build=ami --smoke-only ami-…
 
-It creates exactly what an AMI build may create (issue #36, D21): one builder instance running
-`build.sh`, the image, one smoke-test instance; nothing else outlasts the build. Every resource
-is tagged `workshop=nt-agents-2026`, or with the `--tag`s (a test build:
-`--tag zab-role=test --tag workshop=zab-test`). The temporary security group admits SSH from
-this machine's egress address only, the temporary key pair is this machine's public key, and both
-are deleted at the end; the builder and the smoke instance are terminated also when a step fails.
+(README.md, "Build", has the command in full.) It creates exactly what an AMI build
+may create: one builder instance running `build.sh`, the image, one smoke-test instance; nothing
+else outlasts the build. Every resource carries the `--tag`s, which are required, such as
+`--tag zab-build=ami`, or a test build's `--tag zab-role=test --tag workshop=zab-test` (never
+`zab-scope=…`: the fleet's copy of the image joins the scope, README.md); the region and the
+image's name are required too (#808). The temporary security group admits SSH
+from the egress address of the machine that runs the build only, the temporary key pair is that
+machine's public key, and both are deleted at the end; the builder and the smoke
+instance are terminated also when a step fails.
 The Magma files are copied to the builder for the build and are never committed (`.gitignore`).
+So are the pinned Macaulay2 packages and PARI's data packages, fetched first, before anything is
+created in AWS, from their GitHub releases with the deployer's `gh` and checked against their
+manifests (`m2_debs.py`; #945): the builder needs no credentials for them.
 Standalone script (boto3 is not a zab dependency); tests drive it with fakes for EC2 and SSH.
 """
 
@@ -39,17 +47,20 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "aws"))
+sys.path.insert(0, str(HERE))  # m2_debs, also under `python -I` (review of #950)
+import m2_debs  # noqa: E402 - next to this script
 from aws_common import WARM_VOLUME, ZAB_REPO_URL  # noqa: E402 - the path is set up above
 
 BUILD_SH = HERE / "build.sh"
 AMI_FILES = HERE / "files"  # instructions, smoke sources, comparator-run (build.sh AMI_FILES)
-WORKSHOP_TAG = ("workshop", "nt-agents-2026")
 
 
 def scope_tags(opts: argparse.Namespace) -> dict[str, str]:
-    """The tags every resource carries: `--tag KEY=VALUE` (repeatable) or the workshop default.
-    Test builds pass `--tag zab-role=test --tag workshop=zab-test`: test infrastructure only."""
-    tags = dict(getattr(opts, "tag", None) or [WORKSHOP_TAG])
+    """The tags every resource carries: `--tag KEY=VALUE`, repeatable and required (#808). Test
+    builds pass `--tag zab-role=test --tag workshop=zab-test`: test infrastructure only."""
+    tags = dict(getattr(opts, "tag", None) or [])
+    if not tags:
+        raise SystemExit("build_ami.py: give the build's scope, --tag KEY=VALUE (repeatable)")
     return tags
 
 
@@ -78,6 +89,7 @@ SSH_OPTS = [
 FINAL_CLEANUP = (
     "sudo shutdown -c >/dev/null 2>&1 || true; "
     "rm -f magmapassfile magma.tar.gz magma-licence-setup build.sh ami-files.tar.gz ./*.whl"
+    " m2-debs.tar pari-data.tar"
     " ~/.ssh/authorized_keys"
     " && sudo rm -f /root/.ssh/authorized_keys"
     " && test ! -e magmapassfile && test ! -e magma-licence-setup"
@@ -232,6 +244,17 @@ else
 fi
 check bash -c '/opt/certbot/bin/certbot --help all | grep -q -- --ip-address'
 check bash -c 'jq -e ".disableClaudeAiConnectors == true" /etc/claude-code/managed-settings.json'
+# #882, as build.sh's: Claude Code's own CA list is the system store, which agent reads; neither
+# SSL_CERT_FILE nor CODEX_CA_CERTIFICATE is set for agent (each one set is named).
+managed=/etc/claude-code/managed-settings.json
+check bash -c "jq -e '.env.CLAUDE_CODE_CERT_STORE == \"system\"' $managed"
+store='grep -q -e "-----BEGIN CERTIFICATE-----" /etc/ssl/certs/ca-certificates.crt'
+store="$store"' && ls /etc/ssl/certs | grep -Eqx "[0-9a-f]{8}\.[0-9]+"'
+check as_agent bash -c "$store"
+if ca_env=$(sudo /usr/bin/python3 -I /usr/local/share/workshop/bin/ca_env.py agent 2>&1)
+then printf 'ok   agent environment:\n%s\n' "$ca_env" | sed '2,$s/^/     | /'
+else printf 'FAIL agent environment:\n%s\n' "$ca_env" | sed '2,$s/^/     | /'; fail=1
+fi
 # Issue #474: every tool of /etc/zab/tools.json again, from the image's tools.toml: each one's
 # small computation, as agent with the services' PATH, and the version the build recorded. One
 # line per tool; the Julia ones load Oscar, about half a minute each.
@@ -311,6 +334,34 @@ def files_tarball(dest: str) -> str:
             if path.is_file():
                 tar.add(str(path), arcname=str(path.relative_to(AMI_FILES)))
     return dest
+
+
+def deps_tarball(
+    opts: argparse.Namespace,
+    work: Path,
+    log: Callable[[str], None],
+    kind: m2_debs.Pinned = m2_debs.M2,
+) -> str:
+    """A pinned set (the Macaulay2 packages and their sources, or PARI's data packages), from
+    `<option>-dir` or else release `<option>-release` (the deployer's `gh`), each file checked
+    against its manifest, as one tarball for build.sh's knob (M2_DEBS, PARI_DATA). Raises
+    m2_debs.DepsError, naming the files and the fix (#945)."""
+    files = work / kind.attr
+    files.mkdir()
+    prefix = kind.option.removeprefix("--").replace("-", "_")
+    source, release = getattr(opts, f"{prefix}_dir", None), getattr(opts, f"{prefix}_release")
+    if source:
+        log(f"{kind.what} from {source}")
+        paths = m2_debs.from_dir(Path(source), files, kind=kind)
+    else:
+        log(f"{kind.what} from release {release} (gh)")
+        paths = m2_debs.fetch(release, files, kind=kind)
+    dest = work / kind.tarball
+    with tarfile.open(dest, "w") as tar:  # .debs and tarballs are compressed already
+        for path in paths:
+            tar.add(str(path), arcname=path.name)
+    log(f"  {len(paths)} files checked against {kind.manifest.name}")
+    return str(dest)
 
 
 def console_fingerprints(text: str) -> set[str]:
@@ -561,17 +612,37 @@ class Ssh:
                 time.sleep(5.0)
         return False
 
-    def pin_host_key(self, ip: str) -> str:
-        """Scan the host's ed25519 key into known_hosts; returns its `SHA256:…` fingerprint."""
-        scan = subprocess.run(  # noqa: S603
-            ["ssh-keyscan", "-t", "ed25519", "-T", "15", ip],  # noqa: S607
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        lines = [line for line in scan.stdout.splitlines() if line and not line.startswith("#")]
-        if not lines:
-            raise RuntimeError(f"no ed25519 host key scanned from {ip}")
+    def pin_host_key(self, ip: str, *, every_s: float = 5.0, for_s: float = 120.0) -> str:
+        """Scan the host's ed25519 key into known_hosts; returns its `SHA256:…` fingerprint.
+
+        A fresh instance's port 22 can accept before its host key is served (its first boot
+        still generating the keys, #953), so a scan that finds none is tried again every
+        `every_s` seconds, for up to `for_s`, before the build stops, saying how long it
+        tried."""
+        began, tries, why = time.monotonic(), 0, ""
+        while True:
+            tries += 1
+            try:
+                scan = subprocess.run(  # noqa: S603
+                    ["ssh-keyscan", "-t", "ed25519", "-T", "15", ip],  # noqa: S607
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                out, why = scan.stdout, (scan.stderr or "").strip().splitlines()[-1:]
+            except subprocess.TimeoutExpired:
+                out, why = "", ["timed out"]
+            lines = [line for line in out.splitlines() if line and not line.startswith("#")]
+            if lines:
+                break
+            spent = time.monotonic() - began
+            if spent + every_s > for_s:
+                last = f": {why[0][:120]}" if why else ""
+                raise RuntimeError(
+                    f"no ed25519 host key scanned from {ip} in {spent:.0f} s "
+                    f"({tries} tries, {every_s:.0f} s apart){last}"
+                )
+            time.sleep(every_s)
         keyed = lines[0] + "\n"
         fp = subprocess.run(
             ["ssh-keygen", "-lf", "-"],  # noqa: S607
@@ -792,6 +863,10 @@ def build(
     with tempfile.TemporaryDirectory() as tmp:
         ssh.copy(ip, files_tarball(os.path.join(tmp, "ami-files.tar.gz")), "ami-files.tar.gz")
     remote["AMI_FILES"] = "/home/ubuntu/ami-files.tar.gz"
+    for kind in m2_debs.SETS:  # main() fetched and checked them before any AWS call
+        if getattr(opts, kind.attr, None):
+            ssh.copy(ip, getattr(opts, kind.attr), kind.tarball)
+            remote[kind.knob] = f"/home/ubuntu/{kind.tarball}"
     if opts.zab_wheel:
         ssh.copy(ip, opts.zab_wheel, Path(opts.zab_wheel).name)
         remote["ZAB_WHEEL"] = f"/home/ubuntu/{Path(opts.zab_wheel).name}"
@@ -898,12 +973,20 @@ def plan(opts: argparse.Namespace, log: Callable[[str], None]) -> None:
         f"a public subnet of {opts.vpc_id}" if opts.vpc_id else "the default VPC"
     )
     log(f"would launch one {opts.instance_type} builder from {base} in {opts.region}, {where}")
+    source = opts.deps_dir or f"release {opts.deps_release} (with gh)"
+    log(f"would fetch the Macaulay2 packages from {source}, checked against the manifest")
+    source = opts.pari_data_dir or f"release {opts.pari_data_release} (with gh)"
+    log(f"would fetch PARI's data packages from {source}, checked against the manifest")
     files = [
         "build.sh",
         "ami-files.tar.gz",
+        *(kind.tarball for kind in m2_debs.SETS),
         *([Path(opts.zab_wheel).name] if opts.zab_wheel else []),
     ]
-    remote: dict[str, str] = {"AMI_FILES": "/home/ubuntu/ami-files.tar.gz"}
+    remote: dict[str, str] = {
+        "AMI_FILES": "/home/ubuntu/ami-files.tar.gz",
+        **{kind.knob: f"/home/ubuntu/{kind.tarball}" for kind in m2_debs.SETS},
+    }
     if opts.zab_wheel:
         remote["ZAB_WHEEL"] = f"/home/ubuntu/{Path(opts.zab_wheel).name}"
     if opts.magma_dir:
@@ -932,8 +1015,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--account-id", required=True, help="the workshop AWS account; checked against STS first"
     )
-    parser.add_argument("--region", default="us-west-2")
-    parser.add_argument("--name", default=f"nt-agents-2026-{time.strftime('%Y%m%d')}")
+    parser.add_argument("--region", required=True, help="the region of the build and the image")
+    parser.add_argument(
+        "--name", help="the image's name, such as zab-workshop-YYYYMMDD (required to build)"
+    )
     parser.add_argument("--instance-type", default="m7a.xlarge", help="the builder's type")
     parser.add_argument(
         "--smoke-instance-type",
@@ -970,6 +1055,24 @@ def main(argv: list[str] | None = None) -> int:
         help="optional: the deployer's script for any host-specific setup Magma's licence needs;"
         ' run as root at every boot (README.md, "Magma\'s licence")',
     )
+    parser.add_argument(
+        "--deps-release",
+        metavar="OWNER/REPO@TAG",
+        help="the GitHub release of the pinned Macaulay2 packages, fetched with gh (default:"
+        f" {m2_debs.RELEASE} of the repository this checkout's origin names)",
+    )
+    parser.add_argument(
+        "--deps-dir", help="a directory holding those files instead (a copy of the release)"
+    )
+    parser.add_argument(
+        "--pari-data-release",
+        metavar="OWNER/REPO@TAG",
+        help="the GitHub release of PARI's pinned data packages, fetched with gh (default:"
+        f" {m2_debs.PARI_RELEASE} of the repository this checkout's origin names)",
+    )
+    parser.add_argument(
+        "--pari-data-dir", help="a directory holding those files instead (a copy of the release)"
+    )
     parser.add_argument("--with-sage", action="store_true")
     parser.add_argument("--sage-version", default="10.9")
     parser.add_argument("--smoke", action="store_true", help="also smoke-test the new image")
@@ -993,7 +1096,8 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         type=parse_tag,
         metavar="KEY=VALUE",
-        help="scope tag for every resource, repeatable (default workshop=nt-agents-2026)",
+        required=True,
+        help="a tag for every resource, repeatable and required, such as zab-build=ami",
     )
     parser.add_argument("--dry-run", action="store_true")
     opts = parser.parse_args(argv)
@@ -1001,6 +1105,8 @@ def main(argv: list[str] | None = None) -> int:
     def log(msg: str) -> None:
         print(msg, flush=True)  # a detached run's log must show progress as it happens
 
+    if not opts.smoke_only and not opts.name:  # no default: one would name a deployment (#808)
+        parser.error("--name is required to build an image")
     if not re.fullmatch(r"\d{12}", opts.account_id):
         print("--account-id must be the 12-digit account number", file=sys.stderr)
         return 2
@@ -1045,9 +1151,32 @@ def main(argv: list[str] | None = None) -> int:
     if not Path(opts.ssh_public_key).expanduser().is_file():
         print(f"{opts.ssh_public_key}: no such public key", file=sys.stderr)
         return 2
+    if not opts.smoke_only:  # each set's release, given or the origin's, named first
+        try:
+            for kind in m2_debs.SETS:
+                prefix = kind.option.removeprefix("--").replace("-", "_")
+                if getattr(opts, f"{prefix}_dir"):
+                    continue  # a directory needs no release
+                given = getattr(opts, f"{prefix}_release")
+                release = given or m2_debs.default_release(
+                    kind.release, flag=f"{kind.option}-release"
+                )
+                m2_debs.parse_release(release)
+                setattr(opts, f"{prefix}_release", release)
+        except m2_debs.DepsError as exc:
+            print(exc, file=sys.stderr)
+            return 2
     if opts.dry_run:
         plan(opts, log)
         return 0
+    if not opts.smoke_only:  # before anything is created in AWS, as the Magma tree is checked
+        deps = tempfile.TemporaryDirectory(prefix="zab-ami-deps.")  # removed when main returns
+        try:
+            for kind in m2_debs.SETS:
+                setattr(opts, kind.attr, deps_tarball(opts, Path(deps.name), log, kind))
+        except m2_debs.DepsError as exc:
+            print(exc, file=sys.stderr)
+            return 2
     ec2 = Ec2(opts.region, opts.profile)
     account, arn = ec2.identity()
     if account != opts.account_id:

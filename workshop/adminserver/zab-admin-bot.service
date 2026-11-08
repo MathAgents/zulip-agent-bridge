@@ -10,8 +10,9 @@ User=zab-admin
 Group=zab-admin
 ExecStart=/opt/zab-admin/current/.venv/bin/python -I -m zab.admin bot --config /etc/zab-admin/admin.toml
 # Rosters, out/, state.db, audit.jsonl, runs/, console/ and waker/ (§1.3); not its own SSH key;
-# and !new-workshop's request to the config helper (§2.9), in that helper's requests/ (root's parent).
-ReadWritePaths=/var/lib/zab-admin -/var/lib/zab-admin-config/requests
+# !new-workshop's request to the config helper (§2.9), in that helper's requests/ (root's parent);
+# and !upgrade-server's requests to the upgrade helpers (§1.6, #569), in theirs.
+ReadWritePaths=/var/lib/zab-admin -/var/lib/zab-admin-config/requests -/var/lib/zab-admin-upgrade/requests
 ReadOnlyPaths=/var/lib/zab-admin/.ssh
 Restart=always
 RestartSec=5

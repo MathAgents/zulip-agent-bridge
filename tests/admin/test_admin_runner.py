@@ -43,7 +43,10 @@ from zab.admin.plans import (
 from zab.admin.runner import Capture, Runner
 from zab.zulip import client as zulip_client
 
+from . import botkit
 from .botkit import (
+    ALICE,
+    DREW,
     HARVARD,
     HARVARD_CH,
     OLGA,
@@ -52,6 +55,8 @@ from .botkit import (
     TEST,
     TEST_CH,
     ZULIP_ITALIC,
+    _write,
+    audit_text,
     incoming,
     make_site,
     until,
@@ -158,7 +163,7 @@ def posts(site, by=HARVARD):
 
 
 def records(site, event=None):
-    rows = [json.loads(line) for line in site.audit.read_text().splitlines()]
+    rows = [json.loads(line) for line in audit_text(site.audit).splitlines()]
     return [r for r in rows if event is None or r["event"] == event]
 
 
@@ -167,7 +172,7 @@ def everything(site):
     texts = [p["content"] for p in site.realm.posts()] + [e[2] for e in site.realm.edits]
     texts += [v.decode("utf-8", "replace") for v in site.realm.uploads.values()]
     texts += [p.read_text() for p in Path(site.paths.layout.runs).rglob("*.txt")]
-    return "\n".join([*texts, site.audit.read_text()])
+    return "\n".join([*texts, audit_text(site.audit)])
 
 
 def gone(pid):
@@ -360,7 +365,9 @@ async def test_apply_to_result(site, server):
     assert start["hash"] == plan.hash and start["approvers"] == [OLGA]
     assert (end["plan"], end["verb"], end["args"], end["exit"]) == (plan.name, "stop", ["alice"], 0)
     assert end["outcome"] == "done"
-    assert end["steps"] == [{"script": "aws/power.py", "exit": 0, "ended": ""}]
+    (step,) = end["steps"]  # with its start and its seconds (#570)
+    assert step == {"script": "aws/power.py", "exit": 0, "ended": "", "at": 1800000000.0,
+                    "s": step["s"]}  # fmt: skip
     saved = Path(site.paths.state) / end["output"]
     assert "alice: stopped" in saved.read_text() and stat.S_IMODE(saved.stat().st_mode) == 0o600
     # the dry run at plan time only: a target verb's hash covers the VMs, not its dry run
@@ -892,6 +899,205 @@ async def test_busy_and_two_workshops_at_once(site, server):
     assert server.store.get(two.id).state == DONE
 
 
+#: `roster_sync.py --rename OLD NEW`, as the real one checks and writes: the new slug against
+#: the other workshops' rosters, then (applying) the gate, then its own roster rewritten. The
+#: check comes before the gate: two applies running at once would both pass it.
+RENAME = """\
+    args = sys.argv[1:]
+    roster = pathlib.Path(args[args.index("--roster") + 1])
+    old, new = args[args.index("--rename") + 1 : args.index("--rename") + 3]
+    for key, spec in zip(args, args[1:]):
+        if key == "--workshop-roster":
+            ws, path = spec.split("=", 1)
+            rows = pathlib.Path(path).read_text().splitlines()[1:]
+            if new in [row.split(",")[0] for row in rows]:
+                print("refused: " + new + " is in " + ws + "; a slug is never shared")
+                sys.exit(1)
+    if DRY:
+        print("~ " + old + " -> " + new)
+        sys.exit(0)
+    gate = pathlib.Path(GATE)
+    (gate / (TAG + ".started")).touch()
+    for _ in range(2000):
+        if (gate / "go").exists():
+            break
+        time.sleep(0.01)
+    else:
+        sys.exit(9)
+    lines = roster.read_text().splitlines()
+    lines = [new + line[len(old):] if line.startswith(old + ",") else line for line in lines]
+    roster.write_text("\\n".join(lines) + "\\n")
+    print("renamed " + old + " to " + new)
+"""
+
+
+def slugs(site, workshop):
+    rows = (site.tmp / "ws" / workshop / "roster.csv").read_text().splitlines()[1:]
+    return [row.split(",")[0] for row in rows]
+
+
+async def test_two_workshops_renaming_to_one_slug_at_once_never_both_take_it(site, server):
+    """#646: each apply holds only its workshop's lock, so without the server's roster lock two
+    workshops' renames to one free slug, approved within seconds, would both pass the check and
+    both write it. Under it, harvard's applies; zab-test's waits, says so, then rechecks: its
+    hash covers harvard's roster, which harvard's apply changed, so it is STALE and runs
+    nothing."""
+    gate = site.tmp / "gate"
+    gate.mkdir()
+    fake(site, "admin/roster_sync.py", RENAME.replace("GATE", repr(str(gate))))
+    on_test = {"sender": TESS, "bot": TEST, "stream": TEST_CH}
+    one = await request(server, "!roster rename carol dora")
+    other = await request(server, "!roster rename erin dora", mid=5001, **on_test)
+    assert one.state == other.state == PENDING, (one.note, other.note)
+    await approve(server, one)
+    await until(lambda: (gate / "workshop=harvard-2026.started").exists())
+    runner = server.planner.runner
+    assert runner.rosters.locked() and [p.id for p in runner.queued] == [one.id]
+    await approve(server, other, mid=LATE + 1, **on_test)
+    waits = f"⏳ {other.name} waits for {one.name} of harvard-2026: slugs are unique"
+    started = gate / "workshop=zab-test.started"
+    await until(lambda: started.exists() or any(p.startswith(waits) for p in posts(site, TEST)))
+    assert runner.busy("zab-test").id == other.id  # its workshop's lock first, then the wait
+    assert server.store.get(other.id).state == APPROVED and not started.exists()
+    (gate / "go").touch()
+    await settle(server)
+    assert server.store.get(one.id).state == DONE
+    stale = server.store.get(other.id)
+    assert stale.state == STALE and stale.note.startswith("hash now ")
+    said = posts(site, TEST)[-1]
+    assert said.startswith(f"❌ {other.name} is stale") and "roster.csv changed" in said, said
+    assert slugs(site, "harvard-2026") == ["alice", "bob", "dora"]
+    assert slugs(site, "zab-test") == ["erin"]
+    applied = [c["argv"] for c in calls(site, "admin/roster_sync.py", dry=False)]
+    assert len(applied) == 1 and "workshop=harvard-2026" in applied[0]
+    assert not runner.rosters.locked() and runner.queued == [] and runner.applying == {}
+    # requested again, the rename is refused at its dry run: harvard has the slug now
+    again = await request(server, "!roster rename erin dora", mid=5002, **on_test)
+    assert again.state == REFUSED and "dora is in harvard-2026" in posts(site, TEST)[-1]
+
+
+MIT, MIT_CH, MIA = 903, 47, 108  # a third workshop's bot, its channel and its organizer
+
+
+def third_workshop(site, monkeypatch):
+    """mit-2027, as botkit's zab-test: its bot, channel, organizer, and a roster of one row."""
+    text = site.config_path.read_text()
+    block = text[text.index('[[workshop]]\nname = "zab-test"') :]
+    for old, new in (("zab-test", "mit-2027"), (f"user_id = {TEST}", f"user_id = {MIT}"),
+                     (f"channels = [{TEST_CH}]", f"channels = [{MIT_CH}]"),
+                     (f"organizers = [{TESS}]", f"organizers = [{MIA}]")):  # fmt: skip
+        block = block.replace(old, new)
+    site.config_path.write_text(f"{text}\n{block}")
+    for uid, name, bot in ((MIA, "Mia Organizer", False), (MIT, "Workshop admin · mit-2027", True)):
+        site.realm.person(uid, name, bot=bot)
+        monkeypatch.setitem(botkit.BOTS if bot else botkit.NAMES, uid, name)
+    site.realm.channel(MIT_CH, DREW, ALICE, MIA, MIT)
+    _write(site.tmp / "etc" / "secrets" / "bots" / "mit-2027.zuliprc", site.realm.zuliprc(MIT),
+           0o640)  # fmt: skip
+    roster = "slug,first_name,email,ip,region\nfred,Fred,fred@example.com,203.0.113.6,us-east-1\n"
+    _write(site.tmp / "ws" / "mit-2027" / "roster.csv", roster, 0o600)
+    (site.tmp / "ws" / "mit-2027" / "out").mkdir(mode=0o700)
+
+
+async def test_a_third_workshops_plan_that_comes_as_the_lock_passes_on_says_it_waits(
+    site, monkeypatch
+):
+    """N1 of #793's review: harvard's rename holds the roster lock and zab-test's waits. A
+    third workshop's comes just as harvard's releases it, before zab-test's has resumed: it
+    waits behind zab-test's (an `asyncio.Lock` hands the lock to its first waiter), and says
+    so, naming harvard's, which is still on its way out, and the one more before it. Then each
+    waiter, whose inputs harvard's apply changed, is STALE; only harvard's script applied."""
+    third_workshop(site, monkeypatch)
+    gate = site.tmp / "gate"
+    gate.mkdir()
+    fake(site, "admin/roster_sync.py", RENAME.replace("GATE", repr(str(gate))))
+    srv = await start(site)
+    try:
+        on_test = {"sender": TESS, "bot": TEST, "stream": TEST_CH}
+        on_mit = {"sender": MIA, "bot": MIT, "stream": MIT_CH}
+        one = await request(srv, "!roster rename carol dora")
+        two = await request(srv, "!roster rename erin dora", mid=5001, **on_test)
+        three = await request(srv, "!roster rename fred dora", mid=5002, **on_mit)
+        assert one.state == two.state == three.state == PENDING, (one.note, two.note, three.note)
+        runner = srv.planner.runner
+        await approve(srv, one)
+        await until(lambda: (gate / "workshop=harvard-2026.started").exists())
+        await approve(srv, two, mid=LATE + 1, **on_test)
+        await until(lambda: [p.id for p in runner.queued] == [one.id, two.id])
+        # mit-2027's plan, approved; its apply begins as the lock is released, at once
+        with srv.store.db:
+            srv.store.db.execute("UPDATE plans SET state = ?, approved = ? WHERE id = ?",
+                                 (APPROVED, site.clock(), three.id))  # fmt: skip
+        mit = bot_of(srv, MIT)
+        command, action, fleet = await srv.planner.rebuild(mit, srv.store.get(three.id))
+        job = Job(srv.store.get(three.id), mit, MIT_CH, "ops", command, action, fleet)
+        release, late, loop = runner.rosters.release, [], asyncio.get_running_loop()
+
+        def passing_on():
+            release()
+            if not late:  # before zab-test's resumes: it is queued, so the lock isn't free
+                late.append(asyncio.Task(runner.apply(job), loop=loop, eager_start=True))
+                assert not runner.rosters.locked()
+
+        monkeypatch.setattr(runner.rosters, "release", passing_on)
+        (gate / "go").touch()
+        await until(lambda: bool(late))
+        await asyncio.gather(late[0], *list(srv.planner.tasks))
+        await settle(srv)
+        states = [srv.store.get(p.id).state for p in (one, two, three)]
+    finally:
+        await srv.close()
+    assert states == [DONE, STALE, STALE], states
+    said = posts(site, MIT)
+    waits = f"⏳ {three.name} waits for {one.name} of harvard-2026 and 1 more: slugs are unique"
+    assert said[-2].startswith(waits), said[-2:]
+    assert said[-1].startswith(f"❌ {three.name} is stale"), said[-1]
+    assert [slugs(site, ws) for ws in ("harvard-2026", "zab-test", "mit-2027")] == [
+        ["alice", "bob", "dora"], ["erin"], ["fred"]
+    ]  # fmt: skip
+    applied = [c["argv"] for c in calls(site, "admin/roster_sync.py", dry=False)]
+    assert len(applied) == 1 and "workshop=harvard-2026" in applied[0]
+    assert runner.queued == [] and runner.applying == {}
+
+
+async def test_a_roster_plan_whose_ttl_passes_while_it_waits_expires_before_its_recheck(
+    site, server, monkeypatch
+):
+    """N3 of #793's review: a waiter past its TTL is EXPIRED, whatever the first apply
+    changed, and is told so once it has the lock, without its recheck under it."""
+    gate = site.tmp / "gate"
+    gate.mkdir()
+    fake(site, "admin/roster_sync.py", RENAME.replace("GATE", repr(str(gate))))
+    on_test = {"sender": TESS, "bot": TEST, "stream": TEST_CH}
+    one = await request(server, "!roster rename carol dora")
+    other = await request(server, "!roster rename erin eve", mid=5001, **on_test)
+    runner = server.planner.runner
+    rechecked = []
+    live = runner._live
+
+    async def recheck(plan, *args, **kwargs):
+        rechecked.append(plan.id)
+        return await live(plan, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "_live", recheck)
+    await approve(server, one)
+    await until(lambda: (gate / "workshop=harvard-2026.started").exists())
+    await approve(server, other, mid=LATE + 1, **on_test)
+    await until(lambda: [p.id for p in runner.queued] == [one.id, other.id])
+    site.clock.now += server.config.plan_ttl_minutes * 60
+    (gate / "go").touch()
+    await settle(server)
+    assert server.store.get(one.id).state == DONE
+    expired = server.store.get(other.id)
+    assert (expired.state, expired.note) == (EXPIRED, "not applied within the TTL")
+    assert rechecked == [one.id]  # harvard's recheck alone: zab-test's never ran
+    said = posts(site, TEST)[-1]
+    assert said.startswith(f"❌ {other.name} is expired (not applied within the TTL): nothing "
+                           "was done. Request again.\n`audit #"), said  # fmt: skip
+    assert records(site, "expired")[-1]["plan"] == other.name
+    assert slugs(site, "zab-test") == ["erin"] and runner.queued == []
+
+
 # ----------------------------------------------------------------------- restarts, signals
 
 
@@ -1006,7 +1212,8 @@ async def test_a_step_that_exits_0_at_its_timeout_still_timed_out(site, server, 
     fake(site, "aws/launch.py", """\
         if not DRY:
             signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-            time.sleep(60)
+            for _ in range(6000):  # 60 s, never in one sleep (why: above `CHILD`)
+                time.sleep(0.01)
     """)  # fmt: skip
     fake(site, "admin/scan_hosts.py", 'print("scanned")')
     plan = await request(server, "!launch carol")
@@ -1282,7 +1489,8 @@ async def test_a_timeout_is_never_a_success(site, server, monkeypatch):
     graceful = """\
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         print("partial", flush=True)
-        time.sleep(60)
+        for _ in range(6000):  # 60 s, never in one sleep (why: above `CHILD`)
+            time.sleep(0.01)
     """
     fake(site, "aws/power.py", graceful)
     plan = await request(server, "!stop alice")

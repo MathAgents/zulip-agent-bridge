@@ -20,6 +20,12 @@ def backend():
     return b
 
 
+def loaded(status="idle"):
+    """`thread/read` of a thread the app-server holds loaded: `open_session` resumes it (#632)."""
+    flags = {"activeFlags": []} if status == "active" else {}
+    return {"thread": {"id": "s", "cwd": "/repo", "status": {"type": status, **flags}}}
+
+
 async def test_create_and_steer_use_verified_fields():
     b = backend()
     b.rpc.call.side_effect = [
@@ -68,7 +74,8 @@ async def test_only_owned_approvals_are_answered_by_default():
 async def test_resume_gets_summary_and_active_turn(context):
     b = backend()
     b.rpc.call.side_effect = [
-        {"data": []},  # the thread is cold; its off identity can be applied
+        loaded("active"),
+        {"data": []},  # not loaded by another client: its off identity can be applied
         {"thread": {"id": "s", "cwd": "/repo"}},
         {
             "data": [
@@ -94,7 +101,7 @@ async def test_resume_gets_summary_and_active_turn(context):
     info = await b.open_session(
         "s", t.SessionSpec(cwd="/repo", name="topic", context_prompt=context)
     )
-    resume_params = b.rpc.call.call_args_list[1].args[1]
+    resume_params = b.rpc.call.call_args_list[2].args[1]
     if context:
         assert resume_params["developerInstructions"] == context
     else:
@@ -102,7 +109,7 @@ async def test_resume_gets_summary_and_active_turn(context):
     assert info.active_turn_id == "running"
     assert info.preview == "latest question"
     assert info.last_turn.final_text == "answer"
-    assert b.rpc.call.call_args_list[1].args[1]["excludeTurns"] is True
+    assert b.rpc.call.call_args_list[2].args[1]["excludeTurns"] is True
 
 
 async def test_unavailable_backend_start_does_not_raise(tmp_path):
@@ -123,9 +130,8 @@ async def test_attach_context_reaches_first_accepted_input_only(steer):
         {"thread": {"id": "s", "cwd": "/repo"}},
         {"data": []},
     ]
-    await b.open_session(
-        "s", t.SessionSpec(cwd="/repo", name="topic", context_prompt="Bridge context")
-    )
+    # the resume, at the open of a loaded thread or the next use of an unloaded one (#632)
+    await b._resume("s", t.SessionSpec(cwd="/repo", name="topic", context_prompt="Bridge context"))
     turn_input = t.UserInput(text="continue", client_id="one")
 
     async def submit():
@@ -182,6 +188,7 @@ async def test_updated_settings_survive_closed_thread_reopen():
     await b.update_settings("s", t.SessionSettings(model="new"))
     b.mapper.closed.add("s")
     b.rpc.call.side_effect = [
+        {"data": []},  # not loaded by another client meanwhile (#632)
         {"thread": {"id": "s", "cwd": "/repo"}},
         {"data": []},
         {"turn": {"id": "t"}},
@@ -236,7 +243,8 @@ async def test_next_turn_applies_updated_sandbox(mode, kind):
 async def test_resume_restores_only_persisted_owned_turns():
     b = backend()
     b.rpc.call.side_effect = [
-        {"data": []},  # the thread is cold; its off identity can be applied
+        loaded("active"),
+        {"data": []},  # not loaded by another client: its off identity can be applied
         {"thread": {"id": "s", "cwd": "/repo"}},
         {"data": [{"id": "external", "status": "inProgress"}]},
     ]
@@ -290,6 +298,8 @@ async def test_resume_reconciles_stale_active_without_overwriting_new_notificati
     b.mapper.active["s"] = "old"
 
     async def call(method, params):
+        if method == "thread/read":
+            return loaded("active")
         if method == "thread/resume":
             return {"thread": {"id": "s", "cwd": "/repo"}}
         if notification:
@@ -310,7 +320,8 @@ async def test_resume_reconciles_stale_active_without_overwriting_new_notificati
     if expected is None:
         b.rpc.call.reset_mock()
         await b.interrupt("s")
-        b.rpc.call.assert_not_awaited()
+        # no `turn/interrupt` for the stale turn; `!stop` still looks for sub-agents (#660)
+        assert "turn/interrupt" not in [c.args[0] for c in b.rpc.call.await_args_list]
 
 
 def notify(b, *messages):
@@ -333,6 +344,8 @@ async def test_resume_reports_a_turn_that_completed_after_the_list_was_read():
     notify(b, ("turn/started", {"turn": {"id": "t1"}}))
 
     async def call(method, params):
+        if method == "thread/read":
+            return loaded("active")
         if method == "thread/loaded/list":
             return {"data": []}
         if method == "thread/resume":
@@ -360,6 +373,8 @@ async def test_resume_keeps_the_lists_last_turn_over_an_older_completion():
     notify(b, ("turn/started", {"turn": {"id": "t1"}}), ANSWER, DONE)
 
     async def call(method, params):
+        if method == "thread/read":
+            return loaded("active")
         if method == "thread/loaded/list":
             return {"data": []}
         if method == "thread/resume":

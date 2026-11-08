@@ -23,8 +23,8 @@ git-ignored) or back into `roster.csv` (kept out of git, §4).
 > | `--refserve-owner ORG` | `push_config.py`, with a release | `MathAgents` | the workshop's `github_org`, the organization the files host serves (#693) |
 > | `--gifts-step TEXT` | `zulip_provision.py` | `GIFTS_STEP` (any Claude Max and ChatGPT Pro gifts) | the workshop's `gifts_step`, if it has one (ADMIN §2.1) |
 > | `--mention-after-s SECONDS` | `push_config.py`, with a release | `120` | the workshop's `mention_after_s` (ADMIN §2.1) |
-> | `--tag KEY=VALUE`, repeatable | `status.py`, `roster_import.py`, `roster_sync.py`, `push_waker.py --config-dir` and the scripts of `workshop/aws/` | `workshop=nt-agents-2026`; `push_waker.py`'s, `workshop=` its `--workshop` | `workshop=<ws>` and `zab-scope=<SCOPE>`, and each of `[global] tags` |
-> | `--region` | `roster_import.py`, `roster_sync.py` and the scripts of `workshop/aws/`; `push_waker.py --config-dir`, which requires it | mostly `us-west-2` | the workshop's region |
+> | `--tag KEY=VALUE`, repeatable | `status.py`, `roster_import.py`, `roster_sync.py`, `push_waker.py --config-dir` and the scripts of `workshop/aws/` | none: required (#808); `push_waker.py`'s, `workshop=` its `--workshop` | `workshop=<ws>` and `zab-scope=<SCOPE>`, and each of `[global] tags` |
+> | `--region` | `roster_import.py`, `roster_sync.py` and the scripts of `workshop/aws/`; `push_waker.py --config-dir`, which requires it | none: required (#808) | the workshop's region |
 > | `--workshop` | `push_waker.py`, which requires it with `--config-dir` | `nt-agents-2026` | the workshop's `name` |
 >
 > **The files host has no default organization:** it serves the one its `ZAB_FILES_ORG` names
@@ -216,7 +216,8 @@ so a `--hold` run after a full one takes nothing back.
    of the repository to anyone who has them (SPEC §10.7).
 
 It fills `zulip_user_id`, `zulip_invite` (`joined`) and `zulip_channel_id` in the roster. `--only
-SLUG` limits the run; `--regenerate-keys` rotates existing bot keys. Rows marked `warning:` in the
+SLUG` limits the run; `--regenerate-keys` rotates the keys of the existing bots of every row
+it takes, the whole roster without `--only`. Rows marked `warning:` in the
 table succeeded; read the warning anyway. Rerun it any time: everything is idempotent, and a
 participant who joined meanwhile is reported as `joined`. For a late joiner, rerun it with `--only
 <slug>`, then `provision_repos.py --only <slug>`. Zulip's API rate limit (HTTP 429) is retried
@@ -227,8 +228,9 @@ A sandbox that doesn't let the key's user add subscribers is reported for its ro
 can subscribe others" to include that user in the channel's settings, or delete the channel,
 and rerun.
 
-**`--deactivate`** deactivates the workshop's bots, which invalidates their keys (§7.3); with
-`--only SLUG` (repeatable), only those participants' bots. It uses `DELETE /bots/{id}`:
+**`--deactivate`** deactivates the workshop's bots (§7.3); with `--only SLUG` (repeatable),
+only those participants' bots. Their keys stop working while they are deactivated, and a
+reactivation revives every copy of them. It uses `DELETE /bots/{id}`:
 `DELETE /users/{id}` refuses bots with "No such user".
 
 **Bot endpoints** (shapes read from Zulip's `zerver/views/users.py`, `get_bots_backend` and
@@ -369,8 +371,9 @@ independently:
 2. It installs the two zuliprc files into `/home/agent/.config/zab/` (0600, owner `agent`).
 3. It writes `config.toml` from the workshop profile (SPEC §5.3): `machine = <slug>`,
    `default_project = ~/work/<repo>`, `default_workspace = "worktree"` (each topic works on its
-   own branch in a worktree of the checkout), `max_concurrent_turns = 4`, `mention_after_s`
-   (`--mention-after-s`, §2.4), both bots allowed only for the participant (`allow_emails` set
+   own branch in a worktree of the checkout), `max_concurrent_turns = 10` (per agent, SPEC
+   §7.10), `mention_after_s` (`--mention-after-s`, §2.4), both bots allowed only for the
+   participant (`allow_emails` set
    to the roster e-mail, and `allow_user_ids` to the participant's id once `zulip_provision.py`
    has recorded it), Codex `never` +
    `danger-full-access`, Claude `bypassPermissions`, both at effort `high`, and `[render]
@@ -405,9 +408,9 @@ independently:
    The Codex daemon can still be starting when the first doctor runs: while a check reads
    "daemon unavailable", the doctor alone is retried every 3 s for up to 60 s before the VM is
    reported. What a failing check means for the row is §2.1.
-5. Last, the agents' instructions, after the VM's list of its software and the `sage` wrapper
-   (§2.2). This step runs after the release, the services and the doctor, so it never holds them
-   up.
+5. Last, the agents' instructions, after the VM's list of its software, the `sage` wrapper and
+   the apt source's repair (§2.2). This step runs after the release, the services and the doctor,
+   so it never holds them up.
 6. Then, after `--lean-shared` and before `--idle-stop`, or their defaults (§2.4), the page-cache
    warm-up (§2.3).
 
@@ -467,6 +470,23 @@ In step 5, in this order:
   (`tools-nt-agents-2026-v3.json`), less each tool whose paths that VM lacks, marked as the
   rollout's own so that a later rollout may replace it. An image's own list is never replaced. A
   failure is `tools list: …` in the failures column, and holds nothing up.
+- **The apt source** (#947): an image built with Macaulay2's PPA pinned to a Launchpad snapshot,
+  the Oct 19 image's among them, leaves `/etc/apt/sources.list.d/macaulay2.sources` naming
+  `snapshot.ppa.launchpadcontent.net`, which Launchpad has since expired, so every
+  `apt-get update` on the VM fails. As root, `apt_repair.py` reads that file as apt does
+  (deb822: comments, other fields and stanzas with `Enabled: no` don't count), and acts only when
+  it is a regular file whose sources are such a snapshot and nothing else: it holds the installed
+  macaulay2, macaulay2-common, gfan, msolve and libmsolve3 (`apt-mark hold`), so that a source
+  added later can't change them unasked, then removes the file. A hold that fails, on dpkg's
+  lock say, or a `dpkg-query` that can't read dpkg's database keeps the file, so the next
+  rollout tries both again. It does nothing where the file
+  is gone or apt reads no snapshot in it (the PPA itself, say), so a rerun changes nothing. It
+  leaves alone a file naming the snapshot beside other sources, a link or another kind of file,
+  but says so (`apt: kept …`), since apt may still fail there: look at the file and fix it by
+  hand. The row notes `apt: removed …; held …` and `apt: kept …`; a failure is `apt source: …`
+  in the failures column, and holds nothing up. Newer images carry no such source
+  (`workshop/ami/build.sh` removes it at the end of the build). `trust_fix.py` runs the same
+  script first where its `--apply` will run `apt-get update` (§10).
 - **The instructions:** `~/.codex/AGENTS.md` gets a managed block, between
   `<!-- zab:managed:start -->` and `<!-- zab:managed:end -->`, from
   `workshop/ami/files/agent-instructions.md`, whose line `<!-- zab:tools -->` becomes the tools
@@ -595,7 +615,8 @@ FAIL`. Unreachable hosts are rows. Run it every 30 minutes during the workshop.
   example `under strain: bob (mem)`: look there first when a participant reports a slow or silent
   agent.
 - **Stopped VMs** (idle stop, §8): EC2 is read first, by the scope tags, once per region in the
-  roster's `region` column (us-west-2 when empty). The match is the instance at the row's `ip`,
+  roster's `region` column (us-west-2 when empty, for a row launched before `launch.py` recorded
+  it). The match is the instance at the row's `ip`,
   never the `participant` tag, which after a hand-over still names the old VM. A VM that EC2 says
   is stopped, stopping or starting is not tried over SSH (#439): its bridge reads `stopped`,
   `stopping` or `starting`. A running VM that SSH can't reach is looked up again, and otherwise
@@ -614,8 +635,8 @@ table is unchanged. `--tag KEY=VALUE` (repeatable) scopes the EC2 lookup, as in 
 slug,github,first_name,last_name,email,repo,host,ip,region,host_keys,zulip_user_id,zulip_invite,zulip_channel_id,notes
 ```
 
-Those are the columns every roster has. The scripts add four more, `repo_status`,
-`github_invite`, `name` and `excluded`, and keep any column they don't know. The organizers
+Those are the columns every roster has. The scripts add five more, `repo_status`,
+`github_invite`, `name`, `excluded` and `keep_until`, and keep any column they don't know. The organizers
 supply the input columns (ORGANIZERS §3.1), or `roster_sync.py` makes the rows from the
 workshop's participants' channel (§4a): one per subscriber, linked by `zulip_user_id` from the
 start, with their Zulip name in `name`.
@@ -638,6 +659,9 @@ start, with their Zulip name in `name`.
 - `github` (optional): a manual override for a participant whose Zulip GitHub field stays empty
   (§1b); otherwise `provision_repos.py` writes it.
 - `notes` (optional): free text for the organizers; no script acts on it.
+- `keep_until` (optional): a kept VM's end (docs/ADMIN.md §11.5), in the form `!keep-until`
+  takes: `2026-11-30` (at 15:00 UTC) or `2026-11-30T15:00` (UTC). An empty cell keeps the
+  recorded value.
 
 Slugs and e-mails must be unique, compared case-insensitively. The scripts fill in the rest:
 
@@ -647,6 +671,7 @@ Slugs and e-mails must be unique, compared case-insensitively. The scripts fill 
 | `zulip_user_id`, `zulip_invite`, `zulip_channel_id` (the sandbox) | `zulip_provision.py` |
 | `repo`, `repo_status`, `github`, `github_invite` | `provision_repos.py` |
 | `name`, `excluded` | `roster_sync.py` (`excluded` = `yes` for a row `!roster remove` took out) |
+| `keep_until` | `keep_until.py` (`!keep-until`) |
 
 Each script writes the roster back atomically, only its own columns' changes, keeping
 `roster.csv.bak`, every row and column. The roster contains personal data: keep it out of git
@@ -829,9 +854,15 @@ module docstring has the limits.
   Elastic IPs; kept VMs are protected first (`protect.py`), and the teardown waits until EC2
   shows it (`workshop/aws/README.md`).
 - **The bots:** `zulip_provision.py --roster roster.csv --zuliprc provisioner.zuliprc --deactivate`
-  deactivates them, which invalidates their keys. Each bot is the one whose e-mail its
+  deactivates them, and their keys stop working. Each bot is the one whose e-mail its
   `out/<slug>/<kind>.zuliprc` holds (`--out-dir`), and it must carry the row's name; a mismatch
-  or a missing file is reported and left alone.
+  or a missing file is reported and left alone. Only a bot's owner, here the provisioner, or an
+  organization administrator can reactivate it, and it comes back with the same key: every copy
+  of that key works again, the backups' and the old VM's included. When that isn't wanted, give new keys to the bots of each
+  row that was reactivated, and to no other: `zulip_provision.py --only <slug> --no-rebind
+  --regenerate-keys`, after the reactivation (`docs/ADMIN.md` §3.3). Without `--only`, it would
+  give new keys to every active bot of the roster, and every running VM's bridges would stop
+  answering until their next `push_config.py`.
 - **The sandboxes and their history stay with the participants.** Someone who goes on with zab on
   their own machine creates their own bots, `zab init`, and subscribes them to those channels.
 
@@ -931,6 +962,220 @@ sudo -u zab-admin /opt/zab-admin/current/.venv/bin/python -E -s \
 
 **In direct mode,** on a host of its own, for a fleet run without a server: the waker's own
 README has its install and its runs of `push_waker.py`.
+
+## 10. Trust stores on a VM from an older image: `trust_fix.py` (#816)
+
+A VM keeps the trust stores of the image it was launched from. On an image built before #816,
+such as the one of Oct 19, these hold emSign ECC Root CA - G3, whose intermediates' keys are
+compromised (#671):
+
+- **its uv,** through which every `!rollout` installs the bridge's dependencies, unhashed. An
+  image takes the newest uv at its build, so one built before 2026-10-20 has one older than
+  0.13.4 (the Oct 19 image has 0.13.1 or 0.13.2);
+- **certifi 2026.7.22** in `~/venv`, `/opt/certbot` and lean-lsp-mcp's environment, and in the
+  bridge's until its next `!rollout`;
+- **with Sage, miniforge's** certifi, `ca-certificates` and pip;
+- **the system's `ca-certificates`,** until its unattended upgrades install
+  20260816ubuntu0.24.04.1.
+
+On an image built before #882, **Claude Code's managed settings**,
+`/etc/claude-code/managed-settings.json`, lack `CLAUDE_CODE_CERT_STORE=system`. The requests
+that take Claude Code's own CA list then trust its bundled roots as well as the system store.
+The pinned 2.1.283's bundled roots include G3 (#859).
+
+A VM from a newer image has none of these problems. `trust_fix.py` gives an older VM the newer
+image's versions. On each VM it runs `trust_fix_remote.py` as root, over SSH with the host key
+pinned:
+
+1. `ca-certificates`. Where it is older, an `--apply` first runs the release's `apt_repair.py`,
+   as a rollout does (§2.2, #947): an Oct 19 VM's expired Macaulay2 source fails every
+   `apt-get update`, and the rollout that removes it comes after this fix. Its line comes under
+   the table, after `<slug>: the apt source, before ca-certificates' apt-get update:`, but
+   for `apt: nothing to repair`. A repair that failed reads `FAILED: apt: …` there, or
+   `FAILED: TimeoutExpired: …` when it was cut off after 900 s, and asks for a rerun. Whatever
+   it says, the update runs, and one that still fails is `FAILED: apt-get update: …` as before;
+2. uv, which becomes deploy.sh's pin, checked against its SHA-256;
+3. certifi, by uv.lock's hashes, in `~/venv`, `/opt/certbot` and each uv tool's environment that
+   has one. The check reads them all. A later `!rollout` re-resolves the bridge's dependencies,
+   certifi's newest among them, so it neither undoes this nor trips on it;
+4. conda's two environments, by their prefixes, with conda trusting the system store. conda
+   also updates openssl (its `aggressive_update_packages`), and its solver may move other
+   packages in the `sage` environment;
+5. Claude Code's managed settings: `CLAUDE_CODE_CERT_STORE=system` merged into their `env`, as
+   the image and the first boot write it. Every other key stays (`DISABLE_AUTOUPDATER`,
+   `disableClaudeAiConnectors`), and the file is replaced whole, mode 0644;
+6. then the image's smoke-test check. It also reads that key, and checks that `agent` can read
+   a certificate from `/etc/ssl/certs`: with the store empty or unreadable, Claude Code falls
+   back to its bundled roots.
+
+Each step changes only what is older, missing or different from the image's, so a rerun changes
+nothing. A dry run unless `--apply`.
+
+**What step 5 covers** (#882): only the requests that take Claude Code's own CA list. On
+2.1.283 these were seen to include the messages API and its settings fetches, all to
+`api.anthropic.com`. Those requests then trust the system store alone. A request that doesn't
+take the list, such as a plain `fetch`, still gets the bundled roots, G3 among them. Which of
+Claude Code's requests those are wasn't established. Only a pin of 2.1.304, or of a later
+release byte-searched the same way, removes G3 from them (#859). The step doesn't touch Codex,
+which, as the image configures it, used the system store alone for the API connections probed
+(#859). Claude Code processes started after the step read the setting, the bridge's turns and
+interactive sessions alike (seen on 2.1.283). It isn't known whether a `claude` already running
+picks it up, so restart one.
+
+**First, start the VMs:** a stopped one is `not reached`. During a workshop, `!start all` through
+the bot (ORGANIZERS §2.4), or start only the rows you name; idle stop stops them again later.
+Each `--apply` holds off the VM's idle stop while it works there (below). A spare is no roster
+row: it gets the fix after its `!adopt-spare`, with `--only <its slug>`. Until then its uv is the
+old one, and the adoption's own rollout went through it.
+
+**Not during a `!rollout` or `!final-sync` of the same workshop:** a hand run doesn't take the
+bot's lock. The idle-stop hold, `/run/zab-idle-stop.hold`, is one file per VM for all of them,
+so whichever run ends first removes it for both. `!plans` on the workshop's bot answers `No
+plan is pending on this bot.` when none is applying.
+
+**One run at a time on a VM:** each run of the remote half, a dry run included, holds a lock,
+`/run/zab-trust-fix.lock`, for as long as its process lives. A dropped SSH doesn't end it. A
+second run on that VM refuses at once and changes nothing: its row reads `a repair is still
+running here (its lock is held): nothing done`. So no command this script prints can start a
+repair beside another one. An `--apply`'s idle-stop hold lives inside that lock: the remote
+half writes it once it has the lock, renews it before each step, and removes it before the
+lock goes. No other run of this script touches it. A run killed leaves it, and idle stop
+ignores it from its expiry, an hour on.
+
+**On the admin server,** in a shell there (BOOTSTRAP §3.6), once per workshop. The dry run:
+
+```bash
+WS=<the workshop>
+sudo -u zab-admin /opt/zab-admin/current/.venv/bin/python -E -s \
+  /opt/zab-admin/current/workshop/admin/trust_fix.py --roster /var/lib/zab-admin/ws/$WS/roster.csv \
+  --known-hosts /var/lib/zab-admin/ws/$WS/out/known_hosts
+```
+
+It prints one row per VM. A VM of the Oct 19 image with Sage reads like this (the table is wide):
+
+```
+participant  host          ca-certificates                   uv                            venv                                 certbot                              uv tools                                                                                  conda                                                                                                                     claude store             check
+alice        203.0.113.10  20260816ubuntu0.24.04.1, current  0.13.2: would install 0.13.7  2026.7.22: would install 2026.10.23  2026.7.22: would install 2026.10.23  lean-lsp-mcp 2026.7.22: would install 2026.10.23; zulip-agent-bridge 2026.10.23, current  base would update ca-certificates, certifi, pip and openssl; sage would update ca-certificates, certifi, pip and openssl  unset: would set system  FAILED
+```
+
+- **`ca-certificates`** reads `20260601~24.04.1: would upgrade` where unattended upgrades haven't
+  run yet.
+- **`conda`** reads `absent` without Sage.
+- **Under `uv tools`,** the bridge's reads `zulip-agent-bridge 2026.7.22: would install 2026.10.23`
+  on a VM with no rollout since its launch. A tool an agent installed without certifi reads
+  `<name> no certifi`.
+- **`claude store`** reads `system, current` on a VM from an image built since #882, or once
+  step 5 has run. Where the key holds another value, it reads that value, as in
+  `bundled,system: would set system`. Where there is no file at all, it reads
+  `absent: would set system`, then `absent -> system`: the file step 5 creates holds only that
+  key, and the image's other two, `DISABLE_AUTOUPDATER` and `disableClaudeAiConnectors`, are
+  still missing. The image always writes the file, so it was removed on that VM. Under the
+  table, `<slug>: Claude Code's managed settings were missing` gives the command, over the same
+  pinned SSH, that puts the image's file in its place; then the dry run.
+- **A VM that can't be reached** reads `not reached: ssh: …` under `check`.
+
+Under the table, each failed VM's check lists the bundles that hold the root, such as
+`DISTRUSTED emSign ECC Root CA - G3: /home/agent/venv/lib/python3.12/site-packages/certifi/cacert.pem`,
+and `FAILED: claude: CLAUDE_CODE_CERT_STORE is unset in /etc/claude-code/managed-settings.json`
+until step 5 has run.
+The last line reads `<n> VM(s) reached (dry run: nothing changed)`, with `; not done: <slugs>` for
+those not reached. Then the same command with `--apply` at the end. A VM takes a minute or a
+few, most of it in conda's two installs; six at a time (`--parallel`). Its row then reads:
+
+```
+alice        203.0.113.10  20260816ubuntu0.24.04.1, current  0.13.2 -> 0.13.7  2026.7.22 -> 2026.10.23  2026.7.22 -> 2026.10.23  lean-lsp-mcp 2026.7.22 -> 2026.10.23; zulip-agent-bridge 2026.10.23, current  base updated; sage updated  unset -> system  ok
+```
+
+The last line reads `<n> VM(s) fixed and checked`, and the exit status is 0.
+
+- **A cell that starts `FAILED`:** it gives the step's error, and the other steps went on. An
+  exception in a step is that step's `FAILED: <exception>`.
+- **`blocked, nothing installed: <store> still holds a distrusted root`:** that step would
+  download through a store that an earlier step should have fixed, but didn't. uv's and conda's
+  steps wait for `/etc/ssl/certs`, and certifi's wait for uv.
+- **`FAILED: apt-get update: E: Could not get lock …`** or **`FAILED: apt-get install: E: Could
+  not get lock …`** under `ca-certificates`, with `blocked` after it: the VM's unattended
+  upgrades hold apt's lock, as they do soon after a boot. apt waited 300 s for it. Rerun in a
+  few minutes.
+- **`FAILED: apt-get install killed after 900 s, maybe mid-install`:** dpkg may be left
+  half-configured. Under the table, `<slug>: to see what still runs there …` gives exact
+  commands, over the same pinned SSH (as `zab-admin` when you ran this so):
+  - **the look.** Its first line reads `none running` only when no run holds the VM's lock and
+    none of the remote half (`/usr/bin/python3 -I -`), apt, dpkg, conda, `uv pip install`,
+    the apt source's repair (`apt_repair.py`) or its `apt-mark` runs. Otherwise it reads `a repair is still running here (its lock is held)`, or `no repair
+    holds the lock, but these still run:`, since an apt-get killed can leave a dpkg running on.
+    Either way, the processes follow, each with its PID and how long it has run. Run the look
+    until it reads `none running`;
+  - **`sudo kill PID`,** for one that never ends: put the PID from the look's list in place of
+    `PID`. Kill what the remote half waits on first (a conda, an apt-get), then the remote half
+    if it still doesn't end, then run the look again;
+  - **`sudo dpkg --configure -a`,** once the look reads `none running`.
+
+  Then rerun.
+- **`FAILED: base: …` or `FAILED: sage: …` under `conda`:** conda's own error. conda has no
+  timeout here, since a kill would reach sudo, not conda. Under the table come the look and the
+  kill, then two more commands:
+  - that environment's transactions, `conda list --revisions -p <prefix>`;
+  - if the last transaction is this run's and the environment no longer works (`sage` doesn't
+    start), the one that goes back to the transaction before it: `conda install -y --revision N
+    -p <prefix>`, with conda trusting the system store as step 4 does. Put the number of the
+    transaction before this run's in place of `N`.
+
+  Then rerun.
+- **`FAILED: /etc/claude-code/managed-settings.json left as it is: …`** under `claude store`:
+  the file isn't a JSON object, or its `env` isn't one, so step 5 didn't touch it. The image
+  never writes such a file. Under the table, `<slug>: Claude Code's managed settings, which
+  step 5 left as they are:` gives two commands over the same pinned SSH:
+  - the look, `sudo cat /etc/claude-code/managed-settings.json`, which prints the file;
+  - the one that puts the image's file in its place, with its three keys:
+    `DISABLE_AUTOUPDATER`, `CLAUDE_CODE_CERT_STORE` and `disableClaudeAiConnectors`. Run it only
+    once you know what the file held: anything else in it goes.
+
+  Then the dry run, whose `claude store` reads `system, current`.
+- **`FAILED: claude: agent reads no certificate from /etc/ssl/certs`**, under the table: the
+  system store is empty, or `agent` can't read it, and Claude Code then falls back to its
+  bundled roots. No step changes the store's files. On the VM, `sudo update-ca-certificates
+  --fresh` rebuilds them from the installed `ca-certificates`; then the dry run.
+- **`cut after 3000 s, and it may still be running there`**, or **`connection lost after the
+  run began, and it may still be running there`** (ssh's own exit, once the hold had worked),
+  or **`a repair is still running here (its lock is held)`**, under `check`: this script stopped
+  waiting, or another run holds the VM's lock, and that run may go on. Such a VM is in no
+  rerun command. The last lines read `May still be running on <slugs>: …` with its dry run: run
+  the look under its name until it reads `none running`, then that dry run. A run that never
+  ends: the kill under its name, as above. Another `--apply` meanwhile is refused on the lock
+  in any case.
+- **The rerun:** the last lines read `Not done on <slugs>: …`, then the exact command: this one,
+  with `--only` for each VM that wasn't reached or whose step was blocked or failed, but none
+  that may still be running. `!start` the VMs not reached, fix any other cause, then paste it.
+- **`ok, <n> left (README §10)`** under `check`: what the steps own is fixed, but the check also
+  read software an agent installed, which no step installs, and found the root there. In the
+  image's own environments certifi's bundle was the only file holding it, so anything else
+  holding it came later. Under the table, `<slug>, left: …` names each one:
+  - **`a pip in <env>`**, in `~/venv` or a uv tool's environment. The last lines offer this
+    script's own `--upgrade-left-pips`, with `--only` for those VMs: it upgrades each such pip to
+    26.2.2 or newer, as agent, through uv, from PyPI, unhashed. It is the participant's
+    environment: run it, or leave it and record it in the workshop's organizers channel. It is
+    offered only where uv and uvx are 0.13.4 or newer: elsewhere the last lines say so, and an
+    `--apply` has to bring uv to 0.13.7 first.
+  - **`a uv-managed CPython`**, which uv downloaded for a project that asked for another Python.
+    uv won't change its base environment without `--system --break-system-packages`, and the
+    projects that use it would break if it went. Leave it, and record it.
+  - **`other software`**, such as a package's own bundle (grpcio's `roots.pem`). Leave it, and
+    record it.
+
+  These don't fail the run: its exit status is about what the steps fix. An emptied
+  `~/.local/share/uv/python`, with only uv's own dot files, isn't read.
+
+Nothing printed for you to paste holds text from a VM. The commands are fixed literals with the
+roster's address, and VM text in the table is on one line, with what doesn't print escaped.
+
+A dry run afterwards reads `…, current` in every cell and exits 0. Under `check` it reads `ok`,
+or `ok, <n> left` where an agent's software was left. The next `!rollout` then installs the
+bridge through uv 0.13.7.
+
+**For a fleet run without a server:** from a checkout,
+`uv run python workshop/admin/trust_fix.py --roster roster.csv`, then the same with `--apply`. It
+uses the pinned `out/known_hosts` of §0.
 
 ## See also
 

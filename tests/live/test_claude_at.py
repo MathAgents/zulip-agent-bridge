@@ -10,7 +10,8 @@ Not run here, by design (see `test_not_applicable_here`): AT-3, AT-6 and AT-10 a
 (tests/live/test_codex_*.py); AT-17 and AT-18 are fake-Zulip tests (offline suites); AT-21 is
 Drew's on the staging VM; AT-22 runs only against the fake Zulip
 (tests/core/test_m3_acceptance.py); AT-23 is the soak test, run separately. AT-20 needs the
-core's `!handover` and reports BLOCKED without it.
+core's `!handover` and reports BLOCKED without it. AT-8 skips: its public channel is archived
+(`AT8_SKIP`, SPEC §15.3).
 
 Rules as in test_claude_m2: ZAB_LIVE=claude only (§15.3), the Claude account is ~/.claude2 (never
 the session's ~/.claude), posts go to the zab-dev channels only, as the dev bots and test users
@@ -26,6 +27,7 @@ import time
 from pathlib import Path
 
 import pytest
+from at8 import AT8_SKIP, PUBLIC
 from test_claude_m2 import (
     BOT,
     BOT_ID,
@@ -59,7 +61,6 @@ pytestmark = [
 ]
 
 STREAM2 = 639107  # zab-dev-2 (private; AT-9's move target)
-PUBLIC = 639108  # zab-dev-public (AT-8)
 TESTER2_ID = 1207965  # zabtester2: not in any allowlist (AT-7)
 SPARE_BOT_ID = 1207972  # spare dev-claude: "another bot" (AT-7)
 GITHUB_URL = "https://github.com/owner/repo.git"
@@ -139,11 +140,7 @@ async def at(tmp_path):
         assert (await tester.request("GET", "users/me"))["user_id"] == TESTER_ID
         await runtime.start()
         await until(lambda: asyncio.sleep(0, result=runtime.backends["claude"]._up), 30)
-        for sid, name, private in (
-            (STREAM, "zab-dev", True),
-            (STREAM2, "zab-dev-2", True),
-            (PUBLIC, "zab-dev-public", False),
-        ):
+        for sid, name, private in ((STREAM, "zab-dev", True), (STREAM2, "zab-dev-2", True)):
             channel = await runtime.bridges[0].channel(sid)
             assert channel["name"] == name and runtime.bridges[0].private(channel) == private
         yield LiveAT(runtime, tester, repo)
@@ -286,8 +283,11 @@ async def test_at5_stop(at):
 # --------------------------------------------------------------------------------------- AT-8
 
 
+@pytest.mark.skip(reason=AT8_SKIP)
 async def test_at8_public_refusal(at):
-    """A mention in the public channel gets one refusal and creates no session (§4.5)."""
+    """A mention in the public channel gets one refusal and creates no session (§4.5).
+    Skipped (`AT8_SKIP`): it would need a public channel, and the dev organization's is
+    archived."""
     at.stream = PUBLIC
     first = await at.send(f"{BOT} Test the public-channel refusal.")
     await at.send(f"{BOT} Repeat the public-channel refusal.")
@@ -479,6 +479,7 @@ def test_not_applicable_here():
         "scenario 5; AT-4 runs Claude with steer=false (hold).",
         "AT6 N/A here: approvals are Codex-only (Claude runs bypassPermissions/dontAsk, "
         "approvals=False); tests/live/test_codex_m1.py runs it.",
+        f"AT8 skipped (test_at8_public_refusal): {AT8_SKIP}.",
         "AT10 N/A here: restart (Codex) is tests/live/test_codex_restart.py; Claude's is AT-11.",
         "AT17 N/A live: 429 injection needs the fake Zulip; offline "
         "tests/zulip/test_poster.py::test_429_recovers_and_edits_coalesce.",

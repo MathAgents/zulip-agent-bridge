@@ -30,6 +30,7 @@ SCENARIOS: dict[int, tuple[str, str]] = {
     14: ("Turn begun during startup", "fast"),  # the bridge stopped for seconds (#305)
     15: ("zab sentinel: DM !vm and !restart (#204)", "slow"),
     16: ("Commands as people type them (#709)", "fast"),
+    17: ("Sub-agents across a turn's end (#660)", "fast"),
 }
 
 
@@ -96,6 +97,9 @@ class ScenarioResult:
     passed_parts: list[str] = field(default_factory=list)
     #: How the report names it, when not by its number (the admin suite's `A10`, #356)
     label: str = ""
+    #: External causes, one line each: a Codex request OpenAI refused with a 429 (#842), or a
+    #: failure on the rig's side (#877), and how the part's second run went (`harness.refusal`)
+    external: list[str] = field(default_factory=list)
 
     @property
     def shown(self) -> str:
@@ -144,7 +148,8 @@ class ScenarioResult:
     def explanation(self) -> str:
         missed = [t.text() for t in self.timings if not (t.ok or t.target)]
         over = f"over its threshold: {', '.join(missed)}" if missed else ""
-        return "; ".join(filter(None, [self.reason, over, *self.notes]))
+        external = [f"external cause: {e}" for e in self.external]
+        return "; ".join(filter(None, [self.reason, over, *external, *self.notes]))
 
 
 _RANK = {"skipped": 0, "passed": 1, "failed": 2}
@@ -164,6 +169,7 @@ def combine(a: ScenarioResult, b: ScenarioResult) -> ScenarioResult:
         list(dict.fromkeys(a.parts + b.parts)),
         list(dict.fromkeys(a.passed_parts + b.passed_parts)),
         a.label or b.label,
+        a.external + b.external,
     )
 
 
@@ -182,6 +188,10 @@ class Report:
     required: list[int] = field(default_factory=list)
     #: The summary's heading: the admin suite's report is another (#356)
     title: str = "End-to-end"
+    #: The runner's start-up, one line per event (run.py, #690): EC2's states, each SSH probe,
+    #: cloud-init, a deploy run again. Each line starts with its UTC time, to set beside the
+    #: VM's journal
+    boot: list[str] = field(default_factory=list)
 
     def missed(self) -> list[int]:
         """The required scenarios not completely passed: skipped, a part of them skipped, or
@@ -235,6 +245,7 @@ class Report:
                     f"{mine or '?'} / {theirs or '?'}"
                 )
         self.problems = self.problems + other.problems
+        self.boot = self.boot + other.boot
         self.required = sorted(set(self.required) | set(other.required))
         rows = {r.number: r for r in self.results}
         for row in other.results:
@@ -268,10 +279,9 @@ class Report:
         icon = {"passed": "✅ pass", "failed": "❌ FAIL", "skipped": "⏭ skip"}
         for r in sorted(self.results, key=lambda r: r.number):
             timings = "<br>".join(t.text() for t in r.timings) or "-"
-            lines.append(
-                f"| {r.shown} | {r.name} | {icon.get(r.effective, r.effective)} | "
-                f"{r.seconds:.0f} s | {timings} |"
-            )
+            # a part refused by OpenAI and run again (#842): never a plain pass in the table
+            result = icon.get(r.effective, r.effective) + (" · ⚠️ external" if r.external else "")
+            lines.append(f"| {r.shown} | {r.name} | {result} | {r.seconds:.0f} s | {timings} |")
         skips = [r for r in self.results if r.effective != "failed" and not r.complete]
         if skips:
             lines += ["", "### Not completely run (no result for these parts)", ""]
@@ -279,10 +289,15 @@ class Report:
                 said = [f"skipped: {', '.join(r.open_skips())}"] if r.open_skips() else []
                 said += [f"not run: {', '.join(r.unrun())}"] if r.unrun() else []
                 parts = f" ({'; '.join(said)})" if said else ""
-                lines.append(f"- **{r.shown}. {r.name}**{parts}: {r.reason or 'no reason given'}")
+                # a refused part is named here too: such a row gets no Details line (#842)
+                external = [f"external cause: {e}" for e in r.external]
+                why = "; ".join([r.reason or "no reason given", *external])
+                lines.append(f"- **{r.shown}. {r.name}**{parts}: {why}")
         details = [r for r in self.results if r.explanation() and r not in skips]
         if details:
             lines += ["", "### Details", ""]
             for r in details:
                 lines.append(f"- **{r.shown}. {r.name}** ({r.effective}): {r.explanation()}")
+        if self.boot:
+            lines += ["", "### Start-up", "", *(f"- {line}" for line in self.boot)]
         return "\n".join(lines) + "\n"

@@ -1093,11 +1093,11 @@ pushed to `refs/zab/shares/probe-<time>` of `$SCRATCH`, as `zab share` pushes on
 root listed, its ref deleted, the recheck, and then the 404. In **B**, the commit and its names:
 
 ```bash
-P=$(mktemp -d) && git -C "$P" init -q && printf 'probe\n' > "$P/probe.txt" &&
-  git -C "$P" add probe.txt &&
-  git -C "$P" -c user.name=probe -c user.email=probe@example.invalid commit -q \
+PD=$(mktemp -d) && git -C "$PD" init -q && printf 'probe\n' > "$PD/probe.txt" &&
+  git -C "$PD" add probe.txt &&
+  git -C "$PD" -c user.name=probe -c user.email=probe@example.invalid commit -q \
     -m "zab share probe" -m "Path: probe.txt" -m "Nonce: $(openssl rand -hex 32)" &&
-  PROBE_SHA=$(git -C "$P" rev-parse HEAD) && PROBE_REF="refs/zab/shares/probe-$(date +%s)" &&
+  PROBE_SHA=$(git -C "$PD" rev-parse HEAD) && PROBE_REF="refs/zab/shares/probe-$(date +%s)" &&
   echo "$PROBE_REF $PROBE_SHA"
 # refs/zab/shares/probe-<time> <its commit>
 ```
@@ -1105,7 +1105,7 @@ P=$(mktemp -d) && git -C "$P" init -q && printf 'probe\n' > "$P/probe.txt" &&
 The push, alone, since ssh may ask for your GitHub key's passphrase:
 
 ```bash
-git -C "$P" push -q "git@github.com:$FILES_ORG/$SCRATCH.git" "HEAD:$PROBE_REF"
+git -C "$PD" push -q "git@github.com:$FILES_ORG/$SCRATCH.git" "HEAD:$PROBE_REF"
 ```
 
 Then, still in **B**, the file and the share's root:
@@ -1129,7 +1129,7 @@ sudo -u zab-files env PYTHONPATH=/opt/zab-files.new/src /opt/zab-files.new/venv/
 In **B**, the ref deleted, alone (the passphrase again):
 
 ```bash
-git -C "$P" push -q "git@github.com:$FILES_ORG/$SCRATCH.git" ":$PROBE_REF"
+git -C "$PD" push -q "git@github.com:$FILES_ORG/$SCRATCH.git" ":$PROBE_REF"
 ```
 
 Then the recheck, the 404, and the scratch commit gone:
@@ -1139,7 +1139,7 @@ curl -sS -X POST "http://127.0.0.1:8081/_zab/recheck/$SCRATCH/$PROBE_SHA"
 # revoked
 curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:8081/$SCRATCH/$PROBE_SHA/probe.txt"
 # 404
-rm -rf "$P"
+rm -rf "$PD"
 ```
 
 In **A**, the listing again prints nothing (the block above, again). A recheck that answers

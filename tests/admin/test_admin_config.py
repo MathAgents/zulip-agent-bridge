@@ -158,6 +158,40 @@ tags = ["zab-role=test"]
     assert parse_admin_config(EXAMPLE.replace('release = "final"\n', "")).release == "final"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "git@github.com:MathAgents/zab.git",
+        "git@github.com:a/b.git",
+        "git@github.com:A-1/z_.x-y.git",
+    ],
+)
+def test_the_release_repo_is_a_github_repository_over_ssh(value):
+    """#569: where `!upgrade-server`'s helper fetches the tags, with its deploy key; unset by
+    default, which keeps the in-band upgrade off."""
+    assert parse_admin_config(EXAMPLE).release_repo == ""
+    line = 'release = "final"\n'
+    text = EXAMPLE.replace(line, f'{line}release_repo = "{value}"\n', 1)
+    assert parse_admin_config(text).release_repo == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://github.com/MathAgents/zab.git", "ssh://git@github.com/MathAgents/zab.git",
+        "git@gitlab.com:MathAgents/zab.git", "git@github.com:MathAgents/zab",
+        "git@github.com:MathAgents/.git", "git@github.com:-x/zab.git", "git@github.com:a/b/c.git",
+        "git@github.com:MathAgents/zab.git -oProxyCommand=x", "git@github.com:a/..git",
+        "file:///srv/zab.git", "/srv/zab.git", "git@github.com:a/b.git\n",
+    ],
+)  # fmt: skip
+def test_another_release_repo_is_refused(value):
+    line = 'release = "final"\n'
+    text = EXAMPLE.replace(line, f"{line}release_repo = {json.dumps(value)}\n", 1)
+    with pytest.raises(AdminConfigError, match="release_repo: expected a value matching"):
+        parse_admin_config(text)
+
+
 @pytest.mark.parametrize("tag", ["v0.2.3rc1", "v0.2.٣", "main", "v1.2.3-dirty", "", "v1.2"])
 def test_the_final_pattern_takes_final_tags_only(tag):
     pattern = parse_admin_config(EXAMPLE).release_pattern
@@ -458,6 +492,31 @@ def test_files_lie_in_their_own_directories(old, new, error):
     assert old in EXAMPLE, old
     with pytest.raises(AdminConfigError, match=re.escape(error)):
         parse_admin_config(EXAMPLE.replace(old, new, 1))
+
+
+def test_workshops_sharing_a_files_host_share_its_github_org():
+    """#771: a files host serves one GitHub organization (#693); a trailing `/` is the same
+    host's URL, and another host may serve another organization."""
+    org = 'github_org = "MathAgents"\nrefserve_url = "https://files.mathagents.org"'
+    kept = KEPT.replace(
+        org, 'github_org = "OtherOrg"\nrefserve_url = "https://files.mathagents.org/"'
+    )
+    error = (
+        "workshops harvard-2026 (refserve_url https://files.mathagents.org, github_org "
+        "MathAgents) and nt-agents-2026 (refserve_url https://files.mathagents.org/, github_org "
+        "OtherOrg) share a files host, which serves one GitHub organization"
+    )
+    with pytest.raises(AdminConfigError, match=re.escape(error)):
+        parse_admin_config(TOP + HARVARD + "\n" + kept)
+    other_host = kept.replace("https://files.mathagents.org/", "https://files.example.org")
+    assert parse_admin_config(TOP + HARVARD + "\n" + other_host)
+
+
+def test_workshops_sharing_a_files_host_may_spell_its_github_org_in_any_case():
+    """#771: GitHub's organization names ignore case, so the files host's does too."""
+    by_case = KEPT.replace('github_org = "MathAgents"', 'github_org = "mathagents"')
+    harvard, ws = parse_admin_config(TOP + HARVARD + "\n" + by_case).workshops
+    assert (harvard.github_org, ws.github_org) == ("MathAgents", "mathagents")
 
 
 def test_workshops_share_no_name_or_scope():

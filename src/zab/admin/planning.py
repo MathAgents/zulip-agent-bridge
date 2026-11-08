@@ -41,14 +41,16 @@ inside the bot's process, through the bot's `PlanStore`.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import math
 import os
 import re
 import shlex
+import sqlite3
 from collections import Counter
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
@@ -56,17 +58,21 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
-from zab.admin import newworkshop
-from zab.admin.actions import Action, ActionError, Fleet, Live, build, protect_applying
+import zab
+from zab.admin import monthend, newworkshop, upgradeserver
+from zab.admin.actions import Action, ActionError, Fleet, Layout, Live, build, protect_applying
 from zab.admin.approvals import SERVER, Received, Requirement, Sender, requirement, takes
 from zab.admin.collector import cost_line, note_status
-from zab.admin.fleet import FleetError, protects
+from zab.admin.config import Workshop
+from zab.admin.fleet import FleetError, RowEnd, protects, read_roster
 from zab.admin.grammar import SLUG_RE, Command, Roster, parse
 from zab.admin.pages import disk_gb, disk_space, sentinel, sentinel_down
 from zab.admin.plans import (
+    APPLYING,
     APPROVED,
     DONE,
     EXPIRED,
+    FAILED,
     PLANNING,
     STALE,
     Plan,
@@ -105,6 +111,9 @@ READING = 3
 UNCHANGED_MARK = "☑"
 #: Kept free below Zulip's message limit, and for the attachment's line.
 MARGIN, NOTE_ROOM = 200, 300
+#: The audit footer under a `!status` answer, at most: its line break, `audit #seq · chain` and
+#: 12 hex digits in a code span, with room for a seq of 20 digits (#767).
+FOOTER_ROOM = 64
 #: The dry run's lines shown inline at most (§2.7 item 5); and the status table's, its header
 #: included, in `!status`'s answer and in a plan's status read: more, so that a workshop of
 #: about 40 VMs (§11) shows whole (#764). Zulip's message limit still binds through `_fit`.
@@ -123,7 +132,9 @@ _TAKEN = re.compile(
 #: VMs: the places tried as an answer's start, each a decode of at most the text; the rows,
 #: each four scrubs (about 0.1 s for all of them); the VMs past them are counted.
 STATUS_TRIES, STATUS_ROWS = 4, 1000
-#: A VM's running turns read by backend at most: status.py's `MAX_ITEMS`.
+#: A VM's running turns read by backend at most: status.py's `MAX_ITEMS`, the most turns a
+#: workshop VM runs (10 per backend, push_config.py's `max_concurrent_turns`, #919). Raise
+#: both with that: past status.py's cut, the `N more` here can't show.
 MAX_TURNS = 20
 #: `!status`'s lines under its table (#439), at most, and a VM's own text in one, at most. One
 #: VM gets a few lines of its own (`_one`); several, a line each for those with something to
@@ -137,6 +148,17 @@ _STRAINED = {"load": "load", "mem": "memory", "disk": "disk"}
 _SUMMARY = ("signed in: {both} both, {codex_only} Codex only, {claude_only} Claude only, "
             "{neither} neither; {unreachable} unreachable, {stopped} stopped, "
             "{doctor_fail} doctor FAIL")  # fmt: skip
+#: The room an interrupted `!retire`'s message keeps for its footer and the bot's own lines.
+REPORT_ROOM = 600
+#: The steps of a `!retire` row that save its work: one that failed, tolerated under
+#: `unsynced`, left the row torn down without it (as `runner.Rows.unsaved` has them).
+SAVING = ("start", "idle-stop", "uninstall", "final-sync", "export")
+#: The longest wait for a month-end run after errors that ended runs before their end
+#: (`Planning._abandoned`, review of #835, N1).
+MONTH_END_HELD = 3600
+#: How often the month-end schedules are looked at (§11.5, #570): their warnings are due by the
+#: day, and each look reads every roster that has one.
+MONTH_END_EVERY = 60.0
 _TABLE = """
 CREATE TABLE IF NOT EXISTS plan_topics (
     plan INTEGER PRIMARY KEY REFERENCES plans (id),
@@ -203,6 +225,13 @@ class Runner(Protocol):
 
     async def apply(self, job: Job) -> None: ...
 
+    async def month_end(
+        self, plan: Plan, bot: AdminBot, where: tuple[int, str], fleet: Fleet, schedule: Plan,
+        due: list[monthend.Entry],
+    ) -> None:  # fmt: skip
+        """A month-end run (§11.5, #570): `plan` is APPLYING, its workshop marked busy."""
+        ...
+
 
 class NoRunner:
     """Until PR 10: every plan is refused, and nothing runs."""
@@ -217,6 +246,12 @@ class NoRunner:
         return None
 
     async def apply(self, job: Job) -> None:
+        raise Unavailable("no runner on this server yet (PR 10)")
+
+    async def month_end(
+        self, plan: Plan, bot: AdminBot, where: tuple[int, str], fleet: Fleet, schedule: Plan,
+        due: list[monthend.Entry],
+    ) -> None:  # fmt: skip
         raise Unavailable("no runner on this server yet (PR 10)")
 
 
@@ -612,6 +647,9 @@ class PlanMessage:
 
 
 ATTACH = "\x00attachment\x00"
+#: The commands of a plan whose apply runs no script: `!month-end schedule`'s, whose runs build
+#: their own, with the release then running (§11.5, #570).
+NONE = "**Commands:** none: this plan's apply runs no script."
 
 
 def unchanged_title(plan: Plan, why: str) -> str:
@@ -666,7 +704,8 @@ def plan_message(
         more = len(targets) - len(shown)
         listed = ", ".join(shown) + (f", … and {more} more" if more else "")
         parts = [top, f"**Targets** ({len(targets)}): {listed or 'none'}", *said]
-        parts += ["**Commands**, in order:", fence("\n".join(steps)), title]
+        parts += ["**Commands**, in order:", fence("\n".join(steps))] if action.applied else [NONE]
+        parts += [title]
         parts += [fence("\n".join(lines))] if action.dry_runs else []
         parts += [read_title, fence("\n".join(rows))] if status is not None else []
         return "\n".join([*parts, *([note] if note else []), hashed, footer(head)])
@@ -707,7 +746,7 @@ def plan_message(
             whole_top,
             f"Targets ({len(targets)}): " + ", ".join(targets),
             *notes,
-            "Commands, in order:",
+            "Commands, in order:" if action.applied else NONE,
             *commands,
             "Dry run:" if action.dry_runs else "Dry run: none",
             *dry,
@@ -728,6 +767,14 @@ def _save(path: Path, data: bytes) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
+
+
+def release_moved(layout: Layout) -> bool:
+    """Whether `current` (`layout.release`) names another release than the one this process
+    runs, the release its `zab` was imported from (#569): read afresh, never from a helper's
+    outcome, which an error may have cut short (review of #894, N5)."""
+    here = Path(zab.__file__).resolve().parents[2]  # releases/vX.Y.Z, from its src/zab/
+    return Path(layout.release).resolve() != here
 
 
 def next_plan_id(store: PlanStore) -> int:
@@ -758,6 +805,13 @@ class Planning:
         self.reading: set[str] = set()  # the workshops with a `!status` under way
         self.reads = asyncio.Semaphore(READING)
         self._server: AdminServer | None = None
+        self.month_end_next = 0.0  # when the month-end's next look is due (`month_end`)
+        #: workshop → (month-end runs an error ended in a row, no run before): `_abandoned`
+        self.month_end_held: dict[str, tuple[int, float]] = {}
+        #: a warning Zulip refused, by workshop, row, kind, end, recipient and schedule: its
+        #: tries (`_key`; Codex rounds 2 and 5 on #829: a new end or recipient is a new warning,
+        #: with tries its own; #883: so is a new approval, which tries a refused one again)
+        self.tries: dict[tuple[str, str, str, float, str, int], int] = {}
 
     @property
     def server(self) -> AdminServer:
@@ -799,18 +853,117 @@ class Planning:
         store = server.store
         assert store is not None
         store.db.executescript(_TABLE)
+        monthend.setup(store.db)  # the month-end schedules (§11.5, #570)
         if next_plan_id(store) > MAX_PLAN_ID:
             LOG.error(
                 "plan IDs above P-%d can't be named in commands: no plan can be made", MAX_PLAN_ID
             )
         for plan in store.recover():
-            head = await server.audit("interrupted", **self._fields(plan))
-            await self._say(
-                plan,
-                f"⏹ {plan.name} was interrupted by a restart of the bots: "
-                "nothing resumes on its own. Check `!status`, then request again.",
-                head,
-            )
+            check = "Check `!status`, then request again."
+            if ends := server.ledger.cut(plan.name):  # a `!retire`, from its own records (#837)
+                check = self._left(plan, ends)
+            try:  # the facts are on the log already, its steps' own: this record says the cut
+                head: Head | None = await server.audit("interrupted", **self._fields(plan))
+            except Exception as exc:
+                LOG.warning("%s: interrupted, not recorded (%s)", plan.name, type(exc).__name__)
+                head = None
+            schedule = monthend.run_of(store.db, plan.id)
+            if schedule is not None:  # a month-end run: the next look resumes it (§11.5)
+                check = (
+                    f"It is a month-end run of P-{schedule}: the bot's next look resumes each "
+                    "of its rows at its first unfinished step, its uninstall and sync again "
+                    "unless the ledger still has them."
+                )
+            elif plan.command == "!month-end schedule":  # review of #824, N6
+                check = (
+                    "Its schedule may be stored already: `!month-end show` says, and if it "
+                    "isn't, request again."
+                )
+            lead = "." if schedule is not None else ": nothing resumes on its own."
+            said = f"⏹ {plan.name} was interrupted by a restart of the bots{lead} {check}"
+            if ends:  # a long report attached, a summary in its place (Codex round 1, rework)
+                said = await self._fitted(plan, said, ends)
+            await self._say(plan, said, head)  # a month-end run's rows: taken up (round 2, N7)
+
+    async def _fitted(self, plan: Plan, said: str, ends: Mapping[str, RowEnd]) -> str:
+        """An interrupted `!retire`'s message, as one Zulip message holds it: whole when it
+        fits, room kept for its footer; else its first line, how many rows are retired and
+        which are left, and the whole of it attached (as a long result is, `Runner._result`),
+        so that no row's line is lost to the bot's cut (Codex round 1 on #849's rework). An
+        attachment that fails keeps the whole lines that fit, and says how many it leaves."""
+        bot = self._bot(plan)
+        most = bot.client.limits.get("max_message_length", 10000) if bot else 10000
+        if len(said) <= most - REPORT_ROOM or bot is None:
+            return said
+        head = said.split("\n", 1)[0].removesuffix(" What it did to each row:")
+        left = [row for row, end in ends.items() if not end.retired]
+        summary = (
+            f"\n{len(ends) - len(left)} of {len(ends)} rows retired; left: "
+            f"{monthend.listed(left) or 'none'}."
+        )
+        link = await self._attach(bot, f"{plan.name}-interrupted.txt", said)
+        if link:
+            return f"{head}{summary}\n*What it did to each row, too long to show here: {link}.*"
+        lines, kept = said.split("\n")[1:], [f"{head}{summary}"]  # the summary kept (#855)
+        for line in lines:
+            if len("\n".join([*kept, line])) > most - REPORT_ROOM:
+                break
+            kept.append(line)
+        left_out = len(lines) - (len(kept) - 1)
+        return "\n".join([*kept, f"*… {left_out} more lines: the attachment failed.*"])
+
+    @staticmethod
+    def _left(plan: Plan, ends: Mapping[str, RowEnd]) -> str:
+        """What a `!retire` a restart cut did to each row, and what is left, from its own
+        `retire_step` records, as the ledger took them (#837): retired (torn down `unsynced`,
+        as the result would say, when a step that saves the work failed under `unsynced`);
+        its teardown done, or no VM found, so its VM is gone and its `ip` cleared (#604), for
+        `!retire … unsynced`; cut or failed at its teardown, its VM perhaps gone, for the same
+        `!retire` again and `unsynced` if that finds no VM; or else its VM as its steps left
+        it, for the same `!retire` again, with the plan's own words (`export` until the row's
+        archive is in, `unsynced`; #820). The rows it never reached share one line."""
+        words = [w for w in plan.command.split()[1:] if w in ("export", "unsynced")]
+        lines = ["What it did to each row:"]
+        untouched = [row for row, end in ends.items() if all(c == "not run" for _, c in end.cells)]
+        for row, end in ends.items():
+            if row in untouched:
+                continue
+            cells = dict(end.cells)
+            if end.retired:
+                lost = [s for s in SAVING if cells.get(s, "").startswith("failed")]
+                lines.append(f"- {row}: retired, torn down unsynced ({', '.join(lost)} failed)."
+                             if lost else f"- {row}: retired, every step done.")  # fmt: skip
+                continue
+            stages = [s for s, _ in end.cells]
+            tail = len(stages)  # the steps never ended: the one the restart cut, and after
+            while tail and cells[stages[tail - 1]] == "not run":
+                tail -= 1
+            last = stages[tail - 1] if tail else ""
+            at = last if cells.get(last, "").startswith("failed") else (
+                stages[tail] if tail < len(stages) else last
+            )  # fmt: skip
+            done = [s for s in stages[:tail] if not cells[s].startswith("failed")]
+            failed = [s for s in stages[:tail] if cells[s].startswith("failed")]
+            said = f"- {row}: done {', '.join(done) or 'nothing'}"
+            said += f"; failed {', '.join(failed)}" * bool(failed)
+            said += f"; not done {', '.join(stages[tail:])}" * (tail < len(stages))
+            again = " ".join([f"!retire {row}", *(w for w in words if not (
+                w == "export" and cells.get("export") == "ok"))])  # fmt: skip
+            gone = cells.get("teardown") == "ok" or cells.get("teardown", "").startswith("skip")
+            if gone:
+                said += f". Its VM is gone: `!retire {row} unsynced` ends its bots."
+            elif at == "teardown" or "no VM" in cells.get(at, ""):  # as `stopped_row` says it
+                said += (
+                    f". Its VM may be gone: send `{again}` again; if its plan finds no VM, "
+                    f"`!retire {row} unsynced`."
+                )
+            else:
+                said += f". Its VM is as those steps left it: send `{again}` again."
+            lines.append(said)
+        if untouched:  # one line for the rows it never reached (Codex round 1, rework)
+            again = " ".join(["!retire", *untouched, *words])
+            lines.append(f"- not started: {', '.join(untouched)}. Send `{again}` again.")
+        return "\n".join(lines)
 
     async def tick(self) -> None:
         """Expire the plans whose TTL has passed (§2.5), and say so in their topics; record
@@ -827,6 +980,263 @@ class Planning:
                     bot=used.bot,
                     requester={"id": used.user_id, "name": used.name},
                 )
+        now = self.server.clock()  # a clock set back by more than a look looks at once too
+        if now >= self.month_end_next or now < self.month_end_next - MONTH_END_EVERY:
+            self.month_end_next = self.server.clock() + MONTH_END_EVERY
+            for ws in self.server.config.workshops:
+                try:  # one workshop's failure never keeps the others' warnings back
+                    await self.month_end(ws)
+                except Exception as exc:
+                    LOG.warning("%s: the month end's look failed (%s)", ws.name,
+                                type(exc).__name__, exc_info=exc)  # fmt: skip
+
+    async def month_end(self, ws: Workshop) -> None:
+        """The month-end schedule's look at `ws` (§11.5, #570; `zab.admin.monthend`): each
+        scheduled row that changed since its approval drops out, and a row a restart left
+        `running` too, unless all its steps are done; each warning due goes by DM from the
+        workshop's bot; what happened is said once in the schedule's topic, with a `month_end`
+        record; then the rows due start a run (`_run`)."""
+        server = self.server
+        assert server.store is not None
+        db = server.store.db
+        held = monthend.entries(db, ws.name)
+        scheduled = [e for e in held if e.state == monthend.SCHEDULED]
+        running = [e for e in held if e.state == monthend.RUNNING]
+        if not (scheduled or running):
+            return
+        fleet = await server.read_fleet(ws)
+        roster = await asyncio.to_thread(read_roster, ws.roster)
+        people = {r["slug"]: r.get("zulip_user_id", "") for r in roster}
+        repos = {r["slug"]: r.get("repo", "") for r in roster}
+        said: dict[int, dict[str, list[str]]] = {}
+        idle = self.busy(ws.name) is None  # a run applying now holds its rows: never touched
+        for entry in running if idle else []:  # a run a restart cut short, before it resumes
+            heard = said.setdefault(entry.plan, {})
+            finished = monthend.done(db, entry)
+            if entry.slug in fleet.retired:
+                # retired on the log, by its bots step's record at its place (#855), even when
+                # a cut came before `state.db` had it (#860's review, B1): done, with its line
+                monthend.settle(db, entry, monthend.DONE, "retired", server.clock())
+                heard.setdefault("retired", []).append(entry.slug)  # its line (#840)
+            elif set(finished) >= set(monthend.LAST_STAGES):
+                # every step in `state.db`, its bots' deactivation not on the log: a run of a
+                # development build between #835 and #860, never a release, which wrote no step
+                # records (#855), or a plan since; the log decides
+                monthend.settle(db, entry, monthend.STOPPED, monthend.UNLOGGED, server.clock())
+                heard.setdefault("unrecorded", []).append(entry.slug)
+            elif why := await asyncio.to_thread(monthend.changed, entry, fleet, people):
+                monthend.settle(db, entry, monthend.DROPPED, why, server.clock())
+                heard.setdefault("dropped", []).append(f"{entry.slug} ({why})")
+        sending, sent = True, 0  # the look's DMs stop at the first that fails, or its cap
+        for entry in scheduled:
+            heard = said.setdefault(entry.plan, {})
+            try:  # one row's error never keeps the others back (review of #829, N3)
+                now = server.clock()
+                if why := await asyncio.to_thread(monthend.changed, entry, fleet, people):
+                    if monthend.drop(db, entry, why, now):  # unless it changed meanwhile
+                        heard.setdefault("dropped", []).append(f"{entry.slug} ({why})")
+                    continue
+                if stop := monthend.refused(entry, now):  # #883: a refusal stops the row
+                    if monthend.refuse(db, entry, stop, now):
+                        heard.setdefault(f"{stop} {monthend.REFUSED}", []).append(entry.slug)
+                    continue
+                kind = monthend.due(entry, now)
+                if kind is None or not sending:
+                    continue
+                how = await self._warn(server.bot_of(ws), ws, entry, kind, repos, now)
+            except Exception as exc:
+                LOG.warning("%s: the month end's look at %s failed (%s)", ws.name, entry.slug,
+                            type(exc).__name__, exc_info=exc)  # fmt: skip
+                continue
+            if how:
+                heard.setdefault(f"{kind} {how}", []).append(entry.slug)
+            sent += how not in (monthend.NO_ID, "")
+            # B3 of #829's review: a failure of any kind ends the look's DMs, so that a blip
+            # costs one row's warning at most; N1: so does the cap
+            if how not in (monthend.SENT, monthend.NO_ID) or sent >= monthend.LOOK_DMS:
+                sending = False
+        for plan_id, heard in said.items():
+            if heard:
+                await self._warned(ws, plan_id, heard)
+        await self._run(ws)
+
+    async def _run(self, ws: Workshop) -> None:
+        """A month-end run of `ws`'s due rows (`monthend.due_rows`), when no plan of the
+        workshop applies or is handed over, and its last `!protect` is `PROTECT_SETTLE` old
+        (§11.5: that refusal is a wait). The fleet is read afresh, then, with no await, the
+        checks, the run's plan made APPLYING (a restart marks it INTERRUPTED), the workshop
+        marked busy, and the run spawned (`Runner.month_end`)."""
+        server = self.server
+        assert server.store is not None
+        store, bot = server.store, server.bot_of(ws)
+        fleet = await server.read_fleet(ws)
+        # From here to the busy mark: no await.
+        now = server.clock()
+        due = monthend.due_rows(monthend.entries(store.db, ws.name), now)
+        if not due or self.busy(ws.name) is not None:
+            return
+        if fleet.protection is not None and fleet.protection.wait(now):
+            return
+        if now < self.month_end_held.get(ws.name, (0, 0.0))[1]:  # after errors (`_abandoned`)
+            return
+        if next_plan_id(store) > MAX_PLAN_ID:
+            LOG.error("plan IDs above P-%d can't be named in commands: no run made", MAX_PLAN_ID)
+            return
+        schedule = store.get(due[0].plan)
+        where = self._where(due[0].plan)
+        if schedule is None or where is None:  # never: a schedule's plan has its topic
+            return
+        command = "!retire " + " ".join(e.slug for e in due)
+        plan = store.begin(
+            workshop=ws.name, bot=bot.user_id, requester=bot.user_id, command=command
+        )
+        plan = store.move(plan.id, (PLANNING,), APPLYING, f"a month-end run of {schedule.name}")
+        try:  # APPLYING, so busy (`Runner.busy`): an error from here on fails it (round 5)
+            with store.db:
+                store.db.execute(
+                    "INSERT INTO plan_topics (plan, stream, topic) VALUES (?, ?, ?)",
+                    (plan.id, where[0], where[1]),
+                )
+            monthend.begin_run(store.db, plan.id, schedule.id, due)
+        except Exception as exc:
+            LOG.warning("%s: the month-end run can't begin (%s)", plan.name, type(exc).__name__)
+            await self._abandoned(plan, type(exc).__name__, bot, where, schedule)
+            return
+        self.handed[ws.name] = plan.id
+        self.spawn(self._started(plan, bot, where, fleet, schedule, due),
+                   then=lambda: self._release(ws.name, plan.id))  # fmt: skip
+
+    async def _started(
+        self, plan: Plan, bot: AdminBot, where: tuple[int, str], fleet: Fleet, schedule: Plan,
+        due: list[monthend.Entry],
+    ) -> None:  # fmt: skip
+        """The run's `request` record, which hands its ID out (`fleet.Ledger.floor`), then the
+        run itself; an error that escapes either fails the plan if it is still APPLYING
+        (`_abandoned`, Codex round 5 on #835). The bot stopping leaves it APPLYING, for the
+        next start to mark INTERRUPTED."""
+        try:
+            await self.server.audit(
+                "request", **self._fields(plan),
+                requester={"id": bot.user_id, "name": f"the month-end schedule {schedule.name}"},
+                verb="retire", args=[e.slug for e in due], schedule=schedule.name,
+            )  # fmt: skip
+            await self.runner.month_end(plan, bot, where, fleet, schedule, due)
+        except Exception as exc:
+            LOG.warning("%s: the month-end run failed (%s)", plan.name, type(exc).__name__,
+                        exc_info=exc)  # fmt: skip
+            await self._abandoned(plan, type(exc).__name__, bot, where, schedule)
+        else:
+            self.month_end_held.pop(plan.workshop, None)
+
+    async def _abandoned(
+        self, plan: Plan, why: str, bot: AdminBot, where: tuple[int, str], schedule: Plan
+    ) -> None:
+        """A month-end run that an error ended before its apply did (Codex round 5 on #835):
+        FAILED, if it is still APPLYING, which would keep its workshop busy for every later
+        run and approval until a restart (`Runner.busy` reads `state.db`). Its rows stay as
+        they are: those `running` resume at a later look, at their first unfinished step, or,
+        every step done, are recorded retired (`_retired`); those still `scheduled` run then.
+        The next run of the workshop waits twice as long after each such error in a row, from
+        2 minutes up to `MONTH_END_HELD` (review of #835, N1); each says so in the schedule's
+        topic, with a `month_end` record if it can be written."""
+        store = self.server.store
+        assert store is not None
+        current = store.get(plan.id)
+        failures = self.month_end_held.get(plan.workshop, (0, 0.0))[0] + 1
+        wait = min(MONTH_END_EVERY * 2**failures, MONTH_END_HELD)
+        self.month_end_held[plan.workshop] = (failures, self.server.clock() + wait)
+        if current is None or current.state != APPLYING:
+            return
+        note = f"the run failed before it ended ({why}): its rows are taken up at a later look"
+        store.move(plan.id, (APPLYING,), FAILED, note[:NOTE_CHARS])
+        head = None
+        try:
+            head = await self.server.audit(
+                "month_end", **self._fields(plan), what="run", reason=note, wait_s=wait
+            )
+        except Exception as exc:
+            LOG.warning("%s: its month_end record not written (%s)", plan.name,
+                        type(exc).__name__)  # fmt: skip
+        text = (
+            f"❌ {plan.name}, a month-end run of {schedule.name}, failed before it ended ({why}). "
+            f"Its rows are taken up again in {round(wait / 60)} min at the earliest, each from "
+            "its first unfinished step. The bot's log says why: tell a deployer."
+        )
+        await bot.post(where[0], where[1], text + (f"\n{footer(head)}" if head else ""))
+
+    async def _warn(
+        self, bot: AdminBot, ws: Workshop, entry: monthend.Entry, kind: str,
+        repos: Mapping[str, str], now: float,
+    ) -> str:  # fmt: skip
+        """One warning by DM, recorded before its post, and only while the schedule still holds
+        it (`monthend.claim`: no cancel or replacing schedule since the look read it). How it
+        went: `SENT` once Zulip gave the message's ID; `UNSURE` when it may have landed, never
+        sent again; `REFUSED` once Zulip refused it with a 4xx `TRIES` times; or "" when it
+        wasn't claimed, or wasn't sent but may be at the next look: refused fewer times, or
+        never reaching Zulip (no connection, its rate limit), which is never counted as a try.
+        A notice refused fewer times is taken back, a reminder recorded refused, which keeps
+        its row from running until it goes (`monthend.refused`). Refused at every try, it stops
+        its row (`monthend.refuse`, #883): "" when a cancel, or a schedule with another end or
+        recipient, landed meanwhile, and there was none to stop.
+        The claim records it `UNSURE`, which covers it as sent, and only Zulip's answer makes
+        it `SENT`: a restart while the post is out leaves it `unsure`, never `sent` (review
+        of #829, B2 and B3)."""
+        db = self.server.store.db  # type: ignore[union-attr]
+        if not entry.zulip_user_id.isdigit():
+            claimed = monthend.claim(db, entry, kind, monthend.NO_ID, now)
+            return monthend.NO_ID if claimed else ""
+        write = monthend.notice if kind == monthend.NOTICE else monthend.reminder
+        if kind == monthend.NOTICE:  # a late notice names its own end (`monthend.run_at`)
+            text = monthend.notice(entry, ws.name, repos.get(entry.slug, ""),
+                                   monthend.end_of(entry, now))  # fmt: skip
+        else:
+            text = write(entry, ws.name, repos.get(entry.slug, ""))
+        # first, and then the post with no await between: never sent twice, nor once cancelled
+        if not monthend.claim(db, entry, kind, monthend.UNSURE, now):
+            return ""
+        posted, failed = await bot.delivered(
+            type="private", to=[int(entry.zulip_user_id)], content=text
+        )
+        if posted is not None:
+            monthend.warn(db, entry, kind, monthend.SENT, now)
+            return monthend.SENT
+        if failed == monthend.UNSURE:  # it may have landed: never sent again
+            return monthend.UNSURE
+        # a reminder refused at a try stays refused until it goes: owed, its row never runs,
+        # and once the end has come it stops the row (`monthend.refused`, Codex round 1)
+        owed = monthend.REFUSED if kind == monthend.REMINDER else None
+        if failed == monthend.UNREACHED:  # never reached Zulip: no try counted
+            was = any((k, h) == (kind, monthend.REFUSED) for k, _, h in entry.warned)
+            monthend.warn(db, entry, kind, owed if was else None, now)
+            return ""
+        key = self._key(ws, entry, kind)
+        tried = self.tries[key] = self.tries.get(key, 0) + 1
+        if tried < monthend.TRIES:
+            monthend.warn(db, entry, kind, owed, now)  # taken back, or owed: tried again
+            return ""
+        return monthend.REFUSED if monthend.refuse(db, entry, kind, now) else ""
+
+    @staticmethod
+    def _key(
+        ws: Workshop, entry: monthend.Entry, kind: str
+    ) -> tuple[str, str, str, float, str, int]:
+        """A warning's key in `tries`: its row's, its end's, its recipient's and its schedule's."""
+        return (ws.name, entry.slug, kind, entry.ends, entry.zulip_user_id, entry.plan)
+
+    async def _warned(self, ws: Workshop, plan_id: int, heard: dict[str, list[str]]) -> None:
+        """One line in the schedule's topic for what one look did, and its `month_end`
+        record."""
+        server = self.server
+        assert server.store is not None
+        plan = server.store.get(plan_id)
+        if plan is None:
+            return
+        head = await server.audit(
+            "month_end", workshop=ws.name, bot=plan.bot, plan=plan.name, what="look",
+            rows={key: list(rows) for key, rows in heard.items()},
+            targets=sorted({row.split(" ")[0] for rows in heard.values() for row in rows}),
+        )  # fmt: skip
+        await self._say(plan, monthend.look_line(plan.name, heard), head)
 
     async def handle(
         self, bot: AdminBot, m: Incoming, command: Command, fleet: Fleet | None
@@ -834,6 +1244,8 @@ class Planning:
         """Quick: a plan's preparation and `!status` run as their own tasks."""
         if command.verb in ("approve", "reject"):
             await self.answer(bot, m, command)
+        elif command.verb == "month-end cancel":  # a workshop's verb: its bot has a fleet
+            await self.cancel(bot, m, command, fleet)
         elif command.verb == "status":
             self.spawn(self.status(bot, m, command, fleet))
         elif command.verb == "console":
@@ -843,6 +1255,11 @@ class Planning:
                 self.spawn(self.request(bot, m, command, None))
             else:  # a deployer, whom the [global] bot recognizes too (§2.9)
                 await bot.say(m, "❌ only a global admin requests `!new-workshop`")
+        elif command.verb == "upgrade-server":  # the [global] bot's alone, too (§1.6, #569)
+            if m.sender_id in self.server.config.deployers:
+                self.spawn(self.request(bot, m, command, None))
+            else:  # a global admin who is not a deployer
+                await bot.say(m, "❌ only a deployer requests `!upgrade-server`")
         elif fleet is None:  # the grammar gives workshop verbs to workshop bots only
             await bot.say(m, f"❌ `!{command.verb}` is a workshop's command")
         else:
@@ -908,6 +1325,10 @@ class Planning:
             action = self._build(plan, command, fleet, upload)
         except ActionError as exc:
             return str(exc), ""
+        if action.verb == "month-end schedule":
+            action = await self._noted(action, fleet)
+        elif action.verb == "keep-until" and command.until != "none":
+            action = self._kept(action, command.until)
         if action.verb in ("teardown", "retire") and (why := self._protecting(bot.where)):
             return why, ""
         async with self.preparing.setdefault(bot.where, asyncio.Semaphore(PREPARING)):
@@ -970,6 +1391,68 @@ class Planning:
         )
         return "", ""
 
+    async def _noted(self, action: Action, fleet: Fleet | None) -> Action:
+        """A `!month-end schedule` plan with its notes on the schedule as it is: the rows it
+        would bring back, which the schedule holds cancelled, so that its approval undoes that
+        veto (review of #824, N3); and first, each row with no Zulip ID, whom no warning can
+        reach, and whom approving the plan ends without one (#570's plan; review of #829, N6;
+        #883). Notes are shown, never hashed."""
+        assert self.server.store is not None
+        notes = list(action.notes)
+        held = monthend.entries(self.server.store.db, action.workshop)
+        back = [e for e in held if e.state == monthend.CANCELLED and e.slug in action.targets]
+        if back:
+            named, it = (
+                "; ".join(f"{e.slug} ({e.note})" for e in back),
+                "them" if back[1:] else "it",
+            )
+            out = " ".join(f"`!keep-until none {e.slug}`" for e in back)
+            notes.append(
+                f"**Cancelled, and back with this plan:** {named}. Approving it schedules {it} "
+                f"again; to keep {it} out, first {out}."
+            )
+        if fleet is not None:
+            roster = await asyncio.to_thread(read_roster, fleet.workshop.roster)
+            ids = {r["slug"]: r.get("zulip_user_id", "") for r in roster}
+            unreached = [s for s in action.targets if not ids.get(s, "").isdigit()]
+            if unreached:  # first, and every row named: what the approval consents to (#883)
+                # what approving does before the list, which a plan cut to fit may cut short
+                # (`plan_message` gives its notes a quarter of the room; review of #908, N5)
+                n = len(unreached)
+                rows, whose, listed = ("this row", "its participant", "The row") if n == 1 else (
+                    "each of these rows", "their participants", f"The rows ({n})"
+                )  # fmt: skip
+                notes.insert(0, (
+                    "**No Zulip ID in the roster, so no warning can reach them: approving this "
+                    f"plan ends {rows} at its date all the same, with no notice or reminder.** "
+                    f"Tell {whose} yourselves, or, for the bot to warn them, bind them first "
+                    "(`!provision zulip`), then send `!month-end schedule` again. "
+                    f"{listed}: {', '.join(unreached)}."
+                ))  # fmt: skip
+        return dataclasses.replace(action, notes=tuple(notes))
+
+    def _kept(self, action: Action, until: str | None) -> Action:
+        """A dated `!keep-until` plan with how its rows end, from the workshop's month-end
+        schedule as it is (`monthend.keep_until_note`, #868), and the month-end run applying in
+        the workshop, if one is (`busy`, `monthend.run_of`). One that can't be read leaves the
+        plan as it is, with a note that says so (review of #871, N1). Notes are shown, never
+        hashed."""
+        assert self.server.store is not None and until is not None
+        db, ws = self.server.store.db, action.workshop
+        try:
+            held = monthend.entries(db, ws)
+            busy = self.busy(ws)
+            applying = busy is not None and monthend.run_of(db, busy) is not None
+            run = f"P-{busy}" if applying else None
+            notes = monthend.keep_until_note(held, action.targets, until, ws, run)
+        except (sqlite3.Error, ValueError) as exc:
+            LOG.warning("%s: the month-end schedule can't be read (%s)", ws, type(exc).__name__)
+            notes = [
+                f"**The month-end schedule can't be read** ({type(exc).__name__}): "
+                "`!month-end show` says whether it holds these rows (ORGANIZERS §5.7)."
+            ]
+        return dataclasses.replace(action, notes=(*action.notes, *notes))
+
     def _build(
         self, plan: Plan, command: Command, fleet: Fleet | None, upload: str | None = None
     ) -> Action:
@@ -978,6 +1461,10 @@ class Planning:
         server = self.server
         if fleet is not None:
             return build(command, fleet, layout=server.paths.layout, upload=upload, plan=plan.name)
+        if command.verb == "upgrade-server":  # §1.6, #569
+            return upgradeserver.build(
+                command, server.config, plan=plan.name, bot=plan.bot, layout=server.paths.layout
+            )
         return newworkshop.build(
             command,
             server.config,
@@ -1211,6 +1698,139 @@ class Planning:
             if approved is not None and not spawned:
                 self._release(approved.workshop, approved.id)
 
+    async def cancel(
+        self, bot: AdminBot, m: Incoming, command: Command, fleet: Fleet | None
+    ) -> None:
+        """`!month-end cancel SEL` (§11.5, #570): the named rows out of the workshop's month-end
+        schedule, at once, as `!reject` vetoes a plan: from an approver of the workshop, human
+        and active as `GET /users/{id}` says now (§2.5). It only shrinks what the bot will do.
+        Audited (`month_end`), with the rows it cancelled. Refused while a `!month-end schedule`
+        of the workshop is approved or applying (Codex round 1 on #824): its apply replaces the
+        schedule, and would bring a row cancelled meanwhile back; the check and the cancel come
+        with no await between them, so nothing applies in between."""
+        server, ws = self.server, bot.workshop
+        assert server.store is not None and ws is not None and fleet is not None
+        if m.sender_id not in server.config.approvers(ws):
+            await self._uncancelled(bot, m, "not-approver", f"only an approver of {ws.name} "
+                                    "cancels its month end: nothing was done")  # fmt: skip
+            return
+        try:  # afresh, as for an approval
+            user = (await bot.client.request("GET", f"users/{m.sender_id}"))["user"]
+        except Exception as exc:
+            LOG.warning("GET /users failed (%s)", type(exc).__name__)
+            await bot.say(m, "❌ your account could not be checked: nothing was done")
+            return
+        if user.get("is_bot") is not False or user.get("is_active") is not True:
+            await self._uncancelled(bot, m, "inactive", "only an active human account "
+                                    "cancels: nothing was done")  # fmt: skip
+            return
+        assert command.selection is not None
+        try:  # the roster may have changed since the command was parsed
+            named = command.selection.targets(Roster(fleet.slugs, fleet.spares))
+        except ValueError as exc:
+            await bot.say(m, f"❌ {exc}: nothing was done")
+            return
+        # From here to the cancel: no await (the docstring)
+        busy = self.busy(ws.name)
+        replacing = server.store.get(busy) if busy is not None else None
+        if replacing is not None and replacing.command == "!month-end schedule":
+            await self._uncancelled(
+                bot, m, "busy",
+                f"busy: {replacing.name}, a `!month-end schedule`, is applying, and replaces the "
+                "schedule. Nothing was cancelled: send the cancel again once its result is "
+                "posted.", mark="",
+            )  # fmt: skip
+            return
+        now, who = server.clock(), shown_name(m.sender_name)
+        db = server.store.db
+        running = {e.slug: e for e in monthend.entries(db, ws.name)
+                   if e.state == monthend.RUNNING and e.slug in named}  # fmt: skip
+        done, other = monthend.cancel(db, ws.name, named, f"by {who}, {utc(now)}", now)
+        head = await server.audit(
+            "month_end",
+            workshop=ws.name,
+            bot=bot.user_id,
+            requester={"id": m.sender_id, "name": m.sender_name},
+            what="cancel",
+            targets=done,  # the console's projection reads `targets` (review of #824, N5)
+            named=list(named),
+        )
+        listed = monthend.listed
+        if not done:
+            text = (
+                f"❌ {listed(other)}: not in the month-end schedule, or ended already: nothing "
+                "was done. `!month-end show` shows the schedule."
+            )
+        else:
+            text = (
+                f"✅ The month end of {listed(done)} is cancelled: the schedule ends none of them."
+            )
+            text += self._mid_run([s for s in done if s in running], running)
+            if rest := [s for s in done if s not in running]:
+                text += (
+                    f" {'Each VM' if len(rest) == len(done) else 'The VM of ' + listed(rest)} "
+                    "stays until a `!retire`, or a new `!month-end schedule`."
+                )
+            text += f" Not in the schedule: {listed(other)}." * bool(other)
+            pending = [p.name for p in server.store.pending(bot.user_id)
+                       if p.command == "!month-end schedule"]  # fmt: skip
+            if pending:
+                text += (
+                    f" {pending[0]}, pending, would schedule them again: `!reject {pending[0]}` "
+                    "if it shouldn't."
+                )
+        await bot.say(m, f"{text}\n{footer(head)}")
+
+    def _mid_run(self, mid: list[str], running: Mapping[str, monthend.Entry]) -> str:
+        """What a cancel says of the rows it took out of a run (review of #835, B1): one applying
+        now stops before its next step; one whose run failed or waits is never taken up again
+        (round 2, N1); what the run did stays done either way; a row whose
+        teardown is on record has no VM any more, and only `!retire … unsynced` ends its bots
+        (the teardown cleared its `ip`, #604)."""
+        if not mid:
+            return ""
+        store = self.server.store
+        assert store is not None
+        text = ""
+        live = {s for s in mid if (p := store.get(int(running[s].note.removeprefix("P-"))))
+                and p.state == APPLYING}  # fmt: skip
+        for group, applying in (([s for s in mid if s in live], True),
+                                ([s for s in mid if s not in live], False)):  # fmt: skip
+            if not group:
+                continue
+            runs = " and ".join(sorted({running[s].note for s in group}))
+            one = len(group) == 1
+            if applying:
+                text += (
+                    f" {monthend.listed(group)} {'is' if one else 'are'} in run {runs} now: "
+                    f"{'it stops before its' if one else 'they stop before their'} next step, "
+                    "and what that run did stays done (its result lists it)."
+                )
+            else:  # its run failed, or is held: the next would have taken it up (round 2, N1)
+                text += (
+                    f" {monthend.listed(group)} {'was' if one else 'were'} held by run {runs}, "
+                    "which isn't applying: no run takes "
+                    f"{'it' if one else 'them'} up again, and what it did stays done."
+                )
+        gone = [s for s in mid if "teardown" in monthend.done(store.db, running[s])]
+        if gone:
+            text += (
+                f" The VM of {monthend.listed(gone)} is gone, torn down already: "
+                f"`!retire {gone[0]} unsynced` deactivates its bots and marks it retired."
+            )
+        return text
+
+    async def _uncancelled(
+        self, bot: AdminBot, m: Incoming, code: str, reason: str, mark: str = "❌ "
+    ) -> None:
+        """A `!month-end cancel` refused: a `refused` record, as a refused `!reject`'s, and the
+        answer (review of #824, N5)."""
+        head = await self.server.audit(
+            "refused", workshop=bot.where, bot=bot.user_id, verb="month-end cancel",
+            sender={"id": m.sender_id, "name": m.sender_name}, code=code, reason=reason,
+        )  # fmt: skip
+        await bot.say(m, f"{mark}{reason}\n{footer(head)}")
+
     def _release(self, workshop: str, plan_id: int) -> None:
         if self.handed.get(workshop) == plan_id:
             del self.handed[workshop]
@@ -1273,6 +1893,15 @@ class Planning:
                 self.restart()
                 return
             LOG.warning("%s added a workshop: restart the bots to load it", plan.name)
+        if plan.command.startswith("!upgrade-server ") and release_moved(self.server.paths.layout):
+            # whatever the outcome (#569): this process runs another release than `current`,
+            # whose scripts its argument lists name, so it restarts into it; until then every
+            # workshop stays busy (§2.4 step 5)
+            if self.restart is not None:
+                LOG.info("%s moved current: the bots restart into it", plan.name)
+                self.restart()
+                return
+            LOG.warning("%s moved current: restart the bots, which run another release", plan.name)
         self._release(plan.workshop, plan.id)
 
     # -------------------------------------------------------------------- reads, console
@@ -1283,8 +1912,9 @@ class Planning:
         """`!status SEL`: `status.py --json` through the runner (§3, action 6); no plan. The
         answer is the plans' table and a few readable lines (`status_reply`, #439), scrubbed,
         and the whole of it attached when cut (§2.7 item 5), then the workshop's cost line from
-        the collector's snapshot (§11.2). The read is kept for the collector too
-        (`collector.note_status`, §4.1)."""
+        the collector's snapshot (§11.2), the waker's line and the retired rows'; the answer is
+        fitted with room for those and the audit footer (#767). The read is kept for the
+        collector too (`collector.note_status`, §4.1)."""
         assert fleet is not None  # a workshop's command
         if bot.where in self.reading:
             await bot.say(m, "❌ a `!status` of this workshop is under way: wait for its answer")
@@ -1318,15 +1948,11 @@ class Planning:
                 await asyncio.to_thread(note_status, state, bot.where, found[0], started)
             except OSError as exc:
                 LOG.warning("!status not kept for the console (%s)", exc.strerror)
-        limit = bot.client.limits.get("max_message_length", 10000)
-        reply = status_reply(text or "(no output)", self.server.scrubber, limit=limit)
-        shown = reply.text
         try:  # §11.2; a line it can't make is left out, never the answer (review of #494)
             cost = await asyncio.to_thread(cost_line, state, bot.where, now)
         except Exception as exc:
             LOG.warning("!status: no cost line (%s)", type(exc).__name__)
             cost = None
-        shown = f"{shown}\n\n{cost}" if cost else shown
         paths = self.server.paths
         config = f"{paths.layout.waker}/config.toml"
         try:  # the waker down (#717): a line it can't make is left out too
@@ -1334,9 +1960,13 @@ class Planning:
         except Exception as exc:
             LOG.warning("!status: no waker line (%s)", type(exc).__name__)
             down = None
-        shown = f"{shown}\n\n{down}" if down else shown
-        if command.selection is not None and command.selection.all and fleet.retired:
-            shown += "\n\n" + left_out(fleet)
+        under = [line for line in (cost, down, left_out(fleet) if every else "") if line]
+        # The answer is fitted with room for the lines under it and the footer: a message over
+        # Zulip's limit is cut at its end, which would take the footer (#767)
+        limit = bot.client.limits.get("max_message_length", 10000)
+        limit -= sum(len(line) + 2 for line in under) + FOOTER_ROOM
+        reply = status_reply(text or "(no output)", self.server.scrubber, limit=limit)
+        shown = "\n\n".join([reply.text, *under])
         if reply.full is not None:
             link = await self._attach(bot, "status.txt", reply.full)
             whole = f"The whole status: {link}." if link else "Its attachment failed."

@@ -36,7 +36,9 @@ _WORKSHOP_RE = re.compile(r"[A-Za-z0-9._:/=+@-]{1,256}")
 DROPIN = Path("/etc/systemd/system/zab-waker.service.d/assume-role.conf")
 PROFILE = "zab-waker"
 _NAME = r"[A-Za-z0-9_+=,.@-]"
-_ROLE_ARN_RE = re.compile(rf"arn:aws[a-z-]*:iam::\d{{12}}:role/(?:{_NAME}+/)*{_NAME}{{1,64}}")
+# possessive (#836): as the greedy pattern under `fullmatch` only, its one use; on `role/x/`,
+# `match` or `search` would no longer find the prefix `role/x`
+_ROLE_ARN_RE = re.compile(rf"arn:aws[a-z-]*:iam::\d{{12}}:role/(?:{_NAME}+/)*+{_NAME}{{1,64}}")
 
 
 def aws_config(role_arn: str) -> str:

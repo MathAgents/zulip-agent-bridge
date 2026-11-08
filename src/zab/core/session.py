@@ -17,7 +17,18 @@ from uuid import uuid4
 from zab.core import presentation as view
 from zab.core import types as t
 from zab.core.attachments import load_attachments
-from zab.core.commands import UNKNOWN, login_required, run_command, status_login_hint
+from zab.core.commands import (
+    DETACH,
+    NO_TURN,
+    NO_TURN_NOR_SUBAGENT,
+    SUBAGENTS_UNCHECKED,
+    TURN_ELSEWHERE,
+    UNKNOWN,
+    login_required,
+    run_command,
+    status_login_hint,
+    stopped_subagents,
+)
 from zab.core.peer_context import consume_fork_answers, fork_context, peer_context
 from zab.core.reason import verified_only
 from zab.core.settings import display_setting, effective_settings
@@ -46,13 +57,16 @@ FIRST_REFRESH, LOOK = 60.0, 30.0
 @dataclass
 class Delivery:
     """`quiet`: a command that reached this bot without naming it, as it reached the VM's other
-    bots (SPEC §4.5 rule 6.2, `Route.quiet`): it says nothing where it doesn't act (§4.6)."""
+    bots (SPEC §4.5 rule 6.2, `Route.quiet`): it says nothing where it doesn't act (§4.6).
+    `first`: of those with a session in the topic, this bot comes first by full name, and so
+    answers for them where none acts (`BotBridge.first_here`, #847); true unless `quiet`."""
 
     message_id: int
     sender_id: int
     sender: str
     text: str
     quiet: bool = False
+    first: bool = True
 
 
 @dataclass(frozen=True)
@@ -104,8 +118,10 @@ class SessionActor:
         git_identity: t.GitIdentity | None = None,
         confirm_location: Callable[[str], Awaitable[None]] | None = None,
         reopened: Callable[[], None] | None = None,
+        unmentioned_here: Callable[[int, str], Awaitable[str]] | None = None,
     ) -> None:
         self.row, self.store, self.backend, self.poster = row, store, backend, poster
+        self.unmentioned_here = unmentioned_here  # BotBridge.unmentioned_here, for !session
         self.confirm_location = confirm_location  # BotBridge.verify_card
         self.reopened = reopened  # BotBridge.pending_forks_soon: forks waiting for it (#202)
         self.renderer, self.manager, self.context, self.slots = renderer, manager, context, slots
@@ -377,10 +393,12 @@ class SessionActor:
             except t.BackendUnavailable:
                 self.ready = False
                 raise
-        if self.turn:
+        error = self.row["state"] == "error"  # held until `!status` recovers it (§7.3)
+        if self.turn and not error:
             await self.react(delivery.message_id, "hourglass")
         else:
-            error = self.row["state"] == "error"  # held until `!status` recovers it (§7.3)
+            # in error with its turn's row still running too, as a reopen refused while the
+            # turn ran (review of #854, B1): the note says what unblocks it
             if error or self.slots.locked() or not self.ready:
                 await self.react(delivery.message_id, "hourglass")
                 if not self.waiting_message_id:
@@ -793,6 +811,11 @@ class SessionActor:
                         self.store.set(f"completion:{self.turn['id']}", None)
                         self.store.delete(f"restart_notice:{self.turn['id']}")
                         self.store.delete(f"diff_overlap:{self.turn['id']}")
+                        # Its status message is edited no more: the store forgets its edits (#757).
+                        # Not after a stop that timed out: the backend may still run the turn,
+                        # which recovery then takes up again with that message (codex round 1)
+                        if release_slot:
+                            self.poster.client.edit_bounds.forget(self.turn["status_message_id"])
             finally:
                 if not failed and not cancelled:
                     self.turn = None
@@ -995,16 +1018,18 @@ class SessionActor:
             if self.last_status == content:
                 self.last_status = ""
 
+        mid = self.turn["status_message_id"]
         try:
-            shown = await self.poster.edit(
-                self.turn["status_message_id"], content, final=final, paused=PAUSED, failed=failed
-            )
-            if final and not shown:
+            shown = await self.poster.edit(mid, content, final=final, paused=PAUSED, failed=failed)
+            if final and not shown and mid not in self.poster.held:
                 # Its edits are spent, the last by a final edit that failed (codex round 2): the
-                # summary goes in a new message, as when the old one can't be edited at all.
-                raise EditRefused(self.turn["status_message_id"])
+                # summary goes in a new message, as when the old one can't be edited at all. One
+                # held is a repeat, which goes out when its gap has passed (#806).
+                raise EditRefused(mid)
         except (ZulipError, EditRefused):
             mid = await self.post(content, ACK)
+            if final:  # the summary went out with it: a repeat waits for its gap (#806)
+                self.poster.client.edit_bounds.sent(mid)
             self.last_status = ""
             self.turn["status_message_id"] = mid
             self.store.update("turns", {"id": self.turn["id"]}, status_message_id=mid)
@@ -1042,7 +1067,7 @@ class SessionActor:
             return
         quiet = delivery is not None and delivery.quiet
 
-        if command == "!detach":
+        if command == DETACH:
             note = ""
             if self.turn and self.backend.capabilities.approvals:
                 note = (
@@ -1087,8 +1112,10 @@ class SessionActor:
                 self.put(StopTimeout(tid))
 
             self.stop_timer = asyncio.create_task(timeout())
-        elif quiet and (command == "!stop" or command.split(maxsplit=1)[:1] == ["!new"]):
-            return  # no turn to stop; a session here already: the VM's others act on it
+        elif command == "!stop":  # no turn running
+            await self.stop_idle(delivery)
+        elif quiet and command.split(maxsplit=1)[:1] == ["!new"]:
+            return  # a session here already: the VM's others act on it
         elif command in ("!approve", "!approve-session", "!deny") or decision:
             if not self.pending:
                 return
@@ -1160,6 +1187,46 @@ class SessionActor:
             await self.report_status()
         else:
             await self.post(UNKNOWN)
+
+    async def stop_idle(self, delivery: Delivery | None) -> None:
+        """`!stop` with no turn of this session running (SPEC §7.7, #847): the backend stops the
+        sub-agents its ended turns left running, where it has any (Codex), and the bot says how
+        many it stopped, or, unmentioned too, that one may still run: no other bot would say
+        so (Codex round 2 on #851), or that a turn started outside Zulip runs there, whose
+        sub-agents it leaves alone. Else "No turn is running": from this bot when named, and
+        unmentioned only from the bot that answers for the topic (`Delivery.first`), and only
+        where no turn of the topic runs (§4.6), which its bot stops."""
+        has_subagents = self.backend.capabilities.stop_subagents
+        stopped: t.SubagentStop | None = t.SubagentStop(0)
+        if has_subagents:
+            try:
+                stopped = await self.backend.stop_subagents(self.row["native_id"])
+            except t.TurnElsewhere:
+                await self.post(TURN_ELSEWHERE)
+                return
+            except Exception as exc:
+                self.log_error("Stopping sub-agents", exc)
+                stopped = None  # unknown: never "none ran"
+        if stopped is None:
+            await self.post(SUBAGENTS_UNCHECKED)
+        elif stopped.stopped:  # only this bot knows it
+            await self.post(stopped_subagents(stopped.stopped, unseen=stopped.unseen))
+        elif delivery is None or not delivery.quiet or (delivery.first and not self.turn_here()):
+            # a zero, with what it can't check (Codex round 3), gated as any zero (review
+            # round 3 of #851): beside another bot's running turn, it says nothing
+            if stopped.unseen:
+                await self.post(stopped_subagents(0, unseen=True))
+            else:
+                await self.post(NO_TURN_NOR_SUBAGENT if has_subagents else NO_TURN)
+
+    def turn_here(self) -> bool:
+        """Whether a turn of another bot's session in this topic runs."""
+        rows = self.store.rows("sessions", stream_id=self.row["stream_id"], topic=self.row["topic"])
+        return any(
+            self.store.rows("turns", session_id=row["id"], state="running")
+            for row in rows
+            if row["id"] != self.row["id"] and row["state"] != "detached"
+        )
 
     async def reopen(self, request: Reopen) -> None:
         """Take the backend's snapshot now and apply it at once (SPEC §7.8.1). A snapshot

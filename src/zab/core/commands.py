@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from zab.core.session import Delivery, SessionActor
 
 HELP = """In your own channel, `@claude` or `@codex` talks to one agent; naming neither, to both.
-`!stop` — interrupt the running turn (queued messages are kept).
+`!stop` — interrupt the running turn (queued messages are kept), or sub-agents left running.
 `!status` — current state.
 `!queue [clear]` — show or drop messages waiting for the current turn.
 `!new [opts] prompt` — start a session (in a new topic; `--model`, `--effort`, `--worktree`, …).
@@ -34,15 +34,46 @@ HELP = """In your own channel, `@claude` or `@codex` talks to one agent; naming 
 `!approve`, `!approve-session`, `!deny` — answer an approval request.
 `!attach [ID]`, `!detach` — list, attach or detach a native session.
 `!login` — connect your subscription (in a direct message to this bot).
+`!unmentioned [all|last]` — naming neither agent: to both, or to the topic's last named (in a DM).
 `!help` — this list."""
 DM_HELP = (
-    "In a direct message, only `!login`, `!status`, `!vm`, `!tools`, `!restart` and `!help` "
-    "work. If your bots stop answering, send `!vm` here: it answers even then, and says whether "
-    "your bridge runs; `!restart` restarts the bridge, interrupting running turns. "
-    "`!restart codex` restarts Codex, which also frees memory held by idle Lean servers. "
-    "The other commands below are for channel topics.\n\n" + HELP
+    "In a direct message, only `!login`, `!status`, `!vm`, `!tools`, `!restart`, "
+    "`!unmentioned` and `!help` work. If your bots stop answering, send `!vm` here: it "
+    "answers even then, and says whether your bridge runs; `!restart` restarts the bridge, "
+    "interrupting running turns. `!restart codex` restarts Codex, which also frees memory held "
+    "by idle Lean servers. The other commands below are for channel topics.\n\n" + HELP
 )
 UNKNOWN = "Unknown command; use !help."
+#: The command that detaches a session from its topic: exactly this (`SessionActor.command`),
+#: as the topic's addressee record reads it too (`Router._record`, #891).
+DETACH = "!detach"
+#: `!stop` with no turn running (#847, SPEC §7.7)
+NO_TURN = "No turn is running."
+NO_TURN_NOR_SUBAGENT = "No turn is running, and no sub-agent was."
+SUBAGENTS_UNCHECKED = (
+    "No turn is running, but a sub-agent an earlier turn started may still run: not every "
+    "one could be stopped or checked. Try !stop again."
+)
+TURN_ELSEWHERE = (
+    "A turn started outside Zulip, such as in a terminal, is running on this session, so "
+    "nothing was stopped: stop it where it runs."
+)
+
+
+def stopped_subagents(count: int, *, unseen: bool = False) -> str:
+    """The answer to a `!stop` with no turn that stopped `count` sub-agents, or that can't
+    rule one out (`unseen`: one the backend couldn't see, or check, may run)."""
+    which = "1 sub-agent" if count == 1 else f"{count} sub-agents"
+    text = (
+        f"No turn is running; stopped {which} that an earlier turn left running."
+        if count
+        else "No turn is running, and no sub-agent the bridge saw start is running."
+    )
+    if unseen:  # a backend that can't see them all, or one whose look failed in part
+        text = text.removesuffix(".") + ", but not every one could be checked."
+    return text
+
+
 FORK_NO_SESSION = (
     "No session here to fork: write a prompt to start one, then !fork it; !help lists the commands."
 )
@@ -113,7 +144,9 @@ async def _run_command(actor: SessionActor, command: str, delivery: Delivery | N
     elif command == "!session":
         from zab.core.session_details import session_details
 
-        await actor.post(session_details(actor))
+        where = actor.unmentioned_here  # where a message without a mention goes here (#878)
+        line = await where(actor.row["stream_id"], actor.row["topic"]) if where else ""
+        await actor.post(session_details(actor, line))
     elif command == "!usage":
         from zab.core.usage import usage_reply
 

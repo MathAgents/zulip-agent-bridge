@@ -37,6 +37,29 @@ def test_every_shell_block_parses(number):
     assert result.returncode == 0, result.stderr
 
 
+#: A shell assignment that starts a command, `NAME=value`, its value a `<placeholder>` (quoted
+#: or not, its quotes dropped) or one word; not one quoted in a message, nor a command's
+#: `env NAME=value`.
+ASSIGNED = re.compile(r"(?:^\s*|[;&|(]\s*)([A-Z][A-Z0-9_]*)=(?:(['\"]?)(<[^<>\n]*>)\2|([^\s;]+))")
+
+
+def test_a_variable_the_deployer_sets_is_never_assigned_anything_else():
+    """#768: the share probe's temporary repository took `P`, the AWS profile that the update's
+    step 8 still needed in the same terminal to close port 22. A variable the deployer sets,
+    `NAME=<placeholder>`, always takes the same placeholder, and no block assigns it anything
+    else."""
+    values: dict[str, set[str]] = {}
+    for body in BLOCKS:
+        for line in body.splitlines():
+            if not line.lstrip().startswith("#"):  # an expected output, not a command
+                for name, _, placeholder, word in ASSIGNED.findall(line.split(" #", 1)[0]):
+                    values.setdefault(name, set()).add(placeholder or word)
+    given = {name: found for name, found in values.items() if any(v[0] == "<" for v in found)}
+    assert {"P", "FR", "FILES_HOST", "FILES_ORG", "SCRATCH", "URL"} <= set(given)
+    assert {name: found for name, found in given.items() if len(found) > 1} == {}
+    assert values["PD"] == {"$(mktemp"}  # the probe's repository has a name of its own
+
+
 def test_the_staged_unit_is_the_shipped_one_with_three_changes(tmp_path):
     text = block("sudo tee /run/systemd/system/zab-files-staged.service")
     command = text[text.index("sed ") : text.index(" |\n")]

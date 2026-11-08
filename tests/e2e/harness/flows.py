@@ -32,18 +32,61 @@ STATUS_RE = re.compile(
     r"|⏳ \*\*Working\*\*|✅ \*\*Done\*\*|⏹ \*\*Stopped\*\*|❌ \*\*Failed\*\*"
     r"|⏸ \*\*Waiting for approval\*\*|⏹ stopping…)"
 )
+#: A turn's status once the turn completed: its final state (`TestUser.settled`, #877).
+DONE = r"^✅ \*\*Done\*\*"
 #: The bridge's reply to `!status` in a DM (`zab.core.bridge`).
 DM_STATUS_RE = r"Bridge running"
+
+
+#: `zab.core.unmentioned.command`'s answer to `!unmentioned all` or `!unmentioned last` (#878).
+RULE_SET_RE = r"^Done\. A message in a topic that mentions no agent goes to "
+#: Any answer to `!unmentioned all` that leaves the VM under `all`: set; set while
+#: `bridge.multi_party` is off; or a release without the setting, which knows only `all`.
+RULE_RESET_RE = RULE_SET_RE + r"all|^Set to `all`|^Unknown command"
+
+
+async def set_rule(
+    chat: Chat, kind: str, rule: str, *, pattern: str = "", within: float = 120.0
+) -> None:
+    """`!unmentioned <rule>` in a DM to `kind`'s bot, which sets it for both (#878), and its
+    answer: `pattern`, or by default the one setting `rule` gives."""
+    turn = await chat.dm(kind, f"!unmentioned {rule}")
+    expected = pattern or RULE_SET_RE + ("all" if rule == "all" else "the ones")
+    await chat.reply(turn, expected, within=within)
+
+
+RESET_FAILED = "the start-of-run reset to `all` failed: see the first scenario that used `chat`"
+
+
+async def reset_rule(chat: Chat, tried: list[bool]) -> None:
+    """The run's reset of the rule to `all` (the `chat` fixture's), tried once: `tried` holds
+    whether it succeeded. After a failure each later call fails at once, rather than wait out
+    `ANSWER_S` again for a bridge that didn't answer."""
+    if tried == [False]:
+        raise AssertionError(RESET_FAILED)
+    if not tried:
+        tried.append(False)
+        await set_rule(chat, "claude", "all", pattern=RULE_RESET_RE, within=ANSWER_S)
+        tried[0] = True
 
 
 def echo(token: str) -> str:
     return f"Reply with exactly `{token}` and nothing else. Don't run any tools."
 
 
+#: A side answer's marker (`!btw`, #716; `zab.core.btw`): every part of one starts with it,
+#: linking the `!btw` message. A side answer is never a turn's answer.
+SIDE_ANSWER_RE = r"💬 \[btw\]\("
+
+
 def answer(pattern: str) -> str:
-    """`pattern` in an answer of the agent, never in a turn's status message (whose commentary
-    may quote the prompt)."""
-    return r"^(?!" + STATUS_RE.pattern.removeprefix("^") + r")[\s\S]*?" + pattern
+    """`pattern` in an answer of the agent: never in a turn's status message (whose commentary
+    may quote the prompt), nor in a side answer, which may quote the running turn's prompt
+    (#843: a side answer from Claude said "I therefore haven't sent `DONE-…`", and the running
+    turn's wait took it for that turn's answer). A side answer is awaited by its own marker
+    (scenario 12's `BTW_ANSWER`), never with this."""
+    excluded = STATUS_RE.pattern.removeprefix("^") + "|" + SIDE_ANSWER_RE
+    return r"^(?!" + excluded + r")[\s\S]*?" + pattern
 
 
 @dataclass

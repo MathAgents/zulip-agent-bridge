@@ -1,6 +1,7 @@
 """Commands as people type them (SPEC §4.6; #709): `zab.core.command_text.as_command`."""
 
 import time
+import tracemalloc
 
 import pytest
 
@@ -76,6 +77,21 @@ def test_long_runs_take_linear_time(shape):
     for _ in range(4):
         as_command(text, BOT)
     assert time.perf_counter() - started < 2.0
+
+
+@pytest.mark.parametrize("closed", ["`", "x"])
+def test_a_long_code_span_costs_bounded_memory(closed):
+    """#833: the code span's repeat of a space and a word kept a frame of `re` per pass, 145 MB
+    on a megabyte; a message has 10,000 characters at most, but it costs nothing now."""
+    text = "`!a" + " b" * 500_000 + closed
+    tracemalloc.start()
+    try:
+        base = tracemalloc.get_traced_memory()[0]
+        as_command(text)
+        peak = tracemalloc.get_traced_memory()[1] - base
+    finally:
+        tracemalloc.stop()
+    assert peak < 16_000_000, f"{peak / 1e6:.0f} MB"
 
 
 def test_without_a_mention_only_case_and_code_count():

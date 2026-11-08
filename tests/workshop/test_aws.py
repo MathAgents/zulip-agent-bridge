@@ -19,6 +19,8 @@ import protect
 import pytest
 import teardown
 
+from .scope import FLEET_SCOPE, with_scope
+
 
 @pytest.fixture(autouse=True)
 def never_sleep(monkeypatch):
@@ -194,6 +196,7 @@ def opts(**kw) -> argparse.Namespace:
         "only": None,
         "dry_run": False,
         "spares": 0,
+        "tag": ["workshop=nt-agents-2026"],  # required since #808
     }
     base.update(kw)
     return argparse.Namespace(**base)
@@ -343,7 +346,12 @@ def test_roster_refuses_duplicates_case_insensitively(tmp_path, rows, what, monk
         ac.read_roster(str(path))
     ec2 = FakeEc2()
     monkeypatch.setattr(launch, "Ec2", lambda region: ec2)
-    assert launch.main(["--roster", str(path), "--ami", "a", "--security-group-id", "sg-1"]) == 1
+    assert (
+        with_scope(
+            launch.main, ["--roster", str(path), "--ami", "a", "--security-group-id", "sg-1"]
+        )
+        == 1
+    )
     assert ec2.calls == []  # refused before any AWS call
 
 
@@ -446,6 +454,29 @@ def test_first_boot_applies_swap_pins_and_mcp():
         assert needle in doc, needle
 
 
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("", "/swapfile none swap sw,nofail 0 0\n"),
+        ("/swapfile none swap sw 0 0\n", None),  # an image's own line, by a space
+        ("/swapfile\tnone\tswap\tsw\t0\t0\n", None),  # or by a tab (#799)
+        ("/swapfile2 none swap sw 0 0\n", "/swapfile none swap sw,nofail 0 0\n"),  # another file
+        ("#/swapfile none swap sw 0 0\n", "/swapfile none swap sw,nofail 0 0\n"),  # a comment
+    ],
+)
+def test_first_boot_adds_the_swap_files_fstab_line_once(tmp_path, before, after):
+    """The first boot's fstab line, run as the user data runs it, twice, against a copy of
+    /etc/fstab: it adds its line only when no `/swapfile` line is there, whatever separates
+    its fields, so that an image that carries one doesn't get a second."""
+    line = next(x for x in lines_of(ac.render_user_data(fresh_row())) if "/etc/fstab" in x)
+    fstab = tmp_path / "fstab"
+    fstab.write_text(before)
+    for _ in range(2):
+        run = line.replace("/etc/fstab", shlex.quote(str(fstab)))
+        subprocess.run(["bash", "-c", run], check=True)  # noqa: S603, S607
+    assert fstab.read_text() == before + (after or "")
+
+
 def ac_dir():
     import pathlib
 
@@ -523,7 +554,9 @@ def test_main_refuses_a_roster_slug_in_the_spare_namespace(tmp_path, capsys, mon
     path.write_text("slug,repo\nzab-spare-1,thesis\n")
     ec2 = FakeEc2()
     monkeypatch.setattr(launch, "Ec2", lambda region: ec2)
-    rc = launch.main(["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-1"])
+    rc = with_scope(
+        launch.main, ["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-1"]
+    )
     assert rc == 1 and "zab-spare-1" in capsys.readouterr().err
     assert ec2.calls == []  # refused before any AWS call, queries included
 
@@ -570,15 +603,19 @@ def test_main_requires_and_checks_the_security_group(tmp_path, capsys, monkeypat
     path = tmp_path / "roster.csv"
     path.write_text(ROSTER)
     with pytest.raises(SystemExit):
-        launch.main(["--roster", str(path), "--ami", "ami-1", "--dry-run"])
+        with_scope(launch.main, ["--roster", str(path), "--ami", "ami-1", "--dry-run"])
     assert "--security-group-id" in capsys.readouterr().err
     bad = FakeEc2()
     bad.security_groups["sg-default"] = {"GroupId": "sg-default", "GroupName": "default"}
     monkeypatch.setattr(launch, "Ec2", lambda region: bad)
-    rc = launch.main(["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-default"])
+    rc = with_scope(
+        launch.main, ["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-default"]
+    )
     assert rc == 1 and "default security group" in capsys.readouterr().err
     assert not any(c[0] == "run_instance" for c in bad.calls)
-    rc = launch.main(["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-missing"])
+    rc = with_scope(
+        launch.main, ["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-missing"]
+    )
     assert rc == 1 and "not found" in capsys.readouterr().err
 
 
@@ -703,7 +740,7 @@ def test_spares_launch_without_key_import_and_are_idempotent():
 
 
 def existing_instance(ec2: FakeEc2, name: str) -> str:
-    tags = ac.tag_list(launch.participant_tags(name))
+    tags = ac.tag_list(launch.participant_tags(name, FLEET_SCOPE))
     iid = ec2.run_instance(TagSpecifications=[{"ResourceType": "instance", "Tags": tags}])
     ec2.calls.clear()
     return iid
@@ -724,7 +761,7 @@ def test_rerun_reconciles_a_missing_or_detached_elastic_ip():
     # (b) address allocated and tagged but never associated: associate only
     ec2 = FakeEc2()
     iid = existing_instance(ec2, "alice")
-    aid = ec2.allocate_address(ac.tag_list(launch.participant_tags("alice")))
+    aid = ec2.allocate_address(ac.tag_list(launch.participant_tags("alice", FLEET_SCOPE)))
     ec2.calls.clear()
     out = launch.launch([fresh_row()], ec2, opts(), **kw)
     kinds = [c[0] for c in ec2.calls]
@@ -766,7 +803,8 @@ def test_main_dry_run_needs_no_boto3_and_no_network(tmp_path, capsys, monkeypatc
 
     monkeypatch.setattr(urllib.request, "urlopen", no_network)
     monkeypatch.setitem(sys.modules, "boto3", None)  # importing boto3 raises ImportError
-    rc = launch.main(
+    rc = with_scope(
+        launch.main,
         [
             "--roster",
             str(path),
@@ -777,7 +815,7 @@ def test_main_dry_run_needs_no_boto3_and_no_network(tmp_path, capsys, monkeypatc
             "--dry-run",
             "--spares",
             "1",
-        ]
+        ],
     )
     assert rc == 0
     out = capsys.readouterr().out
@@ -803,7 +841,9 @@ def test_main_writes_the_roster_even_when_launch_blows_up(tmp_path, monkeypatch,
 
     monkeypatch.setattr(launch, "launch", boom)
     with pytest.raises(RuntimeError):
-        launch.main(["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-1"])
+        with_scope(
+            launch.main, ["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-1"]
+        )
     assert ac.read_roster(str(path))[0]["ip"] == "203.0.113.77"
 
 
@@ -813,7 +853,9 @@ def test_main_exit_code_reflects_failures(tmp_path, monkeypatch, capsys):
     ec2 = FakeEc2()
     monkeypatch.setattr(launch, "Ec2", lambda region: ec2)
     monkeypatch.setattr(launch, "wait_for_ssh", lambda ip: True)
-    rc = launch.main(["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-1"])
+    rc = with_scope(
+        launch.main, ["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-1"]
+    )
     out = capsys.readouterr().out
     assert rc == 1 and "FAILED alice" in out and "Host ws-bob-2" in out
     assert ac.read_roster(str(path))[1]["ip"].startswith("203.0.113.")
@@ -867,12 +909,30 @@ def test_tag_override_scopes_lookups_and_creation():
     )
 
 
-def test_both_scripts_share_the_default_tag():
-    assert ac.DEFAULT_TAG_SPEC == "workshop=nt-agents-2026"
-    assert ac.parse_tag(ac.DEFAULT_TAG_SPEC) == ac.WORKSHOP_TAG
+#: Each script's arguments, complete but for the scope and the region
+COMPLETE = {
+    launch.main: ["--roster", "r.csv", "--ami", "ami-1", "--security-group-id", "sg-1"],
+    teardown.main: [],
+    protect.main: [],
+}
+
+
+@pytest.mark.parametrize(("missing", "kept"), [("--tag", "--region"), ("--region", "--tag")])
+def test_the_scripts_share_one_scope_and_require_it_and_the_region(missing, kept, capsys):
+    """#808: no default scope or region, which would name a deployment, and reach its VMs from
+    a script run without them: each script stops at argparse, naming the one missing."""
     assert launch.parse_tags is teardown.parse_tags is protect.parse_tags is ac.parse_tags
-    for specs in (None, [], [ac.DEFAULT_TAG_SPEC], ac.DEFAULT_TAG_SPEC):
+    for specs in ("workshop=nt-agents-2026", ["workshop=nt-agents-2026"]):
         assert ac.parse_tags(specs) == {"workshop": "nt-agents-2026"}
+    for specs in (None, []):
+        with pytest.raises(ValueError, match="no scope: give the workshop's --tag"):
+            ac.parse_tags(specs)
+    given = {"--tag": "workshop=w", "--region": "us-east-2"}
+    for main, argv in COMPLETE.items():
+        with pytest.raises(SystemExit) as stop:
+            main([*argv, kept, given[kept], "--dry-run"])
+        assert stop.value.code == 2
+        assert f"the following arguments are required: {missing}\n" in capsys.readouterr().err
 
 
 # ------------------------------------------------- several scope tags (the test rig, issue #263)
@@ -896,7 +956,7 @@ def test_parse_tags_repeatable_and_refusals():
         ac.scope_tags({})  # an empty scope would match everything
     assert ac.scope_tags(("workshop", "x")) == {"workshop": "x"}  # the old single-tag form
     assert ac.scope_text(RIG_SCOPE) == "zab-role=test, workshop=zab-test"
-    assert ac.scope_label(ac.WORKSHOP_TAG) == "nt-agents-2026"  # spares.json keys unchanged
+    assert ac.scope_label(("workshop", "nt-agents-2026")) == "nt-agents-2026"  # spares.json
     assert ac.scope_label(RIG_SCOPE) == "workshop=zab-test,zab-role=test"
 
 
@@ -946,9 +1006,9 @@ def test_scripts_parse_repeated_tags(monkeypatch, tmp_path):
     monkeypatch.setattr(protect, "Ec2", lambda region: object())
     monkeypatch.setattr(protect, "protect", fake_protect)
     args = ["--tag", RIG_TAGS[0], "--tag", RIG_TAGS[1]]
-    assert teardown.main(args) == 0 and protect.main(args) == 0
+    assert with_scope(teardown.main, args) == 0 and with_scope(protect.main, args) == 0
     assert seen == {"teardown": RIG_SCOPE, "protect": RIG_SCOPE}
-    assert teardown.main(["--tag", "participant=x"]) == 1
+    assert with_scope(teardown.main, ["--tag", "participant=x"]) == 1
 
 
 class _Paginator:
@@ -1099,7 +1159,11 @@ def test_teardown_asks_then_terminates_and_releases():
     ec2 = populated()
     log: list[str] = []
     rc = teardown.teardown(
-        ec2, ("workshop", "nt-agents-2026"), confirm=lambda q: "y", log=log.append
+        ec2,
+        ("workshop", "nt-agents-2026"),
+        region="us-west-2",
+        confirm=lambda q: "y",
+        log=log.append,
     )
     assert rc == 0
     kinds = [c[0] for c in ec2.calls]
@@ -1113,7 +1177,9 @@ def test_teardown_declined_or_dry_run_changes_nothing():
     for kwargs in ({"confirm": lambda q: "n"}, {"dry_run": True}):
         ec2 = populated()
         log: list[str] = []
-        rc = teardown.teardown(ec2, ("workshop", "nt-agents-2026"), log=log.append, **kwargs)
+        rc = teardown.teardown(
+            ec2, ("workshop", "nt-agents-2026"), region="us-west-2", log=log.append, **kwargs
+        )
         assert rc == (2 if "confirm" in kwargs else 0)
         assert not any(c[0] in ("terminate", "release_address") for c in ec2.calls)
         assert len(ec2.addresses) == 2
@@ -1122,7 +1188,9 @@ def test_teardown_declined_or_dry_run_changes_nothing():
 
 def test_teardown_only_one_participant():
     ec2 = populated()
-    rc = teardown.teardown(ec2, ("workshop", "nt-agents-2026"), only="bob-2", yes=True, log=quiet)
+    rc = teardown.teardown(
+        ec2, ("workshop", "nt-agents-2026"), region="us-west-2", only="bob-2", yes=True, log=quiet
+    )
     assert rc == 0
     assert [c for c in ec2.calls if c[0] == "terminate"] == [("terminate", ["i-0003"])]
     assert list(ec2.addresses) == ["eipalloc-0002"]
@@ -1130,7 +1198,9 @@ def test_teardown_only_one_participant():
 
 def test_teardown_nothing_matching():
     ec2 = FakeEc2()
-    assert teardown.teardown(ec2, ("workshop", "other"), yes=True, log=quiet) == 0
+    assert (
+        teardown.teardown(ec2, ("workshop", "other"), region="us-west-2", yes=True, log=quiet) == 0
+    )
 
 
 @pytest.mark.parametrize("bad", ["workshop", "=x", "k="])
@@ -1308,7 +1378,9 @@ def test_main_has_no_github_options(tmp_path, capsys, flag):
     path = tmp_path / "roster.csv"
     path.write_text(ROSTER)
     with pytest.raises(SystemExit) as exc:
-        launch.main(["--roster", str(path), "--ami", "a", "--security-group-id", "sg-1", *flag])
+        with_scope(
+            launch.main, ["--roster", str(path), "--ami", "a", "--security-group-id", "sg-1", *flag]
+        )
     assert exc.value.code == 2 and "unrecognized arguments" in capsys.readouterr().err
 
 
@@ -1422,9 +1494,9 @@ def test_a_dry_run_then_a_real_run_launches(tmp_path, monkeypatch):
     monkeypatch.setattr(launch, "_DryRunEc2", lambda region: ec2)
     monkeypatch.setattr(launch, "wait_for_ssh", lambda ip, **kw: True)
     argv = ["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-1"]
-    assert launch.main([*argv, "--dry-run"]) == 0
+    assert with_scope(launch.main, [*argv, "--dry-run"]) == 0
     assert ac.read_roster(str(path))[0]["host"] == ""
-    assert launch.main(argv) == 0
+    assert with_scope(launch.main, argv) == 0
     row = ac.read_roster(str(path))[0]
     assert row["host"] == "ws-alice" and row["region"] == "us-west-2"
     assert sum(1 for c in ec2.calls if c[0] == "run_instance") == 1
@@ -1432,20 +1504,37 @@ def test_a_dry_run_then_a_real_run_launches(tmp_path, monkeypatch):
 
 def test_first_boot_merges_the_managed_settings(tmp_path):
     """AMI v3 (issue #36): the first boot adds the connector switch to an existing managed
-    settings file without dropping what is there, and creates the file when it is missing."""
-    script = ac.COMMON_FIRST_BOOT
-    snippet = script.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    settings file without dropping what is there, and creates the file when it is missing.
+    #882: and `CLAUDE_CODE_CERT_STORE=system`; a rerun changes nothing; a file that isn't a JSON
+    object is refused, not overwritten. build.sh runs the same lines."""
+    snippet = ac.COMMON_FIRST_BOOT.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    build = (ac_dir().parent / "ami" / "build.sh").read_text()
+    assert build.split("managed-settings.json <<'PY'\n", 1)[1].split("\nPY\n", 1)[0] == snippet
+
+    def merge(path) -> subprocess.CompletedProcess[str]:
+        argv = [sys.executable, "-c", snippet, str(path)]
+        return subprocess.run(argv, capture_output=True, text=True, check=False)  # noqa: S603
+
     path = tmp_path / "managed-settings.json"
     path.write_text(json.dumps({"env": {"OTHER": "x"}, "permissions": {"deny": ["Bash(rm *)"]}}))
-    subprocess.run([sys.executable, "-c", snippet, str(path)], check=True)  # noqa: S603
-    assert json.loads(path.read_text()) == {
-        "env": {"OTHER": "x", "DISABLE_AUTOUPDATER": "1"},
+    assert merge(path).returncode == 0
+    merged = {
+        "env": {"OTHER": "x", "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_CERT_STORE": "system"},
         "permissions": {"deny": ["Bash(rm *)"]},
         "disableClaudeAiConnectors": True,
     }
+    assert json.loads(path.read_text()) == merged
+    assert merge(path).returncode == 0 and json.loads(path.read_text()) == merged  # a rerun
     fresh = tmp_path / "new.json"
-    subprocess.run([sys.executable, "-c", snippet, str(fresh)], check=True)  # noqa: S603
-    assert json.loads(fresh.read_text())["disableClaudeAiConnectors"] is True
+    assert merge(fresh).returncode == 0
+    assert json.loads(fresh.read_text()) == {
+        "env": {"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_CERT_STORE": "system"},
+        "disableClaudeAiConnectors": True,
+    }
+    for bad in ('{"env": {"OTHER": "x"}', "[]", '{"env": ["x"]}'):
+        path.write_text(bad)
+        assert merge(path).returncode != 0, bad
+        assert path.read_text() == bad
 
 
 # ---------------------------------------------------------- --admin-key (PM on #36, Mon 07:10)
@@ -1551,9 +1640,9 @@ def test_main_reads_and_checks_the_admin_key_files(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(launch, "Ec2", lambda region: ec2)
     monkeypatch.setattr(launch, "wait_for_ssh", lambda ip: True)
     base = ["--roster", str(roster), "--ami", "ami-1", "--security-group-id", "sg-1"]
-    assert launch.main([*base, "--admin-key", str(bad)]) == 1
+    assert with_scope(launch.main, [*base, "--admin-key", str(bad)]) == 1
     assert "--admin-key" in capsys.readouterr().err and ec2.calls == []
-    assert launch.main([*base, "--admin-key", str(good)]) == 0
+    assert with_scope(launch.main, [*base, "--admin-key", str(good)]) == 0
     params = next(c[1] for c in ec2.calls if c[0] == "run_instance")
     assert shlex.quote(LAPTOP) in params["UserData"]
 
@@ -1689,7 +1778,7 @@ def test_spares_are_recorded_under_out_for_the_hand_over(tmp_path):
     spares[0].update(ip="203.0.113.50", host_keys="SHA256:a SHA256:b", instance_id="i-1")
     spares[1].update(ip="")  # not launched: not recorded
     key = "nt-agents-2026/us-west-2/zab-spare-1"
-    assert launch.record_spares(spares, path, "us-west-2") == [key]
+    assert launch.record_spares(spares, path, "us-west-2", "nt-agents-2026") == [key]
     entry = json.loads(path.read_text())[key]
     assert entry["ip"] == "203.0.113.50" and entry["host_keys"] == "SHA256:a SHA256:b"
     assert entry["name"] == "zab-spare-1" and entry["instance_id"] == "i-1"
@@ -1698,13 +1787,13 @@ def test_spares_are_recorded_under_out_for_the_hand_over(tmp_path):
     # a rerun whose console no longer shows the keys keeps them for the same instance only
     spares[0]["host_keys"] = ""
     other = {"slug": "zab-spare-2", "spare": "1", "ip": "203.0.113.51", "host_keys": "SHA256:c"}
-    launch.record_spares([spares[0], other], path, "us-west-2")
+    launch.record_spares([spares[0], other], path, "us-west-2", "nt-agents-2026")
     data = json.loads(path.read_text())
     assert data[key]["host_keys"] == "SHA256:a SHA256:b"
     assert data["nt-agents-2026/us-west-2/zab-spare-2"]["host_keys"] == "SHA256:c"
     # codex on #154: a replacement on the same (reused, tagged) Elastic IP is another VM
     spares[0]["instance_id"] = "i-2"
-    launch.record_spares([spares[0]], path, "us-west-2")
+    launch.record_spares([spares[0]], path, "us-west-2", "nt-agents-2026")
     assert json.loads(path.read_text())[key]["host_keys"] == ""
 
 
@@ -1713,8 +1802,8 @@ def test_spares_in_two_regions_are_both_kept(tmp_path):
     path = tmp_path / "spares.json"
     west = dict(ac.spare_rows(1)[0], ip="203.0.113.50", host_keys="SHA256:w", instance_id="i-w")
     east = dict(ac.spare_rows(1)[0], ip="198.51.100.7", host_keys="SHA256:e", instance_id="i-e")
-    launch.record_spares([west], path, "us-west-2")
-    launch.record_spares([east], path, "us-east-2")
+    launch.record_spares([west], path, "us-west-2", "nt-agents-2026")
+    launch.record_spares([east], path, "us-east-2", "nt-agents-2026")
     data = json.loads(path.read_text())
     assert data["nt-agents-2026/us-west-2/zab-spare-1"]["ip"] == "203.0.113.50"
     assert data["nt-agents-2026/us-east-2/zab-spare-1"]["ip"] == "198.51.100.7"
@@ -1727,7 +1816,7 @@ def test_main_records_the_spares_it_launched(tmp_path, monkeypatch):
     monkeypatch.setattr(launch, "Ec2", lambda region: ec2)
     monkeypatch.setattr(launch, "wait_for_ssh", lambda ip: True)
     base = ["--roster", str(roster), "--ami", "ami-1", "--security-group-id", "sg-1"]
-    assert launch.main([*base, "--spares", "1"]) == 0
+    assert with_scope(launch.main, [*base, "--spares", "1"]) == 0
     data = json.loads(launch.SPARES_FILE.read_text())
     key = "nt-agents-2026/us-west-2/zab-spare-1"
     assert list(data) == [key] and data[key]["host_keys"].startswith("SHA256:")
@@ -1752,7 +1841,9 @@ def _launch_main_with(tmp_path, monkeypatch, during):
     monkeypatch.setattr(launch, "Ec2", lambda region: object())
     monkeypatch.setattr(launch, "check_security_group", lambda ec2, sg, **kw: None)
     monkeypatch.setattr(launch, "SPARES_FILE", tmp_path / "out" / "spares.json")
-    rc = launch.main(["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-1"])
+    rc = with_scope(
+        launch.main, ["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-1"]
+    )
     return rc, path
 
 
@@ -1864,7 +1955,7 @@ def test_teardown_keeps_protected_vms_and_their_addresses():
     protect.protect(ec2, TAG, only=["alice"], log=quiet)
     ec2.calls.clear()
     log: list[str] = []
-    assert teardown.teardown(ec2, TAG, yes=True, log=log.append) == 0
+    assert teardown.teardown(ec2, TAG, region="us-west-2", yes=True, log=log.append) == 0
     assert [c for c in ec2.calls if c[0] == "terminate"] == [("terminate", ["i-0003"])]
     assert list(ec2.addresses) == ["eipalloc-0002"]  # alice's address stays with her VM
     assert ec2.instances["i-0001"]["State"]["Name"] == "running"
@@ -1879,28 +1970,53 @@ def test_strict_teardown_fails_on_a_vm_still_protected():
     protect.protect(ec2, TAG, only=["alice"], log=quiet)
     ec2.calls.clear()
     log: list[str] = []
-    assert teardown.teardown(ec2, TAG, yes=True, strict=True, log=log.append) == 1
+    assert (
+        teardown.teardown(ec2, TAG, region="us-west-2", yes=True, strict=True, log=log.append) == 1
+    )
     assert [c for c in ec2.calls if c[0] == "terminate"] == [("terminate", ["i-0003"])]
     assert list(ec2.addresses) == ["eipalloc-0002"]
     assert ec2.instances["i-0001"]["State"]["Name"] == "running"
     refused = [line for line in log if line.startswith("refused i-0001 ws-alice (participant")]
     assert refused and "--strict: every VM selected must go" in refused[0]
     ec2.calls.clear()  # alone: nothing else to do, and still a failure
-    assert teardown.teardown(ec2, TAG, only=["alice"], yes=True, strict=True, log=quiet) == 1
+    assert (
+        teardown.teardown(
+            ec2, TAG, region="us-west-2", only=["alice"], yes=True, strict=True, log=quiet
+        )
+        == 1
+    )
     assert not any(c[0] in ("terminate", "release_address") for c in ec2.calls)
     # its dry run lists it `keep`, and passes: the plan shows it
-    assert teardown.teardown(ec2, TAG, only=["alice"], dry_run=True, strict=True, log=quiet) == 0
+    assert (
+        teardown.teardown(
+            ec2, TAG, region="us-west-2", only=["alice"], dry_run=True, strict=True, log=quiet
+        )
+        == 0
+    )
     protect.protect(ec2, TAG, only=["alice"], off=True, log=quiet)
-    assert teardown.teardown(ec2, TAG, only=["alice"], yes=True, strict=True, log=quiet) == 0
+    assert (
+        teardown.teardown(
+            ec2, TAG, region="us-west-2", only=["alice"], yes=True, strict=True, log=quiet
+        )
+        == 0
+    )
     assert ec2.instances["i-0001"]["State"]["Name"] == "shutting-down" and not ec2.addresses
-    assert teardown.teardown(ec2, TAG, only=["alice"], yes=True, strict=True, log=quiet) == 0
+    assert (
+        teardown.teardown(
+            ec2, TAG, region="us-west-2", only=["alice"], yes=True, strict=True, log=quiet
+        )
+        == 0
+    )
 
 
 def test_teardown_with_only_protected_vms_changes_nothing():
     ec2 = populated()
     protect.protect(ec2, TAG, log=quiet)
     ec2.calls.clear()
-    assert teardown.teardown(ec2, TAG, confirm=lambda q: pytest.fail(q), log=quiet) == 0
+    assert (
+        teardown.teardown(ec2, TAG, region="us-west-2", confirm=lambda q: pytest.fail(q), log=quiet)
+        == 0
+    )
     assert not any(c[0] in ("terminate", "release_address") for c in ec2.calls)
 
 
@@ -1944,7 +2060,12 @@ def test_teardown_never_selects_what_has_no_participant_tag():
         ec2.associate_address(on_alice, "i-0001")
         ec2.calls.clear()
         log: list[str] = []
-        assert teardown.teardown(ec2, TAG, dry_run=dry_run, yes=True, log=log.append) == 0
+        assert (
+            teardown.teardown(
+                ec2, TAG, region="us-west-2", dry_run=dry_run, yes=True, log=log.append
+            )
+            == 0
+        )
         lines = log[0].splitlines()
         assert lines[:6] == [
             "skip i-0005 zab-admin: no participant tag (not a participant's VM or a spare)",
@@ -1979,7 +2100,10 @@ def test_a_zab_admin_tag_wins_over_a_participant_tag_in_teardown_and_protect():
         ec2 = populated()
         server, server_ip = add_server(ec2, {**SERVER_TAGS, "participant": "alice"})
         log: list[str] = []
-        assert teardown.teardown(ec2, TAG, only=only, yes=True, log=log.append) == 0
+        assert (
+            teardown.teardown(ec2, TAG, region="us-west-2", only=only, yes=True, log=log.append)
+            == 0
+        )
         lines = log[0].splitlines()
         assert f"skip {server} zab-admin: tagged zab-admin (not a participant's VM or a spare)" in (
             lines
@@ -1999,8 +2123,12 @@ def test_a_zab_admin_tag_wins_over_a_participant_tag_in_teardown_and_protect():
 
 def test_a_zab_admin_tag_wins_over_a_participant_tag_in_launch():
     ec2 = FakeEc2()
-    server, server_ip = add_server(ec2, {**SERVER_TAGS, **launch.participant_tags("alice")})
-    free = ec2.allocate_address(ac.tag_list({**launch.participant_tags("alice"), "zab-admin": "x"}))
+    server, server_ip = add_server(
+        ec2, {**SERVER_TAGS, **launch.participant_tags("alice", FLEET_SCOPE)}
+    )
+    free = ec2.allocate_address(
+        ac.tag_list({**launch.participant_tags("alice", FLEET_SCOPE), "zab-admin": "x"})
+    )
     ec2.calls.clear()
     out = launch.launch([fresh_row()], ec2, opts(), log=quiet, ssh_ready=lambda ip: True)
     kinds = [c[0] for c in ec2.calls]
@@ -2017,7 +2145,7 @@ def test_a_failed_lookup_is_one_line_in_teardown_and_protect():
             raise RuntimeError("ExpiredToken: the token expired\nRequest ID: 1")
 
     for run in (
-        lambda log: teardown.teardown(Down(), TAG, yes=True, log=log),
+        lambda log: teardown.teardown(Down(), TAG, region="us-west-2", yes=True, log=log),
         lambda log: protect.protect(Down(), TAG, log=log),
     ):
         log: list[str] = []
@@ -2029,7 +2157,9 @@ def test_teardown_with_only_the_server_in_scope_changes_nothing():
     ec2 = FakeEc2()
     add_server(ec2)
     log: list[str] = []
-    rc = teardown.teardown(ec2, TAG, confirm=lambda q: pytest.fail(q), log=log.append)
+    rc = teardown.teardown(
+        ec2, TAG, region="us-west-2", confirm=lambda q: pytest.fail(q), log=log.append
+    )
     assert rc == 0 and log[0].startswith("skip i-0001 zab-admin")
     assert not any(c[0] in ("terminate", "release_address") for c in ec2.calls)
 
@@ -2040,11 +2170,14 @@ def test_teardown_keeps_an_address_attached_to_an_instance_it_does_not_terminate
     it; in another VPC, AWS would refuse it partway through the list."""
     ec2 = populated()
     server, _ = add_server(ec2)
-    stray = ec2.allocate_address(ac.tag_list(launch.participant_tags("alice")))
+    stray = ec2.allocate_address(ac.tag_list(launch.participant_tags("alice", FLEET_SCOPE)))
     ec2.associate_address(stray, server)
     ec2.calls.clear()
     log: list[str] = []
-    assert teardown.teardown(ec2, TAG, only=["alice"], yes=True, log=log.append) == 0
+    assert (
+        teardown.teardown(ec2, TAG, region="us-west-2", only=["alice"], yes=True, log=log.append)
+        == 0
+    )
     want = f"skip {stray} 203.0.113.7: attached to {server}, which this run does not terminate"
     assert want in log[0].splitlines()
     assert [c for c in ec2.calls if c[0] == "terminate"] == [("terminate", ["i-0001"])]
@@ -2056,11 +2189,14 @@ def test_teardown_keeps_an_address_associated_with_a_network_interface_alone():
     """Associated with an interface that has no instance, an address has an `AssociationId` and
     no `InstanceId` (the `Address` shape): it is not free, and is never released."""
     ec2 = populated()
-    eni = ec2.allocate_address(ac.tag_list(launch.participant_tags("alice")))
+    eni = ec2.allocate_address(ac.tag_list(launch.participant_tags("alice", FLEET_SCOPE)))
     ec2.addresses[eni].update(AssociationId="eipassoc-1", NetworkInterfaceId="eni-1")
     ec2.calls.clear()
     log: list[str] = []
-    assert teardown.teardown(ec2, TAG, only=["alice"], yes=True, log=log.append) == 0
+    assert (
+        teardown.teardown(ec2, TAG, region="us-west-2", only=["alice"], yes=True, log=log.append)
+        == 0
+    )
     want = f"skip {eni} 203.0.113.5: attached to eni-1, which this run does not terminate"
     assert want in log[0].splitlines()
     assert [c[1] for c in ec2.calls if c[0] == "release_address"] == ["eipalloc-0002"]
@@ -2070,11 +2206,11 @@ def test_teardown_keeps_an_address_associated_with_a_network_interface_alone():
 def test_teardown_only_is_repeatable_and_looks_up_each_slug():
     ec2 = populated()
     add_server(ec2)
-    spare = ac.tag_list(launch.participant_tags("zab-spare-1"))
+    spare = ac.tag_list(launch.participant_tags("zab-spare-1", FLEET_SCOPE))
     iid = ec2.run_instance(TagSpecifications=[{"ResourceType": "instance", "Tags": spare}])
     ec2.calls.clear()
     only = ["alice", "zab-spare-1", "alice"]
-    assert teardown.teardown(ec2, TAG, only=only, yes=True, log=quiet) == 0
+    assert teardown.teardown(ec2, TAG, region="us-west-2", only=only, yes=True, log=quiet) == 0
     lookups = [c[1] for c in ec2.calls if c[0] in ("find_instances", "find_addresses")]
     scope = {"workshop": "nt-agents-2026"}
     by_slug = [{**scope, "participant": "alice"}, {**scope, "participant": "zab-spare-1"}]
@@ -2087,9 +2223,9 @@ def test_teardown_main_takes_only_repeatedly(monkeypatch):
     seen: dict = {}
     monkeypatch.setattr(teardown, "Ec2", lambda region: object())
     monkeypatch.setattr(teardown, "teardown", lambda ec2, tag, **kw: seen.update(kw) or 0)
-    assert teardown.main(["--only", "alice", "--only", "zab-spare-1", "--dry-run"]) == 0
+    assert with_scope(teardown.main, ["--only", "alice", "--only", "zab-spare-1", "--dry-run"]) == 0
     assert seen["only"] == ["alice", "zab-spare-1"] and seen["dry_run"] is True
-    assert teardown.main([]) == 0 and seen["only"] == []  # no --only: the whole scope
+    assert with_scope(teardown.main, []) == 0 and seen["only"] == []  # no --only: the whole scope
 
 
 def test_protect_never_touches_an_instance_without_a_participant_tag():
@@ -2154,11 +2290,11 @@ def test_main_refuses_an_unknown_only_before_any_aws_call(tmp_path, monkeypatch,
 
     monkeypatch.setattr(launch, "Ec2", no_aws)
     for extra in (["--only", "alice", "--only", "carol"], ["--only", "zab-spare-1"]):
-        assert launch.main([*base, *extra]) == 1
+        assert with_scope(launch.main, [*base, *extra]) == 1
         assert "no such roster row or spare" in capsys.readouterr().err
     target = tmp_path / "state" / "spares.json"
     argv = [*base, "--dry-run", "--spares", "1", "--spares-file", str(target)]
-    assert launch.main([*argv, "--only", "alice", "--only", "zab-spare-1"]) == 0
+    assert with_scope(launch.main, [*argv, "--only", "alice", "--only", "zab-spare-1"]) == 0
     out = capsys.readouterr().out
     assert "ws-alice" in out and "ws-zab-spare-1" in out and "ws-bob-2" not in out
     assert not target.exists() and path.read_text() == ROSTER  # a dry run writes nothing
@@ -2171,7 +2307,7 @@ def test_main_records_spares_in_the_spares_file_given(tmp_path, monkeypatch, cap
     monkeypatch.setattr(launch, "wait_for_ssh", lambda ip: True)
     target = tmp_path / "state" / "spares.json"
     base = ["--roster", str(roster), "--ami", "ami-1", "--security-group-id", "sg-1"]
-    assert launch.main([*base, "--spares", "1", "--spares-file", str(target)]) == 0
+    assert with_scope(launch.main, [*base, "--spares", "1", "--spares-file", str(target)]) == 0
     assert list(json.loads(target.read_text())) == ["nt-agents-2026/us-west-2/zab-spare-1"]
     assert oct(target.stat().st_mode & 0o777) == "0o600"
     assert not launch.SPARES_FILE.exists()
@@ -2199,9 +2335,19 @@ def test_teardown_clears_the_ip_of_the_rows_whose_address_it_released(tmp_path):
     ec2.attributes["i-0001"][0] = True  # alice's VM is protected: kept, with its address
     log: list[str] = []
     scope = ("workshop", "nt-agents-2026")
-    assert teardown.teardown(ec2, scope, dry_run=True, roster=str(path), log=log.append) == 0
+    assert (
+        teardown.teardown(
+            ec2, scope, region="us-west-2", dry_run=True, roster=str(path), log=log.append
+        )
+        == 0
+    )
     assert path.read_text() == ADDRESSED
-    assert teardown.teardown(ec2, scope, yes=True, roster=str(path), log=log.append) == 0
+    assert (
+        teardown.teardown(
+            ec2, scope, region="us-west-2", yes=True, roster=str(path), log=log.append
+        )
+        == 0
+    )
     rows = {r["slug"]: r for r in ac.read_roster(str(path))}
     assert [rows[s]["ip"] for s in ("alice", "bob-2", "carol")] == ["203.0.113.2", "",
                                                                      "198.51.100.9"]  # fmt: skip
@@ -2215,7 +2361,7 @@ def test_teardown_says_which_rows_to_clear_when_the_roster_doesnt_read(tmp_path)
     path.write_text(ADDRESSED + "alice,again@example.org,,,,\n")  # a duplicate slug
     log: list[str] = []
     rc = teardown.teardown(populated(), ("workshop", "nt-agents-2026"), only="bob-2", yes=True,
-                           roster=str(path), log=log.append)  # fmt: skip
+                           region="us-west-2", roster=str(path), log=log.append)  # fmt: skip
     assert rc == 1 and any("clear by hand the ip of its rows at 203.0.113.4" in s for s in log)
 
 
@@ -2256,7 +2402,8 @@ def test_teardown_clears_only_the_addresses_it_released(tmp_path, ec2_kw):
     clock, log = Clock(), []
     scope = ("workshop", "nt-agents-2026")
     rc = teardown.teardown(Refusing(**ec2_kw), scope, yes=True, roster=str(path),
-                           log=log.append, sleep=clock.sleep, clock=clock)  # fmt: skip
+                           region="us-west-2", log=log.append, sleep=clock.sleep,
+                           clock=clock)  # fmt: skip
     rows = {r["slug"]: r for r in ac.read_roster(str(path))}
     assert rc == 1 and (rows["alice"]["ip"], rows["bob-2"]["ip"]) == ("", "203.0.113.4"), log
 
@@ -2285,7 +2432,7 @@ def test_a_row_at_an_existing_spares_address_is_reported_not_cleared():
     his row alone; a spare launched in this run clears nothing of his."""
     ec2 = FakeEc2()
     iid = existing_instance(ec2, "zab-spare-1")
-    aid = ec2.allocate_address(ac.tag_list(launch.participant_tags("zab-spare-1")))
+    aid = ec2.allocate_address(ac.tag_list(launch.participant_tags("zab-spare-1", FLEET_SCOPE)))
     ip = ec2.associate_address(aid, iid)
     bob = {"slug": "bob", "email": "b@example.org", "host": "ws-bob", "ip": ip,
            "host_keys": "SHA256:spare1"}  # fmt: skip
@@ -2366,7 +2513,10 @@ def test_a_launch_keeps_an_address_written_meanwhile_on_the_row_it_cleared(tmp_p
     monkeypatch.setattr(launch, "Ec2", lambda region: object())
     monkeypatch.setattr(launch, "check_security_group", lambda ec2, sg, **kw: None)
     assert (
-        launch.main(["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-1"]) == 0
+        with_scope(
+            launch.main, ["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-1"]
+        )
+        == 0
     )
     rows = {r["slug"]: r for r in ac.read_roster(str(path))}
     assert (rows["zab-test-a"]["ip"], rows["zab-test-r"]["ip"]) == (
@@ -2381,7 +2531,7 @@ def test_a_launch_unsticks_a_roster_where_two_rows_have_one_address():
     dry run clear nothing, since neither learns from EC2 where the address is."""
     ec2 = FakeEc2()
     iid = existing_instance(ec2, "zab-test-r")
-    aid = ec2.allocate_address(ac.tag_list(launch.participant_tags("zab-test-r")))
+    aid = ec2.allocate_address(ac.tag_list(launch.participant_tags("zab-test-r", FLEET_SCOPE)))
     ip = ec2.associate_address(aid, iid)
 
     def stuck():
@@ -2443,7 +2593,12 @@ def test_teardown_drops_the_spares_json_entries_at_the_addresses_it_released(tmp
     }
     path = spares_file(tmp_path, entries)
     scope, log = ("workshop", "nt-agents-2026"), []
-    assert teardown.teardown(ec2, scope, dry_run=True, spares_file=path, log=log.append) == 0
+    assert (
+        teardown.teardown(
+            ec2, scope, region="us-west-2", dry_run=True, spares_file=path, log=log.append
+        )
+        == 0
+    )
     assert json.loads(open(path).read()) == entries
     rc = teardown.teardown(ec2, scope, yes=True, spares_file=path, region="us-west-2",
                            log=log.append)  # fmt: skip
@@ -2462,7 +2617,8 @@ def test_teardown_drops_only_the_spares_whose_address_it_released(tmp_path, ec2_
                f"{W2}/zab-spare-2": {"name": "zab-spare-2", "ip": "203.0.113.2"}}  # fmt: skip
     path, clock = spares_file(tmp_path, entries), Clock()
     rc = teardown.teardown(Refusing(**ec2_kw), ("workshop", "nt-agents-2026"), yes=True,
-                           spares_file=path, log=quiet, sleep=clock.sleep, clock=clock)  # fmt: skip
+                           region="us-west-2", spares_file=path, log=quiet, sleep=clock.sleep,
+                           clock=clock)  # fmt: skip
     assert rc == 1 and sorted(json.loads(open(path).read())) == [f"{W2}/zab-spare-1"]
 
 
@@ -2474,7 +2630,7 @@ def test_a_spares_file_teardown_cant_read_is_named_and_fails_the_run(tmp_path):
     assert not teardown.forget_spares(str(bad), {"203.0.113.4"}, f"{W2}/", log.append)
     assert "remove by hand its entries at 203.0.113.4" in log[0] and bad.read_text() == "{"
     rc = teardown.teardown(populated(), ("workshop", "nt-agents-2026"), yes=True,
-                           spares_file=str(bad), log=quiet)  # fmt: skip
+                           region="us-west-2", spares_file=str(bad), log=quiet)  # fmt: skip
     assert rc == 1
 
 
@@ -2483,7 +2639,7 @@ def test_teardown_takes_the_spares_file_on_its_command_line(tmp_path, monkeypatc
     monkeypatch.setattr(teardown, "Ec2", lambda region: "ec2")
     monkeypatch.setattr(teardown, "teardown", lambda ec2, tag, **kw: seen.update(kw) or 0)
     argv = ["--tag", "workshop=x", "--region", "us-east-2", "--spares-file", "s.json", "--yes"]
-    assert teardown.main(argv) == 0
+    assert with_scope(teardown.main, argv) == 0
     assert (seen["spares_file"], seen["region"]) == ("s.json", "us-east-2")
 
 
@@ -2500,18 +2656,18 @@ def test_record_spares_keeps_the_same_instances_fields_and_drops_a_stale_entry(t
     }))  # fmt: skip
     one = dict(ac.spare_rows(1)[0], ip="203.0.113.5", instance_id="i-1", host_keys="")
     log: list[str] = []
-    launch.record_spares([one], path, "us-west-2", log=log.append)
+    launch.record_spares([one], path, "us-west-2", "nt-agents-2026", log=log.append)
     entry = json.loads(path.read_text())[f"{W2}/zab-spare-1"]
     assert (entry["adopted_by"], entry["note"], entry["host_keys"]) == ("alice", "kept", "SHA256:a")
     # zab-spare-3, launched now, at zab-spare-2's address, released with its VM: that one goes
     three = dict(ac.spare_rows(3)[2], ip="203.0.113.6", instance_id="i-3", host_keys="SHA256:c")
-    launch.record_spares([three], path, "us-west-2", log=log.append)
+    launch.record_spares([three], path, "us-west-2", "nt-agents-2026", log=log.append)
     data = json.loads(path.read_text())
     assert f"{W2}/zab-spare-2" not in data and data[f"{W2}/zab-spare-3"]["ip"] == "203.0.113.6"
     assert "nt-agents-2026/us-east-2/zab-spare-2" in data  # another region: never the same
     assert log == [f"spares.json: {W2}/zab-spare-2 dropped: its address 203.0.113.6 is "
                    f"{W2}/zab-spare-3's now"]  # fmt: skip
     one["instance_id"] = "i-9"  # a replacement: none of the old instance's fields
-    launch.record_spares([one], path, "us-west-2", log=log.append)
+    launch.record_spares([one], path, "us-west-2", "nt-agents-2026", log=log.append)
     entry = json.loads(path.read_text())[f"{W2}/zab-spare-1"]
     assert "adopted_by" not in entry and "note" not in entry and entry["host_keys"] == ""

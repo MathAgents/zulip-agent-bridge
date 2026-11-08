@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from e2e.harness.config import CHECKOUT, RigConfig
-from e2e.harness.vm import Result
+from e2e.harness.vm import Result, connect_line
 
 Local = Callable[[list[str], dict[str, str], float], Result]
 
@@ -79,3 +79,19 @@ def failure(result: Result, slug: str) -> str:
         tail = (result.stderr or result.stdout).strip().splitlines()[-1:] or [""]
         said = tail[0]
     return f"exit {result.returncode}: {said[:600]}"
+
+
+def connect_failed(result: Result, slug: str, host: str) -> str:
+    """The failure of `slug`'s row when push_config failed only at an SSH connect to `host`
+    that never reached the VM: one failure, `<step>: ssh: connect to host <host> port 22:
+    Connection timed out` (or refused, or no route; `vm.connect_line`), notes aside. Else "".
+    push_config may then simply run again, as after any failed step: the admin scripts are
+    idempotent (workshop/admin/README.md; #690)."""
+    if result.ok:
+        return ""
+    cell = failures(result.stdout, slug)
+    said = [f for f in cell.split("; ") if f and not f.startswith("note: ")]
+    if len(said) != 1:
+        return ""
+    step, sep, line = said[0].partition(": ")
+    return said[0] if sep and step and connect_line(line, host) else ""

@@ -77,6 +77,7 @@ class Capabilities:
     rename: bool  # supports rename() (Codex: yes)
     fork: bool = False  # supports fork_session(); opt in only after native verification
     side_question: bool = False  # supports side_question() (`!btw`, #716); likewise
+    stop_subagents: bool = False  # supports stop_subagents() (`!stop` with no turn, #847)
 
 
 @dataclass(slots=True, kw_only=True)
@@ -116,6 +117,14 @@ class SessionSpec:
     # "": the backend sets nothing and removes an inherited ZAB_BOT. The core passes it on
     # every spec (create, open and fork), like git_identity.
     bot: str = ""
+    # Issue #655: the zab session's id (`sessions.id`). Backends set it as ZAB_SESSION in every
+    # process the agent's tools run in, next to ZAB_BOT, so that `zab job` knows which session
+    # started a background job (§5.6, §7.14). "": the backend sets nothing and removes an
+    # inherited ZAB_SESSION. The core chooses the id before create_session, fork_session and
+    # an !attach's open_session, so that the first turn has it, and passes it on every spec
+    # (create, attach, reopen, recovery and fork). Like ZAB_BOT it grants nothing: the bridge
+    # checks a job's session itself (§7.14).
+    session: str = ""
 
 
 @dataclass(slots=True, kw_only=True)
@@ -512,6 +521,23 @@ class Backend(Protocol):
 
     async def interrupt(self, session_id: str) -> None: ...
 
+    async def stop_subagents(self, native_id: str) -> SubagentStop:
+        """`!stop` with no turn of the session running (#847, SPEC §7.7): stop the sub-agents
+        its ended turns left running, and say how many it stopped, and whether one it can't
+        find may still run (`SubagentStop.unseen`): one it can't see, or a look that failed in
+        part after it stopped some. 0 with `unseen` is not "none ran".
+
+        Called only when capabilities.stop_subagents is true. The session may be open without
+        its native thread loaded: nothing is loaded, resumed or started for this, and nothing
+        but those sub-agents is stopped. Raise TurnElsewhere, stopping nothing, when a turn
+        the core doesn't drive runs on the session (a terminal client's, §8.6): its
+        sub-agents are that turn's. When a step failed (a read, a lookup, a stop), one may
+        still run: raise BackendUnavailable if none was stopped, and else report those stopped
+        with `unseen`, so that the core never says none or all ran. Older backends keep
+        stop_subagents=False; core must not call an absent hook.
+        """
+        raise NotImplementedError("This backend has no sub-agents to stop")
+
     async def respond(self, request_id: str, decision: ApprovalDecision) -> None: ...
 
     async def update_settings(self, session_id: str, settings: SessionSettings) -> SessionSettings:
@@ -568,6 +594,21 @@ class SteerRejected(Exception):
 
 class BackendUnavailable(Exception):
     """Raised by any Backend method while the backend is down (§7.1, §7.8.3)."""
+
+
+@dataclass(frozen=True, slots=True)
+class SubagentStop:
+    """What stop_subagents() did (#847): how many sub-agents it stopped, and `unseen`: one may
+    run that the backend never saw start, such as one started before the bridge's last
+    restart, which it can't find for certain, so its absence is unknown."""
+
+    stopped: int
+    unseen: bool = False
+
+
+class TurnElsewhere(Exception):
+    """Raised by stop_subagents() (#847): a turn the core doesn't drive, such as a terminal
+    client's (§8.6), runs on the session's native thread, so nothing was stopped."""
 
 
 class SessionRefused(Exception):

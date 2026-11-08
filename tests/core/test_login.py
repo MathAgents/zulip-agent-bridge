@@ -295,6 +295,7 @@ async def test_slow_status_check_is_cancelled_without_losing_reply(bridge, monke
     assert (
         list(fake.messages.values())[-1]["content"]
         == "Bridge running · git: Test Bot <test-bot@example.zulipchat.com>"
+        " · without a mention: `all`"  # the VM's rule (#878)
     )
 
 

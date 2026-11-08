@@ -67,9 +67,11 @@ def restart_limits(vm) -> tuple[float, float]:
     """(bound, target) of scenario 3's restart, in seconds, from the installed unit (#305): the
     watchdog fires at most `WatchdogSec` after the bridge's last ping, the frozen bridge can't
     act on its SIGABRT, so systemd waits out `TimeoutAbortSec` (`TimeoutStopSec` unless the unit
-    sets it) before the SIGKILL, then `RestartSec`, then the bridge starts (`STARTUP_S`): about
-    395 s for the shipped unit. The target, recorded but never a failure, is `WatchdogSec`."""
-    spans = vm.unit_spans("WatchdogUSec", "TimeoutAbortUSec", "RestartUSec")
+    sets it) before the SIGKILL, then the next restart's delay, then the bridge starts
+    (`STARTUP_S`): about 395 s for the shipped unit. The delay is `RestartUSecNext`: `RestartSec`,
+    or more once earlier automatic restarts in this boot made it back off (#806). The target,
+    recorded but never a failure, is `WatchdogSec`."""
+    spans = vm.unit_spans("WatchdogUSec", "TimeoutAbortUSec", "RestartUSecNext")
     assert 0 < spans["WatchdogUSec"] < float("inf"), f"no watchdog on the bridge's unit: {spans}"
     assert max(spans.values()) < float("inf"), f"an unbounded span: {spans}"
     return sum(spans.values()) + STARTUP_S, spans["WatchdogUSec"]

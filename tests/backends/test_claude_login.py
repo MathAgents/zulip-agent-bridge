@@ -141,10 +141,14 @@ def test_url_extraction_and_failure_reason():
         "Login failed: Request failed with status code 400"
     )
     # #661: redacted before the cut at 200, which a token crossing it would survive in part.
-    # (The line is one line, `Login failed…`: a zuliprc `key=` line cannot be in it.)
     token = "ghp_" + "Z9y8X7w6" * 4 + "V5u4"
     reason = cl._failure_reason("Login failed: " + "w" * 180 + " " + token + "\r\n", "")
     assert "ghp_" not in reason and len(reason) <= 200
+    # #666: stripped before it. The match ends at `\r` or `\n` only, so a zuliprc line can
+    # follow U+2028 in it, and U+3000 after the key ends no line: it is whole once stripped.
+    key = "Q7xK" + "a1B2" * 7
+    reason = cl._failure_reason("Login failed\u2028key=" + key + "\u3000\r\n", "")
+    assert reason == "Login failed\u2028[redacted zulip api key]"
     assert cl.clean_code("  `abc#def`\n") == "abc#def"
 
 

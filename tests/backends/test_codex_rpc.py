@@ -81,3 +81,33 @@ async def test_close_clears_socket_for_stdio_reconnect():
     await rpc.send({"method": "initialized"})
     assert json.loads(stdin.write.call_args.args[0]) == {"method": "initialized"}
     socket.send.assert_not_awaited()
+
+
+async def test_close_passes_on_a_cancellation_of_its_caller():
+    """Review of #965: `close()` waits for the reader it cancelled. A cancel of its caller
+    meanwhile (`CodexBackend.close()` cancelling `_run`, which closes the connection on its
+    way out of a lost one) is no reader's end: swallowed, `_run` went on to reconnect, and
+    `CodexBackend.close()` waited for it forever."""
+    rpc = CodexRpc()
+    unwinding = asyncio.Event()
+
+    async def reader():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            unwinding.set()
+            await asyncio.sleep(0.2)  # a reader slow to unwind
+            raise
+
+    rpc.reader = asyncio.create_task(reader())
+    await asyncio.sleep(0)
+    closing = asyncio.create_task(rpc.close())
+    await asyncio.wait_for(unwinding.wait(), 5)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(closing, 5)
+    await asyncio.wait_for(asyncio.gather(rpc.reader, return_exceptions=True), 5)
+    other = CodexRpc()  # the reader's own cancellation still ends a close() normally
+    other.reader = asyncio.create_task(asyncio.sleep(3600))
+    await asyncio.wait_for(other.close(), 5)
+    assert other.reader is None

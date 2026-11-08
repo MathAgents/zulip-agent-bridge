@@ -39,8 +39,9 @@ from zab.admin.fleet import REINSTALL, TOUCH
 from zab.admin.grammar import _GROUPS, LATER, SPECS, Command, Context, Roster, parse
 from zab.admin.planning import STATUS_COLUMNS, Planning, left_out
 from zab.admin.plans import APPLYING, PENDING, PLANNING, REFUSED, Plan, Requirement
-from zab.admin.runner import TIMEOUT, TIMEOUTS, Ran, Runner
+from zab.admin.runner import TIMEOUT, TIMEOUTS, Ran, Runner, roster_wait
 from zab.admin.wakerdown import down_line, down_text, up_text
+from zab.core.session import WAITING
 from zab.waker.service import STARTING
 
 from .botkit import (
@@ -67,7 +68,10 @@ ROSTER = Roster(("alice", "bob", "carol", "dave"), ("zab-spare-1", "zab-spare-2"
 CTX = Context(901, BOT, PRODUCTION, ROSTER)
 UPLOAD = " [roster.csv](/user_uploads/2/ab/xyzXYZ_-12/roster.csv)"
 #: Commands of the participants' own bots, which the runbook names.
-PARTICIPANT = frozenset({"!login", "!tools", "!vm", "!restart", "!restart codex"})
+PARTICIPANT = frozenset(
+    {"!login", "!tools", "!vm", "!restart", "!restart codex", "!session", "!detach"}
+    | {"!unmentioned", "!unmentioned all", "!unmentioned last"}  # #878
+)
 #: A command named by its verb alone, as prose does: `!teardown`, `!roster import`, `!waker on`;
 #: and `!` itself.
 NAMES = frozenset(
@@ -146,6 +150,17 @@ def test_the_runbooks_nothing_to_change_answers_are_the_bots() -> None:
         assert isinstance(parsed, Command) and parsed.text() == found[2], span
 
 
+def test_the_runbook_names_every_command_that_answers_nothing_to_change() -> None:
+    """§2.3's list of the commands that answer `☑` is the verbs whose dry run may say so
+    (`actions.Verb.nothing`), each named, and no other (review of #817, B1)."""
+    from zab.admin.actions import VERBS
+
+    found = re.search(r"Only (`!roster sync`[^\n]*?) answer this way\.", TEXT)
+    assert found, "§2.3's list of the commands that answer ☑"
+    named = set(re.findall(r"`!([a-z -]+?)`", found[1]))
+    assert named == {verb for verb, spec in VERBS.items() if spec.nothing}, named
+
+
 def test_the_doc_has_commands_to_check() -> None:
     assert len([s for s in SPANS if s.startswith("!")]) > 100
 
@@ -175,16 +190,17 @@ def test_the_rules_the_runbook_states_are_the_bots() -> None:
     `!protect` (§5.4) and the plans that make a row's sync forgotten (§5.1)."""
     assert PHRASE_ABOVE_HALF == {"stop", "rollout", "idle-stop", "uninstall"}
     assert "| `!stop`, `!rollout`, `!idle-stop` or `!uninstall` of more than half the" in TEXT
-    assert DESTRUCTIVE_VERBS == {"teardown", "deactivate-bots", "retire"}
+    assert DESTRUCTIVE_VERBS == {"teardown", "deactivate-bots", "retire", "month-end schedule"}
     assert (
-        "| `!retire`, `!teardown` or `!deactivate-bots` | 2 different people, or 1 global admin |"
-        in TEXT
+        "| `!retire`, `!teardown`, `!deactivate-bots` or `!month-end schedule` | 2 different "
+        "people, or 1 global admin |" in TEXT
     )
     assert (TIMEOUT, TIMEOUTS) == (900, {"launch": 3600} | dict.fromkeys(
-        ("rollout", "final-sync", "export", "teardown"), 1800))  # fmt: skip
+        ("rollout", "final-sync", "export", "teardown", "upgrade-server"), 1800))  # fmt: skip
     assert (
         "The limits are 60 minutes for `!launch`; 30 minutes for `!rollout`, `!final-sync`, "
-        "`!export` and `!teardown`; for `!retire`, 60 minutes, or 20 minutes a row above three, "
+        "`!export`, `!teardown` and a deployer's `!upgrade-server`; for `!retire`, 60 minutes, "
+        "or 20 minutes a row above three, "
         "and 55 minutes more a row with `export` (§5.3); 15 minutes for anything else." in TEXT
     )
     from zab.admin.actions import EXPORT_ROW_S, RETIRE_FLOOR_S, RETIRE_ROW_S
@@ -591,6 +607,12 @@ def retired_line() -> str:
     return left_out(replace(FLEET, retired={"alice": "P-50 at 2026-10-29 14:02 UTC"}))
 
 
+def roster_waits() -> list[str]:
+    """§2.3: a roster plan that waits for another workshop's (#646)."""
+    plan = SimpleNamespace(name="P-41", workshop="harvard-2026")
+    return [roster_wait(plan, [SimpleNamespace(name="P-40", workshop="zab-test")])]
+
+
 def vms_stale(rendered: list[str]) -> str:
     """§5.5: a `!retire` gone STALE because a row's VM appeared (#559), in the bot's own frame
     (P-42's STALE, from the conversation) with `Runner._diff`'s words."""
@@ -657,7 +679,8 @@ async def test_the_bots_answers_are_quoted_whole_both_ways(run_site, tmp_path_fa
         assert frame in SPANS and frame.replace("<script>", "aws/power.py") in rendered, frame
     must = [*answers, *expected, header, plan_line, *approvals, *reasons, *plans, *endings, *framed,
             *await results(), *guard(rendered), ends_stale(rendered), STARTING, *waker_down(),
-            *retire_results(), vms_stale(rendered), retired_line()]  # fmt: skip
+            *retire_results(), vms_stale(rendered), retired_line(), *roster_waits(),
+            WAITING]  # fmt: skip
     unquoted = [x for x in must if quoted(x) is None]
     assert not unquoted, "rendered by the product, not quoted whole by the runbook:\n" + "\n".join(
         unquoted

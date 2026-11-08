@@ -287,11 +287,12 @@ async def test_a_three_vm_rollout_fits_inline(site):
     assert all("zulip_agent_bridge-0.2.4-py3-none-any.whl; " in line for line in vms)
     # 453 characters a VM since the tools list's two files and step (#475), 488 since the sage
     # wrapper's (#482), 545 since the shared Mathlib's default, which the dry run shows as on a
-    # new VM (#704), 562 since every row's idle-stop probe (review of #705); no row has the
-    # waker here, so none has the idle-stop default's install
+    # new VM (#704), 562 since every row's idle-stop probe (review of #705), 588 since the apt
+    # source's repair (#947); no row has the waker here, so none has the idle-stop default's
+    # install
     assert all("scp lean-project; lean-project + shared Mathlib; lean check; " in x for x in vms)
     assert all(line.endswith("; idle-stop probe; staging removed; hold released") for line in vms)
-    assert max(len(line) for line in dry) < 580 and len(dry) < 20
+    assert max(len(line) for line in dry) < 600 and len(dry) < 20
     assert fenced_after(text, "**Status**")[1:] == [
         f"{s}  active, sign-in pending  0.2.3  15 min     0" for s in slugs
     ]

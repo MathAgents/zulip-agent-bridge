@@ -88,6 +88,9 @@ SCRUBBED_ENV = (
 #: Always removed too: they mark a nested Claude Code session (set when zab itself runs inside
 #: one, as the dev tools do) and would make the child believe it is nested.
 NESTING_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
+#: zab's own, set from the spec or removed, never inherited from the bridge: the session's bot
+#: for `zab history` (issue #248) and its id for `zab job` (issue #655; SPEC §5.6).
+ZAB_ENV = ("ZAB_BOT", "ZAB_SESSION")
 #: Who the agent's commits are made as (issue #214, SPEC §5.5): set for a session with a
 #: `git_identity`, removed otherwise so that the user's own git config applies.
 GIT_IDENTITY_ENV = (
@@ -388,6 +391,7 @@ def turn_env(
     connectors: bool = False,
     git_identity: GitIdentity | None = None,
     bot: str = "",
+    session: str = "",
 ) -> dict[str, str]:
     """The environment of a turn: credential and provider variables removed (§9.1), the
     nested-session markers removed (`nested_ok` is kept for callers and has no effect: the
@@ -406,17 +410,20 @@ def turn_env(
     are removed too, so the user's git config applies.
 
     `bot` (issue #248) becomes `ZAB_BOT`, so that `zab history` in the turn reads as this
-    session's bot; without one an inherited `ZAB_BOT` is removed.
+    session's bot; without one an inherited `ZAB_BOT` is removed. `session` (issue #655) becomes
+    `ZAB_SESSION` the same way, so that `zab job` knows the session that started a job (§5.6).
     """
     del nested_ok
     env = dict(os.environ if base is None else base)
-    for name in (*SCRUBBED_ENV, *NESTING_ENV, *GIT_IDENTITY_ENV, "CLAUDE_CONFIG_DIR", "ZAB_BOT"):
+    for name in (*SCRUBBED_ENV, *NESTING_ENV, *GIT_IDENTITY_ENV, "CLAUDE_CONFIG_DIR", *ZAB_ENV):
         env.pop(name, None)
     if git_identity is not None:
         env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = git_identity.name
         env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = git_identity.email
     if bot:
         env["ZAB_BOT"] = bot
+    if session:
+        env["ZAB_SESSION"] = session
     if not is_default_config_dir(config_dir):
         env["CLAUDE_CONFIG_DIR"] = config_dir
     if not connectors:
@@ -534,8 +541,10 @@ def new_turn_id(session_id: str) -> str:
 
 def shorten(text: str, limit: int = 120) -> str:
     """One line, at most `limit` characters, for titles and previews (§9.4). Redacted first:
-    one line, or a cut, defeats the whole-line zuliprc rule (§11.6; review of #658)."""
-    text = " ".join(redact_secrets(str(text).replace("\x00", "")).split())
+    one line, or a cut, defeats the whole-line zuliprc rule (§11.6; review of #658). And again
+    once its blanks are single spaces, which can make a zuliprc line (`key=<32>` and U+3000,
+    or `key` U+3000 `=` …) or a `ZULIP_API_KEY =` that the first pass didn't see (#666)."""
+    text = redact_secrets(" ".join(redact_secrets(str(text).replace("\x00", "")).split()))
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
@@ -703,6 +712,38 @@ _STDERR_TAIL = 100
 #: loop starts; then it is closed, and the CLI still runs whatever it has read (`StreamInput`).
 STEER_IDLE_CLOSE_S = 30.0
 
+#: How long stdin stays open after a `result` while only a background sub-agent keeps the turn
+#: going (#660). Then it is closed, and the CLI's own wait applies: in 2.1.283's bundle, `-p`
+#: waits for a background sub-agent once stdin is closed, at most 10 minutes of idle time
+#: (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`, default 600000), and then stops it. So a sub-agent
+#: that never ends holds the turn about 20 minutes at most, or until `!stop`.
+SUBAGENT_IDLE_CLOSE_S = 600.0
+
+#: The background task types the CLI waits for at the end of a `-p` run instead of stopping
+#: them: a sub-agent of the Agent tool with `run_in_background` (seen live, DECISIONS, the
+#: 2026-10-25 row of #653's VERIFY a), and a workflow, which 2.1.283's print loop waits for
+#: alike (DECISIONS, 2026-11-05). A background `local_bash` command is stopped about 5 s after
+#: stdin closes, so it keeps nothing open.
+WAITED_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
+
+
+def waited_tasks(obj: Mapping[str, Any]) -> set[str]:
+    """The ids of the background sub-agents a `background_tasks_changed` lists as running.
+
+    The object lists every live background task after the change (REPLACE semantics: its
+    schema in 2.1.283's bundle), each with a `task_type`; a task marked `ambient` is no
+    activity. Should a later version list ended tasks with a status, only running ones count.
+    """
+    tasks = obj.get("tasks")
+    return {
+        str(task.get("task_id"))
+        for task in (tasks if isinstance(tasks, list) else [])
+        if isinstance(task, Mapping)
+        and task.get("task_type") in WAITED_TASK_TYPES
+        and not task.get("ambient")
+        and task.get("status") in (None, "running", "pending")
+    }
+
 
 def user_line(text: str, uid: str) -> bytes:
     """One `--input-format stream-json` line: a user message with zab's uuid, which the CLI keeps
@@ -727,22 +768,43 @@ class StreamInput:
     further loop that ends with its own `result` (DECISIONS, the `steer_*` fixtures).
 
     So at each `result`, stdin is closed once every line written has been echoed (or is listed in
-    the result's `user_message_uuids`): no further loop is coming and the CLI exits as it does
-    without steering. Otherwise stdin stays open for the next `result`. If no further loop starts
-    within `idle_close_s` of a `result` that left a line unechoed, stdin is closed anyway; the
-    CLI still runs what it has read, then exits. After the close, `send` raises `SteerRejected`
-    and the core holds the message for the next turn (§7.3).
+    the result's `user_message_uuids`) and no background sub-agent runs: no further loop is
+    coming and the CLI exits as it does without steering. Otherwise stdin stays open for the
+    next `result`. If no further loop starts within `idle_close_s` of a `result` that left a
+    line unechoed, stdin is closed anyway; the CLI still runs what it has read, then exits.
+    After the close, `send` raises `SteerRejected` and the core holds the message for the next
+    turn (§7.3).
+
+    A background sub-agent (`waited_tasks`) outlives the `result` of the loop that started it:
+    the CLI waits for it, and its notification starts a further loop with its own `result`
+    (#660; DECISIONS, #653's VERIFY a). Until then stdin stays open, so that a message is taken
+    in by a loop of its own instead of being held until the sub-agent ends. When the CLI no
+    longer lists one after a `result`, its notification's loop is due, within `idle_close_s`.
+    While only a sub-agent keeps stdin open, it closes `subagent_idle_close_s` after the last
+    `result`, whatever other task-list updates come meanwhile, and the CLI's own wait for the
+    sub-agent applies (`SUBAGENT_IDLE_CLOSE_S`).
     """
 
-    def __init__(self, prompt: str, *, idle_close_s: float | None = None) -> None:
+    def __init__(
+        self,
+        prompt: str,
+        *,
+        idle_close_s: float | None = None,
+        subagent_idle_close_s: float | None = None,
+    ) -> None:
         self.prompt = prompt
         self.prompt_uuid = str(uuid.uuid4())
         self.idle_close_s = STEER_IDLE_CLOSE_S if idle_close_s is None else idle_close_s
+        self.subagent_idle_close_s = (
+            SUBAGENT_IDLE_CLOSE_S if subagent_idle_close_s is None else subagent_idle_close_s
+        )
         self.pending: set[str] = {self.prompt_uuid}  # written, not echoed yet
         self.steers: list[str] = []  # the steers written, in order
         # each steer's uuid -> the core's client_id: the parser reports its echo (#654)
         self.client_ids: dict[str, str] = {}
+        self.agents: set[str] = set()  # the background sub-agents running (`waited_tasks`)
         self.closed = False
+        self._after_result = False  # a `result` came, and no further loop has started since
         self._writer: asyncio.StreamWriter | None = None
         self._timer: asyncio.TimerHandle | None = None
 
@@ -791,25 +853,58 @@ class StreamInput:
         kind = obj.get("type")
         if kind == "user" and obj.get("isReplay"):
             self.pending.discard(str(obj.get("uuid")))
+            self._after_result = False
             self._disarm()
         elif kind == "system" and obj.get("subtype") == "init":
+            self._after_result = False
             self._disarm()  # a further loop has started
+        elif (
+            kind == "system"
+            and obj.get("subtype") == "background_tasks_changed"
+            and not obj.get("parent_tool_use_id")  # as `StreamParser` reads it
+        ):
+            ran, self.agents = self.agents, waited_tasks(obj)
+            if self._after_result and ran and not self.agents:
+                # the last sub-agent ended while the model was idle: its notification's loop is
+                # due, so the wait shortens to `idle_close_s` (never lengthens: Codex on #814)
+                self._arm(self.idle_close_s, shorten_only=True)
         elif kind == "result":
             listed = obj.get("user_message_uuids")
             for uid in listed if isinstance(listed, list) else []:
                 self.pending.discard(str(uid))
-            if not self.pending:
+            self._after_result = True
+            if not self.pending and not self.agents:
                 self.close()
-            elif not self.closed and self._timer is None:
-                self._timer = asyncio.get_running_loop().call_later(self.idle_close_s, self._idle)
+            else:
+                self._arm(self.subagent_idle_close_s if self.agents else self.idle_close_s)
+
+    def _arm(self, delay: float, *, shorten_only: bool = False) -> None:
+        """Close stdin `delay` seconds from now, unless a further loop starts first. The deadline
+        is set at a `result`; any other task-list update may only bring it nearer, so that
+        updates about other tasks never hold stdin open past it (Codex on #814)."""
+        if self.closed:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + delay
+        if shorten_only and self._timer is not None and self._timer.when() <= deadline:
+            return
+        self._disarm()
+        self._timer = loop.call_at(deadline, self._idle)
 
     def _idle(self) -> None:
         self._timer = None
-        log.warning(
-            "claude: no further loop %.0f s after a result, %d line(s) unechoed; closing stdin",
-            self.idle_close_s,
-            len(self.pending),
-        )
+        if self.agents:
+            log.warning(
+                "claude: a background sub-agent still runs %.0f s after a result, with no "
+                "further loop; closing stdin",
+                self.subagent_idle_close_s,
+            )
+        else:
+            log.warning(
+                "claude: no further loop %.0f s after a result, %d line(s) unechoed; closing stdin",
+                self.idle_close_s,
+                len(self.pending),
+            )
         self.close()
 
     def _disarm(self) -> None:
@@ -1219,6 +1314,7 @@ class _Session:
     config_dir: str
     git_identity: GitIdentity | None = None  # the agent's commits (issue #214), from the spec
     bot: str = ""  # ZAB_BOT for `zab history` (issue #248), from the spec
+    session: str = ""  # ZAB_SESSION for `zab job` (issue #655), from the spec
     usage_total: TokenUsage = field(default_factory=TokenUsage)
     plan: dict[str, tuple[str, str]] = field(default_factory=dict)  # carried across turns
     resolved_model: str | None = None  # from the last `system/init` or model check, for display
@@ -1599,6 +1695,7 @@ class ClaudeBackend:
             config_dir=self.config.config_dir(settings.account),
             git_identity=spec.git_identity,
             bot=spec.bot,
+            session=spec.session,
         )
         self._sessions[session.native_id] = session
         return self._info(session)
@@ -1702,6 +1799,7 @@ class ClaudeBackend:
             git_identity=spec.git_identity,  # the fork commits as the agent too (#214)
             fork_from=fork_copy_id(child_id),
             bot=spec.bot,  # and its turns read other topics as this bot (#248)
+            session=spec.session,  # and name the fork's own session to `zab job` (#655)
         )
         self._sessions[child_id] = child
         return self._info(child)
@@ -1752,12 +1850,14 @@ class ClaudeBackend:
                 git_identity=spec.git_identity,
                 fork_from=fork_from,
                 bot=spec.bot,
+                session=spec.session,
             )
             self._sessions[native_id] = session
         else:
             # read at each turn's start, so a running turn keeps the one it began with
             session.git_identity = spec.git_identity
             session.bot = spec.bot
+            session.session = spec.session
             # A live session is kept as it is: a running turn must keep running and be reported
             # (§7.8.1, `!status` during a turn); only an idle one takes the new settings.
             if not session.busy:
@@ -1907,6 +2007,7 @@ class ClaudeBackend:
                     connectors=self.config.claudeai_connectors,
                     git_identity=session.git_identity,
                     bot=session.bot,
+                    session=session.session,
                 )
                 parser.on_answer = release_auth
                 await run_parsed_turn(
@@ -1991,6 +2092,8 @@ class ClaudeBackend:
                 stream_input.close()
                 lost = lost_before + len(stream_input.undelivered)
                 completion[:] = [_with_undelivered_note(ev, lost) for ev in completion]
+                if session.interrupting:
+                    completion[:] = [_stopped_after_result(ev) for ev in completion]
                 for ev in completion:
                     if isinstance(ev, TurnCompleted):
                         session.usage_total = _add_usage(session.usage_total, ev.usage)
@@ -2409,6 +2512,16 @@ def _with_undelivered_note(ev: BackendEvent, lost: int) -> BackendEvent:
     return replace(ev, final_text=((ev.final_text or "").rstrip() + "\n\n" + note).lstrip())
 
 
+def _stopped_after_result(ev: BackendEvent) -> BackendEvent:
+    """A steered turn stopped after one of its `result`s, while its process ran on (a background
+    sub-agent, or a steer's loop, still to come): the turn did not end by itself, so it is
+    `INTERRUPTED`, as a stop before any `result` is (#660). A completion that came after the stop
+    was already made so as it arrived."""
+    if not isinstance(ev, TurnCompleted) or ev.status is not TurnStatus.COMPLETED:
+        return ev
+    return replace(ev, status=TurnStatus.INTERRUPTED, error=None)
+
+
 def _add_usage(total: TokenUsage, turn: TokenUsage | None) -> TokenUsage:
     if turn is None:
         return total
@@ -2578,8 +2691,9 @@ async def _run_capture(
     finally:
         ran.returncode = proc.returncode
     if check and proc.returncode != 0:
-        # redacted before the cut, which can leave too little of a secret for its rule (#661)
-        detail = redact_secrets(err.decode(errors="replace").replace("\x00", "")).strip()[:200]
+        # redacted before the cut, which can leave too little of a secret for its rule (#661),
+        # and after the strip, which can make a zuliprc line whole (#666)
+        detail = redact_secrets(err.decode(errors="replace").replace("\x00", "").strip())[:200]
         raise OSError(f"{' '.join(argv[1:])} exited {proc.returncode}: {detail}")
     return out.decode("utf-8", errors="replace")
 

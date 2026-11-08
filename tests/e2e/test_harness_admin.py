@@ -54,6 +54,43 @@ def test_failures_reads_the_rows_failures_cell(monkeypatch):
     assert admin.failures(printed, "zab") == "" and admin.failures("", "zab-test") == ""
 
 
+HOST = "198.51.100.4"
+TIMED_OUT = f"ssh: connect to host {HOST} port 22: Connection timed out\n"
+
+
+@pytest.mark.parametrize(
+    ("step", "stderr", "again"),
+    [
+        ("ssh", TIMED_OUT, True),  # #690: the owner check, push_config's first connection
+        ("scp config.toml", f"ssh: connect to host {HOST} port 22: Connection refused\r\n"
+         "scp: Connection closed\n", True),
+        ("ssh", f"ssh: connect to host {HOST} port 22: No route to host\n", True),
+        ("ssh", TIMED_OUT.replace(HOST, "203.0.113.9"), False),  # another host
+        ("ssh", f"ubuntu@{HOST}: Permission denied (publickey).\n", False),  # it connected
+        ("ssh", "kex_exchange_identification: read: Connection reset by peer\n", False),  # no host
+        ("ssh", f"Connection to {HOST} closed by remote host.\n", False),  # the command ran
+        ("service install", "Job for zab.service failed.\n", False),
+    ],
+)  # fmt: skip
+def test_a_deploy_that_never_reached_the_vm_is_recognized(monkeypatch, step, stderr, again):
+    """#690: `connect_failed` reads push_config's own row (`_fail`, `render`): one failure, an
+    SSH connect to the VM's address that never got an answer, notes aside."""
+    monkeypatch.syspath_prepend(str(config.CHECKOUT / "workshop" / "admin"))
+    pc = importlib.import_module("push_config")
+    row = pc.VmResult("zab-test", HOST, notes=["keys from the legacy out/Zab-Test/"])
+    pc._fail(row, step, pc.RunResult(255, "", stderr))
+    printed = Result(1, pc.render([row]) + "\n", "\n1 VM(s) failed\n")
+    said = f"{step}: {stderr.splitlines()[0].strip()}"
+    assert admin.connect_failed(printed, "zab-test", HOST) == (said if again else "")
+    if again:  # not that failure beside another, before it or after it (push_config's order)
+        other = "missing codex zuliprc: run zulip_provision.py first"
+        for failures in ([other, said], [said, "agent instructions: exit 1"]):
+            row.failures = failures
+            twice = Result(1, pc.render([row]) + "\n", "")
+            assert admin.connect_failed(twice, "zab-test", HOST) == "", failures
+        assert admin.connect_failed(Result(0, printed.stdout, ""), "zab-test", HOST) == ""
+
+
 def test_a_failed_push_config_says_why_from_its_row(tmp_path, monkeypatch):
     """#517: the error was stderr's last line, `1 VM(s) failed`; now it is the row's failures,
     or the last line of the output when there is no row (a crash, a timeout)."""

@@ -27,6 +27,9 @@ class BridgeConfig:
     auto_clone: bool = False
     allow_public_channels: bool = False
     multi_party: bool = True
+    # Where a channel message that mentions no bot goes (SPEC §4.5, #878): `all` of the VM's
+    # bots, or the `last` ones its topic's newest mention named. The DM `!unmentioned` overrides it.
+    unmentioned: str = "all"
     mention_after_s: int = 120
     status_edit_interval_s: int = 300  # at least 60: Zulip Cloud's guidance (SPEC §4.9, #754)
     max_concurrent_turns: int = 3
@@ -229,6 +232,8 @@ def load_config(path: str | Path | None = None) -> Config:
             fail(f"bridge.{name}", "must not be empty")
     if bridge.default_workspace not in ("shared", "worktree"):
         fail("bridge.default_workspace", "expected shared or worktree")
+    if bridge.unmentioned not in ("all", "last"):
+        fail("bridge.unmentioned", "expected all or last")
     for obj, prefix, names in (
         (bridge, "bridge", ("status_edit_interval_s", "max_concurrent_turns")),
         (render, "render", ("max_upload_mb", "diff_inline_max_lines", "max_text_upload_kb")),

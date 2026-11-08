@@ -1,15 +1,18 @@
-"""The image's wider stack (issue #474): the Macaulay2 PPA, noble's packages, atlas, the
-hash-pinned venv, HomotopyContinuation.jl in the Oscar environment and the first-boot warm-up,
-checked offline against build.sh and the committed files."""
+"""The image's wider stack (issue #474): Macaulay2's pinned packages (#945), noble's packages,
+atlas, the hash-pinned venv, HomotopyContinuation.jl in the Oscar environment and the first-boot
+warm-up, checked offline against build.sh and the committed files."""
 
 from __future__ import annotations
 
 import base64
 import hashlib
 import re
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
+
+import m2_debs
 
 AMI = Path(__file__).resolve().parents[2] / "workshop" / "ami"
 FILES = AMI / "files"
@@ -43,33 +46,55 @@ def armored_key_fingerprint(text: str) -> str:
     return hashlib.sha1(b"\x99" + len(packet).to_bytes(2, "big") + packet).hexdigest().upper()  # noqa: S324
 
 
-def test_the_macaulay2_ppa_is_pinned_by_key_snapshot_and_versions():
-    """Review on #481: a PPA keeps only its newest upload, so the source is Launchpad's snapshot
-    of it at a fixed time; Macaulay2, gfan and msolve are pinned on top; the key file holds the
-    one key (apt trusts every key in it), and its fingerprint is the pinned one."""
+def test_macaulay2_comes_from_the_pinned_packages_of_its_release():
+    """#945: Launchpad's snapshots of the PPA expire, so the five .debs and the source packages
+    they were built from come from a GitHub release, each pinned by its SHA-256 in
+    files/apt/macaulay2-debs.sha256. build.sh checks them again, installs them as files, holds
+    them and keeps the sources, and writes no apt source for the PPA."""
     text = BUILD_SH.read_text()
+    versions = {
+        k: re.search(rf"^{k}=(\S+)", text, re.M).group(1)
+        for k in ("M2_VERSION", "M2_GFAN_VERSION", "M2_MSOLVE_VERSION")
+    }
+    assert versions == {
+        "M2_VERSION": "1.26.06+ds-5~ubuntu24.04.1",
+        "M2_GFAN_VERSION": "0.8~beta-2~ubuntu24.04.1",
+        "M2_MSOLVE_VERSION": "0.9.4-2ppa2~ubuntu24.04.1",
+    }
+    m2, gfan, msolve = versions.values()
+    pinned = m2_debs.read_manifest()
+    assert {n for n in pinned if n.endswith(".deb")} == {
+        f"macaulay2_{m2}_amd64.deb",
+        f"macaulay2-common_{m2}_all.deb",
+        f"gfan_{gfan}_amd64.deb",
+        f"msolve_{msolve}_amd64.deb",
+        f"libmsolve3_{msolve}_amd64.deb",
+    }
+    for deb in (
+        "macaulay2_${M2_VERSION}_amd64.deb",
+        "macaulay2-common_${M2_VERSION}_all.deb",
+        "gfan_${M2_GFAN_VERSION}_amd64.deb",
+        "msolve_${M2_MSOLVE_VERSION}_amd64.deb",
+        "libmsolve3_${M2_MSOLVE_VERSION}_amd64.deb",
+    ):
+        assert f'"{deb}"' in text[text.index("m2_install=(") :], deb
+    assert '$APT install -y --no-install-recommends "${m2_install[@]/#/$m2/}"' in text
+    for source, version in (("macaulay2", m2), ("gfan", gfan), ("msolve", msolve)):
+        assert {f"{source}_{version}.dsc", f"{source}_{version}.debian.tar.xz"} <= set(pinned)
+        assert [n for n in pinned if n.startswith(f"{source}_") and ".orig.tar." in n]
+    assert len(pinned) == 14
+    assert m2_debs.RELEASE == "deps/macaulay2-" + m2.split("~")[0]
+    assert 'sha256sum --check --strict --quiet "$FILES/apt/macaulay2-debs.sha256"' in text
+    assert "sudo apt-mark hold macaulay2 macaulay2-common gfan msolve libmsolve3" in text
+    assert "sudo install -d -m 0755 /usr/src/macaulay2-ppa" in text
+    # no source written (#947's removal of an old one, at the build's end, may name the file)
+    assert "URIs: https://snapshot.ppa" not in text and "tee /etc/apt/sources" not in text
+    assert "M2_VERSION:-" not in text  # not a knob: build_ami.py forwards none
+    assert text.index('[ -z "$M2_DEBS" ]') < text.index("# --- 1. system packages")  # early
+    # the committed key stays, for capturing a new set (m2_debs.py capture)
     key = (FILES / "apt" / "macaulay2-ppa.asc").read_text()
     assert key.count("-----BEGIN PGP PUBLIC KEY BLOCK-----") == 1
-    fpr = re.search(r"^M2_PPA_FPR=([0-9A-F]{40})$", text, re.M).group(1)
-    assert armored_key_fingerprint(key) == fpr
-    assert re.search(r"^M2_PPA_SNAPSHOT=\d{8}T\d{6}Z$", text, re.M)
-    assert re.search(r"^M2_VERSION=1\.26\.06\+ds-2~ubuntu24\.04\.1 ", text, re.M)
-    assert re.search(r"^M2_GFAN_VERSION=0\.8~beta-2~ubuntu24\.04\.1$", text, re.M)
-    assert re.search(r"^M2_MSOLVE_VERSION=0\.9\.4-2ppa2~ubuntu24\.04\.1 ", text, re.M)
-    assert '"macaulay2=$M2_VERSION" "macaulay2-common=$M2_VERSION"' in text
-    assert (
-        '"gfan=$M2_GFAN_VERSION" "msolve=$M2_MSOLVE_VERSION" "libmsolve3=$M2_MSOLVE_VERSION"'
-        in text
-    )
-    uri = "URIs: https://snapshot.ppa.launchpadcontent.net/macaulay2/macaulay2/ubuntu/$M2_PPA_SNAPSHOT"
-    assert uri in text and "URIs: https://ppa.launchpadcontent.net" not in text
-    assert "Signed-By: /etc/apt/keyrings/macaulay2-ppa.asc" in text
-    assert '[ "$(grep -c \'^pub:\' <<<"$keys")" = 1 ]' in text
-    assert "{print $10; exit}" not in text  # no early exit under pipefail (review on #481)
-    assert "M2_VERSION:-" not in text  # not a knob: build_ami.py forwards none
-    assert text.index("macaulay2-ppa.asc") < text.index(
-        'apt_update\n$APT install -y --no-install-recommends "macaulay2'
-    )
+    assert armored_key_fingerprint(key) == m2_debs.KEY_FPR
 
 
 def test_the_wider_apt_stack_is_installed_and_nothing_excluded_is():
@@ -79,12 +104,34 @@ def test_the_wider_apt_stack_is_installed_and_nothing_excluded_is():
         words = m.group(0).split()
         packages |= {w.split("=")[0].strip('"') for w in words[words.index("install") + 1 :]}
     assert {
-        "singular", "polymake", "maxima", "r-base-core", "r-recommended", "r-cran-tidyverse",
-        "r-cran-data.table", "r-cran-rmarkdown", "r-cran-knitr", "r-cran-irkernel", "octave",
-        "graphviz", "gnuplot-nox", "imagemagick", "poppler-utils", "librsvg2-bin", "ghostscript",
-        "z3", "cadical", "pandoc", "4ti2", "lrslib", "nauty", "normaliz", "topcom", "coinor-csdp",
-        "macaulay2", "gfan", "msolve", "bison",
-    } <= packages  # fmt: skip
+        "singular",
+        "polymake",
+        "maxima",
+        "r-base-core",
+        "r-recommended",
+        "r-cran-tidyverse",
+        "r-cran-data.table",
+        "r-cran-rmarkdown",
+        "r-cran-knitr",
+        "r-cran-irkernel",
+        "octave",
+        "graphviz",
+        "gnuplot-nox",
+        "imagemagick",
+        "poppler-utils",
+        "librsvg2-bin",
+        "ghostscript",
+        "z3",
+        "cadical",
+        "pandoc",
+        "4ti2",
+        "lrslib",
+        "nauty",
+        "normaliz",
+        "topcom",
+        "coinor-csdp",
+        "bison",
+    } <= packages  # fmt: skip; Macaulay2, gfan and msolve are .deb files (test above)
     assert not [p for p in packages if EXCLUDED.search(p)]
     assert "wolfram" not in BUILD_SH.read_text().lower()
 
@@ -179,3 +226,86 @@ def test_the_first_boot_warms_the_new_big_trees():
         assert path in ac.WARM_VOLUME
     # Lean first, as before (the first import of Mathlib is what a participant waits for)
     assert ac.WARM_PATHS.index("/opt/lean") < ac.WARM_PATHS.index("/usr/share/Macaulay2")
+
+
+def run_macaulay2_step(tmp_path: Path, tamper: str = "", tarball: bool = False, unlisted: str = ""):
+    """Step 1d under bash, `sudo` and apt recorded, not run, on a small fake set under the pinned
+    names: (exit code, stderr, the sudo and apt command lines)."""
+    text = BUILD_SH.read_text()
+    step = text[text.index("# --- 1d.") : text.index("# --- 2. the participant's user")]
+    versions = dict(re.findall(r"^(M2_\w*VERSION)=(\S+)", step, re.M))
+    m2, gfan = versions["M2_VERSION"], versions["M2_GFAN_VERSION"]
+    msolve = versions["M2_MSOLVE_VERSION"]
+    names = [
+        f"macaulay2_{m2}_amd64.deb", f"macaulay2-common_{m2}_all.deb", f"gfan_{gfan}_amd64.deb",
+        f"msolve_{msolve}_amd64.deb", f"libmsolve3_{msolve}_amd64.deb", f"gfan_{gfan}.dsc",
+    ]  # fmt: skip
+    tmp_path.mkdir()
+    files, debs, calls = tmp_path / "files", tmp_path / "debs", tmp_path / "calls"
+    (files / "apt").mkdir(parents=True)
+    debs.mkdir()
+    for name in names:
+        (debs / name).write_bytes(name.encode())
+    (files / "apt" / "macaulay2-debs.sha256").write_text(
+        "".join(f"{hashlib.sha256(n.encode()).hexdigest()}  {n}\n" for n in names if n != unlisted)
+    )
+    if tamper:
+        (debs / tamper).write_bytes(b"another")
+    source = debs
+    if tarball:
+        source = tmp_path / "m2-debs.tar"
+        tar = ["tar", "-cf", str(source), "-C", str(debs), *names]
+        subprocess.run(tar, check=True)  # noqa: S603 - an argument list
+    stubs = (
+        "set -euo pipefail\n"
+        'log() { echo "==> $*"; }\n'
+        f'sudo() {{ printf "%s\\n" "$*" >> {calls}; }}\n'
+        f'apt_get() {{ printf "apt %s\\n" "$*" >> {calls}; }}\n'
+        f"APT=apt_get\nFILES={files}\nM2_DEBS={source}\n"
+    )
+    run = subprocess.run(  # noqa: S603 - build.sh's own step
+        ["bash", "-c", stubs + step],  # noqa: S607
+        env={"PATH": "/usr/bin:/bin", "TMPDIR": str(tmp_path)},
+        capture_output=True,
+        text=True,
+    )
+    return run.returncode, run.stderr, calls.read_text().splitlines() if calls.exists() else []
+
+
+def test_the_macaulay2_step_installs_the_checked_files_and_keeps_the_sources(tmp_path):
+    for tarball in (False, True):
+        code, err, calls = run_macaulay2_step(tmp_path / str(tarball), tarball=tarball)
+        assert code == 0, err
+        apt = next(c for c in calls if c.startswith("apt install"))
+        assert apt.count(".deb") == 5 and "--no-install-recommends" in apt
+        assert "/macaulay2-common_1.26.06+ds-5~ubuntu24.04.1_all.deb" in apt
+        assert not [c for c in calls if "apt-mark" in c]  # held in step 14, after the smoke test
+        installs = [c for c in calls if c.startswith("install -m 0644")]
+        assert len(installs) == 2  # the one source file, and the manifest as SHA256SUMS
+        assert installs[0].endswith("/gfan_0.8~beta-2~ubuntu24.04.1.dsc /usr/src/macaulay2-ppa/")
+        assert installs[1].endswith("/usr/src/macaulay2-ppa/SHA256SUMS")
+
+
+def test_the_macaulay2_step_stops_on_a_file_that_isnt_the_pinned_one(tmp_path):
+    deb = "gfan_0.8~beta-2~ubuntu24.04.1_amd64.deb"
+    code, err, calls = run_macaulay2_step(tmp_path / "t", tamper=deb)
+    assert code == 1 and "don't match files/apt/macaulay2-debs.sha256" in err
+    assert f"{deb}: FAILED" in err and "build_ami.py" in err
+    assert not [c for c in calls if c.startswith("apt ")]
+
+
+def test_the_macaulay2_step_installs_only_what_the_manifest_lists(tmp_path):
+    """Review of #950: a .deb the install line names but the manifest doesn't (a version bumped
+    in build.sh alone) stops the step: sha256sum --check covers the manifest's lines only."""
+    deb = "libmsolve3_0.9.4-2ppa2~ubuntu24.04.1_amd64.deb"
+    code, err, calls = run_macaulay2_step(tmp_path / "u", unlisted=deb)
+    assert code == 1 and f"{deb} isn't in files/apt/macaulay2-debs.sha256" in err
+    assert not [c for c in calls if c.startswith("apt ")]
+
+
+def test_a_mistyped_pari_data_stops_the_build_early():
+    """Review of #952, N2: a PARI_DATA that names nothing stops the build at its start, rather
+    than the realpath loop emptying it and every package coming from PARI's site."""
+    text = BUILD_SH.read_text()
+    check = 'if [ -n "$PARI_DATA" ] && ! [ -e "$PARI_DATA" ]; then'
+    assert text.index(check) < text.index("for var in ZAB_WHEEL") < text.index("# --- 1. system")

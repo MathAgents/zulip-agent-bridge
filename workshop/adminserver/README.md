@@ -16,6 +16,7 @@ global bot; the waker runs here too.
 | `admin.example.toml` | the model for `/etc/zab-admin/admin.toml` (root 0644); it loads with `zab.admin.config` |
 | `render_policy.py` | not installed: a deployer runs it to make the instance role's policies |
 | `ssh-rule.sh` | not installed: a deployer runs it on their laptop, right before an SSH step, so that the server's port 22 admits their address alone (docs/BOOTSTRAP.md §3.1); `--files-host`, the files host's |
+| `upgrade.py` | not installed: the upgrade driver (#772), which a deployer runs on their machine from the signed copy of the release the server runs, with `python3 -I`; `--setup` once per machine. It reaches no server: it reviews the new release with that copy's `deploy.sh`, signs, verifies and pushes its tag, and makes its copy `~/zab-vN`, from which the server is upgraded (below; `!upgrade-server` once #569 adds it) |
 | `deploy.sh`, `release-paths`, `privileged-paths` | not installed by hand: the deployer runs `deploy.sh` (below), which installs the paths `release-paths` lists, and whose review shows the paths of `privileged-paths` first |
 
 ## Processes
@@ -25,25 +26,31 @@ global bot; the waker runs here too.
 | `zab-admin-bot` | `zab-admin` | `/var/lib/zab-admin`, except `.ssh/` | `/etc/zab-admin/secrets/` (group), the starter's start log (group) | yes |
 | `zab-admin-collector` | `zab-admin` | `console/` and its own `collector/` | the bot's keys, read-only | yes |
 | `zab-admin-config` (#418), a oneshot started by its `.path` unit | root | `/etc/zab-admin` itself (a new workshop's entry in `admin.toml` and `admin.toml.bak`, by renames) and `secrets/bots/` (the bot's key), every other file there read-only and the other secrets hidden (#437); `/var/lib/zab-admin-config`: the request it deletes in `requests/` (zab-admin's 0700 directory, in root's), its outcome `result.json`, and `changes.jsonl` | the request | no: no network |
+| `zab-admin-upgrade-plan` (#569), a oneshot started by its `.path` unit | root | `/var/lib/zab-admin-upgrade` only | of `secrets/`, the release key alone; `/var/lib/zab-admin`, the console's and Caddy's state, `/etc/ssh` and the password hashes are hidden | no: `IPAddressDeny` |
+| `zab-admin-upgrade` (#569), a oneshot started by its `.path` unit | root | what `sudo bash deploy.sh --server` writes, but `/usr`, `/boot` and the home directories | what root reads | as root |
 | `zab-admin-starter` | `zab-starter` | `/var/lib/zab-starter`, its start log in `log/` | nothing under `/var/lib/zab-admin` or `secrets/` | yes |
 | `zab-archive-check@` (#374) | its own per instance (`DynamicUser`) | nothing | nothing under `/etc/zab-admin` or `/var/lib/zab-admin`; only the archive it is handed, read-only | no: no network, no socket (`socket()` and io_uring denied), the shared sockets under `/run` hidden |
 | `zab-console` | `zab-console` | `console/tokens/` (deletes used tokens), `/var/lib/zab-console` | sees only `console/` | no: `IPAddressDeny=any` |
 | `zab-waker` | `zab-waker` | `/var/lib/zab-waker` only, its status file in `status/`; it connects to the starter's socket | sees only `waker/` | no: the rule and `IPAddressDeny` |
 | `caddy` | `caddy` | `/var/lib/caddy` | no zab file | no: the rule and `IPAddressDeny` |
 
-Every unit has the hardening of `workshop/files/zab-files.service` (`ProtectSystem=strict`,
+Every unit but the upgrade's apply helper (below) has the hardening of
+`workshop/files/zab-files.service` (`ProtectSystem=strict`,
 `ProtectHome`, `PrivateTmp`, `NoNewPrivileges`, `UMask=0077`, an empty
 `CapabilityBoundingSet`), checked by `tests/workshop/test_adminserver_units.py`. Two keep one
 capability: `zab-admin-imds` (`CAP_NET_ADMIN`, to load the rule) and Caddy
 (`CAP_NET_BIND_SERVICE`). The config helper keeps two: `CAP_DAC_OVERRIDE`, to read and delete
-the request in `zab-admin`'s 0700 directory, and `CAP_CHOWN`, to give the key its group. The
-units run `/opt/zab-admin/current/.venv/bin/python -I -m zab.admin
-bot|collector|console|starter` and `-m zab.waker run`, from the release tree and venv of
-ADMIN §1.6. The config helper runs
-`/usr/bin/python3 -I -B -S -c …`, the system interpreter the venv is built from, never the
-venv's, so nothing of the venv runs as root. It imports `zab.admin.confighelper` from the
-release's `src/` and the standard library alone, with no site processing, so no `.pth` line
-runs (ADMIN §1.6, #437).
+the request in `zab-admin`'s 0700 directory, and `CAP_CHOWN`, to give the key its group; the
+upgrade's plan helper, `CAP_DAC_OVERRIDE` alone, for its request. The upgrade's apply helper
+runs the release's own `deploy.sh`, as `sudo` over SSH does, so it keeps root's capabilities
+and the units' `NoNewPrivileges`, `PrivateTmp`, `ProtectHome` and `UMask=0077`, with `/usr`
+and `/boot` read-only (`ProtectSystem=true`; ADMIN §1.6). The units run
+`/opt/zab-admin/current/.venv/bin/python -I -m zab.admin bot|collector|console|starter` and
+`-m zab.waker run`, from the release tree and venv of ADMIN §1.6. The config helper and the two
+upgrade helpers run `/usr/bin/python3 -I -B -S -c …`, the system interpreter the venv is built
+from, never the venv's, so nothing of the venv runs as root. Each imports its module
+(`zab.admin.confighelper`, `zab.admin.upgradehelper`) from the release's `src/` and the
+standard library alone, with no site processing, so no `.pth` line runs (ADMIN §1.6, #437).
 
 **The config helper** (ADMIN §2.9, #418) adds a `!new-workshop` entry. The bot writes
 `/var/lib/zab-admin-config/requests/request.json` (the entry as JSON, and the new bot's
@@ -229,6 +236,8 @@ git -C ~/zab worktree add --detach ~/zab-v0.3.0 v0.3.0
 D=~/zab-v0.3.0/workshop/adminserver/deploy.sh
 $D --host <host> --etc ~/zab-admin/etc v0.3.0          # an upgrade
 $D --host <host> --etc ~/zab-admin/etc --wheel v0.3.0  # a fleet wheel
+$D --host <host> --etc ~/zab-admin/etc --expect-diff-sha256 <the review's SHA-256> --with-wheel v0.3.0
+                                                       # both, with one confirmation (#772)
 ```
 
 The bootstrap is `$D --host … --etc … --bootstrap --secrets ~/zab-admin/secrets vX.Y.Z`. The
@@ -292,6 +301,36 @@ commands.
   `vX.Y.ZrcN`; no release older than the running one without `--downgrade`. A branch, a
   lightweight tag and an unsigned one are refused, and so is a tag whose `pyproject.toml` names
   another version. You then type the version to confirm.
+- **Two options of a deploy** (the bootstrap or an upgrade; #772), for a deploy of the release
+  you have just reviewed:
+  - **`--expect-diff-sha256 SHA`,** the SHA-256 the review printed: the deploy refuses, before
+    its prompt, a diff with another one (`this deploy's diff has SHA-256 …, not …, the one you
+    reviewed`). Its diff runs from its base, `--since`'s when given, otherwise the release the
+    server runs: so a review made from another base is refused. Its review is written beside the
+    diff, as always, but not paged again, and the diff is compared before the wheel is built.
+    An empty value is refused, as for every option that takes one.
+  - **`--with-wheel`** builds the release's fleet wheel before the prompt, so that a build that
+    fails stops the deploy before anything changes, and places it after the deploy, as
+    `--wheel` does: one confirmation, `Type vX.Y.Z to deploy it to <host>, which runs …, and
+    place its wheel for !rollout:`. The wheel goes from a payload of its own, never with the
+    bootstrap's `etc/` or secrets. A run that ends before the wheel is placed says why, and
+    prints the `--wheel` command to paste, with this run's paths: the server did not run the
+    release when the run ended (the same deploy, run again, places both, and the command is for
+    a rerun that says the server runs it already), or it is current but its deploy did not
+    finish, or it is deployed and only the wheel's placement failed, or the server did not say
+    what it runs. After an interrupt or a dropped connection, the server half may still be
+    running: a rerun refuses while it does (`another deploy is running`).
+- **`--base-signers FILE`, after a deployer key is replaced** (#587; `docs/BOOTSTRAP.md` §17):
+  FILE holds the retired keys' `allowed_signers` lines. The base, the review's `--since` or the
+  release the server runs, may be signed by one of them or by a key of `--etc`'s
+  `allowed_signers`; the release deployed only by the latter, on the laptop as on the server. A
+  retired key may have leaked, and a base it signed could hide code from the review, which shows
+  only what changed since the base, and so from what you sign. So the base must be the release
+  the server runs (no other `--since`), at the commit its own record names
+  (`/opt/zab-admin/deploys.jsonl`): the review checks it before it shows anything, and so takes
+  `--host` too, and the deploy again, which also requires `--expect-diff-sha256`, the diff you
+  reviewed. Without `--base-signers`, a review still takes no host. A bootstrap and `--wheel`
+  refuse it: they have no base.
 - **The install,** by root through sudo. Root first copies the payload into its own 0700
   directory, refusing anything but plain files, and removes the secrets from the SSH user's
   staging area. Its git repository reads no configuration of root's, and after the fetch
@@ -380,12 +419,12 @@ commands.
   alone (the same wheel, byte for byte, as from the whole tree). A `hatch.toml`, or a
   `pyproject.toml` that configures the build beyond hatchling's backend and the wheel's
   packages (a hook, `backend-path`, a dynamic field, `[tool.uv]`), is refused, and `uv build`
-  runs with `--no-sources`: no code of the tree runs on the laptop (#436; `python3` 3.11 or
+  runs with `--no-sources`: no code of the tree runs on the laptop (#436; `python3` 3.12 or
   newer checks it). The wheel is
   placed in `/var/lib/zab-admin/releases/wheels/` for `!rollout`, zab-admin 0640: once root has
   checked its SHA-256, `zab-admin` writes and renames it, since root never works by name in a
   directory another user owns. A version's wheel is never replaced. deploy.sh notes when your
-  uv is not 0.11.24, the version VERIFY V9 was checked with.
+  uv is not 0.13.7, the version VERIFY V9 was checked with.
 - **uv on the server** is reinstalled whenever its pinned version or tarball hash changes.
 - **The self-check** (the server half must be the tag's own `deploy.sh`, byte for byte)
   protects against running the wrong copy, not against a compromised deployer account: by then
@@ -400,7 +439,8 @@ The tests (`tests/workshop/test_adminserver_deploy.py`) run both halves offline:
 throwaway keys, a local package index, a fake `ssh` set by `ZAB_DEPLOY_SSH`, and
 `ZAB_DEPLOY_PREFIX`, which roots every server path in a temporary directory and only logs the
 steps that need root (apt, systemd, chown). The server half refuses that variable as root. Under
-it, `ZAB_DEPLOY_SYSTEMCTL` may name a stub for the restarts. On the server the payload goes to
+it, `ZAB_DEPLOY_SYSTEMCTL` may name a stub for the restarts, and `ZAB_DEPLOY_IMDS` one that
+says whether the IMDS rule is loaded (it fails when not), which every build checks first. On the server the payload goes to
 `/tmp/zab-deploy.XXXXXXXXXX` (under the prefix in the tests), and the laptop sends `rm` only for
 a name of exactly that form.
 

@@ -1,0 +1,9 @@
+# certbot for IP address certificates, in its own venv /opt/certbot (build.sh step 11c;
+# DECISIONS, 2026-10-05). Compiled, with hashes, into certbot-requirements.txt, which build.sh
+# installs with --require-hashes:
+#   cd workshop/ami/files && uv pip compile -q --python-version 3.12 \
+#     --exclude-newer 2026-10-06T00:00:00Z --exclude-newer-package certifi=2026-10-24T00:00:00Z \
+#     --generate-hashes certbot-requirements.in -o certbot-requirements.txt
+# certifi has a later cutoff than the rest, for 2026.10.23, whose cacert.pem has no emSign ECC
+# Root CA - G3 (#671). Move certifi with uv.lock's (tests/workshop/test_trust_stores.py).
+certbot==5.8.0
