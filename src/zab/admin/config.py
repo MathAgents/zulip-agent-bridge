@@ -66,13 +66,20 @@ _SECURITY_GROUP = re.compile(r"sg-[0-9a-f]{8,17}", re.ASCII)
 _INSTANCE_TYPE = re.compile(r"[a-z][a-z0-9-]*\.[a-z0-9]+", re.ASCII)
 _KEY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", re.ASCII)
 _EMAIL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}@[A-Za-z0-9.-]{1,253}", re.ASCII)
-#: `release_repo` (#569): where `!upgrade-server`'s helper fetches the signed tags, with its
-#: deploy key. GitHub over SSH only, since the helper pins GitHub's host keys.
+#: `release_repo` (#569, #959): where `!upgrade-server`'s helper fetches the signed tags, from
+#: GitHub alone: over SSH with the server's deploy key, GitHub's host keys pinned
+#: (`git@github.com:OWNER/REPO.git`), or a public repository over HTTPS, anonymously, with no
+#: key (`https://github.com/OWNER/REPO.git`). Either way the tags are verified against
+#: allowed_signers. No user, password, token, port or other host passes, and a refusal never
+#: quotes the value (`_Table.unquoted`): it could hold a credential.
 RELEASE_REPO = re.compile(
-    r"git@github\.com:[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+    r"(?:git@github\.com:|https://github\.com/)[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
     r"/[A-Za-z0-9_][A-Za-z0-9._-]{0,99}\.git",
     re.ASCII,
 )
+#: The anonymous form's start: the helper fetches such a `release_repo` over HTTPS, keyless.
+RELEASE_REPO_HTTPS = "https://github.com/"
+RELEASE_REPO_FORMS = "git@github.com:OWNER/REPO.git or https://github.com/OWNER/REPO.git"
 #: `gifts_step` (#709): one line, no control characters, neither starting with whitespace or `-`
 #: nor ending with whitespace, at most `GIFTS_STEP_BYTES` in UTF-8; zulip_provision.py's rule.
 _NOT_TEXT = r"\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff"
@@ -212,6 +219,19 @@ class _Table:
             raise self.fail(key, f"expected a value matching {pattern.pattern}")
         return value
 
+    def unquoted(self, key: str, pattern: re.Pattern[str], expected: str, default: str) -> str:
+        """`text`, for a value that could hold a credential (a URL's user or token, #959): its
+        refusal, whatever the value's type, never quotes it, since the refusal reaches the
+        bot's journal, the plan's outcome and Zulip (#950's lesson)."""
+        self.used.add(key)
+        value = self.data.get(key, default)
+        if not isinstance(value, str) or (value != default and not pattern.fullmatch(value)):
+            raise AdminConfigError(
+                f"{self.prefix}{key}: expected {expected} (the value is not shown: it could hold "
+                "a credential)"
+            )
+        return value
+
     def integer(self, key: str, lo: int, hi: int, default: Any = _MISSING) -> int:
         value = self.get(key, int, default)
         if not lo <= value <= hi:
@@ -291,7 +311,7 @@ def _config(top: _Table, roots: Roots) -> AdminConfig:
         release=release,
         release_pattern=re.compile(RELEASE_PATTERNS[release], re.ASCII),
         console_url=top.text("console_url", _HTTPS, ""),
-        release_repo=top.text("release_repo", RELEASE_REPO, ""),
+        release_repo=top.unquoted("release_repo", RELEASE_REPO, RELEASE_REPO_FORMS, ""),
         global_bot=global_bot,
         workshops=tuple(
             _workshop(top.table(f"workshop[{i}]", entry), roots, scope)

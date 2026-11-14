@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import threading
 from pathlib import Path
@@ -136,6 +137,7 @@ async def test_help_explains_sel_only_where_a_listed_verb_takes_it(site, server)
         "!help": True,
         "!help status": True,
         "!help start": True,  # `!start SEL|spares`
+        "!help trust-fix": True,  # `!trust-fix SEL` (#992)
         "!help roster": False,  # `!roster show [slug]`, `!roster import, …`
         "!help adopt-spare": False,
         "!help version": False,
@@ -145,6 +147,7 @@ async def test_help_explains_sel_only_where_a_listed_verb_takes_it(site, server)
         said = replies(site, HARVARD)[-1]
         assert said.startswith("**harvard-2026's bot** takes:"), (text, said)
         assert (sel in said) is explained and ("SEL" in said) is explained, (text, said)
+        assert ("`!trust-fix SEL`" in said) is (text in ("!help", "!help trust-fix")), said
     await harvard.on_message(incoming(OLGA, "!help", stream=None, to=(HARVARD,), mid=5200))
     said = replies(site, HARVARD)[-1]  # a DM's verbs: `!help`, `!console`
     assert "`!console`" in said and "`!status SEL`" not in said and "SEL" not in said
@@ -1233,11 +1236,12 @@ def test_the_selfcheck_runs_the_config_helpers_command(tmp_path):
     interpreter under -I -B -S. A helper that imports from the venv fails it, as do a release
     without that unit and a unit that runs the venv's interpreter, which zab-build made (review
     of #438). It writes nothing into the tree."""
-    from zab.admin.__main__ import HELPER_PYTHON, HELPER_UNIT, check_helper
+    from zab.admin.__main__ import HELPER_PYTHON, HELPER_UNIT, HELPERS, check_helper
 
     assert check_helper(checks.release_root()) == []
     release = tmp_path / "release"
-    assert check_helper(release) == [f"{HELPER_UNIT}: No such file or directory"]
+    missing = [f"{unit}: No such file or directory" for unit in HELPERS]
+    assert check_helper(release) == missing  # the upgrade helpers' units too (#896)
     unit = release / HELPER_UNIT
     unit.parent.mkdir(parents=True)
     unit.write_bytes((checks.release_root() / HELPER_UNIT).read_bytes())
@@ -1246,15 +1250,56 @@ def test_the_selfcheck_runs_the_config_helpers_command(tmp_path):
     for init in (package.parent / "__init__.py", package / "__init__.py"):
         init.write_text("")
     (package / "confighelper.py").write_text("import httpx\n\ndef main():\n    return 0\n")
-    (problem,) = check_helper(release)
+    (problem, *others) = check_helper(release)
     assert problem.startswith("the config helper's command exited 1: ModuleNotFoundError")
+    assert others == missing[1:]
     assert not list(release.rglob("__pycache__"))
     assert HELPER_PYTHON == "/usr/bin/python3"
     text = unit.read_text().replace(
         f"={HELPER_PYTHON} ", "=/opt/zab-admin/current/.venv/bin/python "
     )
     unit.write_text(text)
-    assert check_helper(release) == [f"{HELPER_UNIT}: not one ExecStart of /usr/bin/python3"]
+    assert check_helper(release)[0] == f"{HELPER_UNIT}: not one ExecStart of /usr/bin/python3"
+
+
+def test_the_selfcheck_runs_the_upgrade_helpers_commands(tmp_path):
+    """Review of #893, N4 (#896): the plan helper's command and the apply helper's, as their
+    units give them, from the release, so that a release that breaks the in-band upgrade fails
+    before the switch. Each call names its action, which reads no command line: the check asks
+    for help in the call, and nothing else runs. An upgradehelper that imports from the venv
+    fails both, as does one whose `main` exits 0 without its usage, as a plan with no request
+    would (review of #982, N2); and a unit that calls another action fails its own."""
+    from zab.admin.__main__ import HELPERS, check_helper
+
+    release = tmp_path / "release"
+    shutil.copytree(checks.release_root() / "src" / "zab", release / "src" / "zab",
+                    ignore=shutil.ignore_patterns("__pycache__"))  # fmt: skip
+    for unit in HELPERS:
+        (release / unit).parent.mkdir(parents=True, exist_ok=True)
+        (release / unit).write_bytes((checks.release_root() / unit).read_bytes())
+    assert check_helper(release) == []
+    helper = release / "src" / "zab" / "admin" / "upgradehelper.py"
+    code = helper.read_text()
+    future = "from __future__ import annotations\n"
+    helper.write_text(code.replace(future, future + "import httpx\n", 1))
+    assert [p.split(": ModuleNotFoundError")[0] for p in check_helper(release)] == [
+        "the plan helper's command exited 1",
+        "the apply helper's command exited 1",
+    ]
+    helper.write_text(
+        code + "\n\ndef main(argv=None):  # no help: it runs, and finds nothing\n    return 0\n"
+    )
+    assert check_helper(release) == [
+        "the plan helper's command exited 0: ",
+        "the apply helper's command exited 0: ",
+    ]
+    helper.write_text(code)
+    plan = release / "workshop" / "adminserver" / "zab-admin-upgrade-plan.service"
+    plan.write_text(plan.read_text().replace("main(['plan'])", "main(['apply'])"))
+    assert check_helper(release) == [
+        f"{plan.relative_to(release)}: its command doesn't end with sys.exit(main(['plan']))"
+    ]
+    assert not list(release.rglob("__pycache__"))
 
 
 async def test_bot_check_runs_the_startup_checks_alone(site, capsys):

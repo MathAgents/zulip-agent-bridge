@@ -163,6 +163,22 @@ def test_a_retire_waits_for_its_own_deadline():
     assert apply_s(plan("!teardown a")) == 1900.0 and apply_s(plan("!stop a")) == 1000.0
 
 
+def test_a_trust_fix_waits_for_its_own_deadline():
+    """#992: a `!trust-fix`'s apply deadline grows with its targets, which `all` doesn't name,
+    as `actions._build_trust_fix` sets it."""
+    from e2e.admin.harness.chat import POST_MARGIN_S, apply_s
+    from e2e.admin.harness.chat import Plan as Posted
+    from zab.admin.actions import TRUST_FIX_FLOOR_S, TRUST_FIX_ROW_S
+
+    def plan(n):
+        targets = [f"r{i}" for i in range(n)]
+        return Posted("P-1", "w", "!trust-fix all", "!approve P-1 3f9a2c", "3f9a2c", "",
+                      targets=targets)  # fmt: skip
+
+    assert apply_s(plan(2)) == TRUST_FIX_FLOOR_S + POST_MARGIN_S
+    assert apply_s(plan(41)) == 41 * TRUST_FIX_ROW_S + POST_MARGIN_S > TRUST_FIX_FLOOR_S
+
+
 async def test_request_approve_and_result():
     plan_text = rendered("!stop zab-test-b", Requirement("change")).text
     approval, _ = planning.approval_message(42, DIGEST, Requirement("change"), "!stop zab-test-b")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import sqlite3
@@ -16,6 +17,7 @@ import pytest
 from zab.core.store import Store
 
 NOW = 1_800_000_000.0
+MONO = 500_000.0  # the monotonic clock's now, in seconds (`ActiveEnterTimestampMonotonic`)
 ME = os.getuid()  # stands for ubuntu where its keys are read
 
 
@@ -30,6 +32,11 @@ class FakeRun:
         codex: str | None = "",
         poweroff: int = 0,
         warm: str = "inactive\nactive\n",
+        jobs: str | None = "",
+        job_since: dict[str, float] | None = None,
+        show_fails: bool = False,
+        job_caps: dict[str, str] | None = None,
+        job_states: dict[str, str] | None = None,
     ):
         self.calls: list[tuple[list[str], dict]] = []
         self.who = who
@@ -37,6 +44,12 @@ class FakeRun:
         self.codex = codex  # active units' list-units lines; None: systemctl fails
         self.poweroff = poweroff
         self.warm = warm  # `systemctl is-active` of the warm-up's unit and cloud-final (#715)
+        self.jobs = jobs  # active `zab-job-*` units' list-units lines (#655); None: it fails
+        #: when each unit became active, monotonic seconds (default: 10 minutes ago)
+        self.job_since = job_since or {}
+        self.show_fails = show_fails
+        self.job_caps = job_caps or {}  # `RuntimeMaxUSec` as systemctl shows it (default 12h)
+        self.job_states = job_states or {}  # `ActiveState` (default active)
 
     def __call__(self, argv, **kwargs):
         self.calls.append((list(argv), kwargs))
@@ -50,6 +63,21 @@ class FakeRun:
             if self.codex is None:
                 return subprocess.CompletedProcess(argv, 1, "", "Failed to connect to bus")
             return subprocess.CompletedProcess(argv, 0, self.codex, "")
+        if argv == idle.JOBS_ACTIVE:
+            if self.jobs is None:
+                return subprocess.CompletedProcess(argv, 1, "", "Failed to connect to bus")
+            return subprocess.CompletedProcess(argv, 0, self.jobs, "")
+        if argv[: len(idle.JOBS_SHOW)] == idle.JOBS_SHOW:
+            if self.show_fails:
+                return subprocess.CompletedProcess(argv, 1, "", "Failed to connect to bus")
+            out = "\n".join(  # systemd's order, the cap before `Id` (Codex on #924)
+                f"RuntimeMaxUSec={self.job_caps.get(unit, '12h')}\nId={unit}\n"
+                f"ActiveState={self.job_states.get(unit, 'active')}\n"
+                f"ActiveEnterTimestampMonotonic="
+                f"{int(self.job_since.get(unit, MONO - 600) * 1e6)}\n"
+                for unit in argv[len(idle.JOBS_SHOW) :]
+            )
+            return subprocess.CompletedProcess(argv, 0, out, "")
         if argv == idle.POWEROFF:
             return subprocess.CompletedProcess(argv, self.poweroff, "", "")
         raise AssertionError(f"unexpected command {argv}")
@@ -135,6 +163,9 @@ def test_an_idle_vm_has_no_reason_to_stay_up():
         ({"uptime": None}, "uptime unknown"),
         ({"load5": None}, "load unknown"),
         ({"running_turns": None}, "running turns unknown"),
+        ({"running_jobs": 1}, "1 background job running"),
+        ({"running_jobs": 3}, "3 background jobs running"),
+        ({"running_jobs": None}, "background jobs unknown"),
         ({"errors": ["logins (who exited 1)"]}, "cannot read logins (who exited 1)"),
     ],
 )
@@ -296,9 +327,13 @@ def test_a_child_that_times_out_keeps_the_vm_up(tmp_path, proc, db):
 
 
 def gather(tmp_path, proc, db, run, **kw):
-    """`idle.gather` as a non-root user, with the login and hold files under tmp_path."""
+    """`idle.gather` as a non-root user, with the login, hold and jobs files under tmp_path."""
     kw.setdefault("login", str(tmp_path / "login"))
     kw.setdefault("hold", str(tmp_path / "hold"))
+    kw.setdefault("jobs_unknown", str(tmp_path / "jobs-unknown"))
+    kw.setdefault("monotonic", MONO)
+    kw.setdefault("config", str(tmp_path / "config.toml"))
+    kw.setdefault("job_seen", str(tmp_path / "job-seen"))
     return idle.gather(str(db), run, proc=str(proc), now=NOW, euid=1000, **kw)
 
 
@@ -336,6 +371,10 @@ def test_who_lines_are_logins():
 
 def run_main(tmp_path, proc, db, run, *extra, minutes="15", **kwargs):
     kwargs.setdefault("read_home", str(tmp_path / "no-read-user"))
+    kwargs.setdefault("jobs_unknown", str(tmp_path / "jobs-unknown"))
+    kwargs.setdefault("monotonic", MONO)
+    kwargs.setdefault("config", str(tmp_path / "config.toml"))
+    kwargs.setdefault("job_seen", str(tmp_path / "job-seen"))
     return idle.main(
         ["--minutes", minutes, "--db", str(db), *extra],
         run=run,
@@ -703,6 +742,348 @@ def test_a_systemctl_that_cant_run_holds_while_the_marker_is_missing(tmp_path, p
     got = gather(tmp_path, proc, db, run, warm=str(tmp_path / "none"))
     assert got.warming is None
     assert "the first boot's volume warm-up unknown" in idle.hold_reasons(got, 10, 0.5)
+
+
+# ------------------------------------------------------------- background jobs (#655)
+
+#: `systemctl --user list-units --plain --no-legend` lines of two running jobs (`zab job
+#: start`'s transient units, SPEC §7.14), one of them stopping
+JOB_LINES = (
+    "zab-job-3f9c0a1b2c3d.service loaded active running /home/agent/.local/bin/zab job _exec\n"
+    "zab-job-00aa11bb22cc.service loaded deactivating stop-post zab job _exec 00aa11bb22cc\n"
+)
+
+
+def test_the_jobs_query_lists_agents_active_job_units():
+    """As the Codex units are listed: agent's user manager, every state of a unit that runs,
+    starts or stops (its `ExecStopPost` writes how it ended), plain lines."""
+    assert idle.JOBS_ACTIVE[:4] == ["systemctl", "--user", "--machine=agent@", "list-units"]
+    assert idle.JOBS_ACTIVE[-1] == "zab-job-*.service"
+    assert idle.JOBS_ACTIVE[:-1] == idle.CODEX_ACTIVE[:-1]
+    assert "--state=active,activating,deactivating,reloading" in idle.JOBS_ACTIVE
+
+
+@pytest.mark.parametrize(
+    ("lines", "count"),
+    [
+        ("", 0),
+        ("\n", 0),
+        (JOB_LINES, 2),
+        (JOB_LINES + JOB_LINES.splitlines()[0] + "\n", 2),  # a unit listed twice counts once
+        (None, None),  # systemctl failed: unknown, so it holds
+        ("zab-job-x.service loaded active running x\n", 1),  # the id's form is zab job's
+        ("codex-app-server.service loaded active running x\n", None),  # not a job's: unknown
+        ("Failed to list units\n", None),
+    ],
+)
+def test_running_jobs_are_counted_from_their_units(lines, count):
+    got = idle.jobs_running(FakeRun(jobs=lines), MONO)
+    assert got == (None if count is None else (count, []))
+
+
+OLD_UNIT, YOUNG_UNIT = "zab-job-3f9c0a1b2c3d.service", "zab-job-00aa11bb22cc.service"
+
+
+HOURS = 3600
+GRACE = idle.JOB_GRACE_S
+
+
+def test_a_unit_holds_only_within_its_own_cap():
+    """Review rounds 2 and 3 of #924: a job holds the VM while it has been active for less
+    than its own cap (`RuntimeMaxUSec`) and 15 minutes, whatever `[jobs] max_hours` made that
+    cap (up to 168 h); a unit without a cap (made by hand, or a job that lost its
+    `RuntimeMaxSec`) never holds. One not active yet (timestamp 0) holds."""
+    run = FakeRun(jobs=JOB_LINES, job_since={OLD_UNIT: MONO - 13 * HOURS})
+    assert idle.jobs_running(run, MONO) == (
+        1, ["a background job active 13 h, past its cap of 12 h"]
+    )  # fmt: skip
+    show = next(argv for argv, _ in run.calls if argv[: len(idle.JOBS_SHOW)] == idle.JOBS_SHOW)
+    assert show[len(idle.JOBS_SHOW) :] == sorted([OLD_UNIT, YOUNG_UNIT])  # names, no pattern
+    assert "--property=RuntimeMaxUSec" in show
+    short = FakeRun(jobs=JOB_LINES, job_since={OLD_UNIT: MONO - 12 * HOURS - GRACE + 60})
+    assert idle.jobs_running(short, MONO) == (2, [])  # a minute short of cap and grace
+    at = FakeRun(jobs=JOB_LINES, job_since={OLD_UNIT: MONO - 12 * HOURS - GRACE})
+    assert idle.jobs_running(at, MONO)[0] == 1
+    # a 24-hour job (B7 of #923's re-review): 13 h in, it holds
+    day = FakeRun(
+        jobs=JOB_LINES, job_since={OLD_UNIT: MONO - 13 * HOURS}, job_caps={OLD_UNIT: "1d"}
+    )
+    assert idle.jobs_running(day, MONO) == (2, [])
+    loose = FakeRun(jobs=JOB_LINES, job_caps={OLD_UNIT: "infinity"})
+    assert idle.jobs_running(loose, MONO) == (1, ["a background job without a time limit"])
+    # review round 4: only the literal `infinity` is no cap; a cap unread is unknown
+    for cap in ("", "12h garbage", "12 h"):
+        assert idle.jobs_running(FakeRun(jobs=JOB_LINES, job_caps={OLD_UNIT: cap}), MONO) is None
+    # a unit that ended between `list-units` and `show`, which still answers for it (systemd
+    # 255: `ActiveState=inactive`, `RuntimeMaxUSec=infinity`, timestamp 0): ended, no note
+    for state in ("inactive", "failed"):
+        ended = FakeRun(
+            jobs=JOB_LINES, job_states={OLD_UNIT: state}, job_caps={OLD_UNIT: "infinity"}
+        )
+        assert idle.jobs_running(ended, MONO) == (1, [])
+    stopping = FakeRun(jobs=JOB_LINES, job_states={OLD_UNIT: "deactivating"})
+    assert idle.jobs_running(stopping, MONO) == (2, [])  # its ExecStopPost runs: still holds
+    assert idle.jobs_running(FakeRun(jobs=JOB_LINES, job_since={OLD_UNIT: 0}), MONO) == (2, [])
+    assert idle.jobs_running(FakeRun(jobs=JOB_LINES, show_fails=True), MONO) is None
+
+
+#: `systemctl --user show A B --property=Id --property=RuntimeMaxUSec
+#: --property=ActiveEnterTimestampMonotonic` for two `systemd-run --user` sleeps, the first with
+#: `RuntimeMaxSec=600`, as systemd 255 (Ubuntu 24.04, the VMs') printed it, the units renamed:
+#: the cap comes before `Id`, whatever order the properties were asked in (Codex on #924)
+SHOWN = """RuntimeMaxUSec=10min
+Id=zab-job-00aa11bb22cc.service
+ActiveEnterTimestampMonotonic=8783908548919
+
+RuntimeMaxUSec=infinity
+Id=zab-job-3f9c0a1b2c3d.service
+ActiveEnterTimestampMonotonic=8783908810312
+"""
+
+
+def shown_by(text):
+    def run(argv, **kwargs):
+        if argv == idle.JOBS_ACTIVE:
+            return subprocess.CompletedProcess(argv, 0, JOB_LINES, "")
+        return subprocess.CompletedProcess(argv, 0, text, "")
+
+    return run
+
+
+def test_systemds_own_order_gives_each_unit_its_own_cap():
+    """Codex round 1 on #924: reading `Id` first gave the first unit no cap and each later
+    unit the cap of the one before, so a job with a cap could be dropped and an idle VM
+    stopped under it. Each blank-line block is one unit's."""
+    a_minute_in = 8783908548919 / 1e6 + 60
+    expected = (1, ["a background job without a time limit"])
+    assert idle.jobs_running(shown_by(SHOWN), a_minute_in) == expected
+    assert idle.show_blocks(SHOWN)[0] == {
+        "RuntimeMaxUSec": "10min",
+        "Id": "zab-job-00aa11bb22cc.service",
+        "ActiveEnterTimestampMonotonic": "8783908548919",
+    }
+    # 10 min and 15 min of grace later, the capped one holds no more either
+    assert idle.jobs_running(shown_by(SHOWN), a_minute_in - 60 + 25 * 60)[0] == 0
+
+
+@pytest.mark.parametrize(
+    "shown",
+    [
+        SHOWN.replace("RuntimeMaxUSec=infinity\n", ""),  # a block without its cap
+        SHOWN.replace("ActiveEnterTimestampMonotonic=8783908810312\n", ""),
+        SHOWN.replace("Id=zab-job-3f9c0a1b2c3d.service\n", ""),
+        SHOWN.replace("=8783908810312", "=n/a"),
+        SHOWN.split("\n\n")[0],  # a unit missing
+    ],
+)
+def test_a_unit_shown_without_a_field_is_unknown(shown):
+    """Codex round 1 on #924: unknown, which holds the VM within the unknown's own limit."""
+    assert idle.jobs_running(shown_by(shown), 8783909000.0) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [
+        ("12h", 12 * 3600), ("1d 12h", 36 * 3600), ("3min", 180), ("3min 30s", 210),
+        ("1w", 604800), ("500ms", 0.5), ("43200000000", 43200), ("infinity", math.inf),
+        ("", None), ("12 hours", None), ("12h x", None), ("12 h", None), ("12h garbage", None),
+    ],
+)  # fmt: skip
+def test_systemd_time_spans_are_read(text, seconds):
+    assert idle.span_seconds(text) == seconds
+
+
+@pytest.mark.parametrize(
+    ("config", "hours"),
+    [
+        (None, 12.0),
+        ("[jobs]\nmax_hours = 24\n", 24.0),
+        ("[jobs]\nmax_hours = 0.05\n", 0.05),
+        ("[jobs]\nmax_hours = 168\n", 168.0),
+        ("[jobs]\nmax_hours = 169\n", 12.0),  # past the config's bound
+        ("[jobs]\nmax_hours = 0\n", 12.0),
+        ("[jobs]\nmax_hours = true\n", 12.0),
+        ('[jobs]\nmax_hours = "24"\n', 12.0),
+        ("jobs = 3\n", 12.0),
+        ("[jobs\n", 12.0),  # not TOML
+        ("[bridge]\nsteer = true\n", 12.0),
+    ],
+)
+def test_the_jobs_cap_is_read_from_the_bridges_config(tmp_path, config, hours):
+    path = tmp_path / "config.toml"
+    if config is not None:
+        path.write_text(config)
+    assert idle.max_hours(str(path)) == hours
+
+
+def test_an_old_unit_alone_lets_the_vm_power_off_and_says_so(tmp_path, proc, db):
+    add_rows(db, handled=NOW - 3600)
+    old = {OLD_UNIT: MONO - 13 * HOURS, YOUNG_UNIT: MONO - 14 * HOURS}
+    run = FakeRun(jobs=JOB_LINES, job_since=old)
+    assert run_main(tmp_path, proc, db, run) == 0
+    assert run.powered_off
+    last = (tmp_path / "idle.log").read_text().splitlines()[-1]
+    assert " power off: idle for 15 min " in last
+    assert last.endswith(
+        "(ignoring a background job active 14 h, past its cap of 12 h; a background job active "
+        "13 h, past its cap of 12 h)"
+    ), last
+    assert not (tmp_path / "job-seen").exists()  # no record: no hold after it (#970, N6)
+
+
+def test_a_unit_without_a_cap_holds_nothing_after_it_either(tmp_path, proc, db):
+    """Review of #970, N6: a unit made by hand (no `RuntimeMaxUSec`) never holds the VM, so it
+    never writes the record that the timeout after a job counts from."""
+    add_rows(db, handled=NOW - 3600)
+    run = FakeRun(jobs=JOB_LINES.splitlines()[0] + "\n", job_caps={OLD_UNIT: "infinity"})
+    assert run_main(tmp_path, proc, db, run) == 0
+    assert run.powered_off and not (tmp_path / "job-seen").exists()
+
+
+def test_a_record_in_the_future_counts_as_now(tmp_path, proc, db):
+    """Review of #970, N5: with the clock set back since a tick saw a job (or a login), the
+    record's mtime lies ahead; it counts as now, and is rewritten so (not in a dry run), so it
+    holds the VM for one timeout, not for the skew."""
+    add_rows(db, handled=NOW - 3600)
+    seen, login = tmp_path / "job-seen", tmp_path / "login"
+    for path in (seen, login):
+        path.touch()
+        os.utime(path, (NOW + 86400, NOW + 86400))
+    run_main(tmp_path, proc, db, FakeRun(), "--dry-run")
+    assert seen.stat().st_mtime == NOW + 86400  # a dry run writes nothing
+    run = FakeRun()
+    run_main(tmp_path, proc, db, run)
+    assert not run.powered_off and seen.stat().st_mtime == login.stat().st_mtime == NOW
+    log = (tmp_path / "idle.log").read_text()
+    assert "a background job ran 0 min ago" in log and "logged in 0 min ago" in log
+
+
+def test_jobs_unknown_hold_for_the_jobs_cap_in_a_row_then_no_longer(tmp_path, proc, db):
+    """Review rounds 2 and 3 of #924: no job can start while agent's manager doesn't answer,
+    and any job running then has ended at its cap, the bridge's `[jobs] max_hours` (12 by
+    default): the unknown holds that long and 15 minutes, and the verdict says why it no
+    longer does."""
+    add_rows(db, handled=NOW - 3600)
+    record, limit = tmp_path / "jobs-unknown", 12 * HOURS + GRACE
+    run = FakeRun(jobs=None)
+    run_main(tmp_path, proc, db, run)
+    assert not run.powered_off and record.read_text() == f"{NOW:.0f}\n"
+    assert "stay up: background jobs unknown" in (tmp_path / "idle.log").read_text()
+    record.write_text(f"{NOW - limit + 60:.0f}\n")  # a minute short
+    run = FakeRun(jobs=None)
+    run_main(tmp_path, proc, db, run)
+    assert not run.powered_off
+    record.write_text(f"{NOW - limit:.0f}\n")
+    (tmp_path / "config.toml").write_text("[jobs]\nmax_hours = 24\n")  # a longer cap holds
+    run = FakeRun(jobs=None)
+    run_main(tmp_path, proc, db, run)
+    assert not run.powered_off
+    (tmp_path / "config.toml").unlink()
+    run = FakeRun(jobs=None)
+    assert run_main(tmp_path, proc, db, run) == 0
+    assert run.powered_off
+    last = (tmp_path / "idle.log").read_text().splitlines()[-1]
+    assert last.endswith("(ignoring background jobs unknown for 12 h 15 min)"), last
+    # listed again: the record goes, and the next unknown counts from then
+    run_main(tmp_path, proc, db, FakeRun())
+    assert not record.exists()
+
+
+def test_a_dry_run_writes_no_unknown_record(tmp_path, proc, db):
+    """Review round 4 of #924: `--dry-run` writes nothing, the unknown's start included; it
+    reads one an earlier tick wrote, and leaves it."""
+    add_rows(db, handled=NOW - 3600)
+    record = tmp_path / "jobs-unknown"
+    run_main(tmp_path, proc, db, FakeRun(jobs=None), "--dry-run")
+    assert not record.exists()
+    record.write_text(f"{NOW - 13 * HOURS:.0f}\n")
+    run = FakeRun(jobs=None)
+    run_main(tmp_path, proc, db, run, "--dry-run")
+    assert record.read_text() == f"{NOW - 13 * HOURS:.0f}\n" and not run.powered_off
+    assert "(ignoring background jobs unknown for 13 h)" in (tmp_path / "idle.log").read_text()
+    run_main(tmp_path, proc, db, FakeRun(), "--dry-run")
+    assert record.exists()  # listed again, but a dry run removes nothing either
+    assert idle.unknown_since(str(record), NOW, False, write=False) is None
+    assert idle.unknown_since(str(tmp_path / "none"), NOW, True, write=False) == NOW
+
+
+def test_since_when_the_jobs_are_unknown_is_recorded_once(tmp_path):
+    path = str(tmp_path / "jobs-unknown")
+    assert idle.unknown_since(path, NOW, True) == NOW
+    assert idle.unknown_since(path, NOW + 600, True) == NOW  # the first time is kept
+    assert idle.unknown_since(path, NOW - 600, True) == NOW - 600  # clock set back: now
+    assert idle.unknown_since(path, NOW, False) is None and not (tmp_path / "jobs-unknown").exists()
+    assert idle.unknown_since(path, NOW, False) is None  # nothing to remove: no error
+    (tmp_path / "jobs-unknown").write_text("garbage\n")
+    assert idle.unknown_since(path, NOW + 5, True) == NOW + 5  # unreadable: from now
+    blocked = str(tmp_path / "missing-dir" / "jobs-unknown")
+    assert idle.unknown_since(blocked, NOW, True) == NOW  # a write that fails holds from now
+
+
+def test_a_running_job_holds_the_vm_up_whatever_its_load(tmp_path, proc, db):
+    """#655: a job that sleeps or waits holds the VM, with no turn, no login and load 0.05;
+    once it has ended, the timeout counts from the last tick that saw it (Codex round 1 on
+    #970), then the VM powers off. No age: the job's own cap (`RuntimeMaxSec`) ends it."""
+    add_rows(db, handled=NOW - 3600)
+    run = FakeRun(jobs=JOB_LINES.splitlines()[0] + "\n")
+    assert run_main(tmp_path, proc, db, run) == 0
+    assert not run.powered_off
+    log = (tmp_path / "idle.log").read_text()
+    assert "stay up: 1 background job running" in log and "turn" not in log
+    seen = tmp_path / "job-seen"
+    os.utime(seen, (NOW - 1000, NOW - 1000))  # last seen more than 15 minutes ago
+    run = FakeRun()
+    assert run_main(tmp_path, proc, db, run) == 0
+    assert run.powered_off
+    last = (tmp_path / "idle.log").read_text().splitlines()[-1]
+    assert "power off: idle for 15 min (no turn, no job, no login, load 0.05" in last
+
+
+def test_a_job_that_ends_between_two_ticks_keeps_the_vm_up_for_the_timeout(tmp_path, proc, db):
+    """Codex round 1 on #970: zab's database shows a job's end only once the bridge's watcher
+    has posted it and its report turn has started, at its next pass. A tick in between, its
+    last message an hour old, must not power the VM off before that: the timeout counts from
+    the last tick that saw the job, a report turn's start then extends it, and with
+    `--no-report` the timeout still runs after the end. `--dry-run` writes nothing."""
+    add_rows(db, handled=NOW - 7200)  # a 2-hour job, nothing else since
+    seen = tmp_path / "job-seen"
+    run_main(tmp_path, proc, db, FakeRun(jobs=JOB_LINES.splitlines()[0] + "\n"), "--dry-run")
+    assert not seen.exists()
+    run_main(tmp_path, proc, db, FakeRun(jobs=JOB_LINES.splitlines()[0] + "\n"))
+    assert seen.stat().st_mtime == NOW  # the tick's clock, not the file system's
+    os.utime(seen, (NOW - 60, NOW - 60))  # the job ended within the last minute
+    run = FakeRun()  # no unit, and no end post or report turn yet
+    assert run_main(tmp_path, proc, db, run) == 0
+    assert not run.powered_off
+    assert "stay up: a background job ran 1 min ago" in (tmp_path / "idle.log").read_text()
+    os.utime(seen, (NOW - 15 * 60, NOW - 15 * 60))  # the timeout since, and no turn
+    assert run_main(tmp_path, proc, db, run) == 0
+    assert run.powered_off
+
+
+def test_jobs_that_cant_be_listed_hold_the_vm_up(tmp_path, proc, db):
+    """A `systemctl` that fails never powers a VM off (module doc), nor one that times out."""
+    add_rows(db, handled=NOW - 3600)
+    run = FakeRun(jobs=None)
+    run_main(tmp_path, proc, db, run)
+    assert not run.powered_off
+    assert "stay up: background jobs unknown" in (tmp_path / "idle.log").read_text()
+
+    def timeout(argv, **kwargs):
+        if argv == idle.JOBS_ACTIVE:
+            raise subprocess.TimeoutExpired(argv, 30)
+        return FakeRun()(argv, **kwargs)
+
+    assert gather(tmp_path, proc, db, timeout).running_jobs is None
+
+
+def test_a_spare_counts_running_jobs_too(tmp_path, proc):
+    """Every rule but the database holds on a spare (#715), this one too."""
+    run, spare_log = FakeRun(jobs=JOB_LINES), tmp_path / "spare.log"
+    none = tmp_path / "none.db"
+    run_main(tmp_path, proc, none, run, "--spare", minutes="10", spare_log=str(spare_log))
+    assert not run.powered_off
+    assert "stay up: 2 background jobs running" in spare_log.read_text()
 
 
 # ------------------------------------------------------------------ a spare's (#715)

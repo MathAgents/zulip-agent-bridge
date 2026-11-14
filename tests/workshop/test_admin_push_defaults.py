@@ -82,22 +82,54 @@ def test_a_timer_installed_but_not_enabled_is_turned_on_again(out_dir):
     assert runner.remotes(ALICE)[-2] == pc.idle_stop_on_cmd(STAGING)
 
 
-@pytest.mark.parametrize(
-    ("answer", "note"),
-    [
-        (pc.IDLE_STOP_ON, None),  # on already, whatever its minutes: quietly left as it is
-        (pc.IDLE_STOP_OFF, "idle stop: left off, as it was turned off on purpose: "
-         f"!idle-stop {DEFAULT} alice turns it on"),
-    ],
-)  # fmt: skip
-def test_a_timer_on_or_idle_stop_off_on_purpose_is_left_as_it_is(out_dir, answer, note):
-    runner = FakeRunner(answers=probe(answer))
+def test_idle_stop_off_on_purpose_is_left_off(out_dir):
+    runner = FakeRunner(answers=probe(pc.IDLE_STOP_OFF))
     result = pc.rollout_vm(ALICE_ROW, idle(out_dir), runner)
     assert result.ok, result.failures
     remotes = runner.remotes(ALICE)
     assert remotes[-2:] == [pc.IDLE_STOP_PROBE_CMD, f"rm -rf -- {STAGING}"]
     assert not any("idle_stop" in c[-1] for c in runner.calls if c[0] == "scp")
-    assert idle_notes(result) == ([note] if note else [])
+    assert idle_notes(result) == [
+        f"idle stop: left off, as it was turned off on purpose: !idle-stop {DEFAULT} alice "
+        "turns it on"
+    ]
+
+
+def test_a_default_rollout_refreshes_a_running_timers_script_and_keeps_its_minutes(out_dir):
+    """#655 (review of #924): a timer already on, at whatever minutes, gets this release's
+    `idle_stop.py`, with its rule that a running background job holds the VM, and nothing
+    else: no unit is uploaded or installed, so its minutes stay the VM's; quietly."""
+    runner = Uploads(answers=probe(pc.IDLE_STOP_ON))
+    result = pc.rollout_vm(ALICE_ROW, idle(out_dir), runner)
+    assert result.ok, result.failures
+    assert idle_notes(result) == []
+    assert runner.sent["idle_stop.py"] == pc.IDLE_STOP_SCRIPT.read_text()
+    assert "background jobs unknown" in runner.sent["idle_stop.py"]  # the rule of #655
+    assert not [name for name in runner.sent if name.startswith(pc.IDLE_STOP_UNIT)]
+    assert "status_read.sh" not in runner.sent
+    remotes = runner.remotes(ALICE)
+    assert remotes[-3:] == [
+        pc.IDLE_STOP_PROBE_CMD,
+        pc.idle_stop_script_cmd(STAGING),
+        f"rm -rf -- {STAGING}",
+    ]
+    # the command installs the script alone: no unit, no reload, no restart of the timer
+    command = pc.idle_stop_script_cmd(STAGING)
+    assert command == (
+        f"sudo install -D -o root -g root -m 0755 {STAGING}/idle_stop.py {pc.IDLE_STOP_PATH}"
+    )
+    assert "systemctl" not in command and pc.IDLE_STOP_UNIT not in command
+    assert pc.dry_name(pc.idle_stop_script_cmd(pc.DRY_STAGING)) == "idle stop script refreshed"
+
+
+@pytest.mark.parametrize("fail", ["scp", "install"])
+def test_a_script_refresh_that_fails_fails_the_row(out_dir, fail):
+    needle = "idle_stop.py" if fail == "scp" else f"{STAGING}/idle_stop.py {pc.IDLE_STOP_PATH}"
+    runner = FakeRunner(answers=probe(pc.IDLE_STOP_ON), fail={needle: "boom"})
+    result = pc.rollout_vm(ALICE_ROW, idle(out_dir), runner)
+    assert not result.ok
+    step = "scp idle_stop.py" if fail == "scp" else "idle stop script"
+    assert any(f.startswith(step) for f in result.failures), result.failures
 
 
 WITHOUT = "this row's waker isn't on"
@@ -127,11 +159,20 @@ ELSEWHERE = f"the waker names {OTHER}, not this VM ({VM})"
     ],
 )  # fmt: skip
 def test_without_the_waker_for_this_vm_idle_stop_is_left_as_it_is(out_dir, woken, answer, note):
-    """ORGANIZERS §4.2: the waker first, then idle stop. The probe, and no change; the note
-    says what it found, and the commands."""
+    """ORGANIZERS §4.2: the waker first, then idle stop. The probe, and no change to the
+    setting; the note says what it found, and the commands. A timer that is on runs this
+    release's script all the same (#655), its minutes kept."""
     runner = FakeRunner(answers=probe(answer))
     result = pc.rollout_vm(ALICE_ROW, idle(out_dir, woken=woken), runner)
     assert result.ok and idle_notes(result) == [f"idle stop: {note}"]
+    if answer == pc.IDLE_STOP_ON:
+        assert runner.remotes(ALICE)[-3:-1] == [
+            pc.IDLE_STOP_PROBE_CMD,
+            pc.idle_stop_script_cmd(STAGING),
+        ]
+        sent = [c[-1].rsplit("/", 1)[1] for c in runner.calls if c[0] == "scp"]
+        assert [name for name in sent if "idle" in name] == ["idle_stop.py"]
+        return
     assert runner.remotes(ALICE)[-2] == pc.IDLE_STOP_PROBE_CMD
     assert not any("idle_stop" in c[-1] for c in runner.calls if c[0] == "scp")
 

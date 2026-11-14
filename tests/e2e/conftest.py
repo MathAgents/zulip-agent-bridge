@@ -1,9 +1,18 @@
 """Fixtures of the end-to-end suite (issue #263) and its report.
 
-Scenarios are test functions marked `e2e` and `scenario(N)`. `ZAB_E2E_SCENARIOS` (`all`, `fast`,
-`slow`, or numbers such as `1,2,5-7`) selects them; `ZAB_E2E_REPORT_JSON` names the file the
-results go to (`run.py` sets both). The fixtures below open nothing until a scenario asks for
-them, and only under `ZAB_LIVE=e2e` (the root conftest skips `e2e` tests otherwise).
+A scenario's parts are test functions marked `e2e` and `scenario(N)`. `ZAB_E2E_SCENARIOS`
+selects them, a comma-separated list of these (`selected`):
+
+- `fast`: the fast scenarios, without their parts marked `slow`: a part that stops the VM, such
+  as scenario 8's cold import, never runs in a fast run (codex on #286);
+- `slow`: the slow scenarios, and the parts marked `slow` of every scenario;
+- `all`: every part of every scenario;
+- a number or a range (`8`, `5-7`): every part of each scenario it names, its `slow` ones too,
+  so that `--require` can pass for it (#978). `8,fast` runs the fast scenarios and all of 8.
+
+Unset, it selects every part. `ZAB_E2E_REPORT_JSON` names the file the results go to (`run.py`
+sets both). The fixtures below open nothing until a scenario asks for them, and only under
+`ZAB_LIVE=e2e` (the root conftest skips `e2e` tests otherwise).
 
 A scenario whose clean-up failed (`harness.cleanup.Leftover`) adds a run problem to the report,
 naming what it left on the VM; when the later scenarios can't run in that state, the run stops
@@ -41,6 +50,31 @@ def _number(item: pytest.Item) -> int | None:
     return int(marker.args[0]) if marker else None
 
 
+def selected(spec: str, items: list[pytest.Item]) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """`items` split by the selection `spec` (`ZAB_E2E_SCENARIOS`): (kept, dropped), each in
+    order. A test of no scenario (a harness's own) is kept. A part marked `slow` (a part of a
+    fast scenario that stops the VM: 8's cold import) is kept when `spec` names its scenario by
+    number or range (#978), or names `slow` or `all`; never for `fast` alone (codex on #286).
+    Any other part is kept when its scenario is selected."""
+    selectors = [p.strip() for p in spec.split(",") if p.strip()]
+    wanted = set(report.select(spec))
+    # a number or a range starts with a digit (`report.select` parsed every selector above); a
+    # group's name never does, whatever groups it knows
+    named = {n for p in selectors if p[:1].isdigit() for n in report.select(p)}
+    every_slow = bool({"slow", "all"} & set(selectors))
+    keep: list[pytest.Item] = []
+    drop: list[pytest.Item] = []
+    for item in items:
+        number = _number(item)
+        if number is None:
+            keep.append(item)
+        elif item.get_closest_marker("slow"):
+            (keep if every_slow or number in named else drop).append(item)
+        else:
+            (keep if number in wanted else drop).append(item)
+    return keep, drop
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     spec = os.environ.get("ZAB_E2E_SCENARIOS")
     parts: dict[int, list[str]] = {}  # every part of every scenario, before the selection
@@ -48,19 +82,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         if (number := _number(item)) is not None:
             parts.setdefault(number, []).append(item.name)
     if spec:
-        wanted = set(report.select(spec))
-        # a part of a fast scenario that stops the VM (`@pytest.mark.slow`, scenario 8's cold
-        # import) runs with the slow group, never in a fast run (codex on #286)
-        slow = bool({p.strip() for p in spec.split(",")} & {"slow", "all"})
-        keep, drop = [], []
-        for item in items:
-            number = _number(item)
-            if number is None:
-                keep.append(item)
-            elif item.get_closest_marker("slow"):
-                (keep if slow else drop).append(item)
-            else:
-                (keep if number in wanted else drop).append(item)
+        keep, drop = selected(spec, items)
         if drop:
             config.hook.pytest_deselected(items=drop)
             items[:] = keep
@@ -75,7 +97,10 @@ def pytest_runtest_call(item: pytest.Item):
     with a fresh nonce, while the run's `_RETRIES` last; its row names the cause, and a second
     refusal fails it (`harness.refusal`, #842). A part that failed on the rig's side runs once
     more the same way, while `_RIG_RETRIES` last; failed so again, or with the budget spent, it
-    is skipped: no result, as the bridge wasn't seen to fail (`harness.rig_failure`, #877)."""
+    is skipped: no result, as the bridge wasn't seen to fail (`harness.rig_failure`, #877). But
+    a refusal or a rig failure after the part had missed a bound, in either run, fails it, the
+    timing kept: neither a rerun nor a skip may erase a failure that was seen (`seen_missed`;
+    #922's and #935's reviews)."""
     number = _number(item)
     if number is None or not item.get_closest_marker("e2e"):
         return (yield)
@@ -84,6 +109,7 @@ def pytest_runtest_call(item: pytest.Item):
     try:
         return (yield)
     except (refusal.Refused, RigFailure) as first:
+        seen_missed(item.name, row, kept, first, "not run again")
         funcargs = getattr(item, "funcargs", {})
 
         def renew() -> None:
@@ -97,8 +123,24 @@ def pytest_runtest_call(item: pytest.Item):
             refusal.retry(item.name, first, row, kept=kept, noted=noted, budget=budget,
                           run=item.runtest, renew=renew)  # fmt: skip
         except RigFailure as last:
+            seen_missed(item.name, row, kept, last, "in its second run")
             pytest.skip(f"no result: {last}")
         return None
+
+
+def seen_missed(name: str, row, kept: int, cause: Exception, when: str) -> None:
+    """Fail the part if the run that `cause` (a refusal or a rig failure) ended had missed a
+    hard bound, its timings after the first `kept`: the timing is kept, and the row says so
+    (#935's review, B3 and round 2). A missed target is no failure, and neither is a bound the
+    rig's Zulip outage left undecided (#943): `Timing.failed` is a bound missed for sure, no
+    target, so the cause's rerun or skip goes ahead as for a bound met."""
+    missed = [t for t in row.timings[kept:] if t.failed]
+    if not missed:
+        return
+    kind = "a refusal" if isinstance(cause, refusal.Refused) else "a rig failure"
+    line = getattr(cause, "line", str(cause))
+    row.external.append(f"{name}: {line}; {when}: a bound was missed")
+    pytest.fail(f"{missed[0].text()}, missed before {kind}: {line}")
 
 
 @pytest.hookimpl(wrapper=True)

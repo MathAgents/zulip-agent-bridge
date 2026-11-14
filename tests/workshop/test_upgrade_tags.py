@@ -65,13 +65,21 @@ def test_a_run_reviews_signs_pushes_and_copies_and_a_rerun_changes_nothing(machi
     assert obj and tag_of(machine, machine.origin) == obj and verifies(machine, machine.key)
     assert f"pushed: origin's {V} is {obj}\n" in out
     copy = machine.home / f"zab-{V}"
+    assert out.endswith(  # it publishes nothing, and says where the server's tags come from
+        f"done: {V} is signed and verified on {machine.c[:12]}, and its copy is\n"
+        f"{copy}. Nothing is published: this run pushed to your clone's\n"
+        "origin at most, and !upgrade-server fetches the tags from release_repo; the\n"
+        "public repository's are its maintainer's publication's, not this tool's (#960).\n"
+        "Upgrade the server as BOOTSTRAP §13.4 says, with the review's SHA-256,\n"
+        f"{machine.sha}, which this run compared with the release message's.\n"
+    ), out
     assert machine.git("rev-parse", "HEAD", where=copy) == machine.c
     again = run(machine, typed="")
     assert again.returncode == 0, said(again)
     assert "zab admin release review" not in again.stdout and "Type " not in again.stdout
     assert f"{machine.sha}: compared again, its review not paged, since {V}'s tag" in again.stdout
     assert f": done ({copy} is its copy)\n" in again.stdout
-    assert f"the review's SHA-256, {machine.sha},\nwhich this run compared" in again.stdout
+    assert f"the review's SHA-256,\n{machine.sha}, which this run compared" in again.stdout
     assert tag_of(machine, machine.clone) == obj == tag_of(machine, machine.origin)
     other = "1" * 64  # a rerun with another SHA-256 than the review's is compared too
     wrong = run(machine, typed="", sha=other)

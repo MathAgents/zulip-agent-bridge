@@ -122,6 +122,9 @@ VALID = [
     ("!grow-disk alice 300GB", Command("grow-disk", slug="alice", size=300)),
     ("!grow-disk bob 1gb", Command("grow-disk", slug="bob", size=1)),
     ("!grow-disk bob 1000GB", Command("grow-disk", slug="bob", size=1000)),
+    # #992: the trust fix, a selection and nothing more
+    ("!trust-fix all", Command("trust-fix", selection=ALL)),
+    ("!trust-fix alice bob", Command("trust-fix", selection=sel("alice", "bob"))),
     ("!approve P-42 3f9a2c", Command("approve", plan=42, hash6="3f9a2c")),
     (
         "!approve P-42 3f9a2c stop 35",
@@ -426,6 +429,7 @@ NO_SELECTION = [
     "!protect on",
     "!waker on",
     "!idle-stop 15",
+    "!trust-fix",
 ]
 
 
@@ -599,6 +603,13 @@ REJECTED = [
     "!grow-disk all 300GB",
     "!grow-disk zab-spare-1 300GB",
     "!grow-disk alice 300GB 400GB",
+    # !trust-fix (#992): no spares, keyword, setting or flag of the script's
+    "!trust-fix spares",
+    "!trust-fix zab-spare-1",
+    "!trust-fix all --apply",
+    "!trust-fix all upgrade-left-pips",
+    "!trust-fix alice apply",
+    "!trust-fix alice --only bob",
     "!help foo",
     "!help rollout status",
     "!rollout v0.2 all",

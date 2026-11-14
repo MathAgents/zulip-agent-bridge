@@ -385,6 +385,9 @@ def test_the_runner_skips_what_is_done_and_a_rerun_goes_on(driver, machine, monk
     if not fail_at:
         assert code == 0 and log == ["one", "two", "checks"]
         assert "[3/3] checks\ndone: v0.3.1 is signed and verified on aaaaaaaaaaaa" in out.out
+        assert out.out.endswith(  # no review phase ran here, so no SHA-256 to name (#960)
+            "not this tool's (#960).\nUpgrade the server as BOOTSTRAP §13.4 says.\n"
+        ), out.out
         return
     assert code == 1 and log == ["one", "two"] and out.err == "stopped: two failed\n"
     assert driver.main(ARGV) == 1 and log == ["one", "two", "two"]  # one is done: skipped

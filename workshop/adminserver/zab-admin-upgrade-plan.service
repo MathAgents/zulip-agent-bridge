@@ -1,17 +1,21 @@
 # docs/ADMIN.md §1.6 (#569): the plan helper of !upgrade-server (zab.admin.upgradehelper, `plan`).
 # Started by zab-admin-upgrade-plan.path, it reads and deletes the bot's request, fetches two tags
-# (the release asked for and the running one) from admin.toml's release_repo with the deploy key,
-# checks the release as deploy.sh does, has the running release's deploy.sh review it, and writes
-# the outcome, with the review's SHA-256, for the plan. It installs nothing and restarts nothing.
+# (the release asked for and the running one) from admin.toml's release_repo, over SSH with the
+# deploy key, or from a public repository over HTTPS with none (#959: anonymous, with the
+# system's CA certificates, which it reads), checks the release as deploy.sh does, has the running
+# release's deploy.sh review it, and writes the outcome, with the review's SHA-256, for the plan.
+# It installs nothing and restarts nothing.
 # A deployer's request starts it before any approval, so it runs in a sandbox: it writes only its
 # own state (the request's directory in it, the bot's, to delete the request), holds one
 # capability, CAP_DAC_OVERRIDE, to read and delete the request in zab-admin's 0700 directory, and
-# reaches the network (GitHub) but not IMDS.
+# reaches the network (GitHub, over SSH or HTTPS: git-remote-https runs under the same filters)
+# but not IMDS. Without the deploy key, its bind below is skipped (`-`).
 # What root runs (§1.6, #437): the system interpreter with -I -B -S, never the venv's; sys.path
 # is the standard library and the release's src/, resolved once through `current`. The helper
 # imports upgradehelper, confighelper, config and checks, and the standard library
-# (tests/admin/test_admin_imports.py, UPGRADE_IMPORTS); then git, ssh, ssh-keygen, and the
-# running release's deploy.sh --review with what it runs (git, python3 -I, perl).
+# (tests/admin/test_admin_imports.py, UPGRADE_IMPORTS); then git (with git-remote-https), ssh,
+# ssh-keygen, and the running release's deploy.sh --review with what it runs (git, python3 -I,
+# perl).
 # Of /etc/zab-admin/secrets it sees the deploy key alone: the rest is under an empty read-only
 # tmpfs. Hidden too: /var/lib/zab-admin (the fleet key, the bot's state, the participants'
 # keys), the console's state (its cookie secret), Caddy's (its TLS keys), the SSH host keys
@@ -50,9 +54,17 @@ ProtectControlGroups=true
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# It makes no Unix socket (#896): socket() only of AF_INET and AF_INET6, and socketpair() and
+# io_uring (whose operations make sockets past RestrictAddressFamilies) are denied. As root, a
+# socket() of AF_UNIX reaches PID 1's private socket, the system bus and the starter's, and a
+# socketpair()'s datagram end sends to any datagram socket by its path (journald's; chronyd's,
+# where chrony runs): no read-only mount stops either. What it runs needs neither: glibc's
+# lookups go on without nscd's and systemd's sockets, and curl wakes its resolver by a pipe.
+RestrictAddressFamilies=AF_INET AF_INET6
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+SystemCallFilter=~@aio:EPERM
+SystemCallFilter=~socketpair:EPERM
 CapabilityBoundingSet=CAP_DAC_OVERRIDE

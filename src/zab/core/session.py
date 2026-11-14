@@ -8,12 +8,13 @@ import json
 import logging
 import shlex
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from zab.core import jobreport
 from zab.core import presentation as view
 from zab.core import types as t
 from zab.core.attachments import load_attachments
@@ -25,9 +26,23 @@ from zab.core.commands import (
     TURN_ELSEWHERE,
     UNKNOWN,
     login_required,
+    new_with_session,
     run_command,
     status_login_hint,
     stopped_subagents,
+)
+from zab.core.jobcontrol import (
+    ALL,
+    NAME_RE,
+    NO_JOBS,
+    STATUS_WINDOW_S,
+    JobControl,
+    RunningJob,
+    keeps_running,
+    none_running,
+    status_lines,
+    stop_target,
+    stopped,
 )
 from zab.core.peer_context import consume_fork_answers, fork_context, peer_context
 from zab.core.reason import verified_only
@@ -36,6 +51,12 @@ from zab.core.store import Store
 from zab.render.redact import redact_secrets
 from zab.zulip.client import EditRefused, ZulipError
 from zab.zulip.poster import ACK, APPROVAL, FINAL, Poster
+
+#: A `!stop NAME` or `!stop jobs` message that a bot of the VM acted on (#655): the bots
+#: share the store, and the one answering for the topic reads it before it says none ran.
+JOB_STOP = "job_stop:"
+#: How many of a session's jobs `!stop jobs` stops at once (the machine runs 4 by default)
+STOPS_AT_ONCE = 4
 
 # The notice under messages held before a turn can start (§7.3).
 WAITING = "⏳ Waiting for a free slot or backend."
@@ -59,7 +80,10 @@ class Delivery:
     """`quiet`: a command that reached this bot without naming it, as it reached the VM's other
     bots (SPEC §4.5 rule 6.2, `Route.quiet`): it says nothing where it doesn't act (§4.6).
     `first`: of those with a session in the topic, this bot comes first by full name, and so
-    answers for them where none acts (`BotBridge.first_here`, #847); true unless `quiet`."""
+    answers for them where none acts (`BotBridge.first_here`, #847); true unless `quiet`.
+    `report`: a background job's report prompt, on the job's owner's behalf (`zab.core.
+    jobreport`): no person's message, so it neither lifts the cap on report turns nor carries
+    the notes that wait (SPEC §7.14)."""
 
     message_id: int
     sender_id: int
@@ -67,6 +91,7 @@ class Delivery:
     text: str
     quiet: bool = False
     first: bool = True
+    report: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,8 +144,10 @@ class SessionActor:
         confirm_location: Callable[[str], Awaitable[None]] | None = None,
         reopened: Callable[[], None] | None = None,
         unmentioned_here: Callable[[int, str], Awaitable[str]] | None = None,
+        jobs: JobControl = NO_JOBS,
     ) -> None:
         self.row, self.store, self.backend, self.poster = row, store, backend, poster
+        self.jobs = jobs  # the background jobs, for `!stop` and `!stop NAME` (§7.14, #655)
         self.unmentioned_here = unmentioned_here  # BotBridge.unmentioned_here, for !session
         self.confirm_location = confirm_location  # BotBridge.verify_card
         self.reopened = reopened  # BotBridge.pending_forks_soon: forks waiting for it (#202)
@@ -354,6 +381,8 @@ class SessionActor:
 
     async def deliver(self, delivery: Delivery) -> None:
         if self.row["state"] in ("detached", "readonly"):
+            if delivery.report:  # no turn will take it: it waits as a note, not a turn to come
+                jobreport.not_taken(self.store, self.row["bot"], self.row["id"], delivery)
             return
         with self.store.transaction():
             receipt = self.store.rows(
@@ -363,6 +392,8 @@ class SessionActor:
                 return  # A restored and an already queued copy may meet after recovery.
             self.store.claim(self.row["bot"], delivery.message_id, self.row["id"])
             self.store.hold(self.row["id"], delivery.message_id, delivery.sender, delivery.text)
+            if not delivery.report:  # a person's message: report turns may follow again (§7.14)
+                jobreport.person_spoke(self.store, self.row["id"])
             self.state(last_sender_id=delivery.sender_id)
             self.store.set(f"sender:{self.row['id']}", delivery.sender)
             self.store.update(
@@ -443,7 +474,10 @@ class SessionActor:
                 + " (other AI agents in this topic); answer it yourself.]\n\n"
                 + text
             )
-        files = await load_attachments(self, message_ids)
+        # a report prompt is zab's own text: no attachment of a person's (review of #942)
+        files = await load_attachments(
+            self, [m for m in message_ids if not jobreport.is_report(self.store, self.row["id"], m)]
+        )
         if files:
             text += "\n\nAttachments saved locally:\n" + "\n".join(a.path for a in files)
         user_input = self.user_input(text, sender)
@@ -500,6 +534,17 @@ class SessionActor:
                 + "\n[end of held messages]"
             )
         )
+        # the notes that wait (a lost job's, a report past the cap) head the next turn that a
+        # person's message starts, a `!handover` included; never one of report prompts alone
+        # (SPEC §7.14)
+        ids = [m["message_id"] for m in held]
+        notes = (
+            jobreport.take_notes(self.store, self.row["id"])
+            if any(not jobreport.is_report(self.store, self.row["id"], mid) for mid in ids)
+            else []
+        )
+        if notes:
+            text = jobreport.notes_block(notes) + text
         try:
             snapshot_started = time.time()
             snapshot = await self.manager.snapshot(self.context.workspace)
@@ -519,6 +564,7 @@ class SessionActor:
                 started_at=snapshot_started,
             )
             self.turn = self.store.rows("turns", session_id=self.row["id"], native_turn_id=tid)[0]
+            jobreport.turn_started(self.store, self.row["id"], ids, notes)  # passed on once
             self.poster.client.metrics.counts["turns_started"] += 1
             self.accept_input([m["message_id"] for m in held])
             self.new_turn_view()
@@ -1096,6 +1142,8 @@ class SessionActor:
                 self.release()
         elif command == "!attach" or command.startswith("!attach "):
             await self.post("This topic already has a session; use !detach first.")
+        elif (target := stop_target(command)) is not None:
+            await self.stop_jobs(target, delivery)
         elif command == "!stop" and self.turn:
             for rid in list(self.pending):
                 await self.backend.respond(rid, t.ApprovalDecision.CANCEL)
@@ -1112,10 +1160,16 @@ class SessionActor:
                 self.put(StopTimeout(tid))
 
             self.stop_timer = asyncio.create_task(timeout())
+            if jobs := await self.session_jobs():
+                await self.post(keeps_running(jobs))  # the turn only (§7.14, D44)
         elif command == "!stop":  # no turn running
             await self.stop_idle(delivery)
-        elif quiet and command.split(maxsplit=1)[:1] == ["!new"]:
-            return  # a session here already: the VM's others act on it
+        elif command.split(maxsplit=1)[:1] == ["!new"]:
+            # a session here already (§4.6, #985): unmentioned, beside the VM's other bots, it
+            # says nothing (one without a session starts its own); else it says so, and that a
+            # prompt wasn't sent
+            if not quiet:
+                await self.post(new_with_session(self.backend.kind, command))
         elif command in ("!approve", "!approve-session", "!deny") or decision:
             if not self.pending:
                 return
@@ -1197,27 +1251,110 @@ class SessionActor:
         unmentioned only from the bot that answers for the topic (`Delivery.first`), and only
         where no turn of the topic runs (§4.6), which its bot stops."""
         has_subagents = self.backend.capabilities.stop_subagents
-        stopped: t.SubagentStop | None = t.SubagentStop(0)
+        found: t.SubagentStop | None = t.SubagentStop(0)
+        answer = ""
         if has_subagents:
             try:
-                stopped = await self.backend.stop_subagents(self.row["native_id"])
+                found = await self.backend.stop_subagents(self.row["native_id"])
             except t.TurnElsewhere:
-                await self.post(TURN_ELSEWHERE)
-                return
+                answer = TURN_ELSEWHERE
             except Exception as exc:
                 self.log_error("Stopping sub-agents", exc)
-                stopped = None  # unknown: never "none ran"
-        if stopped is None:
-            await self.post(SUBAGENTS_UNCHECKED)
-        elif stopped.stopped:  # only this bot knows it
-            await self.post(stopped_subagents(stopped.stopped, unseen=stopped.unseen))
+                found = None  # unknown: never "none ran"
+        if answer:
+            pass
+        elif found is None:
+            answer = SUBAGENTS_UNCHECKED
+        elif found.stopped:  # only this bot knows it
+            answer = stopped_subagents(found.stopped, unseen=found.unseen)
         elif delivery is None or not delivery.quiet or (delivery.first and not self.turn_here()):
             # a zero, with what it can't check (Codex round 3), gated as any zero (review
             # round 3 of #851): beside another bot's running turn, it says nothing
-            if stopped.unseen:
-                await self.post(stopped_subagents(0, unseen=True))
+            if found.unseen:
+                answer = stopped_subagents(0, unseen=True)
             else:
-                await self.post(NO_TURN_NOR_SUBAGENT if has_subagents else NO_TURN)
+                answer = NO_TURN_NOR_SUBAGENT if has_subagents else NO_TURN
+        # Its jobs run on: `!stop` stops a turn only (§7.14, D44). Only this bot knows them, so
+        # it says so even where it would otherwise say nothing (§4.6).
+        if jobs := await self.session_jobs():
+            answer = (answer + "\n" if answer else "") + keeps_running(jobs)
+        if answer:
+            await self.post(answer)
+
+    async def stop_jobs(self, target: str, delivery: Delivery | None) -> None:
+        """`!stop NAME` and `!stop jobs` (SPEC §4.6, §7.14): stop the session's running job
+        of that name, or all of them, and reply once their units have stopped; that reply is
+        their end post, with no report turn. Without such a job, "No background job …":
+        unmentioned (`Delivery.quiet`), only where no other bot's session in the topic has one,
+        and from the bot that answers for the topic (`Delivery.first`); a bot that has one
+        answers for itself.
+
+        The VM's bots handle one unmentioned message each in its own actor, in any order: a
+        bot that stops a job records it for the message first (`job_stop:<message id>` in the
+        shared store), so that the one answering for the topic, which may come after the stop,
+        doesn't then say that none ran (Codex round 1 on #934). It reads the jobs, then the
+        record, with no await between them: a job gone from the first read was recorded
+        before its stop."""
+        mine = await self.session_jobs()
+        chosen = [job for job in mine if target == ALL or job.name == target]
+        if not chosen:
+            if delivery is not None and delivery.quiet:
+                fresh = await self.fresh_here()  # read first: the checks below don't await
+                if not delivery.first or self.jobs_here(target, fresh):
+                    return
+                if self.store.get(f"{JOB_STOP}{delivery.message_id}"):
+                    return  # another bot of the VM stopped it for this message
+            code = f"`{target}`" if NAME_RE.fullmatch(target) else view.code(target)
+            await self.post(none_running(target, code))
+            return
+        if delivery is not None:
+            self.store.set(f"{JOB_STOP}{delivery.message_id}", self.row["bot"])
+        # Together, a few at a time: a stop waits up to the unit's `TimeoutStopSec` (15 s)
+        # for a job that ignores SIGTERM, and the actor waits for them all (#934's N5).
+        bound = asyncio.Semaphore(STOPS_AT_ONCE)
+
+        async def stop(job: RunningJob) -> float | None:
+            async with bound:
+                return await self.jobs.stop(self.row["id"], job)
+
+        results = await asyncio.gather(*(stop(job) for job in chosen), return_exceptions=True)
+        done, failed = [], []
+        for job, result in zip(chosen, results, strict=True):
+            if isinstance(result, BaseException):
+                self.log_error("Stopping a background job", result)
+            if isinstance(result, float | int) and not isinstance(result, bool):
+                done.append((job, float(result)))
+            else:
+                failed.append(job)  # None, or a stop that raised: each is reported
+        await self.post(stopped(done, failed))
+
+    async def session_jobs(self) -> list[RunningJob]:
+        """The session's running jobs: the watcher's rows, and those too new to have one
+        (`JobControl.unrecorded`), each once."""
+        rows = self.jobs.running(self.row["id"])
+        known = {job.id for job in rows}
+        fresh = [job for job in await self.jobs.unrecorded(self.row["id"]) if job.id not in known]
+        return sorted([*rows, *fresh], key=lambda job: job.started_at)
+
+    def others_here(self) -> list[dict[str, Any]]:
+        rows = self.store.rows("sessions", stream_id=self.row["stream_id"], topic=self.row["topic"])
+        return [r for r in rows if r["id"] != self.row["id"] and r["state"] != "detached"]
+
+    async def fresh_here(self) -> list[RunningJob]:
+        """The other bots' sessions' jobs in this topic that have no row yet."""
+        found = await asyncio.gather(*(self.jobs.unrecorded(r["id"]) for r in self.others_here()))
+        return [job for jobs in found for job in jobs]
+
+    def jobs_here(self, target: str, fresh: Sequence[RunningJob] = ()) -> bool:
+        """Whether another bot's session in this topic has a running job `target` names: by the
+        watcher's rows, now, or among `fresh`, read just before."""
+        return any(
+            target == ALL or job.name == target
+            for job in [
+                *fresh,
+                *(job for row in self.others_here() for job in self.jobs.running(row["id"])),
+            ]
+        )
 
     def turn_here(self) -> bool:
         """Whether a turn of another bot's session in this topic runs."""
@@ -1332,7 +1469,20 @@ class SessionActor:
                 )
         from zab.core.git_identity import display
 
-        await self.post(line + note + display(self.git_identity))
+        text = line + note + display(self.git_identity)
+        # the session's background jobs, running or ended in the last day (§7.14)
+        rows = self.jobs.jobs_of(self.row["id"], time.time() - STATUS_WINDOW_S)
+        known = {row["id"] for row in rows}
+        rows += [
+            dict(id=j.id, name=j.name, state="running", started_at=j.started_at, ended_at=None,
+                 result=None)
+            for j in await self.jobs.unrecorded(self.row["id"])
+            if j.id not in known
+        ]  # fmt: skip
+        if rows:
+            jobs = await asyncio.to_thread(status_lines, rows, self.jobs.directory)
+            text += "\n" + "\n".join(jobs)
+        await self.post(text)
 
     async def close(self) -> None:
         for task in (self.runner, self.timer, self.waiter, self.stop_timer):

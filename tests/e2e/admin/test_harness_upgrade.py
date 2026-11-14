@@ -4,6 +4,7 @@ admin.toml line, the push and the deploy key, against stand-ins for git, gh and 
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -50,15 +51,39 @@ def test_the_release_repository_is_a_test_participants_or_none():
     assert all(upgrade.allowed(name) for name in SAME)
     assert not any(upgrade.allowed(name) for name in REFUSED)
     assert RELEASE_REPO.fullmatch(upgrade.ssh_url(TEST_REPO))
+    assert RELEASE_REPO.fullmatch(upgrade.https_url(TEST_REPO))  # #959
+
+
+#: The HTTPS form's public test repository (#959).
+PUBLIC_REPO = "MathAgents/zab-test-release-public"
+#: Never the public one (#977's review, N2): the test participant's, the private one, near misses.
+NOT_PUBLIC = ("MathAgents/zab-test-a", "MathAgents/zab-test-d", "MathAgents/zab-test",
+              "MathAgents/zab-test-release", "MathAgents/zab-test-releases",
+              "MathAgents/zab-test-r-public", "Other/zab-test-release-public")  # fmt: skip
+
+
+def test_the_public_release_repository_is_a_release_one_or_none():
+    """#959: the HTTPS form's repository, by the same rules, and never the private one; and
+    only `MathAgents/zab-test-release-*`, never a test participant's (#977's review, N2)."""
+    name = upgrade.PUBLIC_ENV
+    assert upgrade.release_repo({upgrade.ENV: TEST_REPO}, name) == ""
+    given = {upgrade.ENV: TEST_REPO, name: f" {PUBLIC_REPO} "}
+    assert upgrade.release_repo(given, name) == PUBLIC_REPO
+    for bad in ("a/b/c", *REFUSED, *NOT_PUBLIC, TEST_REPO, TEST_REPO.upper()):
+        with pytest.raises(ValueError, match=name):
+            upgrade.release_repo({upgrade.ENV: TEST_REPO, name: bad}, name)
+    assert upgrade.allowed_public(PUBLIC_REPO.lower())
+    assert not any(upgrade.allowed_public(bad) for bad in NOT_PUBLIC)
 
 
 def test_admin_toml_gets_one_release_repo_line_before_its_tables():
     toml = 'provider = "aws"\nrelease_repo = "git@github.com:Old/one.git"\n\n[global]\nx = 1\n'
-    text = upgrade.with_release_repo(toml, "MathAgents/zab-test-release")
-    assert text.count("release_repo") == 1
-    head, tables = text.split("[global]", 1)
-    assert 'release_repo = "git@github.com:MathAgents/zab-test-release.git"' in head
-    assert "x = 1" in tables
+    for url in (upgrade.ssh_url(TEST_REPO), upgrade.https_url(TEST_REPO)):
+        text = upgrade.with_release_repo(toml, url)
+        assert text.count("release_repo") == 1
+        head, tables = text.split("[global]", 1)
+        assert f'release_repo = "{url}"' in head and "x = 1" in tables
+    assert upgrade.https_url(TEST_REPO) == f"https://github.com/{TEST_REPO}.git"
 
 
 class Runs:
@@ -127,6 +152,115 @@ def test_github_must_say_the_repository_is_the_one_named_and_private(tmp_path, f
     failed = Runs({("gh", "api", f"repos/{TEST_REPO}", "--jq"): Result(1, "", "Not Found")})
     with pytest.raises(RuntimeError, match="Not Found"):
         upgrade.push(tmp_path, TEST_REPO, TOKEN, "refs/tags/v0.3.1", run=failed)
+
+
+class Exported:
+    """A stand-in for `Releases` in `publish`: its public repository, and what `exports_of`
+    says, or the refusal it raises."""
+
+    def __init__(self, tmp_path, exports=(("p" * 40, "s" * 40),), refusal: str = "") -> None:
+        self.public, self.exports, self.refusal, self.asked = tmp_path, list(exports), refusal, []
+
+    def exports_of(self, base, *refs):
+        self.asked.append((base, refs))
+        if self.refusal:
+            raise ValueError(self.refusal)
+        return self.exports
+
+
+REFS = ("refs/tags/v0.3.0", "refs/tags/v0.3.1")
+
+
+def public_github(full: str = PUBLIC_REPO, private: str = "false") -> dict:
+    return {("gh", "api", f"repos/{PUBLIC_REPO}", "--jq"): Result(0, f"{full}\t{private}\n", "")}
+
+
+def test_only_checked_exports_of_the_commit_under_test_go_public(tmp_path, monkeypatch):
+    """#977's review, B1: `publish` pushes the HTTPS form's refs only once every commit they
+    reach is an export of the commit under test, its tree checked as a real publication checks
+    it, and GitHub says the repository is public and the one named; otherwise nothing is
+    pushed, and nothing is asked of GitHub before the checks have passed."""
+    checked, state = [], {"found": []}
+
+    def problems(rel, exports, work, tool=None, scan=None):
+        checked.append(exports)
+        return state["found"]
+
+    monkeypatch.setattr(upgrade, "publication_problems", problems)
+    rel, runs = Exported(tmp_path), Runs(public_github())
+    assert upgrade.publish(rel, PUBLIC_REPO, TOKEN, "b" * 40, REFS, tmp_path, run=runs) == [
+        ("p" * 40, "s" * 40)
+    ]
+    assert rel.asked == [("b" * 40, REFS)] and checked == [rel.exports]
+    (asked, pushed) = runs.seen
+    assert asked[:3] == ["gh", "api", f"repos/{PUBLIC_REPO}"]
+    assert pushed[-3:] == [upgrade.https_url(PUBLIC_REPO), *REFS] and "--force" in pushed
+    for rel_, found, why in (
+        (Exported(tmp_path, refusal="is an export of 1234, no test release"), [], "no test rel"),
+        (Exported(tmp_path), ["pppp: README.md:3 links to dropped AGENTS.md"], "not published"),
+        (Exported(tmp_path), ["pppp: scan: generic-api-key x.md:1"], "nothing pushed"),
+    ):
+        state["found"], runs = found, Runs(public_github())
+        with pytest.raises(ValueError, match=why):
+            upgrade.publish(rel_, PUBLIC_REPO, TOKEN, "b" * 40, REFS, tmp_path, run=runs)
+        assert runs.seen == []  # neither GitHub nor a push
+    state["found"] = []
+    other = "MathAgents/zab-test-release-other"
+    for full, private, why in ((PUBLIC_REPO, "true", "is not public"),
+                               (other, "false", "is MathAgents/")):  # fmt: skip
+        runs = Runs(public_github(full, private))
+        with pytest.raises(ValueError, match=why):
+            upgrade.publish(Exported(tmp_path), PUBLIC_REPO, TOKEN, "b" * 40, REFS, tmp_path,
+                            run=runs)  # fmt: skip
+        assert [argv[:2] for argv in runs.seen] == [["gh", "api"]]  # nothing pushed
+    for bad in NOT_PUBLIC:
+        runs = Runs(public_github())
+        with pytest.raises(ValueError, match="not one of MathAgents/zab-test-release-"):
+            upgrade.publish(Exported(tmp_path), bad, TOKEN, "b" * 40, REFS, tmp_path, run=runs)
+        assert runs.seen == []
+
+
+def test_the_private_push_refuses_a_public_repository(tmp_path):
+    with pytest.raises(ValueError, match="is not private"):
+        upgrade.push(tmp_path, TEST_REPO, TOKEN, "refs/tags/v0.3.1", run=Runs(github(
+            private="false")))  # fmt: skip
+
+
+def test_without_the_publication_tool_the_https_case_says_so(tmp_path):
+    """#977's Codex round 2: a public export's tree has no `tools/publish/`, and the HTTPS case
+    then says why it can't publish, rather than failing on a missing file. (The tests of the
+    tool's own checks are in `tests/publish/`, which the export drops with it.)"""
+    with pytest.raises(RuntimeError, match="no publication tool in this tree"):
+        upgrade.export_tool(tmp_path / "tools" / "publish" / "export.py")
+
+
+@pytest.mark.skipif(not shutil.which("bash"), reason="needs bash")
+def test_the_deploy_key_is_set_aside_and_put_back_never_over_one(tmp_path):
+    """#959's case sets the server's deploy key aside, and the test's `finally` puts it back; a
+    run cut short before that gets it back at the next setup (`MAKE_KEY`), never a new key."""
+    key = tmp_path / "release-key"
+    key.write_text("private\n")
+    (tmp_path / "release-key.pub").write_text(f"{PUBLIC} zab-admin-e2e-release\n")
+
+    def bash(literal: str) -> subprocess.CompletedProcess:
+        argv = ["bash", "-c", literal, "bash", str(key)]
+        return subprocess.run(argv, capture_output=True, text=True, check=False)  # noqa: S603
+
+    assert bash(upgrade.KEY_ASIDE).returncode == 0
+    assert not key.exists() and (tmp_path / "release-key.aside").read_text() == "private\n"
+    assert bash(upgrade.KEY_BACK).returncode == 0 and key.read_text() == "private\n"
+    assert bash(upgrade.KEY_BACK).returncode == 0 and key.read_text() == "private\n"  # no-op
+    assert bash(upgrade.KEY_ASIDE).returncode == 0
+    made = bash(upgrade.MAKE_KEY)  # the next run's setup: the same key, back, no ssh-keygen
+    assert made.returncode == 0 and made.stdout.startswith(PUBLIC), made.stderr
+    assert key.read_text() == "private\n" and not (tmp_path / "release-key.aside").exists()
+    (tmp_path / "release-key.aside").write_text("older\n")  # never over a key there
+    assert bash(upgrade.KEY_BACK).returncode == 0 and key.read_text() == "private\n"
+    aside = bash(upgrade.KEY_ASIDE)  # nor a key set aside over one before (#977's review, N3)
+    assert aside.returncode == 1 and "release-key.aside is there already" in aside.stderr
+    assert key.read_text() == "private\n" and (tmp_path / "release-key.aside").read_text() == (
+        "older\n"
+    )
 
 
 class Server:

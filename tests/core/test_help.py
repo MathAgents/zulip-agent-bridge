@@ -38,6 +38,9 @@ def test_help_has_one_command_or_tight_group_per_line():
         "!queue",
     ]
     assert "queued messages are kept" in lines[0]
+    # #655: a background job outlives `!stop`, which stops the turn only (SPEC §4.6)
+    assert lines[3].startswith("`!stop NAME`, `!stop jobs` — stop this topic's background job")
+    assert "`!stop` alone never" in lines[3]
     assert "SSH" not in HELP
 
 

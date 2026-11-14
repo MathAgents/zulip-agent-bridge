@@ -11,8 +11,9 @@ deployers = [101]               # SSH and deploy, and request and approve !upgra
 destructive_approvals = 2       # the test server uses 1
 plan_ttl_minutes = 10
 release = "final"               # final tags only; the test server takes "rc" too
-# !upgrade-server's repository, fetched with the server's deploy key (§1.6); unset, it is off
-# release_repo = "git@github.com:MathAgents/zulip-agent-bridge.git"
+# !upgrade-server's repository (§1.6); unset, it is off. A public one by its HTTPS address,
+# fetched anonymously (#959), or any by its SSH address, with the server's deploy key
+# release_repo = "https://github.com/MathAgents/zulip-agent-bridge.git"
 console_url = "https://admin.example.org"   # Q4; its host goes into the Caddyfile
 
 [global]

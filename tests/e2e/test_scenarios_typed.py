@@ -11,7 +11,9 @@ the same way, so that one of the two answers.
 2. **A session topic** (Claude's, started with a mention), under #713's rules: `` `!help` `` and
    `!Usage`, unmentioned, go to both bots and are answered once, by Claude (the VM's first bot,
    and the one with a session here); a prompt that starts with a code span, after a typed
-   `@claude` (``@claude `!x` is …``), is delivered to Claude alone, which answers it. No
+   `@claude` (``@claude `!x` is …``), is delivered to Claude alone, which answers it; and, where
+   the build has #985, ``@claude !new Reply with exactly `NEW-…` …`` gets Claude's one answer
+   that the topic already has a Claude session and that the prompt wasn't sent, and no turn. No
    "Unknown command" comes, and Codex posts nothing in the topic.
 3. **`!login`, for each bot,** started four ways (`!Login`, `` `!login` ``, a mention, a typed
    mention of its kind) and each time cancelled another way (`` `!login cancel` ``,
@@ -40,7 +42,7 @@ from e2e.test_scenarios_features import SENTINEL_VM, check_vm, vm_format
 from e2e.test_scenarios_sentinel import DOCTOR, replies, sentinel_up_for
 from zab.backends.claude_login import INSTRUCTIONS
 from zab.backends.codex import device_code_reply
-from zab.core.commands import DM_HELP, HELP
+from zab.core.commands import DM_HELP, HELP, new_with_session
 
 pytestmark = pytest.mark.e2e
 #: The sentinel answers a DM sent `CLOCK_MARGIN_S` (5 s) after its queue was registered: one
@@ -97,6 +99,12 @@ def topic_help() -> str:
 def prompt(token: str) -> str:
     """A prompt that starts with a code span holding `!x`: a prompt, never a command."""
     return f"`!x` is how this topic writes a factorial. {echo(token)}"
+
+
+def new_again(token: str) -> str:
+    """A `!new` with a prompt, in a topic where the bot already has a session (#985): answered
+    that the prompt wasn't sent, never run."""
+    return "!new " + echo(token)
 
 
 def codex_reply() -> str:
@@ -196,6 +204,14 @@ async def test_topic_commands_as_people_type_them(chat: Chat, vm, scenario, nonc
     asked = await chat.say("claude", topic, typed("claude", prompt(later)), mention_bot=False)
     _, took = await chat.reply(asked, answer(later))
     scenario.timing("a prompt that starts with `!x`, answered", took)
+    # #985: a `!new` where Claude has a session here gets one answer, and its prompt no turn
+    if renewed := installed.has(vm, installed.NEW_WITH_SESSION):
+        text = new_again(f"NEW-{nonce}")
+        again = await chat.say("claude", topic, typed("claude", text), mention_bot=False)
+        said = new_with_session("claude", text)
+        await chat.reply(again, "^" + re.escape(said) + "$", within=120)
+        after_new = await replies(chat, again)
+        assert after_new == [said], f"`@claude !new …` with a session: {after_new}"
     codex = chat.bots["codex"]
     from_codex = [m for m in await chat.user.after(turn.narrow, turn.message_id)
                   if m["sender_id"] == codex]  # fmt: skip
@@ -206,7 +222,12 @@ async def test_topic_commands_as_people_type_them(chat: Chat, vm, scenario, nonc
     assert not unknown, f"a typed command was unknown: {unknown}"
     scenario.notes.append(
         "topic: `!help` and !Usage answered once, unmentioned; an @claude `!x` prompt "
-        "answered by Claude alone"
+        "answered by Claude alone; "
+        + (
+            "@claude !new <prompt>: the session's answer, no turn"
+            if renewed
+            else "!new with a session not checked: the installed zab predates #985"
+        )
     )
 
 

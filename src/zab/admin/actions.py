@@ -605,6 +605,29 @@ def _build_protect(j: _Job) -> tuple[Step, ...]:
     return (_dry(j.run("aws/protect.py", j.tags, j.region, off, _only(j.slugs))),)
 
 
+#: `!trust-fix`'s apply deadline (#992): an hour, or this much a row, whichever is more. A VM
+#: takes 12 minutes at worst short of a hang: apt's lock waited out twice (300 s each, after a
+#: `!start all`, which then blocks the later steps), or apt, then conda's two installs, a few
+#: minutes each; trust_fix.py runs six at a time (`--parallel`), so 2 minutes a row.
+TRUST_FIX_FLOOR_S, TRUST_FIX_ROW_S = 3600, 120
+
+
+def _build_trust_fix(j: _Job) -> tuple[Step, ...]:
+    """trust_fix.py (#992; workshop/admin/README.md §10): its run without `--apply` is the plan's
+    dry run. `--admin-bot`: that dry run shows a row not reached, a stopped VM most often, rather
+    than failing the plan, as `!rollout`'s plan shows one; the apply fails on it, and prints each
+    VM's outcome as it ends. Its deadline grows with its rows (`TRUST_FIX_ROW_S`)."""
+    argv = j.run("admin/trust_fix.py", j.roster, j.kh, "--admin-bot", _only(j.slugs))
+    j.timeout = float(max(TRUST_FIX_FLOOR_S, len(j.slugs) * TRUST_FIX_ROW_S))
+    j.notes.append(
+        "**The trust fix** (workshop/admin/README.md §10) gives each VM the current image's "
+        "trust stores; a VM takes a minute or a few, six at a time. A row `not reached` (a VM "
+        "stopped, as the status shows) is left as it is, and fails the apply: `!start` it, then "
+        "`!trust-fix` it again."
+    )
+    return (Step(_cat(argv, "--apply"), argv),)
+
+
 def _build_rollout(j: _Job) -> tuple[Step, ...]:
     """push_config.py with the release and the command's words, then the targets' status. Each
     of `lean-shared` and `idle-stop=` left out is its default (#704), which the plan's notes say;
@@ -701,8 +724,9 @@ def _default_notes(
         m = IDLE_STOP_DEFAULT
         out.append(
             f"**Idle stop: {m} min (default)** where the waker is on for the VM and no timer is "
-            "on, unless it was turned off on purpose (`!idle-stop 0`); a timer that is on stays "
-            "as it is. Each row's result says what it found."
+            "on, unless it was turned off on purpose (`!idle-stop 0`); a timer that is on keeps "
+            "its minutes, and gets this release's idle-stop script (#655). Each row's result "
+            "says what it found."
         )
         missing = [s for s in j.slugs if s not in (woken or {})]
         sel = j.command.selection
@@ -1130,7 +1154,8 @@ def _retire_notes(j: _Job, ips: Mapping[str, str], *, unsynced: bool, export: bo
 #: `!retire` ended, which only `!launch`, `!adopt-spare`, `!retire`, `!teardown` (by its tag,
 #: harmless), `!status` (a read), `!deactivate-bots` and `!provision zulip` still name (#559).
 REACH_VM = frozenset({"start", "stop", "rollout", "idle-stop", "uninstall", "final-sync",
-                      "export", "protect", "provision repos", "grow-disk"})  # fmt: skip
+                      "export", "protect", "provision repos", "grow-disk",
+                      "trust-fix"})  # fmt: skip
 
 
 #: What brings a retired row back into service (round 2 of #565): `launch.py` leaves a row alone
@@ -1207,6 +1232,10 @@ VERBS: dict[str, Verb] = {
     ),
     "launch": Verb(_build_launch, TARGETS, region=True),
     "protect": Verb(_build_protect, TARGETS, region=True, status=True, launched=True),
+    # a reconciler (#992): each step changes only what it finds older than the image's, so its
+    # dry run, live state such as an unattended upgrade's, is shown, not hashed; `all` is the
+    # rows with a VM, which the script would skip otherwise
+    "trust-fix": Verb(_build_trust_fix, RECONCILER, status=True, launched=True),
     "rollout": Verb(_build_rollout, DRY_RUN, status=True, normalize=normalize_dry_run),
     "idle-stop": Verb(_build_idle_stop, DRY_RUN, status=True, normalize=normalize_dry_run),
     # No --wait: !start returns once EC2 has the requests. --wait has one deadline for all VMs

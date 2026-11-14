@@ -230,7 +230,8 @@ async def test_waker_stream(chat: Chat, ec2, instance_id, scenario, nonce):
 
         # a ⏰ from any of the bots: one from the wrong bot fails at once, not after a timeout
         found = await chat.user.wait_for(first_alarms, within=120, what="a ⏰ on the mention")
-        scenario.timing("wake: mention to its ⏰", time.monotonic() - first.sent_at, high=60)
+        scenario.timing("wake: mention to its ⏰", time.monotonic() - first.sent_at, high=60,
+                        outage=chat.user.blind(first.sent_at))  # fmt: skip
         assert found == [first.bot], f"⏰ on the mention from {found}, not [{first.bot}]"
         await asyncio.sleep(10)  # the other ⏰s, if any, come in the same pass
         each = sorted(await alarms(both))
@@ -300,7 +301,8 @@ async def test_waker_follow_ups(chat: Chat, ec2, instance_id, scenario, nonce):
         # a ⏰ from any bot; one from the wrong bot fails after the pass, not after a timeout
         await chat.user.wait_for(found, within=120, what="a ⏰ on a follow-up")
         sent = min(turn.sent_at for turn in (first, second, third))
-        scenario.timing("wake: follow-up to its ⏰", time.monotonic() - sent, high=60)
+        scenario.timing("wake: follow-up to its ⏰", time.monotonic() - sent, high=60,
+                        outage=chat.user.blind(sent))  # fmt: skip
         await asyncio.sleep(10)  # the other ⏰s, if any, come in the same pass
         each = await found()
         assert each is not None, "the ⏰s on the follow-ups went away"

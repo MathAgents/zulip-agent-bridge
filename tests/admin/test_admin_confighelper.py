@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from workshop.test_adminserver_deploy import ROOT, UNIT_PROBE, _user_manager, run_in_unit
 from zab.admin import confighelper
 from zab.admin.config import parse_admin_config
 from zab.admin.confighelper import Paths, Refused
@@ -174,6 +175,43 @@ def test_under_the_units_umask_the_bot_can_read_what_it_must(helper):
     assert (helper.etc / "admin.toml").stat().st_mode & 0o777 == 0o644
     key = helper.etc / "secrets" / "bots" / "mit-2027.zuliprc"
     assert key.stat().st_mode & 0o777 == 0o640
+
+
+#: The helper's run in its unit (`run_in_unit`), after the probe, with the spec's paths and owners.
+UNIT_RUN = (
+    UNIT_PROBE
+    + """
+from zab.admin import confighelper
+from zab.admin.config import Roots
+
+paths = confighelper.Paths(**spec["paths"], roots=Roots(**spec["roots"]))
+code = confighelper.run(paths, spec["owner"], spec["group"])
+with open(report, "w", encoding="utf-8") as f:
+    json.dump({"made": made, "code": code}, f)
+"""
+)
+
+
+@pytest.mark.skipif(not _user_manager(), reason="no user systemd manager with namespaces")
+def test_a_new_workshop_is_added_under_the_units_filters(helper):
+    """#896: the helper's own run, a service of this user's manager under its unit's settings but
+    its paths (`run_in_unit`): with no socket of any family, no socketpair and no io_uring, a
+    request is applied as above, the key given its group."""
+    helper.request()
+    paths, roots = helper.paths, helper.paths.roots
+    spec = {
+        "paths": {"requests": paths.requests, "config": paths.config, "state": paths.state},
+        "roots": {name: getattr(roots, name) for name in ("workshops", "secrets", "break_glass")},
+        "owner": helper.owner,
+        "group": helper.group,
+    }
+    unit = ROOT / "workshop" / "adminserver" / "zab-admin-config.service"
+    report, journal = run_in_unit(unit, UNIT_RUN, spec, helper.tmp)
+    made = ["EAFNOSUPPORT", "EAFNOSUPPORT", "EPERM", "EPERM"]  # no socket, socketpair, io_uring
+    assert report == {"made": made, "code": 0}, journal
+    assert helper.result()["ok"] is True
+    key = helper.etc / "secrets" / "bots" / "mit-2027.zuliprc"
+    assert key.read_text() == ZULIPRC and key.stat().st_gid == helper.group
 
 
 def test_no_request_is_a_quiet_pass(helper):

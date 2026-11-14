@@ -1160,6 +1160,79 @@ def test_a_connection_lost_after_the_hold_may_still_be_running(tmp_path, monkeyp
     assert "--only alice --apply" not in out
 
 
+def test_the_bots_dry_run_shows_a_row_not_reached_and_its_apply_fails_on_it(
+    tmp_path, monkeypatch, capsys
+):
+    """#992: as `!trust-fix` runs it (`--admin-bot`), a dry run with a VM not reached, a stopped
+    one, exits 0 with its row saying so, so that the plan shows it as `!rollout`'s shows a
+    stopped VM; by hand it still exits 1. The apply fails on that row, and its rerun is the
+    bot's command, never a shell line an organizer can't run."""
+    roster = tmp_path / "roster.csv"
+    roster.write_text(
+        "slug,email,ip\nalice,a@example.org,198.51.100.7\ncarol,c@example.org,198.51.100.9\n"
+    )
+    monkeypatch.setattr(trust_fix, "subprocess_runner", Runner(REPORT, down={"198.51.100.9"}))
+    monkeypatch.setattr(sys, "argv", ["/srv/trust_fix.py"])
+    base = ["--roster", str(roster), "--known-hosts", "kh"]
+    assert trust_fix.main([*base, "--admin-bot"]) == 0
+    out = capsys.readouterr().out
+    down = "not reached: ssh: connect to host 198.51.100.9 port 22: timed out"
+    assert re.search(rf"\ncarol +198\.51\.100\.9 .*{re.escape(down)}\n", out), out
+    assert out.endswith("\n1 VM(s) reached (dry run: nothing changed); not done: carol\n"), out
+    assert not re.search(r"^done: ", out, re.M)  # the plan's dry run: the table alone
+    assert trust_fix.main(base) == 1  # by hand, as before
+    assert capsys.readouterr().out.endswith("; not done: carol\n")
+    assert trust_fix.main([*base, "--apply"]) == 1
+    assert not re.search(r"^done: ", capsys.readouterr().out, re.M)  # by hand: the table
+    assert trust_fix.main([*base, "--admin-bot", "--apply"]) == 1
+    out = capsys.readouterr().out
+    # each VM's line as it ends, before the table (review round 1 on #994, N1)
+    ended = {line for line in out.split("\nparticipant ")[0].splitlines() if line}
+    assert ended == {
+        "done: alice (198.51.100.7): ok (uv: 0.13.2 -> 0.13.7)",
+        f"done: carol (198.51.100.9): {down}",
+    }, out
+    assert re.search(rf"\ncarol +198\.51\.100\.9 .*{re.escape(down)}\n", out), out
+    assert "\n1 VM(s) fixed and checked; not done: carol\n" in out
+    assert out.endswith("fix any other cause the rows give. Then rerun them:\n  !trust-fix carol\n")
+
+
+def test_the_bots_run_that_may_still_go_on_is_sent_again_later(tmp_path, monkeypatch, capsys):
+    """#992: under the bot, a run that may still be going on its VM is in no rerun either, and
+    the line says to send `!trust-fix` for it later, whose plan's row reads that a repair is
+    still running there while it lasts; the pips' upgrade, which the bot doesn't take, stays
+    the deployer's command."""
+    roster = tmp_path / "roster.csv"
+    roster.write_text(
+        "slug,email,ip\nalice,a@example.org,198.51.100.7\ncarol,c@example.org,198.51.100.9\n"
+    )
+    blocked = {"uv": "blocked, nothing installed: /etc/ssl/certs still holds a distrusted root"}
+    run = Runner({**REPORT, "steps": blocked}, drop={"198.51.100.7"})
+    monkeypatch.setattr(trust_fix, "subprocess_runner", run)
+    monkeypatch.setattr(sys, "argv", ["/srv/trust_fix.py"])
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    args = ["--roster", str(roster), "--known-hosts", "kh", "--apply", "--admin-bot"]
+    assert trust_fix.main(args) == 1
+    out = capsys.readouterr().out
+    assert (
+        "\nMay still be running on alice: not in any rerun here. Send this some minutes later:"
+        " its plan's row reads `a repair is still running here` while that run lasts (one that"
+        " never ends: a deployer, README §10):\n  !trust-fix alice\n"
+    ) in out
+    assert out.endswith("rerun them:\n  !trust-fix carol\n")
+    # a deployer's commands, the look among them, run as the bot's user, its key and known_hosts
+    me = pwd.getpwuid(os.getuid()).pw_name
+    look = trust_fix.ssh_argv("198.51.100.7", trust_fix.LOOK_CMD, known_hosts="kh")
+    assert f"\n  {shlex.join(['sudo', '-u', me, *look])}\n" in out
+    pips = SimpleNamespace(
+        admin_bot=True, upgrade_left_pips=False, roster="r.csv", known_hosts="kh", apply=True
+    )
+    assert trust_fix.rerun(pips, ["alice"]) == "!trust-fix alice"
+    upgrade = trust_fix.rerun(pips, ["alice"], pips=True)
+    assert upgrade.startswith(f"sudo -u {me} ") and "--admin-bot" not in upgrade
+    assert upgrade.endswith("--only alice --apply --upgrade-left-pips")
+
+
 #: A run's lifetime, in a process of its own: the remote half loaded from its file, its lock
 #: taken; then it sleeps (to be killed), raises, or returns.
 HOLDER = """

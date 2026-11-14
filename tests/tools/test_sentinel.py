@@ -354,7 +354,7 @@ async def test_restart_runs_fixed_commands_and_confirms_on_the_new_bridges_heart
         ["systemctl", "--user", "restart", "--no-block", "zab.service"],
     ]
     first, last = s.client.sent()
-    assert first == "🔄 Restarting your bridge: running turns will be interrupted."
+    assert first == sn.RESTARTING_BRIDGE
     assert last == (
         "✅ Your bridge is back: it is processing Zulip events again (8 seconds after the restart)."
     )
@@ -405,7 +405,7 @@ async def test_one_restart_a_minute_across_bots(make):
         ["systemctl", "--user", "reset-failed", "codex-app-server.service"],
         ["systemctl", "--user", "restart", "codex-app-server.service"],
     ]
-    assert other.client.sent()[-1] == "✅ Codex is running again."
+    assert other.client.sent()[-1] == sn.CODEX_BACK
 
 
 async def test_restart_codex_without_a_daemon(make):
@@ -635,7 +635,7 @@ async def test_every_command_the_bridge_left_gets_an_answer(make, tmp_path):
     s = await ready(make(systemd=no_fork))
     await s.handle(dm("!restart"))
     assert s.client.sent() == [
-        "🔄 Restarting your bridge: running turns will be interrupted.",
+        sn.RESTARTING_BRIDGE,
         "⚠️ The restart failed (exit 126); bridge: unknown.",
     ]
     assert "bridge state unknown (unknown)" in (await s.vm_report())
@@ -681,7 +681,7 @@ async def test_the_organizers_hold_refuses_restarts(make, tmp_path, hold):
     assert "bridge not running (inactive): send !restart" in await s.vm_report()
     s.run.active = "active"
     await s.handle(dm("!restart codex", mid=2))
-    assert s.client.sent()[-1] == "✅ Codex is running again."
+    assert s.client.sent()[-1] == sn.CODEX_BACK
 
 
 def test_the_hold_is_idle_stops():
@@ -738,3 +738,133 @@ def test_main_refuses_a_bad_config(tmp_path, capsys):
 def test_zab_sentinel_is_a_command():
     assert cli.COMMANDS["sentinel"] == "zab.tools.sentinel"
     assert sn.SENTINEL_UNIT == "zab-sentinel.service"
+
+
+# ------------------------------------------------------------- !vm's background jobs (#655)
+
+
+class JobSystemd(Systemd):
+    """`Systemd`, which also lists the job units that run and answers their `MemoryCurrent`
+    (`None`: the manager doesn't answer `list-units`)."""
+
+    def __init__(self, running=(), memory=None, **kw):
+        super().__init__(**kw)
+        self.running, self.memory = running, memory or {}
+
+    async def __call__(self, argv, seconds):
+        if argv[2:3] == ["list-units"]:
+            self.calls.append(list(argv))
+            if self.running is None:
+                return 1, ""
+            return 0, "\n".join(
+                f"zab-job-{i}.service loaded active running x" for i in self.running
+            )
+        if argv[2:5] == ["show", "-p", "MemoryCurrent"]:
+            self.calls.append(list(argv))
+            job_id = argv[-1].removeprefix("zab-job-").removesuffix(".service")
+            return (0, str(self.memory[job_id])) if job_id in self.memory else (1, "")
+        return await super().__call__(argv, seconds)
+
+
+def a_job(
+    state_dir: Path, job_id: str, name: str, started: float, *, ended: bool = False, boot="b"
+):
+    from zab import jobs as zjobs
+
+    directory = zjobs.jobs_dir(state_dir) / job_id
+    directory.mkdir(parents=True)
+    zjobs.Job(
+        id=job_id, name=name, argv=["python3", "x.py"], cwd="/w", bot="claude",
+        session="", attached=None, started_at=started, boot_id=boot, directory=directory,
+    ).save()  # fmt: skip
+    if ended:
+        zjobs.write_json(directory / "ended.json", {"SERVICE_RESULT": "success"})
+
+
+@pytest.mark.parametrize("bridge", ["active", "inactive"])
+async def test_vm_lists_the_running_jobs_itself_also_with_the_bridge_down(make, bridge):
+    """Codex round 1 on #941: on the workshop VMs the sentinel answers DM `!vm`, so it lists the
+    machine's running background jobs itself, from their directories and systemd, never through
+    the bridge, and also while the bridge is down (§13.5)."""
+    a, b, c = "a" * 12, "b" * 12, "c" * 12
+    systemd = JobSystemd(running=(a, b), memory={a: 1288490188}, active=bridge)
+    s = await ready(make(systemd=systemd))
+    state = s.state_dir
+    a_job(state, a, "rank-search", NOW - 600)
+    a_job(state, b, "build", NOW - 60)
+    a_job(state, c, "done", NOW - 900, ended=True)  # its end is written: not running
+    touch(s.heartbeat_file, NOW - 40)
+    await s.handle(dm("!vm"))
+    (reply,) = s.client.sent()
+    assert reply.splitlines()[-1] == (
+        "Background jobs: `rank-search` since <time:2027-01-15T07:50:00+00:00>, 1.2 GB memory · "
+        "`build` since <time:2027-01-15T07:59:00+00:00>, memory unavailable"
+    )
+    if bridge == "inactive":
+        assert "bridge not running (inactive): send !restart" in reply
+    assert [
+        "systemctl",
+        "--user",
+        "show",
+        "-p",
+        "MemoryCurrent",
+        "--value",
+        f"zab-job-{c}.service",
+    ] not in systemd.calls
+
+
+async def test_vm_lists_no_jobs_line_without_running_jobs(make):
+    systemd = JobSystemd(running=())
+    s = await ready(make(systemd=systemd))
+    await s.handle(dm("!vm"))
+    assert "Background jobs" not in s.client.sent()[0]
+    assert not any(c[2] == "list-units" for c in systemd.calls)  # no job: systemd isn't asked
+    a_job(s.state_dir, "a" * 12, "gone", NOW - 600)  # no `ended.json`, but its unit is gone
+    await s.handle(dm("!vm", mid=2))
+    assert "Background jobs" not in s.client.sent()[1]
+
+
+async def test_vm_lists_this_boots_unended_jobs_when_the_manager_doesnt_answer(make):
+    """With no answer from the manager, a job of this boot without its `ended.json` is taken to
+    run; one of an earlier boot can't be, and isn't listed (#941's review, N1)."""
+    systemd = JobSystemd(running=None)
+    s = await ready(make(systemd=systemd))
+    a_job(s.state_dir, "a" * 12, "rank-search", NOW - 600, boot=s.boot)
+    a_job(s.state_dir, "b" * 12, "cut-off", NOW - 90000, boot="an-earlier-boot")
+    await s.handle(dm("!vm"))
+    assert s.client.sent()[0].splitlines()[-1] == (
+        "Background jobs: `rank-search` since <time:2027-01-15T07:50:00+00:00>, memory unavailable"
+    )
+
+
+async def test_a_hand_written_jobs_name_and_time_cost_nothing_but_safety(make):
+    """#941's review, B2 and N2: a job whose name the pattern doesn't allow, or whose time
+    doesn't convert, never loads (`zab.jobs`' `typed()`), so it isn't listed; and a jobs line
+    that fails anyway costs only that line, never the VM report."""
+    from zab import jobs as zjobs
+
+    a, b = "a" * 12, "b" * 12
+    s = await ready(make(systemd=JobSystemd(running=(a, b))))
+    a_job(s.state_dir, a, "ok", NOW - 600)
+    for job_id, name, started in ((b, "x` @**all** `y", 1e300),):
+        directory = zjobs.jobs_dir(s.state_dir) / job_id
+        directory.mkdir(parents=True)
+        zjobs.write_json(
+            directory / "job.json",
+            {"schema": 1, "id": job_id, "name": name, "argv": ["x"], "cwd": "/w", "bot": "",
+             "session": "", "started_at": started, "boot_id": "b"},
+        )  # fmt: skip
+    assert zjobs.Job.load(zjobs.jobs_dir(s.state_dir) / b) is None
+    await s.handle(dm("!vm"))
+    last = s.client.sent()[0].splitlines()[-1]
+    assert last == (
+        "Background jobs: `ok` since <time:2027-01-15T07:50:00+00:00>, memory unavailable"
+    )
+
+    async def broken():
+        raise OSError("unreadable")
+
+    s.jobs_line = broken
+    await s.handle(dm("!vm", mid=2))
+    report = s.client.sent()[1]
+    assert report.startswith("**ws-alice**") and "Background jobs" not in report

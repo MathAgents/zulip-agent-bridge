@@ -912,7 +912,8 @@ async def test_a7_stop_and_start(scenario, tester, rigged, aws, nonce):
     started = time.monotonic()
     answer = await t.ask("!status zab-test-b", STATUS_ANSWER, within=PLAN_S)
     # #439: EC2's state, no SSH attempt; over the threshold, A7 fails but runs on (its stops)
-    scenario.timing("!status of a stopped VM", time.monotonic() - started, high=STOPPED_STATUS_S)
+    scenario.timing("!status of a stopped VM", time.monotonic() - started,
+                    high=STOPPED_STATUS_S, outage=tester.blind(started))  # fmt: skip
     shown = status_of(await whole(tester, answer)).get(B, {}).get("state")
     assert shown == "stopped", f"!status shows zab-test-b {shown}: {answer['content'][:300]}"
     await t.run("!start zab-test-b")

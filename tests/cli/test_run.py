@@ -86,6 +86,7 @@ async def test_runtime_caps_manager_at_registered_server_limit(tmp_path, monkeyp
 
         async def initialize(self):
             self.initialized = True
+            self.jobs_at_start = getattr(self, "jobs", None)  # the actors made here copy it
 
         def unverify(self):
             self.unverified = True
@@ -117,9 +118,14 @@ async def test_runtime_caps_manager_at_registered_server_limit(tmp_path, monkeyp
         assert runtime.bridges[2].peers == [runtime.bridges[2]]
         # one Lean reaper for the machine, only with a Codex backend (SPEC §7.12, #249)
         assert (runtime.lean_reaper is not None) == (kind == "codex" and PROC)
+        # one jobs watcher for the machine, every bridge's `JobControl` from before its
+        # `initialize()` (#655; #934's N3)
+        assert all(b.jobs_at_start is runtime.jobs for b in runtime.bridges)
+        assert runtime.job_watch is not None and not runtime.job_watch.done()
     finally:
         await runtime.close()
     assert runtime.lean_reaper is None or runtime.lean_reaper.cancelled()
+    assert runtime.job_watch.cancelled()
 
 
 async def test_recovery_wait_does_not_block_other_backend_events():

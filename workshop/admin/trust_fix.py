@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""`trust_fix.py --roster R --known-hosts KH [--only SLUG …] [--apply [--upgrade-left-pips]]`
-(README.md §10).
+"""`trust_fix.py --roster R --known-hosts KH [--only SLUG …] [--apply [--upgrade-left-pips]]
+[--admin-bot]` (README.md §10).
 
 A VM launched from an image built before #816 keeps the trust stores of that image: its uv,
 whose built-in roots hold emSign ECC Root CA - G3 up to 0.13.3 and through which `!rollout`
@@ -30,6 +30,13 @@ what was left, and the commands that look into a run that ended badly. Exit 0 wh
 reached passed the check (with `--apply`) or was reached (without); 1 otherwise. The remote
 commands, and every command printed for the deployer, are fixed literals with the roster's
 validated addresses and slugs: nothing from a VM reaches a shell or a printed command.
+
+`--admin-bot`, as the admin bot's `!trust-fix` runs it (docs/ADMIN.md §3, #992): its dry run,
+the plan, exits 0 once the table is printed, whatever its rows say, so that a row not reached,
+a stopped VM most often, is shown in the plan, as `!rollout`'s plan shows one, and its apply
+fails on it; the reruns it prints are the bot's command, `!trust-fix <slugs>`; and with
+`--apply`, each VM's outcome is printed as it ends (`done_line`), before the table, so that the
+bot's progress shows it and a run cut short by the bot's deadline keeps the VMs done so far.
 """
 
 import argparse
@@ -41,6 +48,7 @@ import pwd
 import re
 import shlex
 import sys
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -164,6 +172,15 @@ class FixResult:
         return [self.slug, self.host, *(scrub(c) for c in cells), scrub(check)]
 
 
+def done_line(result: FixResult) -> str:
+    """One VM's outcome as it ends (`--admin-bot --apply`): its `check` cell, then each step's
+    cell that isn't `-`, as the table shows them, scrubbed."""
+    slug, host, *cells, check = result.row()
+    steps = "; ".join(f"{name}: {cell}" for name, cell in zip(STEPS, cells, strict=True)
+                      if cell != "-")  # fmt: skip
+    return f"done: {slug} ({host}): {check}" + (f" ({steps})" if steps else "")
+
+
 def remote_script() -> str:
     """trust_fix_remote.py with trust_stores.py's and apt_repair.py's sources in place of their
     placeholders."""
@@ -274,7 +291,8 @@ def recovery(result: FixResult, args: argparse.Namespace) -> list[str]:
     fixed literals, with the roster's address and conda's fixed prefixes."""
 
     def ssh(remote: str) -> str:
-        return as_run(ssh_argv(result.host, remote, known_hosts=args.known_hosts))
+        argv = ssh_argv(result.host, remote, known_hosts=args.known_hosts)
+        return as_run(argv, bot=getattr(args, "admin_bot", False))
 
     steps, out = result.steps(), []
     apt_killed = steps.get("ca-certificates", "").startswith("FAILED: apt-get install killed")
@@ -305,9 +323,10 @@ def recovery(result: FixResult, args: argparse.Namespace) -> list[str]:
     return out
 
 
-def as_run(argv: list[str]) -> str:
-    """ARGV as this run was: through `sudo -u` if sudo ran it."""
-    if os.environ.get("SUDO_USER"):
+def as_run(argv: list[str], *, bot: bool = False) -> str:
+    """ARGV as this run was: through `sudo -u` if sudo ran it, or the admin bot (`bot`), as
+    whose user a deployer runs it in a shell on the server (README §10)."""
+    if os.environ.get("SUDO_USER") or bot:
         argv = ["sudo", "-u", pwd.getpwuid(os.getuid()).pw_name, *argv]
     return shlex.join(argv)
 
@@ -320,6 +339,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(PIPS, action="store_true", help="with --apply: the pips left too")
     parser.add_argument("--parallel", type=int, default=6)
     parser.add_argument("--known-hosts", default=str(DEFAULT_KNOWN_HOSTS))
+    parser.add_argument("--admin-bot", action="store_true", help="as !trust-fix runs it")
     args = parser.parse_args(argv)
     if args.upgrade_left_pips and not args.apply:
         parser.error(f"{PIPS} needs --apply")
@@ -329,18 +349,28 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 1
+    stream, said = args.admin_bot and args.apply, threading.Lock()
+
+    def ended(result: FixResult) -> FixResult:
+        if stream:  # as it ends, whole lines, one VM at a time
+            with said:
+                print(done_line(result), flush=True)
+        return result
+
     results = run_parallel(
         rows,
-        lambda row: fix_vm(
-            row,
-            subprocess_runner,
-            apply=args.apply,
-            script=script,
-            known_hosts=args.known_hosts,
-            pips=args.upgrade_left_pips,
+        lambda row: ended(
+            fix_vm(
+                row,
+                subprocess_runner,
+                apply=args.apply,
+                script=script,
+                known_hosts=args.known_hosts,
+                pips=args.upgrade_left_pips,
+            )
         ),
         parallel=args.parallel,
-        on_error=lambda row, exc: FixResult(slug=slug_of(row), problem=f"{exc!r}"),
+        on_error=lambda row, exc: ended(FixResult(slug=slug_of(row), problem=f"{exc!r}")),
     )
     print(format_table(COLUMNS, [r.row() for r in results]))
     for r in results:
@@ -358,7 +388,14 @@ def main(argv: list[str] | None = None) -> int:
     # A run that may still be going is never rerun beside itself (Codex round 3 on #856): it
     # gets its dry run, once the look above reads `none running`.
     going = [r.slug for r in results if r.cut]
-    if args.apply and going:
+    if args.apply and going and args.admin_bot:  # its plan's row says while that run lasts
+        print(
+            f"\nMay still be running on {', '.join(going)}: not in any rerun here. Send this"
+            " some minutes later: its plan's row reads `a repair is still running here` while"
+            " that run lasts (one that never ends: a deployer, README §10):"
+            f"\n  {rerun(args, going)}"
+        )
+    elif args.apply and going:
         print(
             f"\nMay still be running on {', '.join(going)}: not in any rerun here. Run the first"
             " command under its name above until it reads `none running`, then its dry run:"
@@ -372,7 +409,8 @@ def main(argv: list[str] | None = None) -> int:
             " where a step names it (unattended upgrades: a few minutes); fix any other cause the"
             f" rows give. Then rerun them:\n  {rerun(args, again)}"
         )
-    return 1 if bad else 0
+    # the bot's plan shows every row, those not reached too; its apply fails on them
+    return 1 if bad and (args.apply or not args.admin_bot) else 0
 
 
 def pips(results: list[FixResult], args: argparse.Namespace) -> None:
@@ -399,12 +437,16 @@ def rerun(
     args: argparse.Namespace, slugs: list[str], *, pips: bool | None = None, apply: bool = True
 ) -> str:
     """This run's command again for SLUGS, as it was given, through `sudo -u` if sudo ran it;
-    without APPLY, its dry run."""
+    without APPLY, its dry run. With `--admin-bot`, the bot's command, whose plan is the dry run
+    and whose approval the apply; but for the pips, which it doesn't take (README §10)."""
     pips = apply and (args.upgrade_left_pips if pips is None else pips)
+    if args.admin_bot and not pips:  # the slugs are the roster's, as the table shows them
+        return f"!trust-fix {' '.join(slugs)}"
     argv = [sys.executable, "-E", "-s", sys.argv[0]]  # this script, as the command named it
     argv += ["--roster", args.roster, "--known-hosts", args.known_hosts]
     argv += [x for slug in slugs for x in ("--only", slug)]
-    return as_run([*argv, *(["--apply"] if apply else []), *([PIPS] if pips else [])])
+    tail = [*(["--apply"] if apply else []), *([PIPS] if pips else [])]
+    return as_run([*argv, *tail], bot=args.admin_bot)
 
 
 if __name__ == "__main__":

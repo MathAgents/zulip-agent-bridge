@@ -1039,9 +1039,9 @@ deployers = [<YOUR_USER_ID>]                 # SSH and deploy; get the backups b
 destructive_approvals = 2                    # ADMIN §2.5
 plan_ttl_minutes = 10
 release = "final"                            # signed final tags only: vX.Y.Z, never an rc
-# where !upgrade-server fetches the signed tags, with the server's deploy key (§13.4): the public
-# zab repository's SSH address, if you own it; optional: or delete
-release_repo = "git@github.com:<RELEASE_OWNER>/<RELEASE_REPO>.git"
+# where !upgrade-server fetches the signed tags (§13.4): the public zab repository's HTTPS
+# address, anonymously; or a repository's SSH address, with the server's deploy key; optional
+release_repo = "https://github.com/<RELEASE_OWNER>/<RELEASE_REPO>.git"
 console_url = "https://<HOST>"               # the console (ADMIN §4); its host goes into the Caddyfile
 
 [global]                                     # the fleet's scope (ADMIN §5); `Workshop admin`
@@ -1203,13 +1203,14 @@ Once you have signed a tag of the public repository, every `git fetch origin --t
 ```text
 The reviewed diff, the empty tree..<first 12 of C>, is ~/zab-admin/zab-admin-empty..<first 12 of C>.diff
   SHA-256 <hex>; release tree <hex> (<n> paths of workshop/adminserver/release-paths)
-Sign it once reviewed, then verify and push it:
+Sign it once reviewed, then verify it:
   git -C ~/zab-vX.Y.Z tag -s vX.Y.Z -m "zab vX.Y.Z" <C>
   git -C ~/zab-vX.Y.Z tag -v vX.Y.Z
-  git -C ~/zab-vX.Y.Z push origin vX.Y.Z
+Only after the Good line, push it, chained behind tag -v again:
+  git -C ~/zab-vX.Y.Z tag -v vX.Y.Z >/dev/null 2>&1 && git -C ~/zab-vX.Y.Z push origin vX.Y.Z
 ```
 
-The last four lines are the commands to paste, in any directory: they name the clone `deploy.sh` read, as an absolute path (here the worktree, which shares `~/zab`'s tags and `origin`), the version of C's own `pyproject.toml` and all of C. Where C's `pyproject.toml` has no single `version = "X.Y.Z"` line, the review prints `No tag command:` and the reason instead.
+Its last five lines are two headers, each with the commands to paste under it, in any directory: they name the clone `deploy.sh` read, as an absolute path (here the worktree, which shares `~/zab`'s tags and `origin`), the version of C's own `pyproject.toml` and all of C. The push runs only behind a `tag -v` that passes, so the three command lines pasted at once push nothing when the tag doesn't verify (#968). An older release's `deploy.sh` prints the push unchained, `git -C … push origin vX.Y.Z`, under one header, `Sign it once reviewed, then verify and push it:`: never paste that line with the other two. Where C's `pyproject.toml` has no single `version = "X.Y.Z"` line, the review prints `No tag command:` and the reason instead.
 
 **If the clone has the tag already,** the review says `No tag command: … already has a tag vX.Y.Z` instead. `git -C ~/zab tag -v "$V"` says whose it is:
 - **`Good "git" signature with ED25519 key SHA256:gTGOWot/…`, then `No principal matched.`, with SECURITY.md's fingerprint:** the public repository's tag, which you fetched, signed by the maintainer's key, which your `allowed_signers` doesn't list. Sign your own on the same commit, below.
@@ -1219,7 +1220,7 @@ The last four lines are the commands to paste, in any directory: they name the c
 
 Any other output is a signature that doesn't verify. Read the review first, whichever it is. Keep the SHA-256: the bootstrap prints the same one for the same base. **What you certify by signing** (ADMIN §1.6; DECISIONS D31, D32): that this is the release's commit, which passed the checks your process requires (the maintainer's releases pass CI, the reviews and the end-to-end suite), and that you read its privileged surface yourself: `deploy.sh`, the systemd units, `sysusers.conf`, `tmpfiles.conf`, the nftables rules, the Caddyfile and `render_policy.py` (or its policy, §10), and the further files `workshop/adminserver/privileged-paths` lists: the root helper's `confighelper.py`, `config.py` and `checks.py`, `pyproject.toml`, `build-constraints.txt`, and `uv.lock` through its summary by package. The review marks them all `P`. Read every line of those, then sign.
 
-**In a repository whose releases you tag yourself,** sign and verify, then push. The review printed the same three commands; never paste its push line with the other two, since a `tag -s` that fails (no key in the agent) makes an unsigned tag and exits 0:
+**In a repository whose releases you tag yourself,** sign and verify, then push. The review printed the same commands, its push chained as below; a `tag -s` that fails (no key in the agent) makes an unsigned tag and exits 0, so never paste an older review's unchained push line with the other two:
 
 ```sh
 git -C ~/zab tag -s "$V" -m "zab $V" "$C"
@@ -1516,14 +1517,21 @@ These hold before, during and after the bootstrap. They keep the deployment's ke
 
 ### 13.4 The in-band upgrade: the deploy key, `release_repo`, and when `deploy.sh` is still the way
 
-Once the server runs a release with it (its `deploy.sh` has `--in-band`), a deployer upgrades the server in-band: `!upgrade-server vX.Y.Z sha256=<your review's SHA-256>` in `#zab-admins`, approved by one deployer (ADMIN §1.6, #569). The server fetches the release from `release_repo` with a deploy key of its own, checks it as `deploy.sh` does, and installs it with the release's own `deploy.sh`, its fleet wheel included. Nothing reaches the server over SSH. `deploy.sh` from your machine stays the bootstrap (§11) and the fallback (below).
+Once the server runs a release with it (its `deploy.sh` has `--in-band`), a deployer upgrades the server in-band: `!upgrade-server vX.Y.Z sha256=<your review's SHA-256>` in `#zab-admins`, approved by one deployer (ADMIN §1.6, #569). The server fetches the release from `release_repo`, a public repository anonymously over HTTPS, or any repository over SSH with a deploy key of its own, checks it as `deploy.sh` does, and installs it with the release's own `deploy.sh`, its fleet wheel included. Nothing reaches the server over SSH. `deploy.sh` from your machine stays the bootstrap (§11) and the fallback (below).
 
 **What it guards.** The server installs only a release signed by a key of its own `allowed_signers` that its `release` pattern allows, newer than the one it runs: the in-band upgrade only goes forward, and `downgrade` is refused. A rollback is `deploy.sh --downgrade` from your machine (*After an applied upgrade*, below). `sha256=` makes your request install only the diff you reviewed, from the base you reviewed it from. It is no secret, though: a refused plan shows the right value. So it keeps an honest request to its review; it is no barrier against a compromised bot, whose limit is the signature.
 
-**Which repository.** `release_repo` needs the server's deploy key, which only the repository's owner, or an admin of it, can add:
-- **The public zab repository,** for its owner's server, by its SSH address, `git@github.com:<OWNER>/<REPO>.git` of the address `README.md`'s install line gives: the server fetches the published releases there, one commit each, whose tags are signed with the key SECURITY.md publishes, a key of that server's `allowed_signers`. Nothing is pushed for the server: a release's tag is there once it is published. The running release's tag there must name the commit the server's `deploys.jsonl` records for it, which holds for a release deployed from the public repository's commit. A server that runs one deployed from another repository's commit, such as the clone the release was first tagged in, first takes one hand deploy of a published release (*Onto the public repository's commits*, below).
-- **A repository whose releases you tag yourself** (§9), which you own: that repository.
-- **Otherwise,** the public repository's releases, signed by you or by the maintainer (SECURITY.md's line in your `allowed_signers`, §2.2): a **private repository of your own** that holds their tags, since the public repository's deploy keys are its owner's. Make it once, with `gh` signed in as its owner. It prints `https://github.com/<OWNER>/<REPO>`:
+**Two forms.** `release_repo` names a GitHub repository in one of two forms (#959):
+- **`https://github.com/<OWNER>/<REPO>.git`, a public repository,** fetched anonymously over HTTPS, GitHub authenticated by the server's CA certificates. No deploy key, and nothing to add on GitHub: any server may name a public repository its deployers don't own. Skip the setup's steps 1 and 2.
+- **`git@github.com:<OWNER>/<REPO>.git`, any repository, a private one included,** over SSH with the server's deploy key, which only the repository's owner, or an admin of it, can add (steps 1 and 2), and GitHub's host keys pinned in the release.
+
+Either way the server installs only tags signed by a key of its own `allowed_signers`: the form decides how the tags travel, never which are trusted. No user, token, port or other host is taken, and a refusal never shows the value. The HTTPS form needs a running release whose loader takes it: an older one refuses it at step 3's checks (`release_repo: expected …`), so keep the SSH form until the server runs one that does.
+
+**Which repository:**
+- **The public zab repository,** by its HTTPS address, `https://github.com/<OWNER>/<REPO>.git` of the address `README.md`'s install line gives, or, for its owner's server, by its SSH address with a deploy key: the server fetches the published releases there, one commit each, whose tags are signed with the key SECURITY.md publishes, a key of that server's `allowed_signers`. Nothing is pushed for the server: a release's tag is there once it is published, signed and pushed by the maintainer's publication of the release, never by `upgrade.py` (the adminserver README), which pushes only to your clone's origin. The running release's tag there must name the commit the server's `deploys.jsonl` records for it, which holds for a release deployed from the public repository's commit. A server that runs one deployed from another repository's commit, such as the clone the release was first tagged in, first takes one hand deploy of a published release (*Onto the public repository's commits*, below).
+  With the maintainer's signature (SECURITY.md's line in your `allowed_signers`, §2.2), this is the repository for any server, by its HTTPS address.
+- **A repository whose releases you tag yourself** (§9), which you own: that repository, by its HTTPS address if it is public.
+- **Otherwise,** the public repository's releases, signed by you (§9): your tags aren't in the public repository, so a **repository of your own** holds them, private (the SSH form) or public (the HTTPS form). Make it once, with `gh` signed in as its owner (`--public` for a public one). It prints `https://github.com/<OWNER>/<REPO>`:
 
   ```sh
   gh repo create <OWNER>/<REPO> --private --description "zab release tags for the admin server"
@@ -1532,7 +1540,7 @@ Once the server runs a release with it (its `deploy.sh` has `--in-band`), a depl
 Either way, set it in this shell for the steps below, with the release the server runs (`!version` names it):
 
 ```sh
-RR=git@github.com:<OWNER>/<REPO>.git
+RR=<the repository's address>   # https://github.com/<OWNER>/<REPO>.git, or git@github.com:<OWNER>/<REPO>.git
 RUNNING=<release>               # vX.Y.Z, the release the server runs
 [ -d ~/zab-"$RUNNING" ] || git -C ~/zab worktree add --detach ~/zab-"$RUNNING" "$RUNNING"
 ```
@@ -1543,7 +1551,7 @@ RUNNING=<release>               # vX.Y.Z, the release the server runs
 ~/zab-"$RUNNING"/workshop/adminserver/ssh-rule.sh
 ```
 
-1. **The deploy key, on the server.** The private key stays there, root's, 0600 (`ssh-keygen`'s default); its `.pub` is 0644:
+1. **The deploy key, on the server** (the SSH form alone: with the HTTPS form, go to step 3). The private key stays there, root's, 0600 (`ssh-keygen`'s default); its `.pub` is 0644:
 
    ```sh
    ssh -t "$HOST" "sudo ssh-keygen -q -t ed25519 -N '' -C zab-release -f /etc/zab-admin/secrets/release-key && sudo cat /etc/zab-admin/secrets/release-key.pub"
@@ -1564,12 +1572,12 @@ RUNNING=<release>               # vX.Y.Z, the release the server runs
    diff -u ~/zab-admin/etc/admin.toml ~/zab-admin/etc/admin.toml.server && echo same
    ```
 
-   Take the server's, add the line `release_repo = "git@github.com:<OWNER>/<REPO>.git"` before its first `[` table, and check it with the release's loader. The diff shows that one `+` line, and the check ends `ok`:
+   Take the server's, add the line `release_repo = "<RR's value>"` before its first `[` table, and check it with the release's loader. The diff shows that one `+` line, and the check ends `ok`:
 
    ```sh
    cp ~/zab-admin/etc/admin.toml.server ~/zab-admin/etc/admin.toml
    ${EDITOR:-nano} ~/zab-admin/etc/admin.toml
-   diff -u ~/zab-admin/etc/admin.toml.server ~/zab-admin/etc/admin.toml   # only: +release_repo = "git@github.com:<OWNER>/<REPO>.git"
+   diff -u ~/zab-admin/etc/admin.toml.server ~/zab-admin/etc/admin.toml   # only: +release_repo = "<RR's value>"
    cd ~/zab-"$RUNNING" && uv run python -m zab.admin.config --config ~/zab-admin/etc/admin.toml check && echo ok
    ```
 
@@ -1610,24 +1618,46 @@ RUNNING=<release>               # vX.Y.Z, the release the server runs
      and this block again; the staging block's diff then shows only `-release_repo = …`, and this
      block ends `bot check: OK (<n> bots)` on the file as it was. That leaves the in-band upgrade
      off, and `deploy.sh` the way. Then `rm ~/zab-admin/etc/admin.toml.server`.
-4. **The check, at once:** the running release's tag in `release_repo`, read on the server with its deploy key and GitHub's pinned host keys, as the plan helper reads it.
-   - **With a private repository of your own,** push the tag there first. It prints `* [new tag] vX.Y.Z -> vX.Y.Z`, or `Everything up-to-date`:
+4. **The check, at once:** the running release's tag in `release_repo`, read on the server as the plan helper reads it.
+   - **With a repository of your own,** push the tag there first. It prints `* [new tag] vX.Y.Z -> vX.Y.Z`, or `Everything up-to-date`:
 
      ```sh
      git -C ~/zab push "$RR" "refs/tags/$RUNNING"
      ```
+
+     **With `RR` in the HTTPS form,** this push goes from your machine over HTTPS, so it needs a git credential there. The server's reads stay anonymous. Either:
+     - let git use `gh`'s sign-in, as an account that may push to the repository, once before the push. It prints nothing:
+
+       ```sh
+       gh auth setup-git
+       ```
+
+     - or push to the repository's SSH address, with your own SSH key, while `RR` stays the HTTPS address the server reads:
+
+       ```sh
+       git -C ~/zab push git@github.com:<OWNER>/<REPO>.git "refs/tags/$RUNNING"
+       ```
+
+     Without either, a credential helper already set up on your machine may answer: macOS's keychain, or Git Credential Manager, which may open a browser. If it holds another account's token, the push fails with `Permission to <OWNER>/<REPO>.git denied to <user>`. With no helper, git asks for a user name and password, or fails with `could not read Username for 'https://github.com'`. GitHub refuses an account's password there: it takes a token, which `gh auth setup-git` supplies.
    - **With the public repository,** push nothing, ever, from `~/zab`: the tag there is the published one, and a push of `~/zab`'s would be rejected, as `already exists`, or, for a release not published yet, would put `~/zab`'s commit and its history on the public repository.
 
-   Then the check:
+   Then the check. For the HTTPS form, anonymously, with no credential and no redirect:
+
+   ```sh
+   ssh "$HOST" "GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.followRedirects=false ls-remote $RR refs/tags/$RUNNING"
+   ```
+
+   For the SSH form, as root, with the deploy key and GitHub's pinned host keys:
 
    ```sh
    ssh -t "$HOST" "sudo env GIT_SSH_COMMAND='ssh -F /dev/null -i /etc/zab-admin/secrets/release-key -o IdentitiesOnly=yes -o IdentityAgent=none -o UserKnownHostsFile=/opt/zab-admin/current/workshop/adminserver/github-known-hosts -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o BatchMode=yes' git ls-remote $RR refs/tags/$RUNNING"
    ```
 
    It prints one line, `<40 hex>	refs/tags/vX.Y.Z`. Otherwise:
-   - `Permission denied (publickey)`: step 2 isn't done;
-   - `ERROR: Repository not found.`: `RR` names another repository than the one step 2 added the key to;
-   - `Host key verification failed.`: GitHub's host key changed (below);
+   - `fatal: could not read Username for 'https://github.com': terminal prompts disabled` (HTTPS): the repository is private, or isn't there, which GitHub answers alike to an anonymous reader. A private one takes the SSH form;
+   - `Permission denied (publickey)` (SSH): step 2 isn't done;
+   - `ERROR: Repository not found.` (SSH): `RR` names another repository than the one step 2 added the key to;
+   - `Host key verification failed.` (SSH): GitHub's host key changed (below);
    - nothing: the tag isn't there. With a repository of your own, push it. With the public repository, the running release isn't published there: *Onto the public repository's commits* (below) comes first.
 
    The plan shows the same faults, quoted: `git fetch said "…"`.
@@ -1642,6 +1672,13 @@ git -C ~/zab show "$C:pyproject.toml" | grep '^version'   # version = "X.Y.Z", $
 [ -d ~/zab-"$V" ] || git -C ~/zab worktree add --detach ~/zab-"$V" "$C"
 ```
 
+**After `upgrade.py`** (the adminserver README), run from `~/zab-"$RUNNING"` for `V`, steps 1 and 2 are done, but for one push. It reviewed `C` as step 1 does, with the running release's `deploy.sh` and since the running release, and compared the review's SHA-256 with the one you gave it. It signed `V` in your clone and made `~/zab-"$V"`. It pushed `V` to your clone's origin at most:
+- with `release_repo` that origin, nothing is left;
+- with the public repository, push nothing, but its published tag must be there before step 4;
+- with a repository of your own, step 2's last push, of both tags to `release_repo`, is still yours.
+
+Then go on to step 3.
+
 1. **Review it with the running release's `deploy.sh`,** since the running release. The server's plan reviews it so, and compares the SHA-256:
 
    ```sh
@@ -1649,8 +1686,8 @@ git -C ~/zab show "$C:pyproject.toml" | grep '^version'   # version = "X.Y.Z", $
    ```
 
    Among its last lines: `  SHA-256 <hex>; release tree <hex> (<n> paths of workshop/adminserver/release-paths)`. The first hex is your `sha256=`. After it come the review's file, its `P` lines, and the tag commands, or `No tag command: …`. A review with another release's `deploy.sh`, or from another base, gives another SHA-256, which the server refuses: nothing is planned.
-2. **Sign it, and push both tags to `release_repo`.** With the public repository as `release_repo`, sign and push nothing: both tags are the published ones, and `C` may be the public commit or the commit the release was first tagged at, whose release paths, and so whose review, are the same. Otherwise, the review's last lines say which case you are in:
-   - **`Sign it once reviewed, then verify and push it:`** (a repository whose releases you tag yourself): run its `tag -s` and `tag -v` lines, but not its `push origin` line.
+2. **Sign it, and push both tags to `release_repo`.** With the public repository as `release_repo`, sign and push nothing: both tags are the published ones, and the new release's must be there before step 4, or the plan refuses (`the fetch of … failed`). `C` may be the public commit or the commit the release was first tagged at, whose release paths, and so whose review, are the same. Otherwise, the review's last lines say which case you are in:
+   - **`Sign it once reviewed, then verify it:`** (or `… then verify and push it:` from an older running release; a repository whose releases you tag yourself): run its `tag -s` and `tag -v` lines, but not its `push origin` line, chained or not: the push below takes both tags to `release_repo`.
    - **`No tag command: … already has a tag vX.Y.Z`,** with your own signature: the clone holds the public repository's tag, fetched above. Replace it with yours, in your clone, with these four lines together, as §9 does. Run the last three only if the first prints SECURITY.md's fingerprint and `No principal matched.` (§9 says what its other answers mean):
 
      ```sh
@@ -1665,6 +1702,12 @@ git -C ~/zab show "$C:pyproject.toml" | grep '^version'   # version = "X.Y.Z", $
 
    ```sh
    git -C ~/zab tag -v "$V" >/dev/null 2>&1 && git -C ~/zab push "$RR" "refs/tags/$V" "refs/tags/$RUNNING"
+   ```
+
+   **With `RR` in the HTTPS form,** this push needs the git credential of the setup's step 4 (`gh auth setup-git`). Or send it to the repository's SSH address instead, chained the same way, while the server keeps reading `RR` anonymously:
+
+   ```sh
+   git -C ~/zab tag -v "$V" >/dev/null 2>&1 && git -C ~/zab push git@github.com:<OWNER>/<REPO>.git "refs/tags/$V" "refs/tags/$RUNNING"
    ```
 3. **The role's policy, before you send the command.** Has `render_policy.py` changed since the running release? The plan's `render_policy.py:` line will say the same, but by then the plan's 10 minutes (ADMIN §2.4) are running, and an IAM change can take longer:
 
@@ -1704,14 +1747,14 @@ git -C ~/zab show "$C:pyproject.toml" | grep '^version'   # version = "X.Y.Z", $
    ```
 
 **When `deploy.sh` is still the way.** The plan or the apply refuses each of these, all but the `/usr` case before anything changes. Each `deploy.sh` line here and below reaches the server over SSH: refresh the SSH rule first (the setup's first block).
-- **A release the in-band path can't install:** a release without it, whose `deploy.sh` has no `--in-band` (the apply's first run, `--build-wheel`, fails, and nothing is installed). The same for a downgrade to one, which also needs `release_repo` out of `admin.toml` first, since its loader refuses the key: step 3's blocks, with the line deleted, and each diff showing only `-release_repo = …`. Then deploy it from your machine, with its own `deploy.sh` (§9's worktree); add `--downgrade` before `"$V"` for an older one. It shows the review since the running release, asks `Type vX.Y.Z to deploy it to <host>, which runs vX.Y.Z:`, and ends with the units' restart:
+- **A release the in-band path can't install:** a release without it, whose `deploy.sh` has no `--in-band` (the apply's first run, `--build-wheel`, fails, and nothing is installed). The same for a downgrade to one, which also needs `release_repo` out of `admin.toml` first, since its loader refuses the key: step 3's blocks, with the line deleted, and each diff showing only `-release_repo = …`. So does a downgrade to a release whose loader takes the key in its SSH form alone, with `release_repo` in the HTTPS form: its deploy would stop at its self-check (`release_repo: expected …`), before the switch. Delete the line, or change it to the SSH form after steps 1 and 2, with the same blocks. Then deploy it from your machine, with its own `deploy.sh` (§9's worktree); add `--downgrade` before `"$V"` for an older one. It shows the review since the running release, asks `Type vX.Y.Z to deploy it to <host>, which runs vX.Y.Z:`, and ends with the units' restart:
 
   ```sh
   ~/zab-"$V"/workshop/adminserver/deploy.sh --host "$HOST" --etc ~/zab-admin/etc --out ~/zab-admin "$V"
   ```
 - **A release whose upgrade writes `/usr`** (an `apt-get install`, which `deploy.sh` runs only at a bootstrap today). The apply helper's unit keeps `/usr` read-only, so the write fails. Before the switch, nothing changes; after it, see §13.1.
-- **A signer removed from `allowed_signers`** (§17): the running release's tag, the review's base, no longer verifies. Deploy the next release from your machine with §17's step 9; in-band works again from there. If you take that step's public-repository alternative instead, signing the running release's tag again, `release_repo` still holds the old tag object. Push the new one with `git -C ~/zab push --force "$RR" "refs/tags/$RUNNING"`; the server takes it, since its commit is the same.
-- **GitHub's SSH host key rotated:** the pinned keys (`workshop/adminserver/github-known-hosts`) come from the running release, so the fetch is refused until a release with the new keys is deployed with `deploy.sh`.
+- **A signer removed from `allowed_signers`** (§17): the running release's tag, the review's base, no longer verifies. Deploy the next release from your machine with §17's step 9; in-band works again from there. If you take that step's public-repository alternative instead, signing the running release's tag again, `release_repo` still holds the old tag object. Push the new one with `git -C ~/zab push --force "$RR" "refs/tags/$RUNNING"` (with `RR` in the HTTPS form, after the setup's step 4 `gh auth setup-git`, or to the repository's SSH address instead); the server takes it, since its commit is the same.
+- **GitHub's SSH host key rotated** (the SSH form): the pinned keys (`workshop/adminserver/github-known-hosts`) come from the running release, so the fetch is refused until a release with the new keys is deployed with `deploy.sh`.
 - **A tag moved in `release_repo` to another commit:** a released tag never moves, so the server keeps the copy it took and refuses the moved one, every time. Ask its signer why. Once that is understood, either release under another version, or remove the server's copy: `ssh -t "$HOST" sudo git -C /var/lib/zab-admin-upgrade/repo.git tag -d vX.Y.Z`, which prints `Deleted tag 'vX.Y.Z' (was <hex>)`.
 
 **After an applied upgrade:**
@@ -1721,7 +1764,7 @@ git -C ~/zab show "$C:pyproject.toml" | grep '^version'   # version = "X.Y.Z", $
   ssh "$HOST" systemctl status zab-admin-bot.service --no-pager | head -5   # failed, or activating again and again
   ```
 
-  Go back to the earlier release, with its own `deploy.sh`, from your machine. If the earlier release has no in-band upgrade, take `release_repo` out of `admin.toml` first (above). This is the only way back: `!upgrade-server` only goes forward, and refuses `downgrade`. The command shows the review back to the earlier release, asks `Type vX.Y.Z to deploy it to <host>, which runs vX.Y.Z:`, and ends with the units' restart:
+  Go back to the earlier release, with its own `deploy.sh`, from your machine. If the earlier release has no in-band upgrade, or takes only the SSH form while `release_repo` is in the HTTPS form, change `admin.toml` first (above). This is the only way back: `!upgrade-server` only goes forward, and refuses `downgrade`. The command shows the review back to the earlier release, asks `Type vX.Y.Z to deploy it to <host>, which runs vX.Y.Z:`, and ends with the units' restart:
 
   ```sh
   V=<the earlier release>          # vX.Y.Z, the one the server ran before

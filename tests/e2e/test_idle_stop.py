@@ -1,5 +1,8 @@
 """Scenario 11 of issue #263: idle stop (#207), then a DM wakes the VM.
 
+Part 2 (#655): a background job, which sleeps with the load under 0.5, holds the VM up past the
+timeout; once it has ended, the VM stops.
+
 This module's name sorts before the other scenario modules, so in a full run idle stop starts
 right after the deploy, before any scenario's turn: the VM stays up for N minutes after zab's
 last activity, so a turn just before would shift the window being measured.
@@ -8,12 +11,14 @@ last activity, so a turn just before would shift the window being measured.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import time
 
 import pytest
 
-from e2e.harness.admin import push_config
+from e2e.harness import installed
+from e2e.harness.admin import admin_dir, push_config
 from e2e.harness.cleanup import IDLE_STOP_LEFT, undo, vm_up
 from e2e.harness.flows import DM_STATUS_RE, Chat
 
@@ -87,3 +92,91 @@ async def test_idle_stop(chat: Chat, rig, ec2, instance_id, vm, scenario):
         # stops here: a 10-minute idle stop would break the later scenarios (4's block, 8's).
         await undo(IDLE_STOP_LEFT, lambda: vm_up(ec2, instance_id, vm), attempts=1)
         await undo(IDLE_STOP_LEFT, lambda: push_config(rig, "--idle-stop", "0"))
+
+
+#: Part 2's job (#655): longer than the timeout, so that only the job holds the VM up past it
+JOB_S = 14 * 60
+JOB_HELD = "stay up: 1 background job running"
+
+
+def holds_for_jobs() -> bool:
+    """Whether the tested build's `idle_stop.py`, which `push_config` installs, counts the
+    jobs' units (#924's `JOBS_ACTIVE`; #938's review, B2)."""
+    return "zab-job-" in (admin_dir() / "idle_stop.py").read_text()
+
+
+def job_verdicts(
+    log: str, since: float, until: float, needle: str = "background job running"
+) -> list[str]:
+    """The log's lines that say a background job held the VM (`needle`; after its end, "a
+    background job ran "), stamped between `since` and `until` (with or without other reasons
+    beside it)."""
+    found = []
+    for line in log.splitlines():
+        stamp, _, rest = line.partition(" ")
+        try:
+            at = dt.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.UTC)
+        except ValueError:
+            continue
+        if rest.startswith("stay up:") and needle in rest:
+            if since <= at.timestamp() <= until:
+                found.append(line)
+    return found
+
+
+@pytest.mark.scenario(11)
+async def test_a_background_job_holds_the_vm_up(
+    chat: Chat, rig, ec2, instance_id, vm, scenario, nonce
+):
+    """Part 2 (#655): `push_config --idle-stop 10`, then a 14-minute `zab job` that sleeps
+    (started over SSH: no topic, no zab activity). The VM stays up past the timeout while the
+    job runs, and stops a timeout after its end: idle stop counts it from the last tick that saw
+    the job (#970's Codex round 1), and says so in between ("a background job ran …"); the log
+    names the job."""
+    if not installed.job_help(vm):
+        pytest.skip("the installed zab has no background jobs (#655)")
+    if not holds_for_jobs():
+        pytest.skip("the tested build's idle stop doesn't count background jobs (#924)")
+    marker, name = f"S11J-{nonce}", f"s11j-{nonce}"
+    job = ["/home/agent/.local/bin/zab", "job", "start", "--name", name, "--"]
+    job += ["python3", "-c", f"import time; time.sleep({JOB_S})", marker]
+    try:
+        push_config(rig, "--idle-stop", str(MINUTES))
+        # the clock starts at the job's start (#938's review, B3): the stop can't come before
+        # its end, nor much after; the login waited for below makes the login's hold known
+        began, began_at = time.monotonic(), time.time()
+        res = vm.run(vm.as_agent(*job), check=False, timeout=60)
+        assert res.ok, f"zab job start exited {res.returncode}: {(res.stderr or res.stdout)[-300:]}"
+        vm.script(WAIT_FOR_LOGIN, timeout=240)  # as part 1
+        state = ec2.state(instance_id)
+        while state not in ("stopping", "stopped") and time.monotonic() - began < JOB_S + 20 * 60:
+            await asyncio.sleep(20)  # AWS only, as part 1
+            state = ec2.state(instance_id)
+        took, stopped_at = time.monotonic() - began, time.time()
+        assert state in ("stopping", "stopped"), f"still {state} after {took:.0f} s"
+        # a timeout after the job's end: from the last tick that saw it, at most a tick (60 s
+        # and its run, `AccuracySec=5s`) before the end, to the first tick a timeout later, a
+        # tick at most after that, then the 20 s poll: about 9 to 12 minutes after the end. The
+        # job left no zab activity, and the login (at its start) is long past
+        scenario.timing(
+            "stop after the job's start",
+            took,
+            low=JOB_S + (MINUTES - 1) * 60 - 30,
+            high=JOB_S + (MINUTES + 4) * 60,
+        )
+        ec2.wait_state(instance_id, "stopped", timeout=300)
+        await asyncio.sleep(35)  # the waker's state refresh
+        turn = await chat.dm("claude", "!status")
+        await chat.reply(turn, DM_STATUS_RE, within=600)
+        log = vm.run(["sudo", "tail", "-n", "60", "/var/log/zab-idle-stop.log"]).stdout
+        held = job_verdicts(log, began_at - 60, stopped_at + 60)
+        assert held, f"no verdict naming the job in the log: {log[-400:]!r}"
+        after = job_verdicts(log, began_at - 60, stopped_at + 60, "a background job ran ")
+        assert after, f"no verdict holding for the timeout after the job: {log[-400:]!r}"
+        assert this_runs_power_offs(log, began_at - 60, stopped_at + 60), log[-300:]
+        scenario.notes.append("held: " + held[-1][:200])
+    finally:
+        await undo(IDLE_STOP_LEFT, lambda: vm_up(ec2, instance_id, vm), attempts=1)
+        await undo(IDLE_STOP_LEFT, lambda: push_config(rig, "--idle-stop", "0"))
+        with contextlib.suppress(Exception):  # gone with the stop, unless the VM never stopped
+            vm.run(vm.as_agent("/home/agent/.local/bin/zab", "job", "stop", name), check=False)

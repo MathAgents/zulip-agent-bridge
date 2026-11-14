@@ -3,9 +3,10 @@ topic's addressee record, which the rule `last` reads.
 
 The store is the bridge process's, so the rule and each record are the VM's, one for all its
 bots: each bot finds the same addressees for a message. A record keeps, for each of a topic's
-prompts that named any of the VM's bots, which ones it named (a command names none: whom the
-participant talks to, not whom they send a command); a message without a mention goes, under
-`last`, to those of the newest such prompt before it. Before it, not the newest of all:
+prompts that named any of the VM's bots, which ones it named (a command other than `!new`, with
+or without a prompt, names none: whom the participant talks to, not whom they send a command);
+a message without a mention goes, under `last`, to those of the newest such prompt before it.
+Before it, not the newest of all:
 the VM's bots read their queues each at its own pace (a catch-up replays one bot's after the
 other's), and a bot that is behind still finds the record that the message followed. So an entry
 stays while a bot may still read a message it precedes (`RETAIN_S`)."""

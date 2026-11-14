@@ -30,7 +30,8 @@ records that idle stop was turned off on purpose; without `--tag`/`--wheel` only
 The defaults of a rollout that names neither (#704), with a release: `--lean-shared-default` does
 what `--lean-shared` does on a VM whose Mathlib isn't shared yet, and only probes one that has it;
 `--idle-stop-default MINUTES` turns idle stop on, last, on a VM with no timer whose waker is on
-(`--has-waker`), unless its idle stop was turned off on purpose. A spare's own idle stop (#715,
+(`--has-waker`), unless its idle stop was turned off on purpose; a timer that is on keeps its
+minutes and gets this release's `idle_stop.py` (#655). A spare's own idle stop (#715,
 `spare_idle_stop.py`) is never a row's: the default replaces it where the waker is on, and
 removes it elsewhere, and a hand-over (`--adopt-spare`) without either idle-stop flag removes it.
 `--restart-codex` also stops the old bridge and restarts the Codex daemon before the new bridge
@@ -211,7 +212,8 @@ IDLE_STOP_OFF_RECORD = "/etc/zab/idle-stop.off"
 #: `--idle-stop-default`'s look at a VM (#704), a fixed literal. Its state, the first that holds:
 #: a spare's idle stop (#715: `idle_stop.py --spare`, which `spare_idle_stop.py` installs), by
 #: its unit's flag, which is never the row's (spare: replaced, or removed where the row's waker
-#: isn't on); its timer is installed and enabled (on: left as it is, whatever its minutes); idle
+#: isn't on); its timer is installed and enabled (on: its minutes kept, its script replaced by
+#: this release's, #655); idle
 #: stop was turned off on purpose, by the record (off: left off); the timer is installed but not
 #: enabled, by hand or after a failed `enable` (disabled: turned on again); the log of an idle
 #: stop that ran there, which `--idle-stop 0` keeps and nothing else removes: a VM turned off
@@ -750,6 +752,15 @@ def idle_stop_on_cmd(staging: str) -> str:
         ["sudo", "visudo", "-cqf", rule],
         ["sudo", "install", *root, "-m", "0440", rule, READ_SUDOERS],
         ["sudo", VM_PYTHON, IDLE_STOP_PATH, "--setup-read-user"],
+    )
+
+
+def idle_stop_script_cmd(staging: str) -> str:
+    """A running timer's script replaced by this release's (#655): the uploaded `idle_stop.py`
+    installed as root, its units, and so its minutes, left as they are. The next tick runs it."""
+    root = ["-o", "root", "-g", "root"]
+    return remote_chain(
+        ["sudo", "install", "-D", *root, "-m", "0755", f"{staging}/idle_stop.py", IDLE_STOP_PATH],
     )
 
 
@@ -1419,13 +1430,14 @@ def idle_stop_default_step(
     """`--idle-stop-default MINUTES` (#704): `--idle-stop MINUTES` on a VM whose timer isn't on,
     and only where the row's waker is on (`--has-waker`) for this VM, the instance the waker
     names: the waker first, then idle stop (ORGANIZERS §4.2). Every VM is probed
-    (`IDLE_STOP_PROBE_CMD`). Where the waker is on, a timer that is on stays as it is, quietly;
-    idle stop turned off on purpose stays off, noted; a timer installed but not enabled is
-    turned on again, noted. Any other row is left as it is, with a note: of the commands where
-    no timer is on, and louder where one is, since that VM may stop with no way to wake it
-    (review of #705). A spare's idle stop (#715) is never the row's: where the waker is on, the
-    row's replaces it, and elsewhere it is removed, noted. A probe that fails, or answers nothing
-    it knows, is a failure."""
+    (`IDLE_STOP_PROBE_CMD`). A timer that is on keeps its minutes, quietly, and runs this
+    release's script from the next tick (`idle_stop_refresh_step`, #655): an older one would
+    power the VM off under a background job. Where the waker is on, idle stop turned off on
+    purpose stays off, noted; a timer installed but not enabled is turned on again, noted. Any
+    other row is left as it is, with a note: of the commands where no timer is on, and louder
+    where one is, since that VM may stop with no way to wake it (review of #705). A spare's idle
+    stop (#715) is never the row's: where the waker is on, the row's replaces it, and elsewhere
+    it is removed, noted. A probe that fails, or answers nothing it knows, is a failure."""
     minutes, slug = opts.idle_stop_default, result.slug
     probe = ssh_argv(result.host, IDLE_STOP_PROBE_CMD, known_hosts=opts.known_hosts)
     res = runner(probe, timeout_s=60)
@@ -1464,11 +1476,33 @@ def idle_stop_default_step(
             f"idle stop: left as it is, since {why}: !waker on {slug}, then !idle-stop "
             f"{minutes} {slug}"
         )
-    if why or state in (IDLE_STOP_ON, IDLE_STOP_OFF):
+    if state == IDLE_STOP_ON:  # its minutes kept, whatever the default's
+        return idle_stop_refresh_step(result, opts, runner, staging)
+    if why or state == IDLE_STOP_OFF:
         return True
     if state == IDLE_STOP_DISABLED:
         result.notes.append("idle stop: its timer was installed but not enabled: turned on again")
     return idle_stop_step(result, opts, runner, staging, local, minutes=minutes)
+
+
+def idle_stop_refresh_step(result: VmResult, opts: Options, runner: Runner, staging: str) -> bool:
+    """A timer that is on, under `--idle-stop-default` (#655): this release's `idle_stop.py`
+    uploaded and installed in place of the VM's, with its rules (a running background job holds
+    the VM up), and nothing else: the units, so the minutes, stay the VM's. Only `--idle-stop N`
+    changes those. Quiet when it worked; a failure is recorded."""
+    kh = opts.known_hosts
+    scp = scp_argv(str(IDLE_STOP_SCRIPT), result.host, f"{staging}/idle_stop.py", known_hosts=kh)
+    res = runner(scp, timeout_s=300)
+    if not res.ok:
+        _fail(result, "scp idle_stop.py", res)
+        return False
+    res = runner(
+        ssh_argv(result.host, idle_stop_script_cmd(staging), known_hosts=kh), timeout_s=120
+    )
+    if not res.ok:
+        _fail(result, "idle stop script", res)
+        return False
+    return True
 
 
 def spare_timer_off_step(result: VmResult, opts: Options, runner: Runner, then: str = "") -> bool:
@@ -1810,6 +1844,7 @@ _DRY_NAMES = {
     LEAN_SHARED_UNDO_CMD: "lean rollback",
     remote_chain(["rm", "-rf", "--", DRY_STAGING]): "staging removed",
     idle_stop_on_cmd(DRY_STAGING): "idle stop installed",
+    idle_stop_script_cmd(DRY_STAGING): "idle stop script refreshed",
     lean_shared_on_cmd(DRY_STAGING): "lean-project + shared Mathlib",
     lean_check_cmd(): "lean check",
     lean_reclaim_cmd(False): "lean reclaim report",
@@ -2052,7 +2087,8 @@ def main(argv: list[str] | None = None) -> int:
         metavar="MINUTES",
         help="with a release (#704): --idle-stop MINUTES on each VM with no idle-stop timer whose "
         "waker is on (--has-waker), unless its idle stop was turned off on purpose (--idle-stop "
-        "0); every other VM is left as it is",
+        "0); a timer that is on keeps its minutes and gets this release's idle_stop.py (#655); "
+        "every other VM is left as it is",
     )
     parser.add_argument(
         "--has-waker",

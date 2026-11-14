@@ -6,13 +6,13 @@ server, and the server half repeats the checks), each named by its reason; after
 server still runs what it ran. The good rc then deploys as a last hand deploy does when
 `release_repo` is the public repository (#958, BOOTSTRAP §13.4): reviewed in the rig's own
 repository, which plays the private one, since the running release; exported to the rig's
-public repository (`Releases.export`); and deployed from that public commit, from a clone of
-the public repository holding the running release's private tag alone, with
-`--expect-diff-sha256` of the private review, which holds the deploy to the release paths
-reviewed. `!version` shows the public commit, the audit log has its `upgrade` record with that
-commit and the reviewed diff's SHA-256, and its venv holds exactly the hashed wheels of
-`uv.lock`'s admin group, made by uv, with zab itself on a `.pth` and nothing built. A10b's
-in-band upgrades then start from that public release.
+public repository (`Releases.export`), whose history starts afresh with it each run (#977);
+and deployed from that public commit, from a clone of the public repository holding the running
+release's private tag alone, with `--expect-diff-sha256` of the private review, which holds the
+deploy to the release paths reviewed. `!version` shows the public commit, the audit log has its
+`upgrade` record with that commit and the reviewed diff's SHA-256, and its venv holds exactly
+the hashed wheels of `uv.lock`'s admin group, made by uv, with zab itself on a `.pth` and nothing
+built. A10b's in-band upgrades then start from that public release.
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ async def test_deploy_gate(scenario, admin_rig, rigged, server, tester, tmp_path
     # deployed from the public commit, whose diff from the private base must be the review's
     reviewed = upgrade.reviewed_sha256(script, admin_rig.repo, admin_rig.etc, private, running,
                                        tmp_path)  # fmt: skip
-    commit = rel.export(good, private)
+    commit = rel.export(good, private, fresh=True)  # this run's public history alone (#977)
     clone = rel.deploy_clone(running, tmp_path / "deploy-clone")
     started = time.monotonic()
     done = rel.deploy(script, good, "--expect-diff-sha256", reviewed, out=tmp_path, log=log,

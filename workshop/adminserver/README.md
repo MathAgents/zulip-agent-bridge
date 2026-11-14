@@ -16,7 +16,7 @@ global bot; the waker runs here too.
 | `admin.example.toml` | the model for `/etc/zab-admin/admin.toml` (root 0644); it loads with `zab.admin.config` |
 | `render_policy.py` | not installed: a deployer runs it to make the instance role's policies |
 | `ssh-rule.sh` | not installed: a deployer runs it on their laptop, right before an SSH step, so that the server's port 22 admits their address alone (docs/BOOTSTRAP.md §3.1); `--files-host`, the files host's |
-| `upgrade.py` | not installed: the upgrade driver (#772), which a deployer runs on their machine from the signed copy of the release the server runs, with `python3 -I`; `--setup` once per machine. It reaches no server: it reviews the new release with that copy's `deploy.sh`, signs, verifies and pushes its tag, and makes its copy `~/zab-vN`, from which the server is upgraded (below; `!upgrade-server` once #569 adds it) |
+| `upgrade.py` | not installed: the upgrade driver (#772), which a deployer runs on their machine from the signed copy of the release the server runs, with `python3 -I`; `--setup` once per machine. It reaches no server, and publishes nothing: it reviews the new release with that copy's `deploy.sh`, signs and verifies its tag, pushes it to your clone's origin unless origin has another tag of the commit, and makes its copy `~/zab-vN`. `!upgrade-server` fetches the release's tags from `release_repo` (`docs/BOOTSTRAP.md` §13.4): with the public repository, the tags of the release's publication there, which its maintainer signs and pushes before the upgrade and this tool never makes (#960); `deploy.sh` from `~/zab-vN` stays the fallback (below) |
 | `deploy.sh`, `release-paths`, `privileged-paths` | not installed by hand: the deployer runs `deploy.sh` (below), which installs the paths `release-paths` lists, and whose review shows the paths of `privileged-paths` first |
 
 ## Processes
@@ -230,7 +230,8 @@ git -C ~/zab worktree add --detach ~/zab-v0.2.9 v0.2.9     # the last release yo
 # what the review prints last, to paste (gpg.format=ssh, your dedicated key):
 git -C ~/zab-v0.2.9 tag -s v0.3.0 -m "zab v0.3.0" <the commit you reviewed, in full>
 git -C ~/zab-v0.2.9 tag -v v0.3.0
-git -C ~/zab-v0.2.9 push origin v0.3.0
+# only after tag -v's Good line, the push, chained behind it again (#968):
+git -C ~/zab-v0.2.9 tag -v v0.3.0 >/dev/null 2>&1 && git -C ~/zab-v0.2.9 push origin v0.3.0
 
 git -C ~/zab worktree add --detach ~/zab-v0.3.0 v0.3.0
 D=~/zab-v0.3.0/workshop/adminserver/deploy.sh
@@ -290,8 +291,11 @@ commands.
   are not UTF-8. The `.diff` file holds the raw diff, in git's order, which the SHA-256 covers.
   Last, on stderr and outside what the SHA-256 covers, it prints the commands to sign, verify
   and push the commit, which work pasted in any directory (#468): `Sign it once reviewed, then
-  verify and push it:`, then `git -C <the clone it read> tag -s vX.Y.Z -m "zab vX.Y.Z" <the
-  commit>`, `… tag -v vX.Y.Z` and `… push origin vX.Y.Z`. The clone is an absolute path, and
+  verify it:`, then `git -C <the clone it read> tag -s vX.Y.Z -m "zab vX.Y.Z" <the commit>`
+  and `… tag -v vX.Y.Z`; then `Only after the Good line, push it, chained behind tag -v
+  again:`, then `… tag -v vX.Y.Z >/dev/null 2>&1 && … push origin vX.Y.Z`, so that the lines
+  pasted at once never push a tag that doesn't verify: git 2.43's `tag -s` makes an unsigned
+  tag and exits 0 when it can't sign (#968). The clone is an absolute path, and
   `vX.Y.Z` the version of the commit's own `pyproject.toml`, which the deploy requires. Where
   that file has no single `version = "X.Y.Z"` line, or the clone has that tag already, it prints
   `No tag command:` and the reason instead.

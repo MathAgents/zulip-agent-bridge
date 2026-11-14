@@ -97,6 +97,14 @@ refserve_owner = "MathAgents"      # the GitHub owner the server serves; set you
 # Never lean-lsp-mcp, builds or Claude's (§7.12).
 reap_idle_minutes = 30             # 0 turns it off
 
+[jobs]
+# Background jobs that outlive their turn (`zab job start`, §7.14). Limits per machine, all bots
+# together; `zab service install` writes the memory share into zab-jobs.slice (§13.3).
+report = true                      # a turn for the agent to report when a job ends (--no-report)
+max_running = 4                    # jobs running at once: 0 to 64; 0 turns jobs off
+max_hours = 12                     # each job's cap (systemd's RuntimeMaxSec): above 0, at most 168
+max_memory_percent = 75            # all jobs together, of the machine's memory: 10 to 90
+
 # --- Workshop profile (`zab init --profile workshop`) differs as follows:
 # [bridge] machine = "<github>", default_project = "~/work/<repo>", max_concurrent_turns = 2
 # (the workshop VMs' config comes from workshop/admin/push_config.py, which also sets

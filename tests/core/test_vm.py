@@ -80,8 +80,9 @@ async def test_vm_routes_without_starting_turn_and_hides_channel_processes(
     assert backend.start_turn.await_count == calls
 
 
-def fake_bridge(*backends, running=0):
-    """A `BotBridge` stand-in for `vm.report`: one bridge per backend."""
+def fake_bridge(*backends, running=0, jobs_dir=None, rows=None):
+    """A `BotBridge` stand-in for `vm.report`: one bridge per backend; `jobs_dir`, its watcher's
+    jobs directory (#655), and `rows`, its store's rows by table."""
     bridges = [
         SimpleNamespace(backend=backend, actors={i: SimpleNamespace(turn=i < running)})
         for i, backend in enumerate(backends)
@@ -89,6 +90,13 @@ def fake_bridge(*backends, running=0):
     first = bridges[0]
     first.config = SimpleNamespace(projects=[SimpleNamespace(path="/work")])
     first.all_bridges = bridges
+    first.jobs = SimpleNamespace(directory=jobs_dir)
+    tables = rows or {}
+    first.store = SimpleNamespace(
+        rows=lambda table, **where: [
+            dict(r) for r in tables.get(table, []) if all(r.get(k) == v for k, v in where.items())
+        ]
+    )
     return first
 
 
@@ -251,3 +259,102 @@ async def test_real_vmstat_import_collection_and_summary(tmp_path):
     assert "unavailable" not in "".join(channel[1:4])
     assert channel[4] == f"disk at `{tmp_path}/gone`: unavailable"
     assert channel[-1].endswith(f"zab {__version__}")
+
+
+async def test_vm_counts_the_machines_jobs_and_a_dm_lists_them(monkeypatch, tmp_path):
+    """#655 (SPEC §13.5): the status line counts the machine's running background jobs, after
+    the turns; a DM also lists each one's name, topic, start and memory, never a command line.
+    They come from the job directories and systemd, as the sentinel reads them, so a job
+    started without a bot, which the watcher keeps no row for, counts too (#941's review, B3);
+    the store gives only a job's topic."""
+    from zab import jobs as zjobs
+    from zab.tools.common import RunResult
+
+    directory = zjobs.jobs_dir(tmp_path)
+    boot = zjobs.boot_id()
+    made = []
+    for job_id, name, bot, started in (
+        ("a" * 12, "rank-search", "claude", 1_800_000_000.0),
+        ("b" * 12, "build", "", 1_800_000_600.0),  # `zab job start` typed in a terminal
+        ("c" * 12, "done", "claude", 1_799_999_000.0),
+    ):
+        (directory / job_id).mkdir(parents=True)
+        job = zjobs.Job(
+            id=job_id, name=name, argv=["x"], cwd="/w", bot=bot, session="", attached=None,
+            started_at=started, boot_id=boot, directory=directory / job_id,
+        )  # fmt: skip
+        job.save()
+        made.append(job)
+    zjobs.write_json(made[2].directory / "ended.json", {"SERVICE_RESULT": "success"})
+    units = "\n".join(f"zab-job-{c * 12}.service loaded active running x" for c in "ab")
+
+    def runner(argv, **kw):
+        return RunResult(0, units, "")
+
+    monkeypatch.setattr(vm, "subprocess_runner", runner)
+    monkeypatch.setattr(vm, "collect", AsyncMock(return_value=stat()))
+    memories = AsyncMock(side_effect=["1.2 GB memory", "memory unavailable"])
+    monkeypatch.setattr(vm, "memory", memories)
+    rows = {
+        "jobs": [dict(id="a" * 12, session_id="s1")],  # the watcher's: `build` has no row
+        "sessions": [dict(id="s1", stream_id=7, topic="primes")],
+    }
+    one = fake_bridge(backend("codex", ok=True), jobs_dir=directory, rows=rows)
+    one.client = SimpleNamespace(site="https://zulip.example")
+    one.channel = AsyncMock(return_value={"name": "sandbox"})
+    channel = await vm.report(one, dm=False)
+    status = f"no turns running · 2 jobs running · up 2 hours · Codex signed in · zab {__version__}"
+    assert channel.endswith("\n\n" + status)
+    assert "Background jobs" not in channel
+    dm = await vm.report(one, dm=True)
+    assert dm.splitlines()[-1] == (
+        "Background jobs: `rank-search` in #**sandbox>primes** since "
+        "<time:2027-01-15T08:00:00+00:00>, 1.2 GB memory · `build` in no topic since "
+        "<time:2027-01-15T08:10:00+00:00>, memory unavailable"
+    )
+    none = fake_bridge(backend("codex", ok=True))
+    assert "jobs running" not in await vm.report(none, dm=True)
+
+
+async def test_a_job_with_a_name_out_of_the_pattern_never_reaches_dm_vm(monkeypatch, tmp_path):
+    """#941's review, B2: anything running as the agent's user can write a `job.json`. A name
+    the pattern doesn't allow never loads (`zab.jobs`' `typed()`), so DM `!vm` lists no such
+    job; `name_code` still makes one safe, as `tests/core/test_jobs_commands.py` checks."""
+    from zab import jobs as zjobs
+    from zab.tools.common import RunResult
+
+    directory = zjobs.jobs_dir(tmp_path)
+    job_id = "d" * 12
+    (directory / job_id).mkdir(parents=True)
+    bad = "x` @**all** [click](https://example.com) `y"
+    zjobs.write_json(
+        directory / job_id / "job.json",
+        {"schema": 1, "id": job_id, "name": bad, "argv": ["x"], "cwd": "/w", "bot": "",
+         "session": "", "started_at": 1_800_000_000.0, "boot_id": zjobs.boot_id()},
+    )  # fmt: skip
+    assert zjobs.Job.load(directory / job_id) is None
+    units = f"zab-job-{job_id}.service loaded active running x"
+    monkeypatch.setattr(vm, "subprocess_runner", lambda argv, **kw: RunResult(0, units, ""))
+    monkeypatch.setattr(vm, "collect", AsyncMock(return_value=stat()))
+    monkeypatch.setattr(vm, "memory", AsyncMock(return_value="memory unavailable"))
+    one = fake_bridge(backend("codex", ok=True), jobs_dir=directory)
+    report = await vm.report(one, dm=True)
+    assert "Background jobs" not in report and "@**all**" not in report
+
+
+async def test_a_jobs_memory_comes_from_its_unit(monkeypatch):
+    from zab.tools.common import RunResult
+
+    seen = []
+
+    def runner(argv, **kw):
+        seen.append(argv)
+        return RunResult(0, "1288490188\n", "")
+
+    monkeypatch.setattr(vm, "subprocess_runner", runner)
+    assert await vm.memory("a" * 12) == "1.2 GB memory"
+    unit = f"zab-job-{'a' * 12}.service"
+    assert seen == [["systemctl", "--user", "show", "-p", "MemoryCurrent", "--value", unit]]
+    assert await vm.memory("../etc") == "memory unavailable"  # only a job's own unit
+    monkeypatch.setattr(vm, "subprocess_runner", lambda argv, **kw: RunResult(0, "[not set]\n", ""))
+    assert await vm.memory("a" * 12) == "memory unavailable"

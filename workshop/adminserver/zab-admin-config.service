@@ -61,9 +61,16 @@ ProtectControlGroups=true
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
-RestrictAddressFamilies=AF_UNIX
+# It makes no socket (#896): socket() of any family, socketpair() and io_uring (whose operations
+# make sockets past RestrictAddressFamilies) are denied. As root, a socket() of AF_UNIX reaches
+# PID 1's private socket, the system bus and the starter's, and a socketpair()'s datagram end
+# sends to any datagram socket by its path (journald's; chronyd's, where chrony runs): no
+# read-only mount stops either. It keeps the journal streams systemd gives it as stdout, stderr.
+RestrictAddressFamilies=none
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+SystemCallFilter=~@aio:EPERM
+SystemCallFilter=~socketpair:EPERM
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE

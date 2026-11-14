@@ -348,6 +348,36 @@ async def test_start_and_resume_carry_the_specs_bot():
     ]
 
 
+async def test_start_and_resume_carry_the_specs_session():
+    """Issue #655: thread/start and a cold thread/resume each send the spec's ZAB_SESSION, the
+    resume the session it reopens for (a new row's after `!detach` and `!attach`), not the one
+    the thread was started for."""
+    first, second = "3f9c2a7b-0000-4000-8000-000000000001", "3f9c2a7b-0000-4000-8000-000000000002"
+    sent: list[tuple[str, dict]] = []
+    b = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    b.rpc = AsyncMock()
+    b.rpc.up = True
+
+    async def call(method, params):
+        if method == "config/read":
+            return {"config": {"shell_environment_policy": {"exclude": None, "set": None}}}
+        if method in ("thread/start", "thread/resume"):
+            sent.append((method, params["config"]))
+            return {"thread": {"id": "s", "cwd": "/repo"}}
+        return {"data": []}
+
+    b.rpc.call.side_effect = call
+    info = await b.create_session(replace(spec(), session=first))
+    fresh = CodexBackend("c", BackendConfig(kind="codex", codex_home="/isolated"))
+    fresh.rpc = b.rpc
+    await fresh._resume("s", replace(spec(), session=second, settings=info.settings))
+    assert [(m, c["shell_environment_policy.set"][SESSION_KEY]) for m, c in sent] == [
+        ("thread/start", first),
+        ("thread/resume", second),
+    ]
+    assert all(SESSION_KEY in c["shell_environment_policy.exclude"] for _, c in sent)
+
+
 @pytest.mark.parametrize("enabled", [True, False])
 async def test_a_loaded_thread_with_a_known_identity_is_resumed_whatever_its_bot(enabled):
     """DECISIONS, 2026-10-13: ZAB_BOT is not part of the loaded-thread check. A thread the

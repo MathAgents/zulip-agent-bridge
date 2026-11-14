@@ -5,6 +5,7 @@ live run."""
 from __future__ import annotations
 
 import re
+import time
 
 import pytest
 
@@ -26,6 +27,12 @@ class User:
         self.sent: list[tuple[int, str, str]] = []
         self.waits: list[tuple[str, int, tuple[int, ...]]] = []
         self.watched: list[tuple[str, int, tuple[int, ...], float]] = []
+
+    def clock(self) -> float:
+        return time.monotonic()
+
+    def blind(self, since: float) -> float:
+        return 0.0  # its waits never fail (#943)
 
     async def silent(self, narrow, *, after_id, senders, seconds):
         topic = next(n["operand"] for n in narrow if n["operator"] == "topic")

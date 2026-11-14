@@ -159,6 +159,11 @@ MONTH_END_HELD = 3600
 #: How often the month-end schedules are looked at (§11.5, #570): their warnings are due by the
 #: day, and each look reads every roster that has one.
 MONTH_END_EVERY = 60.0
+#: Verbs never requested while the other is approved or applying in their workshop (#992): the
+#: trust fix shares each VM's idle-stop hold with a rollout and a final sync (workshop/admin/
+#: README.md §10). Any two of a workshop's plans already apply one at a time (§2.4 step 5).
+EXCLUSIVE = {"trust-fix": ("rollout", "final-sync"), "rollout": ("trust-fix",),
+             "final-sync": ("trust-fix",)}  # fmt: skip
 _TABLE = """
 CREATE TABLE IF NOT EXISTS plan_topics (
     plan INTEGER PRIMARY KEY REFERENCES plans (id),
@@ -1331,6 +1336,8 @@ class Planning:
             action = self._kept(action, command.until)
         if action.verb in ("teardown", "retire") and (why := self._protecting(bot.where)):
             return why, ""
+        if why := self._excluded(bot.where, action.verb):
+            return why, ""
         async with self.preparing.setdefault(bot.where, asyncio.Semaphore(PREPARING)):
             prepared = await self.runner.prepare(plan, action, fleet)
         if prepared.unchanged and not prepared.ok:
@@ -1615,6 +1622,21 @@ class Planning:
             return ""
         verb, *args = plan.command.removeprefix("!").split() or [""]
         return protect_applying(plan.name, verb) if protects(verb, args) else ""
+
+    def _excluded(self, workshop: str, verb: str) -> str:
+        """#992: why a `verb` plan is refused while its workshop's busy plan (approved, or
+        applying) is one of its `EXCLUSIVE` verbs; "" otherwise."""
+        assert self.server.store is not None
+        busy = self.busy(workshop) if verb in EXCLUSIVE else None
+        plan = self.server.store.get(busy) if busy is not None else None
+        theirs = plan.command.removeprefix("!").split(" ", 1)[0] if plan is not None else ""
+        if plan is None or theirs not in EXCLUSIVE[verb]:
+            return ""
+        return (
+            f"{plan.name} (`!{theirs}`) is approved or applying here, and the trust fix never runs "
+            "beside a rollout or a final sync: they share each VM's idle-stop hold. Request it "
+            f"again once {plan.name}'s result is posted"
+        )
 
     async def answer(self, bot: AdminBot, m: Incoming, command: Command) -> None:
         """`!approve P-n hash6 [phrase]` and `!reject P-n` (§2.5)."""

@@ -579,7 +579,8 @@ class IdleVM:
         """One run of `zab-idle-stop.service`, with `--minutes 10`, the shortest."""
 
         def run(argv, **kwargs):
-            assert argv in (["who"], idle.POWEROFF), argv  # no zab rows: nothing else to ask
+            # no zab rows: nothing else to ask but the background jobs (#655), of which none
+            assert argv in (["who"], idle.JOBS_ACTIVE, idle.POWEROFF), argv
             self.off = self.off or argv == idle.POWEROFF
             return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -596,6 +597,9 @@ class IdleVM:
             hold=str(self.hold),
             euid=1000,
             warm=str(warmed),
+            jobs_unknown=str(self.tmp / "run" / "jobs-unknown"),
+            job_seen=str(self.tmp / "run" / "job-seen"),
+            config=str(self.tmp / "no-config.toml"),
         )
         self.events.append("tick: " + log.read_text().splitlines()[-1].split(" ", 1)[1])
 

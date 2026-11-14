@@ -347,13 +347,19 @@ class Releases:
             raise RuntimeError(f"{commit[:12]}: no version in pyproject.toml")
         return found.group(1)
 
-    def version_commit(self, base: str, version: str) -> str:
-        """`base` with its version set to `version` (no `v`), as a new commit."""
+    def version_commit(
+        self, base: str, version: str, files: Mapping[str, bytes] | None = None
+    ) -> str:
+        """`base` with its version set to `version` (no `v`), as a new commit; and with `files`,
+        each path written whole with its bytes, as they are (A10b's review case, #963)."""
         bare = version.removeprefix("v")
         edits = {
             "pyproject.toml": (r'(?m)^version = "[^"]*"$', f'version = "{bare}"'),
             "src/zab/__init__.py": (r'(?m)^__version__ = "[^"]*"$', f'__version__ = "{bare}"'),
         }
+        files = dict(files or {})
+        if set(files) & set(edits):
+            raise ValueError(f"{sorted(set(files) & set(edits))}: the version's own files")
         with tempfile.TemporaryDirectory(prefix="ae2e-index-") as tmp:
             env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
             env |= {"GIT_AUTHOR_NAME": AUTHOR, "GIT_COMMITTER_NAME": AUTHOR}
@@ -366,6 +372,11 @@ class Releases:
                     raise RuntimeError(f"{base[:12]}:{path}: no version line to set")
                 blob = self.git("hash-object", "-w", "--stdin", input=text)
                 self.git("update-index", "--cacheinfo", f"100644,{blob},{path}", env=env)
+            for n, (path, data) in enumerate(files.items()):
+                source = Path(tmp) / f"file-{n}"  # bytes, never through a text mode
+                source.write_bytes(data)
+                blob = self.git("hash-object", "-w", "--no-filters", str(source))
+                self.git("update-index", "--add", "--cacheinfo", f"100644,{blob},{path}", env=env)
             tree = self.git("write-tree", env=env)
             message = f"zab admin e2e: {version} of {base[:12]} (test only)"
             return self.git("commit-tree", tree, "-p", base, "-m", message, env=env)
@@ -389,9 +400,15 @@ class Releases:
         return self.run(["git", "-C", str(self.rig.repo), "rev-parse", "--verify", "--quiet",
                          f"refs/tags/{version}"]).ok  # fmt: skip
 
-    def release(self, base: str, version: str, signer: str | None = "signing") -> str:
-        """A test release of `base`: its version commit, tagged. The commit."""
-        commit = self.version_commit(base, version)
+    def release(
+        self,
+        base: str,
+        version: str,
+        signer: str | None = "signing",
+        files: Mapping[str, bytes] | None = None,
+    ) -> str:
+        """A test release of `base`: its version commit (with `files`), tagged. The commit."""
+        commit = self.version_commit(base, version, files)
         self.tag(version, commit, signer)
         return commit
 
@@ -412,12 +429,17 @@ class Releases:
              f"refs/tags/{version}"]
         ).ok  # fmt: skip
 
-    def export(self, version: str, commit: str, signer: str | None = "signing") -> str:
+    def export(
+        self, version: str, commit: str, signer: str | None = "signing", *, fresh: bool = False
+    ) -> str:
         """The public release of the test release `commit`, as `tools/publish` makes one: its
         tree less the export's `DROP`, one commit on the public repository's `main` with an
         `Exported-from:` trailer, pushed there (only it and the public history travel), then
-        tagged there afresh, signed with the rig's `signer` key (None: unsigned). The public
-        commit."""
+        tagged there afresh, signed with the rig's `signer` key (None: unsigned). With `fresh`
+        (A10's, each run), a root commit, `main` moved to it: the public history starts again,
+        so that it holds this run's exports alone (#977's review, B1). Nothing here needs an
+        earlier export: deploy.sh and the plan helper diff two trees, and bundle a whole tag.
+        The public commit."""
         if not (self.public / "HEAD").exists():
             made = self.run(["git", "init", "-q", "--bare", "-b", "main", str(self.public)])
             if not made.ok:
@@ -425,8 +447,8 @@ class Releases:
         tool = self.run(["git", "-C", str(self.rig.repo), "show", f"{commit}:{EXPORT_TOOL}"])
         drops = dropped(tool.stdout) if tool.ok else ()
         parent: list[str] = []
-        if self.run(["git", "-C", str(self.public), "rev-parse", "--verify", "--quiet",
-                     "refs/heads/main"]).ok:  # fmt: skip
+        if not fresh and self.run(["git", "-C", str(self.public), "rev-parse", "--verify",
+                                   "--quiet", "refs/heads/main"]).ok:  # fmt: skip
             # the public main, here too: the rig's repository may be newer than the public one
             self.git(
                 "fetch", "-q", "--no-tags", str(self.public), "+refs/heads/main:refs/public/main"
@@ -445,7 +467,7 @@ class Releases:
             tree = self.git("write-tree", env=env)
             message = f"zab {version}\n\nExported-from: {commit}\n"
             public = self.git("commit-tree", tree, *parent, "-m", message, env=env)
-        self.git("push", "-q", str(self.public), f"{public}:refs/heads/main")
+        self.git("push", "-q", str(self.public), f"{'+' if fresh else ''}{public}:refs/heads/main")
         self.run(["git", "-C", str(self.public), "tag", "-d", version])  # an earlier run's
         if signer is None:
             self.public_git(*IDENTITY, "tag", "-a", "--no-sign", "-m", version, version, public)
@@ -453,6 +475,53 @@ class Releases:
             signing = ("-c", "gpg.format=ssh", "-c", f"user.signingkey={self.rig.keys / signer}")
             self.public_git(*IDENTITY, *signing, "tag", "-s", "-m", version, version, public)
         return public
+
+    def exports_of(self, base: str, *refs: str) -> list[tuple[str, str]]:
+        """Every commit of the public repository that `refs` reach, each with its private
+        source: what a push of `refs` would send. ValueError, before anything is pushed, unless
+        each is an export (one `Exported-from:` trailer) of a test release of `base`, the commit
+        under test: a version commit whose one parent is `base` (#977's review, B1). An earlier
+        run's export of another commit, or anything else, is refused: run A10, which starts the
+        public history afresh. And each ref must be one of those commits, or a tag of one: a tag
+        of a tree or a blob, which `rev-list` doesn't list, or a tag of a tag, is refused too, so
+        nothing goes public that these checks didn't see (#977's review round 2, N1)."""
+        exports = []
+        for public in self.public_git("rev-list", *refs).split():
+            said = self.public_git("log", "-1", "--format=%B", public)
+            found = re.findall(r"(?m)^Exported-from: ([0-9a-f]{40})$", said)
+            if len(found) != 1:
+                raise ValueError(f"{public[:12]} is no export of a test release: nothing pushed")
+            listed = self.run(["git", "-C", str(self.rig.repo), "rev-list", "--parents", "-n",
+                               "1", found[0]])  # fmt: skip
+            if not listed.ok or listed.stdout.split()[1:] != [base]:
+                raise ValueError(
+                    f"{public[:12]} is an export of {found[0][:12]}, no test release of "
+                    f"{base[:12]}, the commit under test: nothing pushed (run A10 first, which "
+                    "starts the public history afresh)"
+                )
+            exports.append((public, found[0]))
+        checked = {public for public, _ in exports}
+        for ref in refs:
+            what, commit = self._points_at(ref)
+            if commit not in checked:
+                raise ValueError(f"{ref} is {what}, no export checked here: nothing pushed")
+        return exports
+
+    def _points_at(self, ref: str) -> tuple[str, str]:
+        """What `ref` of the public repository is, and its commit: itself, or the one commit an
+        annotated tag names directly; "" for anything else."""
+        obj = self.public_git("rev-parse", "--verify", ref)
+        kind = self.public_git("cat-file", "-t", obj)
+        if kind == "commit":
+            return "a commit", obj
+        if kind != "tag":
+            return f"a {kind}", ""
+        header = self.public_git("cat-file", "tag", obj).split("\n\n", 1)[0].splitlines()
+        named = [line.split(" ", 1)[1] for line in header if line.startswith("object ")]
+        types = [line.split(" ", 1)[1] for line in header if line.startswith("type ")]
+        if types == ["commit"] and len(named) == 1:
+            return "a tag of a commit", named[0]
+        return f"a tag of a {'/'.join(types) or 'nothing'}", ""
 
     def deploy_clone(self, base: str, to: Path) -> Path:
         """The deployer's clone of the public repository (BOOTSTRAP §13.4), at `to`, new: its

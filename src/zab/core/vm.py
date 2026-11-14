@@ -14,8 +14,20 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from zab import __version__
+from zab import jobs as zjobs
+from zab.core.fork import topic_link
+from zab.core.jobcontrol import (
+    count_text,
+    job_entry,
+    jobs_line,
+    memory_argv,
+    memory_text,
+    still_running,
+    unended,
+)
 from zab.core.reason import asked_by
 from zab.tools import vmstat
+from zab.tools.common import subprocess_runner
 
 if TYPE_CHECKING:
     from zab.core import types as t
@@ -108,11 +120,19 @@ async def report(bridge: BotBridge, *, dm: bool) -> str:
         except Exception:
             return None
 
-    found, states = await asyncio.gather(
-        stat(), asyncio.gather(*(sign_in(backend) for backend in backends))
+    async def running_jobs() -> list[zjobs.Job]:
+        try:
+            return await machine_jobs(bridge)
+        except Exception:
+            return []  # a job directory that can't be read costs only the jobs' line
+
+    found, states, jobs = await asyncio.gather(
+        stat(), asyncio.gather(*(sign_in(backend) for backend in backends)), running_jobs()
     )
     running = sum(bool(a.turn) for b in bridges for a in b.actors.values())
     status = [turns_text(running)]
+    if jobs:  # the machine's, every bot's and those of none (§7.14)
+        status.append(count_text(len(jobs)))
     if found is not None and (up := vmstat.uptime_text(found)):
         status.append(up)
     names = [b.kind.capitalize() for b in backends]
@@ -120,4 +140,62 @@ async def report(bridge: BotBridge, *, dm: bool) -> str:
     status.append(f"zab {__version__}")
     if found is None:
         return "VM statistics unavailable; try !vm again.\n" + " · ".join(status)
-    return vmstat.format_report(found, status=status, totals_only=not dm)
+    report = vmstat.format_report(found, status=status, totals_only=not dm)
+    if dm and jobs:
+        report += "\n" + await listed_jobs(bridge, jobs)
+    return report
+
+
+async def machine_jobs(bridge: BotBridge) -> list[zjobs.Job]:
+    """The machine's running jobs, from their directories and systemd, as the sentinel reads
+    them (`unended`, `still_running`): every bot's, and those started without one, which the
+    watcher keeps no row for (#941's review, B3)."""
+    directory = bridge.jobs.directory
+    if directory is None:
+        return []
+    jobs = await asyncio.to_thread(unended, directory)
+    if not jobs:
+        return []
+    done = await asyncio.to_thread(
+        subprocess_runner, zjobs.LIST_UNITS, env=zjobs.user_env(), timeout_s=30
+    )
+    return still_running(jobs, done.ok, done.stdout, zjobs.boot_id())
+
+
+async def listed_jobs(bridge: BotBridge, jobs: list[zjobs.Job]) -> str:
+    """DM `!vm`'s line of the machine's running jobs (§13.5): each one's name, its topic as a
+    link ("no topic" for an unattached one), its start and its memory, its unit's
+    `MemoryCurrent`. Never a command line. The topic is the watcher's record of the job (its
+    `jobs` row), never `job.json`'s word for it."""
+
+    async def topic(job: zjobs.Job) -> str:
+        rows = bridge.store.rows("jobs", id=job.id)
+        session_id = rows[0]["session_id"] if rows else None
+        found = bridge.store.rows("sessions", id=session_id) if session_id else []
+        if not found:
+            return "no topic"
+        session = found[0]
+        try:
+            name = (await bridge.channel(session["stream_id"], background=True)).get("name", "")
+        except Exception:
+            name = ""
+        return topic_link(bridge.client.site, session["stream_id"], name, session["topic"])
+
+    topics = [await topic(job) for job in jobs]
+    memories = await asyncio.gather(*(memory(job.id) for job in jobs))
+    return jobs_line(
+        [
+            job_entry(job.name, job.started_at, mem, where)
+            for job, where, mem in zip(jobs, topics, memories, strict=True)
+        ]
+    )
+
+
+async def memory(job_id: str) -> str:
+    """`1.2 GB memory`, from the job's unit (`systemctl --user show`, an argument list), or
+    `memory unavailable`."""
+    argv = memory_argv(job_id)
+    if argv is None:
+        return "memory unavailable"
+    done = await asyncio.to_thread(subprocess_runner, argv, env=zjobs.user_env(), timeout_s=10)
+    return memory_text(done.ok, done.stdout)

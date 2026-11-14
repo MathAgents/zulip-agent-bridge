@@ -276,7 +276,7 @@ def test_a_launch_of_a_retired_row_puts_it_back_in_service_from_its_start(verb):
         ("!start bob", True), ("!stop bob", True), ("!rollout v0.2.2 bob", True),
         ("!idle-stop 0 bob", True), ("!uninstall bob", True), ("!final-sync bob", True),
         ("!export bob", True), ("!protect off bob", True), ("!provision repos bob", True),
-        ("!waker on bob", True), ("!grow-disk bob 300GB", True),
+        ("!waker on bob", True), ("!grow-disk bob 300GB", True), ("!trust-fix bob", True),
         ("!waker off bob", False), ("!status bob", False),
         ("!retire bob unsynced", False), ("!teardown bob unsynced", False),
         ("!deactivate-bots bob", False), ("!provision zulip bob", False),

@@ -42,11 +42,14 @@ CODEX_UNIT = "codex-app-server.service"
 #: The sentinel's replies (`zab.tools.sentinel`).
 RUNNING = r"(?m)^bridge running, last Zulip event .+ ago · "
 STOPPED = r"(?m)^bridge not running \(inactive\): send !restart · "
-RESTARTING = r"^🔄 Restarting your bridge: running turns will be interrupted\.$"
+RESTARTING = (
+    r"^🔄 Restarting your bridge: running turns will be interrupted; "
+    r"background jobs keep running\.$"
+)
 BACK = r"^✅ Your bridge is back: it is processing Zulip events again \(.+ after the restart\)\.$"
 REFUSED = r"^⏳ A restart ran less than a minute ago; try again in \d+ s\.$"
 CODEX_RESTARTING = r"^🔄 Restarting Codex: its running turns will be interrupted\.$"
-CODEX_BACK = r"^✅ Codex is running again\.$"
+CODEX_BACK = r"^✅ Codex is running again; background jobs keep running\.$"
 #: How long a second reply has to come before the scenario takes it that none will: the bridge
 #: answers a DM command within a few seconds.
 QUIET_S = 20

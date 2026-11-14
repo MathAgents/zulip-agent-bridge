@@ -234,7 +234,7 @@ async def test_claude_notes_while_a_subagent_works(chat: Chat, vm, scenario, non
         others = [f"also left: {other.what}" for other in left[1:]]  # review of #922, N4
         first.after = "; ".join([*failed, *rigs, *others])
         raise first
-    missed = [t for t in scenario.timings[kept:] if not (t.ok or t.target)]
+    missed = [t for t in scenario.timings[kept:] if t.failed]
     if rigs and not failed and not missed:  # the part runs again (`conftest`, #877)
         raise next(r for r in results if isinstance(r, RigFailure))
     # a failure seen stays one: a rig failure beside it never turns it into a rerun (B2)

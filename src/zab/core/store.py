@@ -98,6 +98,21 @@ _ADDED_TABLES = {
     "message_finals": """CREATE TABLE IF NOT EXISTS message_finals (
  bot TEXT NOT NULL, message_id INTEGER NOT NULL, pending TEXT, PRIMARY KEY (bot, message_id)
 )""",
+    # the background jobs the bridge has seen (SPEC §6.2, §7.14; #655): its watcher's
+    "jobs": """CREATE TABLE IF NOT EXISTS jobs (
+ id TEXT PRIMARY KEY, bot TEXT NOT NULL, session_id TEXT, name TEXT NOT NULL,
+ state TEXT NOT NULL, started_at REAL NOT NULL, ended_at REAL, result TEXT, handled_at REAL,
+ end_message_id INTEGER, report_turn_id INTEGER
+)""",
+    # ... and each end post being tried, one per session (#940's review round 2): its jobs
+    # and its sends, each one's jobs and destination (JSON), its first try, its tries, its
+    # next, and whether a send may have landed unseen (`unknown`), so that no restart sends it
+    # again unlooked for
+    "job_posts": """CREATE TABLE IF NOT EXISTS job_posts (
+ id INTEGER PRIMARY KEY, bot TEXT NOT NULL, session_id TEXT NOT NULL, job_ids TEXT NOT NULL,
+ sends TEXT NOT NULL, first_at REAL NOT NULL, attempts INTEGER NOT NULL, next_at REAL NOT NULL,
+ unknown INTEGER NOT NULL, UNIQUE (bot, session_id)
+)""",
 }
 #: A final mark whose message has no count: one #757's zab forgot after a rollback, which
 #: never names `message_finals`. Removed at each start.
@@ -356,6 +371,16 @@ class Store:
                     f"DELETE FROM {table} WHERE bot=? AND message_id=?",  # noqa: S608
                     [(bot, mid) for mid in message_ids],
                 )
+
+    def forget_job_post(self, post_id: int) -> None:
+        """A pending end post's row, gone once it went out or ended (§7.14)."""
+        with self.transaction():
+            self.db.execute("DELETE FROM job_posts WHERE id=?", (post_id,))
+
+    def forget_job(self, job_id: str) -> None:
+        """A job's row, gone with its directory (§7.14's retention)."""
+        with self.transaction():
+            self.db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
 
     def get(self, key: str, default: Any = None) -> Any:
         rows = self.rows("kv", key=key)

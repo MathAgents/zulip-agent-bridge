@@ -20,6 +20,26 @@ holds:
     session, more than 24 hours old, the verdict names it as possibly stale ("staying up only
     for a detached codex turn running 31 h (possibly stale: check with `zab status`)"); such
     rows come from `!attach` and recovery, which are to settle them at the source;
+- a background job runs (#655; SPEC §7.14): one of `agent`'s `zab-job-*` units, which
+  `zab job start` makes, is active, whatever its load, since a job that sleeps or waits on the
+  network or the disk would otherwise be powered off under it. Each job's own cap
+  (`RuntimeMaxSec`, `[jobs] max_hours`, 12 hours by default) stops it, and the usual timeout
+  applies after it ends, counted from the last tick that saw a job hold the VM
+  (`/run/zab-idle-stop.job`'s mtime; "a background job ran 3 min ago"): zab's database shows
+  the job's end only once the bridge's watcher has posted it and its report turn has started,
+  up to its next pass later, so a tick in between would otherwise power the VM off before the
+  end post (Codex round 1 on #970). The verdict says "2 background jobs running". No hold
+  outlasts a cap, so that no error holds a VM up for good. A unit holds only while it has been
+  active (`ActiveEnterTimestampMonotonic`) for less than its own cap (`RuntimeMaxUSec`) and
+  `JOB_GRACE_S` (15 min); one without a cap (`infinity`: made by hand, or a job that lost its
+  `RuntimeMaxSec`) never holds, and the verdict says "(ignoring a background job active 13 h,
+  past its cap of 12 h)" or "(ignoring a background job without a time limit)". A `systemctl`
+  that can't list them holds the VM up ("background jobs unknown") only until that has lasted
+  the jobs' cap, the bridge's `[jobs] max_hours` (12 by default; `CONFIG`), and 15 min in a row,
+  since no job can start while agent's manager doesn't answer, and any job running then has
+  ended at its cap: then "(ignoring background jobs unknown for 12 h 15 min)". When that began
+  is kept in `/run/zab-idle-stop.jobs-unknown` (tmpfs: a boot, which ends every job, starts it
+  again);
 - zab took a message in for its agents (a turn, a delivery to a running turn, an attach), held one
   for a busy session, or a turn started or ended, less than N minutes ago. Messages the bridge
   ignores don't count: `Store.claim` records every message a bot sees as `ignored` before it
@@ -81,6 +101,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pwd
 import re
@@ -89,6 +110,7 @@ import stat
 import subprocess
 import sys
 import time
+import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -128,6 +150,35 @@ CODEX_ACTIVE = [
     "--plain",
     "codex-app-server*.service",
 ]
+#: agent's background jobs (#655): `zab job start` runs each as a transient unit
+#: `zab-job-<id>.service` of agent's user manager; one stopping (its `ExecStopPost` writing how
+#: it ended) still counts. The id's form is `zab job`'s, not checked here
+JOBS_ACTIVE = [*CODEX_ACTIVE[:-1], "zab-job-*.service"]
+_JOB_UNIT = re.compile(r"zab-job-\S+\.service")
+#: ... and each one's cap and when it became active, on the monotonic clock (µs), as
+#: `JOBS_SHOW + [unit, …]`
+JOBS_SHOW = [
+    *_USER_SYSTEMCTL,
+    "show",
+    "--property=Id",
+    "--property=ActiveState",
+    "--property=RuntimeMaxUSec",
+    "--property=ActiveEnterTimestampMonotonic",
+]
+#: How long past its cap a job, or jobs that can't be listed, still hold the VM (module doc)
+JOB_GRACE_S = 15 * 60
+#: The bridge's config, for `[jobs] max_hours` (SPEC §7.14): 12 when it has none, and the
+#: config's own bounds, above 0 and at most 168
+CONFIG = "/home/agent/.config/zab/config.toml"
+MAX_HOURS, MAX_HOURS_LIMIT = 12.0, 168.0
+#: Since when the jobs couldn't be listed, in epoch seconds (tmpfs: gone at boot)
+JOBS_UNKNOWN = "/run/zab-idle-stop.jobs-unknown"
+#: When a background job was last seen holding the VM (its mtime), for the timeout after its end
+JOB_SEEN = "/run/zab-idle-stop.job"
+#: A systemd time span as `systemctl show` prints it: `12h`, `1d 12h`, `3min 30s`, `infinity`
+_SPAN = re.compile(r"(\d+(?:\.\d+)?)(us|µs|ms|s|min|h|d|w|month|y)")
+_SPAN_S = {"us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1, "min": 60, "h": 3600, "d": 86400,
+           "w": 604800, "month": 2629800, "y": 31557600}  # fmt: skip
 #: An SSH session's process title: `sshd: ubuntu@notty` (OpenSSH 9.6, Ubuntu 24.04) or
 #: `sshd-session: ubuntu@pts/0` (9.8 and later). The listener and `[priv]` halves have no `@`.
 _SSH_SESSION = re.compile(rb"^sshd(?:-session)?: [^\s@\[]+@")
@@ -172,6 +223,9 @@ class Facts:
     last_login: float | None = None  # epoch, from LOGIN's mtime
     hold_until: float | None = None  # epoch, from HOLD
     running_turns: int | None = 0  # rows that count, after the rules above
+    running_jobs: int | None = 0  # agent's active `zab-job-*` units (#655)
+    jobs_ignored: list[str] = field(default_factory=list)  # past their caps: no hold
+    last_job: float | None = None  # epoch, from JOB_SEEN's mtime: a job last seen holding
     ignored_rows: list[str] = field(default_factory=list)  # why the others don't
     suspect_rows: list[str] = field(default_factory=list)  # counted, but possibly stale
     last_activity: float | None = None  # newest handled message or turn start/end (epoch)
@@ -202,6 +256,13 @@ def hold_reasons(facts: Facts, minutes: int, max_load: float) -> list[str]:
         )
     elif facts.running_turns:
         reasons.append(f"{facts.running_turns} turn(s) running")
+    if facts.running_jobs is None:  # for at most the jobs' cap in a row (`gather`)
+        reasons.append("background jobs unknown")
+    elif facts.running_jobs:
+        jobs = "job" if facts.running_jobs == 1 else "jobs"
+        reasons.append(f"{facts.running_jobs} background {jobs} running")
+    elif facts.last_job is not None and facts.now - facts.last_job < idle:
+        reasons.append(f"a background job ran {_minutes(max(0.0, facts.now - facts.last_job))} ago")
     if facts.last_activity is not None and facts.now - facts.last_activity < idle:
         reasons.append(f"zab active {_minutes(max(0.0, facts.now - facts.last_activity))} ago")
     if facts.load5 is None:
@@ -260,6 +321,21 @@ def who_logins(run: Run) -> list[str]:
         if len(parts) >= 2:
             users.append(f"{parts[0]}@{parts[1]}")
     return users
+
+
+def clamped(path: str, now: float, *, write: bool = True) -> float | None:
+    """`path`'s mtime, as `read_mtime`; one in the future (the clock set back since it was
+    written) counts as `now`, and is rewritten so unless `write` is off, so that a record
+    holds the VM for one timeout at most, never for the clock's skew (review of #970, N5)."""
+    mtime = read_mtime(path)
+    if mtime is None or mtime <= now:
+        return mtime
+    if write:
+        try:
+            os.utime(path, (now, now))
+        except OSError:
+            pass
+    return now
 
 
 def read_mtime(path: str) -> float | None:
@@ -369,6 +445,126 @@ def codex_active(run: Run) -> bool | None:
     return bool(res.stdout.strip())
 
 
+def _hours(seconds: float) -> str:
+    hours, minutes = divmod(int(seconds // 60), 60)
+    return f"{hours} h {minutes} min" if minutes else f"{hours} h"
+
+
+def span_seconds(text: str) -> float | None:
+    """A time span as `systemctl show` prints it, in seconds: `math.inf` for the literal
+    `infinity`, no cap; None for an empty value or anything else it can't read, which is
+    unknown, not "no cap" (review round 4 of #924). A bare number is microseconds."""
+    text = text.strip()
+    if text == "infinity":
+        return math.inf
+    if text.isdigit():
+        return int(text) / 1e6
+    parts = text.split()
+    found = [_SPAN.fullmatch(part) for part in parts]
+    if not parts or not all(found):
+        return None
+    return sum(float(m[1]) * _SPAN_S[m[2]] for m in found if m)
+
+
+def show_blocks(text: str) -> list[dict[str, str]]:
+    """`systemctl show`'s output for several units, one dict of `key=value` lines per unit:
+    the units are separated by a blank line, and within one the properties come in systemd's
+    order, not the order asked for (systemd 255 prints `RuntimeMaxUSec` before `Id`)."""
+    blocks = []
+    for chunk in re.split(r"\n\s*\n", text):
+        fields = dict(line.partition("=")[::2] for line in chunk.splitlines() if "=" in line)
+        if fields:
+            blocks.append(fields)
+    return blocks
+
+
+def max_hours(path: str = CONFIG) -> float:
+    """The bridge's `[jobs] max_hours`, or `MAX_HOURS` when it has none or one out of bounds."""
+    try:
+        with open(path, "rb") as f:
+            hours = tomllib.load(f).get("jobs", {}).get("max_hours", MAX_HOURS)
+    except (OSError, ValueError, AttributeError):
+        return MAX_HOURS
+    ok = isinstance(hours, (int, float)) and not isinstance(hours, bool)
+    return float(hours) if ok and 0 < hours <= MAX_HOURS_LIMIT else MAX_HOURS
+
+
+def jobs_running(run: Run, monotonic: float) -> tuple[int, list[str]] | None:
+    """How many of agent's background jobs hold the VM (`JOBS_ACTIVE`), and a note on each that
+    doesn't: active on the `monotonic` clock (s) for its cap and `JOB_GRACE_S` or longer, or
+    without a cap; None when systemctl can't say, or answers anything else than job units."""
+    res = run(JOBS_ACTIVE, capture_output=True, text=True, timeout=30)
+    if res.returncode != 0:
+        return None
+    units = sorted({line.split()[0] for line in res.stdout.splitlines() if line.strip()})
+    if not all(_JOB_UNIT.fullmatch(unit) for unit in units):
+        return None
+    if not units:
+        return 0, []
+    res = run([*JOBS_SHOW, *units], capture_output=True, text=True, timeout=30)
+    if res.returncode != 0:
+        return None
+    since: dict[str, int] = {}
+    caps: dict[str, float] = {}
+    gone: set[str] = set()
+    for fields in show_blocks(res.stdout):
+        unit, stamp = fields.get("Id", "").strip(), fields.get("ActiveEnterTimestampMonotonic")
+        state = fields.get("ActiveState", "").strip()
+        cap = span_seconds(fields.get("RuntimeMaxUSec", ""))
+        if state in ("inactive", "failed") and unit:  # ended between the two calls
+            gone.add(unit)
+            continue
+        if not unit or stamp is None or not stamp.strip().isdigit() or cap is None:
+            return None  # a field missing or unreadable: unknown, held within its own limit
+        since[unit], caps[unit] = int(stamp), cap
+    if set(since) | gone != set(units):
+        return None
+    holding, old = 0, []
+    for unit in units:
+        if unit in gone:
+            continue
+        cap = caps[unit]
+        age = monotonic - since[unit] / 1e6 if since[unit] else 0.0  # 0: not active yet
+        if cap == math.inf:
+            old.append("a background job without a time limit")
+        elif age >= cap + JOB_GRACE_S:
+            old.append(f"a background job active {_hours(age)}, past its cap of {_hours(cap)}")
+        else:
+            holding += 1
+    return holding, old
+
+
+def unknown_since(path: str, now: float, unknown: bool, *, write: bool = True) -> float | None:
+    """Since when the jobs couldn't be listed, recorded at `path` the first time (a write that
+    fails counts from `now`); None, and the record gone, once they could be. A time later than
+    now, after the clock was set back, counts as now. Without `write` (`--dry-run`), the
+    record is only read."""
+    if not write:
+        if not unknown:
+            return None
+        try:
+            return min(float(Path(path).read_text().split()[0]), now)
+        except (OSError, ValueError, IndexError):
+            return now
+    if not unknown:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"cannot remove {path}: {exc}", file=sys.stderr)
+        return None
+    try:
+        return min(float(Path(path).read_text().split()[0]), now)
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        Path(path).write_text(f"{now:.0f}\n")
+    except OSError as exc:
+        print(f"cannot write {path}: {exc}", file=sys.stderr)
+    return now
+
+
 def group_alive(pgid: int) -> bool:
     """Whether a process group exists (root may signal it; signal 0 only checks)."""
     try:
@@ -442,6 +638,11 @@ def gather(
     alive: Callable[[int], bool] = group_alive,
     warm: str = WARM_DONE,
     spare: bool = False,
+    jobs_unknown: str = JOBS_UNKNOWN,
+    monotonic: float | None = None,
+    config: str = CONFIG,
+    dry_run: bool = False,
+    job_seen: str = JOB_SEEN,
 ) -> Facts:
     """Every fact the checks need; what can't be read is recorded, never guessed. On a `spare`,
     a missing zab database is none to read (module doc)."""
@@ -460,7 +661,8 @@ def gather(
         facts.reads = [s for s in sessions if s == READ_SESSION]
     except (OSError, subprocess.SubprocessError) as exc:
         facts.errors.append(f"logins ({exc})")
-    facts.last_login = read_mtime(login)
+    facts.last_login = clamped(login, facts.now, write=not dry_run)
+    facts.last_job = clamped(job_seen, facts.now, write=not dry_run)
     facts.hold_until = read_hold(hold)
     try:
         facts.warming = warm_up_running(run, warm)
@@ -470,6 +672,15 @@ def gather(
         facts.warming = False  # never for good (module doc)
         hours = WARM_MAX_S // 3600
         facts.warm_ignored = f"the first boot's volume warm-up, unfinished after {hours} h up"
+    try:
+        jobs = jobs_running(run, time.monotonic() if monotonic is None else monotonic)
+    except (OSError, subprocess.SubprocessError):
+        jobs = None
+    facts.running_jobs, facts.jobs_ignored = jobs if jobs is not None else (None, [])
+    since = unknown_since(jobs_unknown, facts.now, jobs is None, write=not dry_run)
+    if since is not None and facts.now - since >= max_hours(config) * 3600 + JOB_GRACE_S:
+        facts.running_jobs = 0  # no job could start since, and any then running has ended
+        facts.jobs_ignored = [f"background jobs unknown for {_hours(facts.now - since)}"]
     as_root = (os.geteuid() if euid is None else euid) == 0
     try:
         state = read_db_as_agent(db, run) if as_root else read_db(db)
@@ -618,6 +829,7 @@ def _stamp(now: float) -> str:
 
 def verdict(facts: Facts, reasons: Sequence[str], minutes: int) -> str:
     ignored = [*facts.ignored_rows, *([facts.warm_ignored] if facts.warm_ignored else [])]
+    ignored += facts.jobs_ignored
     ignoring = f" (ignoring {'; '.join(ignored)})" if ignored else ""
     if reasons:
         return "stay up: " + "; ".join(reasons) + ignoring
@@ -627,8 +839,8 @@ def verdict(facts: Facts, reasons: Sequence[str], minutes: int) -> str:
         else f", zab idle {_minutes(facts.now - facts.last_activity)}"
     )
     return (
-        f"power off: idle for {minutes} min (no turn, no login, load {facts.load5:.2f}{idle})"
-        + ignoring
+        f"power off: idle for {minutes} min (no turn, no job, no login, load {facts.load5:.2f}"
+        f"{idle})" + ignoring
     )
 
 
@@ -668,6 +880,10 @@ def main(
     keys_owner: int | None = None,
     warm: str = WARM_DONE,
     spare_log: str = SPARE_LOG,
+    jobs_unknown: str = JOBS_UNKNOWN,
+    monotonic: float | None = None,
+    config: str = CONFIG,
+    job_seen: str = JOB_SEEN,
 ) -> int:
     parser = argparse.ArgumentParser(prog="idle_stop.py", description=__doc__.splitlines()[0])
     parser.add_argument("--minutes", type=int)
@@ -698,7 +914,8 @@ def main(
     log = spare_log if args.spare else log
     facts = gather(
         args.db, run, proc=proc, now=now, euid=euid, login=login, hold=hold, alive=alive,
-        warm=warm, spare=args.spare,
+        warm=warm, spare=args.spare, jobs_unknown=jobs_unknown, monotonic=monotonic,
+        config=config, dry_run=args.dry_run, job_seen=job_seen,
     )  # fmt: skip
     if facts.reads:  # the journal only: they change no verdict
         print(f"not logins: {', '.join(facts.reads)} (status reads, #507)", flush=True)
@@ -707,6 +924,12 @@ def main(
             Path(login).touch()
         except OSError as exc:
             print(f"cannot write {login}: {exc}", file=sys.stderr)
+    if facts.running_jobs and not args.dry_run:  # the timeout after a job counts from here
+        try:
+            Path(job_seen).touch()
+            os.utime(job_seen, (facts.now, facts.now))
+        except OSError as exc:
+            print(f"cannot write {job_seen}: {exc}", file=sys.stderr)
     reasons = hold_reasons(facts, args.minutes, args.max_load)
     line = f"{_stamp(facts.now)} {verdict(facts, reasons, args.minutes)}"
     if reasons:

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zulip-agent-bridge"
-version = "0.2.19"
+version = "0.2.20"
 description = "Drive Codex and Claude Code sessions on your own machines from Zulip topics"
 readme = "README.md"
 license = "MIT"
@@ -60,7 +60,7 @@ markers = [
   "live: needs a real CLI login or Zulip dev bot; runs only with ZAB_LIVE / ZAB_LIVE_ZULIP set",
   "e2e: the end-to-end suite against the test VM (issue #263); runs only with ZAB_LIVE=e2e",
   "scenario(n): the issue #263 scenario an e2e test belongs to (ZAB_E2E_SCENARIOS selects)",
-  "slow: offline, several seconds: a PR's CI leaves it out (-m 'not slow'), a push to main runs it (#473); in the e2e suite, a part of a fast scenario that stops the VM: it runs with the slow group only",
+  "slow: offline, several seconds: a PR's CI leaves it out (-m 'not slow'), a push to main runs it (#473); in the e2e suite, a part of a fast scenario that stops the VM: it runs with --scenarios slow or all, or when its scenario is named by number or range, never with fast alone (conftest.selected, #978)",
   "timing: offline, a bound on CPU against a reference timed in the same run: CI runs it in its timing job, one test at a time, not beside another xdist worker, whose load on a runner's second thread (two vCPUs, one core) swings a process's CPU by up to 1.7 times (#485)",
   "admin_e2e: the admin end-to-end suite on the rig (issue #356); runs only with ZAB_LIVE=admin-e2e",
   "admin_scenario(label): the ADMIN.md §7 scenario (A1 to A20, A10b) an admin e2e test belongs to",

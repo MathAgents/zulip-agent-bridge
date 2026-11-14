@@ -164,32 +164,89 @@ tags = ["zab-role=test"]
         "git@github.com:MathAgents/zab.git",
         "git@github.com:a/b.git",
         "git@github.com:A-1/z_.x-y.git",
+        "https://github.com/MathAgents/zulip-agent-bridge.git",  # #959: a public one, keyless
+        "https://github.com/a/b.git",
+        "https://github.com/A-1/z_.x-y.git",
     ],
 )
-def test_the_release_repo_is_a_github_repository_over_ssh(value):
-    """#569: where `!upgrade-server`'s helper fetches the tags, with its deploy key; unset by
-    default, which keeps the in-band upgrade off."""
+def test_the_release_repo_is_a_github_repository_over_ssh_or_https(value):
+    """#569, #959: where `!upgrade-server`'s helper fetches the tags, over SSH with its deploy
+    key, or anonymously over HTTPS from a public repository; unset by default, which keeps the
+    in-band upgrade off."""
     assert parse_admin_config(EXAMPLE).release_repo == ""
     line = 'release = "final"\n'
     text = EXAMPLE.replace(line, f'{line}release_repo = "{value}"\n', 1)
     assert parse_admin_config(text).release_repo == value
 
 
+#: A credential in a value, or what could be one: never taken, never shown (#959).
+SECRET = "ghp_" + "S3cr3t" * 6  # made up
+CREDENTIALED = (
+    f"https://{SECRET}@github.com/MathAgents/zab.git",
+    f"https://x-access-token:{SECRET}@github.com/MathAgents/zab.git",
+    f"https://user:{SECRET}@github.com/MathAgents/zab.git",
+    f"https://github.com/MathAgents/zab.git?token={SECRET}",
+    f"https://github.com/MathAgents/zab.git#{SECRET}",
+    f"https://github.com:443@{SECRET}/MathAgents/zab.git",
+    f"https://github.com.{SECRET}.example/MathAgents/zab.git",
+    f"ssh://git:{SECRET}@github.com/MathAgents/zab.git",
+    f"git@github.com:MathAgents/zab.git {SECRET}",
+)
+
+
 @pytest.mark.parametrize(
     "value",
     [
-        "https://github.com/MathAgents/zab.git", "ssh://git@github.com/MathAgents/zab.git",
-        "git@gitlab.com:MathAgents/zab.git", "git@github.com:MathAgents/zab",
-        "git@github.com:MathAgents/.git", "git@github.com:-x/zab.git", "git@github.com:a/b/c.git",
+        "ssh://git@github.com/MathAgents/zab.git", "git@gitlab.com:MathAgents/zab.git",
+        "git@github.com:MathAgents/zab", "git@github.com:MathAgents/.git",
+        "git@github.com:-x/zab.git", "git@github.com:a/b/c.git",
         "git@github.com:MathAgents/zab.git -oProxyCommand=x", "git@github.com:a/..git",
         "file:///srv/zab.git", "/srv/zab.git", "git@github.com:a/b.git\n",
+        # #959: the HTTPS form is GitHub's, by its own name, with the repository and no more
+        "http://github.com/MathAgents/zab.git", "https://github.com/MathAgents/zab",
+        "https://github.com/MathAgents/zab.git/", "https://github.com:443/MathAgents/zab.git",
+        "https://www.github.com/MathAgents/zab.git", "https://GitHub.com/MathAgents/zab.git",
+        "https://gitlab.com/MathAgents/zab.git", "https://github.com/MathAgents/zab/x.git",
+        "https://github.com//MathAgents/zab.git", "https://github.com/../zab.git",
+        "https://github.com/MathAgents/zab.git\n", " https://github.com/MathAgents/zab.git",
+        "git@github.com:https://github.com/a/b.git", "https://github.com/a/b.git@x",
+        *CREDENTIALED,
     ],
 )  # fmt: skip
-def test_another_release_repo_is_refused(value):
+def test_another_release_repo_is_refused_and_never_shown(value):
+    """A refusal names the two forms, never the value: it reaches the bot's journal, the
+    plan's outcome and Zulip, and an HTTPS URL could carry a token (#950's lesson)."""
     line = 'release = "final"\n'
     text = EXAMPLE.replace(line, f"{line}release_repo = {json.dumps(value)}\n", 1)
-    with pytest.raises(AdminConfigError, match="release_repo: expected a value matching"):
+    with pytest.raises(AdminConfigError) as refused:
         parse_admin_config(text)
+    assert said(refused.value) == [REFUSED_REPO] * 2  # the loader's, then admin.toml's
+
+
+#: The refusal of any release_repo the loader doesn't take, prefixed with admin.toml's name.
+REFUSED_REPO = (
+    "release_repo: expected git@github.com:OWNER/REPO.git or https://github.com/OWNER/REPO.git"
+    " (the value is not shown: it could hold a credential)"
+)
+
+
+def said(error: BaseException) -> list[str]:
+    """What an error and each it was raised from or during say, without admin.toml's name:
+    a traceback shows them all."""
+    chain: list[str] = []
+    while error is not None:
+        chain.append(str(error).removeprefix("admin.toml: "))
+        error = error.__cause__ or error.__context__
+    return chain
+
+
+@pytest.mark.parametrize("value", ["[1, 2]", "42", "true", f'{{ url = "https://{SECRET}@x" }}'])
+def test_a_release_repo_of_another_type_is_refused_and_never_shown(value):
+    line = 'release = "final"\n'
+    text = EXAMPLE.replace(line, f"{line}release_repo = {value}\n", 1)
+    with pytest.raises(AdminConfigError) as refused:
+        parse_admin_config(text)
+    assert said(refused.value) == [REFUSED_REPO] * 2
 
 
 @pytest.mark.parametrize("tag", ["v0.2.3rc1", "v0.2.٣", "main", "v1.2.3-dirty", "", "v1.2"])

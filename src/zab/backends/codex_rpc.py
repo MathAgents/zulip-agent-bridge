@@ -242,6 +242,11 @@ class CodexRpc:
         if self.socket:
             await self.socket.close()
             self.socket = None
+        # A spawned app-server is signalled before any await that a cancel of the caller can cut
+        # short (#967): `CodexBackend.close()` cancelling `_run` during the reader's wait below
+        # left the child running. Its exit is waited for after the reader's.
+        if self.process and self.process.returncode is None:
+            self.process.terminate()
         if self.reader:
             self.reader.cancel()
             # Not an `await` under `suppress(CancelledError)`: it swallowed a cancel of the
@@ -250,7 +255,6 @@ class CodexRpc:
             await asyncio.wait({self.reader})
             self.reader = None
         if self.process and self.process.returncode is None:
-            self.process.terminate()
             try:
                 await asyncio.wait_for(self.process.wait(), 5)
             except TimeoutError:

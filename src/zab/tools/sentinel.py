@@ -61,10 +61,19 @@ from typing import Any
 import httpx
 
 from zab import __version__
+from zab import jobs as zjobs
 from zab.commands.service import SENTINEL as SENTINEL_UNIT
 from zab.config import BotConfig, Config, ConfigError, allowed_users, load_config
 from zab.core.addressing import mention, without_typed_address
 from zab.core.command_text import as_command
+from zab.core.jobcontrol import (
+    job_entry,
+    jobs_line,
+    memory_argv,
+    memory_text,
+    still_running,
+    unended,
+)
 from zab.tools import vmstat
 from zab.zulip.client import ZulipClient, ZulipError
 
@@ -103,6 +112,12 @@ HELD_CODEX = (
     "⏸ Nothing was restarted: your organizers are working on this VM (a rollout or a sync), "
     "and may be restarting Codex themselves. Send !restart codex again when they finish."
 )
+#: `!restart`'s first reply, and `!restart codex`'s confirmation (§13.5): a background job runs
+#: in its own unit, outside the bridge's and the daemon's, and survives both (§7.14, #655 V1).
+RESTARTING_BRIDGE = (
+    "🔄 Restarting your bridge: running turns will be interrupted; background jobs keep running."
+)
+CODEX_BACK = "✅ Codex is running again; background jobs keep running."
 
 #: `(argv, timeout) -> (exit code, stdout)`, a fixed argument list, never a shell string.
 Runner = Callable[[Sequence[str], float], Awaitable[tuple[int, str]]]
@@ -662,7 +677,42 @@ class Sentinel:
     async def vm_report(self) -> str:
         stat = await asyncio.to_thread(self.collect, self.disk_paths)
         status = [await self.bridge_line(), vmstat.uptime_text(stat), f"zab {__version__}"]
-        return vmstat.format_report(stat, status=[part for part in status if part])
+        report = vmstat.format_report(stat, status=[part for part in status if part])
+        try:
+            jobs = await self.jobs_line()
+        except Exception as exc:  # a malformed job costs only the jobs' line (#941's review)
+            log.warning("Background jobs unreadable: %s", type(exc).__name__)
+            jobs = ""
+        return f"{report}\n{jobs}" if jobs else report
+
+    async def jobs_line(self) -> str:
+        """The machine's running background jobs, as the bridge's DM `!vm` lists them (§13.5),
+        read here, not through the bridge, which may be down (Codex round 1 on #941): the job
+        directories (`zab.jobs`) and systemd, each by an argument list. A job without its
+        `ended.json` whose unit is listed runs; with no answer from the manager, this boot's
+        jobs without one are taken to run (`still_running`): one of an earlier boot without its
+        `ended.json` was cut off. No topic: the sessions are in the bridge's store, which the
+        sentinel doesn't read."""
+        jobs = await asyncio.to_thread(unended, zjobs.jobs_dir(self.state_dir))
+        if not jobs:
+            return ""
+        code, out = await self.run(zjobs.LIST_UNITS, 30)
+        jobs = still_running(jobs, code == 0, out, self.boot or "")
+        if not jobs:
+            return ""
+
+        async def memory(job: zjobs.Job) -> str:
+            argv = memory_argv(job.id)
+            answer = await self.run(argv, 10) if argv else (1, "")
+            return memory_text(answer[0] == 0, answer[1])
+
+        memories = await asyncio.gather(*(memory(job) for job in jobs))
+        return jobs_line(
+            [
+                job_entry(job.name, job.started_at, mem)
+                for job, mem in zip(jobs, memories, strict=True)
+            ]
+        )
 
     async def restart(self, units: Sequence[str], *, block: bool) -> int:
         """`reset-failed` (a unit that hit its start limit restarts too), then `restart`."""
@@ -681,7 +731,7 @@ class Sentinel:
                 uid, f"⏳ A restart ran less than a minute ago; try again in {wait:.0f} s."
             )
             return
-        await self.tell(uid, "🔄 Restarting your bridge: running turns will be interrupted.")
+        await self.tell(uid, RESTARTING_BRIDGE)
         old = await self.main_pid()
         started = self.now()
         code = await self.restart([ZAB_UNIT], block=False)
@@ -743,7 +793,7 @@ class Sentinel:
         code = await self.restart(units, block=True)
         states = [await self.unit_state(u) for u in units]
         if code == 0 and all(s == "active" for s in states):
-            await self.tell(uid, "✅ Codex is running again.")
+            await self.tell(uid, CODEX_BACK)
         else:
             await self.tell(
                 uid,

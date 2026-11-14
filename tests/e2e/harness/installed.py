@@ -44,6 +44,8 @@ HAS_FORK = "from zab.core import commands as c; print('!fork' in c.HELP)"
 HAS_FORK_REPORT = "import zab.core.peer_context as p; print(hasattr(p, 'fork_context'))"
 #: ... and one `!fork` that both bots get forks both into one topic (#712)
 HAS_FORK_BOTH = "import zab.core.fork as f; print(hasattr(f, 'fork_of_message'))"
+#: `!new` where the bot has a session in the topic: an answer, never "Unknown command" (#985)
+NEW_WITH_SESSION = "from zab.core import commands as c; print(hasattr(c, 'new_with_session'))"
 #: `!btw` (#716): the help text lists it once the command exists, and each backend answers
 #: side questions once it implements them
 HAS_BTW = "from zab.core import commands as c; print('!btw' in c.HELP)"
@@ -83,6 +85,45 @@ FILES_RENDER = re.compile(r"Markdown renders as on GitHub.*?#L\d", re.S)
 #: #668's line: Claude Code's warning on a background sub-agent is about its findings, so the
 #: notes are still due while it runs
 NOTES_WHILE_WAITING = re.compile(r"That is about its findings, not its\s+progress")
+
+
+#: `zab job start --help` of the installed zab, as `agent` (#655): background jobs, and with
+#: `--no-report` in it, report turns when a job ends (#655 part 5)
+JOB_HELP = ["/home/agent/.local/bin/zab", "job", "start", "--help"]
+
+
+def _source(needle: str) -> str:
+    """A probe: whether the installed package's source holds `needle`, a fixed phrase that
+    only the part it names writes."""
+    return (
+        "import pathlib, zab; d = pathlib.Path(zab.__file__).parent; "
+        f"print(any({needle!r} in p.read_text(errors='ignore') for p in d.rglob('*.py')))"
+    )
+
+
+#: #655's later parts, by a phrase only each writes: the watcher's log event (SPEC §7.14,
+#: `job_ended`, part 4, #940), the report turn's request (Appendix A.3, part 5, #942), the reply
+#: to `!stop jobs` with none running (part 6a, #934), and topic `!status`'s line of a running
+#: job (part 6b, #941)
+JOB_WATCHER = _source("job_ended")
+JOB_REPORTS = _source("report the result to the user briefly")
+JOB_STOP_NAME = _source("No background job is running here.")
+JOB_STATUS = _source(" · running since ")
+
+
+def job_help(vm) -> str:
+    """The installed `zab job start --help`, "" when the build has no `zab job`: argparse
+    refuses the word (exit 2, "invalid choice"). Anything else that fails (SSH, a timeout,
+    `sudo`) raises, as every probe's does: an unknown build is an error, not a skip (#935's
+    review, B6)."""
+    res = vm.run(vm.as_agent(*JOB_HELP), check=False, timeout=60)
+    if res.ok:
+        return res.stdout
+    if res.returncode == 2 and "invalid choice" in f"{res.stderr or ''}{res.stdout or ''}":
+        return ""
+    raise RuntimeError(
+        f"zab job start --help: exit {res.returncode}: {(res.stderr or res.stdout)[-200:]!r}"
+    )
 
 
 def ask(vm, snippet: str) -> str:

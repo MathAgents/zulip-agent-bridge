@@ -148,6 +148,32 @@ def test_a_command_changes_no_record(pair):
     assert addressees(store, 1, "t") == (NAMES[0],)
 
 
+@pytest.mark.parametrize("new", ["!new", "!new --model m", "!New"])
+@pytest.mark.parametrize("address", [CODEX, "@codex"])
+def test_a_bare_new_records_its_bot(pair, new, address):
+    """#955: a `!new` without a prompt chooses whom the participant talks to, as one with a
+    prompt does. In Claude's topic, `@codex !new` starts Codex's session, and the follow-ups
+    without a mention go to Codex alone; in a new topic, they don't also start Claude's, as
+    with no record. From the text alone: where Codex had a session already, the same. An
+    unmentioned `!new` names nobody, and records nothing."""
+    store, routers = pair
+    bind(store, 1, 1)
+    route(routers, 2, f"{CLAUDE} work")
+    assert actions(route(routers, 3, f"{address} {new}")) == ["new", "ignore"]
+    assert addressees(store, 1, "topic") == (NAMES[0],)
+    bind(store, 0, 4)
+    assert actions(route(routers, 5, "and then?")) == ["deliver", "ignore"]
+    assert actions(route(routers, 6, f"{address} {new}", topic="t")) == ["new", "ignore"]
+    assert actions(route(routers, 7, "go on", topic="t")) == ["new", "ignore"]
+    route(routers, 8, f"{CLAUDE} you now")
+    assert actions(route(routers, 9, f"{address} {new}")) == ["command", "ignore"]
+    assert actions(route(routers, 10, "and now?")) == ["deliver", "ignore"]
+    assert actions(route(routers, 11, new)) == ["command", "ignore"]  # to Codex, recorded
+    assert addressees(store, 1, "topic") == (NAMES[0],)
+    assert actions(route(routers, 12, new, topic="u")) == ["new", "new"]  # no record: to all
+    assert addressees(store, 1, "u") == ()
+
+
 def test_only_a_detach_its_actor_carries_out_amends_the_record(pair):
     """#891: a bot's actor detaches on exactly `!detach`, its own mentions taken off
     (`actor_text`): `@claude !detach now` detaches nothing, and amends nothing, nor does an
@@ -572,6 +598,23 @@ async def test_a_later_detach_changes_no_earlier_message(make_pair):
             elif kind == "codex":
                 await pair.until(lambda: not pair.rows("t"), "the detach")
     assert not pair.rows("t") and {r["bot"] for r in pair.store.rows("sessions")} == {"codex"}
+
+
+async def test_a_bare_new_keeps_the_follow_ups_with_its_bot(make_pair):
+    """#955, in process: in Claude's topic, a bare `@codex !new` starts Codex's session, and the
+    next message without a mention is Codex's turn alone; Claude's session gets nothing."""
+    pair = await make_pair()
+    claude, codex = (f"@**{BOTS[kind][1]}**" for kind in ("claude", "codex"))
+    await dm_to(pair, "codex", "!unmentioned last")
+    await pair.say(f"{claude} remember orchid", "t")
+    await pair.turns(1, "t", kinds=("claude",))
+    await pair.say(f"{codex} !new", "t")
+    await pair.turns(1, "t")
+    follow_up = await pair.say("which flower?", "t")
+    await pair.turns(2, "t", kinds=("codex",))
+    rows = pair.rows("t")
+    assert len(pair.ended(rows["claude"])) == 1 and not pair.store.held(rows["claude"]["id"])
+    assert not pair.store.get(f"message_audience:claude:{follow_up}")["addressed"]
 
 
 @pytest.mark.parametrize("last", [False, True])

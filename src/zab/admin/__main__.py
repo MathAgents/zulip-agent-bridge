@@ -20,9 +20,9 @@ or new privileges. So it checks what that context can, and nothing that needs mo
 - every subcommand's modules import, from this release's tree and venv: the starter's SDK
   (`starter.sdk()`, boto3), the bot's (every other `zab.admin` module, the Zulip client and
   httpx), the collector's and the console's, whose two static files are read;
-- the config helper's own command, as its unit gives it, answers `--help` from this release
-  (`check_helper`): the system interpreter under `-I -B -S`, from the standard library and
-  `src/` alone;
+- each root helper's own command, as its unit gives it, answers `--help` from this release
+  (`check_helper`): the config helper's, and the upgrade's plan and apply helpers' (#569), the
+  system interpreter under `-I -B -S`, from the standard library and `src/` alone;
 - every script the actions run answers `--help` (`checks.check_scripts`), without writing
   into the tree.
 Exit 0 and `selfcheck: OK` when all pass; 2 for an admin.toml the loader refuses; 1 otherwise.
@@ -56,6 +56,19 @@ _USAGE = (
 HELPER_UNIT = "workshop/adminserver/zab-admin-config.service"
 CURRENT = "/opt/zab-admin/current"
 HELPER_PYTHON = "/usr/bin/python3"
+#: Each root helper's unit, as `check_helper` runs its command: the helper's name, the call its
+#: command ends with, and that call asking for help, which its usage then starts. The upgrade
+#: helpers' calls name their action (#569), so `--help` goes into the call, not after the command
+#: (review of #893, N4).
+HELPERS = {
+    HELPER_UNIT: ("the config helper", "main()", "main(['--help'])", "zab-admin-config"),
+    "workshop/adminserver/zab-admin-upgrade-plan.service": (
+        "the plan helper", "main(['plan'])", "main(['plan', '--help'])", "zab-admin-upgrade",
+    ),
+    "workshop/adminserver/zab-admin-upgrade.service": (
+        "the apply helper", "main(['apply'])", "main(['apply', '--help'])", "zab-admin-upgrade",
+    ),
+}  # fmt: skip
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -110,27 +123,35 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def check_helper(root: Path) -> list[str]:
-    """The config helper's command, as `HELPER_UNIT` gives it, run with `--help` from the release
-    at `root` (for `current`): the interpreter root runs, the system's, under `-I -B -S`. So this
-    fails when the helper imports anything from the venv (#437)."""
+    """Each root helper's command (HELPERS), as its unit gives it but for its call, which asks for
+    help, run from the release at `root` (for `current`): the interpreter root runs, the
+    system's, under `-I -B -S`. So this fails when a helper imports anything from the venv
+    (#437), or its unit runs another interpreter or call. Nothing but the help runs."""
+    found = (_check_command(root, unit, *how) for unit, how in HELPERS.items())
+    return [problem for problem in found if problem]
+
+
+def _check_command(root: Path, unit: str, name: str, call: str, asked: str, program: str) -> str:
+    """One helper's command (`check_helper`): its problem, or ""."""
     try:
-        lines = (root / HELPER_UNIT).read_text(encoding="utf-8").splitlines()
+        lines = (root / unit).read_text(encoding="utf-8").splitlines()
     except OSError as exc:
-        return [f"{HELPER_UNIT}: {exc.strerror}"]
+        return f"{unit}: {exc.strerror}"
     starts = [line.partition("=")[2] for line in lines if line.startswith("ExecStart=")]
     argv = shlex.split(starts[0].replace(CURRENT, str(root))) if len(starts) == 1 else []
     if argv[:1] != [HELPER_PYTHON]:
-        return [f"{HELPER_UNIT}: not one ExecStart of {HELPER_PYTHON}"]
+        return f"{unit}: not one ExecStart of {HELPER_PYTHON}"
+    if argv[-2:-1] != ["-c"] or not argv[-1].endswith(f"sys.exit({call})"):
+        return f"{unit}: its command doesn't end with sys.exit({call})"
+    argv[-1] = argv[-1].removesuffix(f"{call})") + f"{asked})"
     try:  # the system's interpreter, and the release's own unit: no shell, no message text
-        done = subprocess.run(  # noqa: S603
-            [*argv, "--help"], capture_output=True, timeout=60, check=False
-        )
+        done = subprocess.run(argv, capture_output=True, timeout=60, check=False)  # noqa: S603
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return [f"the config helper's command: {type(exc).__name__}"]
-    if done.returncode != 0 or not done.stdout.startswith(b"usage: zab-admin-config"):
+        return f"{name}'s command: {type(exc).__name__}"
+    if done.returncode != 0 or not done.stdout.startswith(f"usage: {program}".encode()):
         last = done.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
-        return [f"the config helper's command exited {done.returncode}: {last[0][:200]}"]
-    return []
+        return f"{name}'s command exited {done.returncode}: {last[0][:200]}"
+    return ""
 
 
 if __name__ == "__main__":

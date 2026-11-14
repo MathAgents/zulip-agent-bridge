@@ -336,8 +336,11 @@ class Router:
         Before the public-channel rule, whose channel state may change between two bots' reads
         (a public topic's routing reads no record), and an expired message's too.
 
-        A prompt (neither a command nor an aside; `!new` included) records the VM's bots it
-        names: whom the participant talks to, not whom they send a command. A `!detach` is the
+        A prompt (neither a command nor an aside; `!new`, with or without a prompt, included)
+        records the VM's bots it names: whom the participant talks to, not whom they send a
+        command. A bare `@codex !new` starts Codex's session here, a choice of whom to talk to
+        as with a prompt, so it records Codex (#955), with a session here or not, since the
+        record reads only the message's text and position. A `!detach` is the
         one command that amends it, by removal: under its own id, the newest entry before it
         without the bots it detaches, so that every bot reads the same after it, in any order.
         Those are the bots it reaches (named, in a multi-party channel too; without a mention, in

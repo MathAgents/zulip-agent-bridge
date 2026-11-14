@@ -20,6 +20,7 @@ COMMANDS = {
     "sentinel": "zab.tools.sentinel",
     "history": "zab.tools.history",
     "share": "zab.tools.share",
+    "job": "zab.tools.job",
 }
 DEV_COMMANDS = {
     "claude-turn": "zab.dev.claude_turn",

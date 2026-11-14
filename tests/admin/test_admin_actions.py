@@ -370,6 +370,21 @@ EXACT = [
             )
         ],
     ),
+    # #992: its run without --apply is the plan's dry run; `all` is the rows with a VM
+    (
+        "!trust-fix all",
+        [(f"{PY}/admin/trust_fix.py {R} {KH} --admin-bot {LAUNCHED} --apply", NO_APPLY, ())],
+    ),
+    (
+        "!trust-fix dave bob",
+        [
+            (
+                f"{PY}/admin/trust_fix.py {R} {KH} --admin-bot --only bob --only dave --apply",
+                NO_APPLY,
+                (),
+            )
+        ],
+    ),
     (
         "!uninstall all",
         [(PUSH.format(release="") + f" --uninstall {LAUNCHED}", PARALLEL_DRY, ())],
@@ -906,7 +921,12 @@ def test_the_normalizer():
 
 @pytest.mark.parametrize(
     "message",
-    ["!provision zulip hold all", "!provision repos alice", "!provision repos invites-only alice"],
+    [
+        "!provision zulip hold all",
+        "!provision repos alice",
+        "!provision repos invites-only alice",
+        "!trust-fix alice",  # #992: a VM's stores or its instance changed since: not STALE
+    ],
 )
 def test_a_reconcilers_hash_ignores_changed_live_state(message, layout):
     """#493: an invitation accepted, or sent outside the bot, between plan and approval changes

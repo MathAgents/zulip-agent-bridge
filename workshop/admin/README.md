@@ -562,8 +562,10 @@ and its limits; `--uninstall` removes it.
     step, and no timing build. A VM with no Lean workspace is noted, not failed.
   - `--idle-stop-default MINUTES` (at least 10) runs `--idle-stop MINUTES`'s step, last, on each
     VM whose waker is on and whose idle-stop timer isn't on, unless its idle stop was turned off
-    on purpose (§8). Every VM is probed first. A timer that is on stays as it is. Where the waker
-    is on, a timer installed but not enabled is turned on again. Every other VM is left as it
+    on purpose (§8). Every VM is probed first. A timer that is on keeps its minutes, and gets
+    this release's `idle_stop.py`, so that its rules are the release's (#655: a running
+    background job holds the VM up). Where the waker is on, a timer installed but not enabled is
+    turned on again. Every other VM is left as it
     is, with a note, which is a warning where the timer is on and the waker isn't.
   - `--has-waker SLUG[=INSTANCE]` (repeatable) names a row whose waker is on; `all` names every
     selected row. With `=INSTANCE`, as the admin bot passes it, the VM must also be that EC2
@@ -888,8 +890,8 @@ stop's log, `/var/log/zab-idle-stop.log`: `--idle-stop-default` reads a VM with 
 timer as turned off on purpose too.
 
 Once a minute it checks, and keeps the VM up while any of these holds: the VM has been up for
-less than the timeout; a turn is running, at any age; zab took a message in for its agents, or a
-turn started or ended, within the timeout; the 5-minute load average is 0.5 or more; someone is
+less than the timeout; a turn is running, at any age; a background job runs, whatever its load
+(below); zab took a message in for its agents, or a turn started or ended, within the timeout; the 5-minute load average is 0.5 or more; someone is
 logged in, or was within the timeout; a `push_config.py` or `final_sync.py` run holds it. Every
 rollout writes `/run/zab-idle-stop.hold`, with an expiry an hour ahead, before its first change,
 and removes it at the end, so no tick between its SSH connections can stop the VM; `final_sync.py`
@@ -902,8 +904,26 @@ survive. `idle_stop.py`'s module docstring has every rule.
   when the verdict changes, for example from "stay up: zab active 3 min ago" to "power off: idle
   for 15 min (…)".
 - To try it without stopping anything: `sudo /usr/bin/python3 /usr/local/lib/zab/idle_stop.py
-  --minutes 15 --dry-run` on the VM. Over SSH it always says "stay up: logged in: …", because you
-  are; its other reasons are still worth reading.
+  --minutes 15 --dry-run` on the VM. Over SSH it always says "stay up", with your login among
+  its reasons ("logged in: ubuntu@notty" for a command sent over SSH, "ubuntu@pts/0" or the like
+  in a terminal), because you are; its other reasons are still worth reading.
+- **Background jobs** (#655; SPEC §7.14). An agent starts a job that outlives its turn with
+  `zab job start`, which runs it as a transient unit `zab-job-<id>.service` of `agent`'s user
+  manager. While one is active, the VM stays up even when the job sleeps or waits with the load
+  under 0.5, and the verdict says "stay up: 1 background job running". Each job's own cap,
+  `[jobs] max_hours` (12 hours by default, the unit's `RuntimeMaxSec`), stops it, and the
+  timeout counts again after it ends, from the last minute's check that saw it running: its end
+  post and its report turn, which is zab activity, come within that time when the post's first
+  try goes out (a retry, at 15 or 31 minutes, can come after a shorter timeout, and then at the
+  VM's next start). A job holds a VM for at
+  most 12 VM-hours at the default `max_hours`. To find what holds a VM: `sudo systemctl --user
+  --machine=agent@ list-units 'zab-job-*'`, or the topic's `!status`. No hold outlasts a cap: a unit holds only while it
+  has been active for less than its own cap (`RuntimeMaxUSec`) and 15 minutes, and one without
+  a cap (made by hand) never does, "(ignoring a background job without a time limit)"; and a
+  `systemctl` that can't list the units holds the VM up ("background jobs unknown") until that
+  has lasted the bridge's `[jobs] max_hours` (12 by default) and 15 minutes in a row, then
+  "(ignoring background jobs unknown for 12 h 15 min)". Every release rollout gives a VM whose timer is on this rule: `--idle-stop-default`
+  (§2.4) replaces its `idle_stop.py` and keeps its minutes.
 - **The first boot's volume warm-up** (`aws_common.WARM_FIRST_BOOT`, #715) holds every VM up while
   it can still end: its marker `/var/lib/zab-warm.done` is missing, and `zab-warm-volume.service`,
   or cloud-init's last stage, which starts it, is running. A stop would cut it off for good. The
@@ -1022,6 +1042,18 @@ which, as the image configures it, used the system store alone for the API conne
 interactive sessions alike (seen on 2.1.283). It isn't known whether a `claude` already running
 picks it up, so restart one.
 
+**Through the admin bot** (#992; ORGANIZERS §4.4), in the workshop's organizers channel, with
+no shell on the server: `!trust-fix all`, or slugs. Its plan's dry run is this script's run
+without `--apply`, its approval the `--apply`, each as the bot's user with the fleet key, as
+below, and with `--admin-bot`: the dry run then exits 0 once its table is printed, so that a row
+`not reached` is shown in the plan rather than refusing it, and the apply fails on that row; the
+reruns it prints are `!trust-fix <slugs>`, and the other commands it prints, a deployer's,
+start `sudo -u zab-admin`, for a shell on the server. With `--apply`, it prints a line per VM as
+it ends, `done: <slug> (<address>): <check> (<cells>)`, before the table: the bot's progress
+message shows the latest, and its deadline (60 minutes, or 2 minutes a row above 30) keeps the VMs done. The bot refuses it beside a `!rollout` or
+`!final-sync` of the same workshop, and those beside it (ADMIN §2.4 step 5). It doesn't take
+`--upgrade-left-pips`: that stays a hand run. The rest of this section reads the same for it.
+
 **First, start the VMs:** a stopped one is `not reached`. During a workshop, `!start all` through
 the bot (ORGANIZERS §2.4), or start only the rows you name; idle stop stops them again later.
 Each `--apply` holds off the VM's idle stop while it works there (below). A spare is no roster
@@ -1029,9 +1061,9 @@ row: it gets the fix after its `!adopt-spare`, with `--only <its slug>`. Until t
 old one, and the adoption's own rollout went through it.
 
 **Not during a `!rollout` or `!final-sync` of the same workshop:** a hand run doesn't take the
-bot's lock. The idle-stop hold, `/run/zab-idle-stop.hold`, is one file per VM for all of them,
-so whichever run ends first removes it for both. `!plans` on the workshop's bot answers `No
-plan is pending on this bot.` when none is applying.
+bot's lock, as `!trust-fix` does. The idle-stop hold, `/run/zab-idle-stop.hold`, is one file per
+VM for all of them, so whichever run ends first removes it for both. `!plans` on the workshop's
+bot answers `No plan is pending on this bot.` when none is applying.
 
 **One run at a time on a VM:** each run of the remote half, a dry run included, holds a lock,
 `/run/zab-trust-fix.lock`, for as long as its process lives. A dropped SSH doesn't end it. A
@@ -1042,7 +1074,8 @@ half writes it once it has the lock, renews it before each step, and removes it 
 lock goes. No other run of this script touches it. A run killed leaves it, and idle stop
 ignores it from its expiry, an hour on.
 
-**On the admin server,** in a shell there (BOOTSTRAP §3.6), once per workshop. The dry run:
+**By hand on the admin server,** in a shell there (BOOTSTRAP §3.6), once per workshop, when the
+bot can't: the same runs, without `--admin-bot`. The dry run:
 
 ```bash
 WS=<the workshop>

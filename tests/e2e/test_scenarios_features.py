@@ -379,8 +379,8 @@ async def record_warm_up(
 @pytest.mark.slow
 async def test_lean_cold_import(rig, ec2, instance_id, vm, scenario):
     """The first `import Mathlib` with a cold page cache, after a VM stop and start: timed and
-    recorded. It stops the VM, so it runs with the slow group (`--scenarios slow` or `all`),
-    never in a fast run.
+    recorded. It stops the VM, so it runs with the slow group (`--scenarios slow` or `all`), or
+    when 8 is named by number (`--scenarios 8`, #978), never in a fast run.
 
     The import starts as soon as SSH answers, while #461's warm-up runs, as on a VM woken for a
     Lean question: the part records the time from the start request to the finished import,

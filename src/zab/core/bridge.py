@@ -43,6 +43,7 @@ from zab.core.fork import (
     waits,
 )
 from zab.core.git_identity import display as identity_display
+from zab.core.jobcontrol import NO_JOBS, JobControl, count_text
 from zab.core.login import Login
 from zab.core.metrics import Metrics
 from zab.core.router import Route, Router
@@ -111,6 +112,9 @@ class BotBridge:
         self.attaching: dict[str, list[t.BackendEvent]] = {}
         self.peers: list[BotBridge] = [self]
         self.all_bridges: list[BotBridge] = [self]
+        # The background jobs, for `!stop NAME` and `!stop jobs` (§7.14, #655): none until a
+        # watcher gives the bridge its own
+        self.jobs: JobControl = NO_JOBS
         self.users: dict[int, dict[str, Any]] = {}
         self.owner_id: int | None = None
         self.router: Router | None = None
@@ -416,6 +420,12 @@ class BotBridge:
                 next(iter(siblings)) if kind != self.backend.kind and len(siblings) == 1 else None
             )
         return result
+
+    def jobs_note(self) -> str:
+        """DM `!status`'s count of this bot's running background jobs (§4.6, §7.14), its
+        unattached ones included, or "": one read of the watcher's `jobs` table."""
+        text = count_text(len(self.store.rows("jobs", bot=self.bot.name, state="running")))
+        return f" · background {text}" if text else ""
 
     def first_here(self, message: dict[str, Any], peers: tuple[str, ...]) -> bool:
         """Whether this bot comes first among the bots an unmentioned command reached (`peers`
@@ -997,6 +1007,7 @@ class BotBridge:
             confirm_location=self.verify_card,
             reopened=self.pending_forks_soon,
             unmentioned_here=self.unmentioned_here,
+            jobs=self.jobs,
         )
         self.actors[row["native_id"]] = actor
         for pending in self.store.pending_deliveries(self.bot.name):
@@ -1008,6 +1019,7 @@ class BotBridge:
                             pending["sender_id"],
                             pending["sender"],
                             pending["text"],
+                            report=bool(pending.get("report")),  # a job's (#655)
                         )
                     )
                 else:
@@ -1381,6 +1393,7 @@ class BotBridge:
                     + identity_display(self.git_identity)
                     + await status_login_hint(self.backend)
                     + f" · without a mention: `{unmentioned.rule(self.store, default)}`"
+                    + self.jobs_note()
                     if route.text.strip() == "!status"
                     else ""
                 )

@@ -59,12 +59,13 @@ def test_codex_daemons_are_deduplicated_and_explicitly_isolated(setup):
         for name in ("one", "two")
     }
     rendered = service.units(config)
-    assert set(rendered) == {"zab.service", "codex-app-server.service", "zab-sentinel.service"}
+    others = {"zab.service", "zab-sentinel.service", "zab-jobs.slice"}  # the slice: #655
+    assert set(rendered) == {"codex-app-server.service", *others}
     assert 'Environment="CODEX_HOME=/isolated"' in rendered["codex-app-server.service"]
     config.backends["two"].codex_home = "/other"
-    assert len(service.units(config)) == 4
+    assert len(service.units(config)) == 2 + len(others)
     config.backends["two"].connect = "spawn"
-    assert len(service.units(config)) == 3
+    assert len(service.units(config)) == 1 + len(others)
 
 
 def test_uninstall_preserves_unmanaged_units(setup):
@@ -133,7 +134,7 @@ def test_exported_codex_home_is_pinned_in_both_units(setup, monkeypatch):
     assert all(
         'Environment="CODEX_HOME=/isolated/exported-home"' in body and "CODEX_ACCESS_TOKEN" in body
         for name, body in rendered.items()
-        if name != "zab-sentinel.service"  # it runs no agent
+        if name not in ("zab-sentinel.service", "zab-jobs.slice")  # they run no agent
     )
     assert "CODEX_ACCESS_TOKEN" in rendered["zab-sentinel.service"]
     assert service.main(["install"]) == 0
@@ -194,7 +195,9 @@ def test_workshop_venv_is_used_by_units_and_doctor(setup, monkeypatch, capsys, r
     )
     python.chmod(0o755)
     assert service.main(["install"]) == 0
-    for body in service.units(config).values():
+    for name, body in service.units(config).items():
+        if name == "zab-jobs.slice":
+            continue  # no process of its own: each job's environment is its caller's (#655)
         assert f'Environment="PATH={venv}/bin:' in body
         assert f'Environment="VIRTUAL_ENV={venv}"' in body
     monkeypatch.setenv("VIRTUAL_ENV", "/interactive")

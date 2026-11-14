@@ -8,22 +8,28 @@ rig's repository over git's `file` transport (`Paths.fetch_url`, the tests' seam
 `release_repo` over SSH, and runs unprivileged: the requests' owner is the test's own uid.
 """
 
+import contextlib
 import copy
+import dataclasses
 import hashlib
 import json
 import os
 import pathlib
 import re
 import shutil
+import socket
+import ssl
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 
 import pytest
 
 from workshop.test_adminserver_deploy import (
     DEPLOY,
+    UNIT_PROBE,
     UNIT_STEPS,
     WHEELS,
     Rig,
@@ -32,6 +38,7 @@ from workshop.test_adminserver_deploy import (
     _user_manager,
     call,
     reviewed_sha256,
+    run_in_unit,
     systemctl_log,
 )
 from workshop.test_adminserver_deploy import bootstrapped as bootstrapped  # the fixtures
@@ -321,6 +328,27 @@ def test_sanitized_is_deploy_shs_sanitize(server):
     assert uh.logged(job, uh.DEPLOY_LOG) == ours[-uh.TAIL :]
 
 
+def _sanitize(data: bytes) -> bytes:
+    """deploy.sh's own `sanitize` of `data`, by bash and perl, with the locale deploy.sh sets."""
+    sanitize = DEPLOY.read_text().split("\nsanitize() {\n", 1)[1].split("\n}\n", 1)[0]
+    script = f"export LC_ALL=C\nsanitize() {{\n{sanitize}\n}}\nsanitize"
+    return call(["bash", "-c", script], input=data, capture_output=True, check=True).stdout
+
+
+def test_an_encoded_surrogate_is_shown_as_sanitize_shows_it_and_above_unicode_is_not():
+    """#963's review, B1: perl's `utf8::decode` is lax. It decodes an encoded surrogate, which
+    `sanitize` shows as `<U+D800>`, and so does `sanitized` now; before, it showed the line's
+    every byte above 0x7F as `<XX>`. It also decodes a code point above U+10FFFF, which
+    `sanitize` passes through raw, not UTF-8: that stays apart, both visible, each its own way
+    (the follow-up to #963)."""
+    surrogates = "· x ".encode() + b"\xed\xa0\x80 \xed\xbf\xbf y\n"
+    assert uh.sanitized(surrogates) == ["· x <U+D800> <U+DFFF> y"]
+    assert _sanitize(surrogates).decode("utf-8") == "· x <U+D800> <U+DFFF> y\n"
+    above = "· x ".encode() + b"\xf4\x90\x80\x80 y\n"  # U+110000, as perl encodes it
+    assert uh.sanitized(above) == ["<C2><B7> x <F4><90><80><80> y"]
+    assert _sanitize(above) == above  # raw: perl writes U+110000 back in its own encoding
+
+
 def test_a_changed_render_policy_is_said(server):
     """§2.9: the server never renders the policy for the account owner; the plan says when the
     script changed, for the deployer to render it on their own machine."""
@@ -561,6 +589,190 @@ def test_the_ssh_command_holds_fixed_paths_and_no_agent(server, tmp_path):
     odd = uh.Paths(**{**_fields(server.paths), "key": str(tmp_path / "a key")})
     with pytest.raises(uh.Refused, match="not a plain path"):
         uh.ssh_command(uh.start(odd, "P-7.plan"))
+
+
+# --- release_repo over HTTPS (#959) -----------------------------------------------------------
+
+HTTPS_REPO = "https://github.com/Example/zab.git"
+#: git's words when GitHub answers an anonymous reader 401: a private repository, or none.
+ANONYMOUS = "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+
+
+def _settings(args: tuple[str, ...]) -> list[str]:
+    return [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "-c"]
+
+
+def test_over_https_a_public_repository_is_fetched_with_no_key(server, monkeypatch):
+    """#959: `release_repo`'s HTTPS form is fetched over HTTPS alone, with no deploy key (there
+    is none here), no credential helper and no redirect, TLS verified; a failure gives git's
+    reason, then what the form needs."""
+    rig = server.rig
+    text = (rig.etc / "admin.toml").read_text()
+    (rig.etc / "admin.toml").write_text(text.replace(REPO, HTTPS_REPO, 1))
+    server.paths = uh.Paths(**{**_fields(server.paths), "fetch_url": ""})  # no seam
+    rig.release("v0.3.1")
+    fetches, real = [], uh.git
+
+    def git(job, *args, **kw):
+        if "fetch" not in args:
+            return real(job, *args, **kw)
+        fetches.append(args)
+        raise uh.Refused(f"git fetch said {uh.said(ANONYMOUS)}")
+
+    monkeypatch.setattr(uh, "git", git)
+    found = server.plan(sha256="0" * 64)
+    refused(found, rf"^the fetch of v0\.3\.1, v0\.3\.0 from {re.escape(HTTPS_REPO)} failed: git "
+                   r"fetch said .*terminal prompts disabled\"; over HTTPS, release_repo must be a "
+                   r"public repository: a private one takes the SSH form")  # fmt: skip
+    (args,) = fetches
+    assert HTTPS_REPO in args and not (server.state.parent / "release-key").exists()
+    settings = _settings(args)
+    for setting in ("protocol.allow=never", "protocol.https.allow=always", "credential.helper=",
+                    "http.followRedirects=false", "http.sslVerify=true"):  # fmt: skip
+        assert setting in settings, settings
+    assert not [s for s in settings if s.startswith(("core.sshCommand", "protocol.ssh",
+                                                     "protocol.file"))]  # fmt: skip
+    job = uh.start(server.paths, "P-7.plan")
+    assert not {"GIT_SSL_NO_VERIFY", "GIT_ASKPASS", "SSH_ASKPASS"} & set(job.env)
+    with pytest.raises(uh.Refused, match=r"^release_repo is not one of git@github.com:OWNER"):
+        uh.fetch(job, "https://example.org/Example/zab.git", ("v0.3.1",))
+
+
+@pytest.mark.parametrize(
+    "why",
+    [
+        "git fetch took over 300 s",
+        "git fetch said \"fatal: unable to access 'https://github.com/Example/zab.git/': "
+        'Could not resolve host: github.com"',
+        "git fetch said \"fatal: unable to access 'https://github.com/Example/zab.git/': "
+        'server certificate verification failed. CAfile: /etc/ssl/certs/ca-certificates.crt"',
+    ],
+)  # fmt: skip
+def test_only_githubs_anonymous_answer_gets_the_public_repository_hint(server, monkeypatch, why):
+    """#976's review, N2: a timeout, a name that doesn't resolve or a certificate refused says
+    git's reason alone; "must be a public repository" follows only GitHub's anonymous 401."""
+    job = uh.start(uh.Paths(**{**_fields(server.paths), "fetch_url": ""}), "P-7.plan")
+
+    def git(job, *args, **kw):
+        raise uh.Refused(why)
+
+    monkeypatch.setattr(uh, "git", git)
+    with pytest.raises(uh.Refused) as refused_:
+        uh.fetch(job, HTTPS_REPO, ("v0.3.1",))
+    assert str(refused_.value).endswith(f"failed: {why}"), refused_.value
+
+
+@pytest.fixture
+def tls(tmp_path):
+    """A TLS server on 127.0.0.1 with a self-signed certificate, which no system CA trusts: each
+    connection's handshake, then closed. Its port."""
+    if not shutil.which("openssl"):
+        pytest.skip("no openssl")
+    key, cert = tmp_path / "tls.key", tmp_path / "tls.crt"
+    call(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+          "-nodes", "-subj", "/CN=127.0.0.1", "-days", "1", "-keyout", str(key), "-out",
+          str(cert)], capture_output=True, check=True)  # fmt: skip
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    listening = socket.create_server(("127.0.0.1", 0))
+
+    def serve():
+        while True:
+            try:
+                conn, _ = listening.accept()
+            except OSError:
+                return
+            with contextlib.suppress(OSError):
+                context.wrap_socket(conn, server_side=True).close()
+            conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    yield listening.getsockname()[1]
+    listening.close()
+
+
+def test_the_https_fetch_verifies_the_servers_certificate(server, monkeypatch, tls):
+    """Real git, offline: the HTTPS form's settings let git-remote-https run (git refuses any
+    protocol it isn't allowed), and it refuses a server whose certificate the system's CAs don't
+    vouch for. GitHub's address is swapped for 127.0.0.1 here, nothing else."""
+    monkeypatch.setattr(uh, "RELEASE_REPO_HTTPS", "https://127.0.0.1:")
+    job = uh.start(uh.Paths(**{**_fields(server.paths), "fetch_url": ""}), "P-7.plan")  # no seam
+    uh.ensure_repo(job)
+    with pytest.raises(uh.Refused, match=r"(?i)certificate") as refused_:
+        uh.fetch(job, f"https://127.0.0.1:{tls}/Example/zab.git", ("v0.3.1",))
+    assert uh.HTTPS_HINT not in str(refused_.value)  # no 401: no hint (#976's review, N2)
+
+
+def _hardening(unit: str) -> list[str]:
+    """A unit's sandbox and filters as `systemd-run -p` arguments, but its paths and its
+    capability bound, which a user manager can't apply (the sandbox test covers the paths)."""
+    skipped = {"ExecStart", "Type", "TimeoutStartSec", "CapabilityBoundingSet", *SANDBOX_KINDS}
+    argv: list[str] = []
+    for line in (SERVER / unit).read_text().split("[Service]", 1)[1].splitlines():
+        kind, equals, _ = line.partition("=")
+        if equals and not line.startswith("#") and kind not in skipped:
+            argv += ["-p", line]
+    return argv
+
+
+@pytest.mark.skipif(not _user_manager(), reason="no user systemd manager with namespaces")
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_the_plan_units_filters_let_an_https_fetch_through(tls, host):
+    """#959, the unit's network access: under the plan unit's own filters (its system calls,
+    address families, no write-and-execute memory, /proc and devices narrowed, the system read
+    only), git-remote-https connects, reads the system's CA certificates and makes its TLS
+    handshake: it fails on the test server's certificate, not on a filter. By `localhost` too,
+    which curl resolves itself."""
+    env = [
+        "/usr/bin/env",
+        "-i",
+        "PATH=/usr/bin:/bin",
+        "HOME=/tmp",
+        "LC_ALL=C",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "GIT_TERMINAL_PROMPT=0",
+    ]
+    fetch = ["/usr/bin/git", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+             "-c", "credential.helper=", "-c", "http.followRedirects=false", "ls-remote",
+             f"https://{host}:{tls}/Example/zab.git"]  # fmt: skip
+    hardening = _hardening("zab-admin-upgrade-plan.service")
+    assert "-p" in hardening and "MemoryDenyWriteExecute=true" in hardening
+    argv = ["systemd-run", "--user", "--wait", "--pipe", "--quiet", *hardening, "--", *env, *fetch]
+    done = call(argv, capture_output=True, text=True, timeout=60)
+    assert done.returncode != 0 and re.search(r"(?i)certificate", done.stderr), done.stderr
+
+
+#: The plan helper's run in its unit (`run_in_unit`), after the probe, with the spec's paths.
+PLAN_RUN = (
+    UNIT_PROBE
+    + """
+from zab.admin import upgradehelper as uh
+
+fields = {**spec["paths"], "deploy_env": tuple(map(tuple, spec["paths"]["deploy_env"]))}
+code = uh.run(uh.PLAN, uh.Paths(**fields), spec["owner"])
+with open(report, "w", encoding="utf-8") as f:
+    json.dump({"made": made, "code": code}, f)
+"""
+)
+
+
+@pytest.mark.skipif(not _user_manager(), reason="no user systemd manager with namespaces")
+def test_the_plan_helper_plans_under_its_units_filters(server, tmp_path):
+    """#896: the helper's own run, a service of this user's manager under its unit's settings but
+    its paths (`run_in_unit`): with no AF_UNIX socket, no socketpair and no io_uring, it fetches
+    (over git's file transport here; the network's are the test above, and A10b's on the rig),
+    verifies both tags with ssh-keygen, has the running release's deploy.sh review the release
+    (bash, git, python3, perl), and plans it with the deployer's SHA-256."""
+    server.rig.release("v0.3.1")
+    sha = server.sha256("v0.3.1")
+    server.request(sha256=sha)
+    spec = {"paths": dataclasses.asdict(server.paths), "owner": os.getuid()}
+    unit = SERVER / "zab-admin-upgrade-plan.service"
+    report, journal = run_in_unit(unit, PLAN_RUN, spec, tmp_path)
+    assert report == {"made": ["EAFNOSUPPORT", "allowed", "EPERM", "EPERM"], "code": 0}, journal
+    found = json.loads((server.state / "results" / "P-7.plan.json").read_text())
+    assert found["ok"] is True and found["diff_sha256"] == sha, found["message"]
 
 
 # --- the apply --------------------------------------------------------------------------------

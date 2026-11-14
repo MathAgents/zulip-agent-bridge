@@ -13,13 +13,23 @@ unsigned tag; a tag signed by an unknown key; a ref that points at another tag's
 release; the word `downgrade`, which the bot refuses with the way back (`deploy.sh --downgrade`),
 since the in-band upgrade only goes forward; a `sha256=` that isn't the deployer's review's. The
 good rc is then planned with the SHA-256 the deployer's own review prints (the running release's
-`deploy.sh --review`, since it), the same in the public repository as in the private one, approved
-by one deployer and applied: the server runs it, `!version` shows it once the bots have restarted
-into it, the deploy record and its copy in the audit log name the plan and the SHA-256, and its
-fleet wheel is placed for `!rollout`, the same bytes as the laptop's `--wheel` builds (hatchling's
-builds reproduce: DECISIONS, 2026-10-17), with the SHA-256 the result shows. At the end, once no
-apply runs, the server's `admin.toml` is the rig's again, as A16 leaves it, and a good tag the
-server took but doesn't run is dropped.
+`deploy.sh --review`, since it), the same in the public repository as in the private one. With
+`ZAB_ADMIN_E2E_PUBLIC_RELEASE_REPO`, a public test repository, it comes from there (#959):
+`release_repo` in its HTTPS form, anonymous, and the server's deploy key set aside, so that only
+that form can fetch it, for the plan and the recheck before the apply; the refusals above took
+the SSH form. What goes public there is this run's exports of the commit under test alone, each
+tree first checked as `tools/publish` checks a release's (`upgrade.publish`). Its review holds
+non-ASCII text and control characters (#963, `upgrade.HIDDEN`, in a privileged file and as its
+CHANGELOG section): the plan's review, as the server showed it (its deploy.sh's `sanitize`, then
+the plan helper's `shown()`), is the deployer's `.review` byte for byte, and its CHANGELOG
+section, which `shown()` alone shows, is the server's perl's `sanitize` of the same bytes. The
+good rc is then approved by one deployer and applied: the server runs it,
+`!version` shows it once the bots have restarted into it, the deploy record and its copy in the
+audit log name the plan and the SHA-256, and its fleet wheel is placed for `!rollout`, the same
+bytes as the laptop's `--wheel` builds (hatchling's builds reproduce: DECISIONS, 2026-10-17),
+with the SHA-256 the result shows. At the end, once no apply runs, the server's `admin.toml` is
+the rig's again, as A16 leaves it, its deploy key is back, and a good tag the server took but
+doesn't run is dropped.
 """
 
 from __future__ import annotations
@@ -40,6 +50,8 @@ DEPLOYS = "/opt/zab-admin/deploys.jsonl"
 AUDIT = "/var/lib/zab-admin/audit.jsonl"
 #: The plan helper's copy of the tags it took, which a failed run may leave holding `good`.
 TAKEN = "/var/lib/zab-admin-upgrade/repo.git"
+#: The helpers' outcomes, `P-n.plan.json` among them: the plan's text as the server made it.
+RESULTS = "/var/lib/zab-admin-upgrade/results"
 #: The apply helper's unit, its own 1500 s and more: the bots never restart while it runs.
 APPLY_UNIT, APPLY_UNIT_S = "zab-admin-upgrade.service", 1600.0
 WHEELS = "/var/lib/zab-admin/releases/wheels"
@@ -53,6 +65,7 @@ async def test_upgrade_server_in_band(scenario, admin_rig, rigged, server, teste
     repo, token = upgrade.release_repo(), upgrade.release_token()
     if not (repo and token):
         pytest.skip(upgrade.NO_REPO)
+    https_repo = upgrade.release_repo(name=upgrade.PUBLIC_ENV)  # #959: the HTTPS form's
     rel = Releases(admin_rig)
     rel.ensure_repo()
     running = server.running()
@@ -65,12 +78,17 @@ async def test_upgrade_server_in_band(scenario, admin_rig, rigged, server, teste
     rig_toml = (admin_rig.etc / "admin.toml").read_text(encoding="utf-8")
     upgrade.deploy_key(server, repo, token)
     upgrade.push(rel.public, repo, token, f"refs/tags/{running}")  # the review's base
-    server.install_etc("admin.toml", upgrade.with_release_repo(rig_toml, repo))
+    server.install_etc("admin.toml", upgrade.with_release_repo(rig_toml, upgrade.ssh_url(repo)))
     try:
         await restart(server, admins)  # the bots read release_repo at their start
-        await _cases(scenario, rel, admin_rig, rigged, server, tester, admins, (repo, token),
-                     running, good, tmp_path)  # fmt: skip
+        await _cases(scenario, rel, admin_rig, rigged, server, tester, admins,
+                     (repo, token, https_repo), running, good, tmp_path)  # fmt: skip
     finally:
+        # #959's case, first (#977's review, N1): the apply fetches nothing, so the key may come
+        # back while it runs, and nothing after can skip it; a failure is noted
+        back = server.script(upgrade.KEY_BACK, upgrade.KEY, sudo=True, check=False)
+        if not back.ok:
+            scenario.notes.append(f"the deploy key was NOT put back: {back.stderr.strip()[-200:]}")
         # review of #902, N4: an apply still running (an approval that timed out) ends first; a
         # bot restarted before its switch would run on in the old release
         for _ in range(int(APPLY_UNIT_S / 10)):
@@ -90,7 +108,7 @@ async def test_upgrade_server_in_band(scenario, admin_rig, rigged, server, teste
 
 async def _cases(scenario, rel, admin_rig, rigged, server, tester, admins, where, running, good,
                  tmp_path) -> None:  # fmt: skip
-    repo, token = where  # the test release repository, and its own token
+    repo, token, https_repo = where  # the test release repositories, and their token
 
     async def refused(version: str, why: str, case: str, sha256: str = "0" * 64, more: str = ""):
         with pytest.raises(Refused) as caught:
@@ -101,9 +119,10 @@ async def _cases(scenario, rel, admin_rig, rigged, server, tester, admins, where
         scenario.notes.append(f"{case}: refused ({why})")
 
     def pushed(version: str, signer: str | None = "signing") -> tuple[str, str]:
-        """The private test release, signed, and its public commit, tagged with `signer`'s key
-        and pushed to the test release repository (#958). Both commits."""
-        private = rel.release(rigged.commit, version)
+        """The private test release, with the review's text (#963), signed, and its public
+        commit, tagged with `signer`'s key and pushed to the test release repository (#958).
+        Both commits."""
+        private = rel.release(rigged.commit, version, files=upgrade.hidden_files(version))
         public = rel.export(version, private, signer)
         upgrade.push(rel.public, repo, token, f"refs/tags/{version}")
         return private, public
@@ -144,10 +163,30 @@ async def _cases(scenario, rel, admin_rig, rigged, server, tester, admins, where
     assert same == sha, "the private review's SHA-256 isn't the public one's"
     await refused(good, r"not the sha256= you gave", "a SHA-256 not the review's", "1" * 64)
 
+    if https_repo:  # #959: the good rc from a public repository, anonymously, with no key
+        # public at once (#977's review, B1): this run's exports of the commit under test alone,
+        # each tree checked as tools/publish checks a release's, or nothing is pushed
+        refs = (f"refs/tags/{running}", f"refs/tags/{good}")
+        exports = upgrade.publish(rel, https_repo, token, rigged.commit, refs,
+                                  tmp_path / "publication")  # fmt: skip
+        url = upgrade.https_url(https_repo)
+        toml = (admin_rig.etc / "admin.toml").read_text(encoding="utf-8")
+        # the bots ask only whether release_repo is set; the helpers read admin.toml anew
+        server.install_etc("admin.toml", upgrade.with_release_repo(toml, url))
+        server.script(upgrade.KEY_ASIDE, upgrade.KEY, sudo=True)  # back in the test's `finally`
+        scenario.notes.append(
+            f"published to {https_repo}: {len(exports)} exports of test releases of "
+            f"{rigged.commit[:12]}, each tree checked as tools/publish checks one; the good rc "
+            f"from release_repo = {url}, the deploy key set aside"
+        )
+    else:
+        scenario.notes.append(f"the HTTPS form (#959) not covered: {upgrade.PUBLIC_ENV} unset")
+
     plan = await admins.request(f"!upgrade-server {good} sha256={sha}", within=PLAN_S)
     assert plan.phrase == "", f"{plan.id} asks for a phrase: one deployer's approval, no more"
     assert f"SHA-256 {sha}; release tree" in plan.text, plan.text[:600]
     assert f"release {good}: tag " in plan.text and f"base, running {running}: tag " in plan.text
+    _shown_alike(scenario, server, plan.id, (good, commit), running, script.read_text(), tmp_path)
     _, text = await admins.approve(plan)
     assert text.startswith(f"✅ **{plan.id}**"), text[:600]
     shown_sha = re.search(rf"{re.escape(good)} is installed and current, with its fleet wheel "
@@ -195,4 +234,36 @@ async def _cases(scenario, rel, admin_rig, rigged, server, tester, admins, where
     scenario.notes.append(
         f"{good} upgraded in-band by {plan.id}: the bots restarted into it, and its wheel is "
         "placed, the same bytes as the laptop's build"
+    )
+
+
+def _shown_alike(scenario, server, plan_id, release, running, deploy_sh, out) -> None:
+    """#963: the good rc's review holds `upgrade.HIDDEN`. The plan's, as the server showed it
+    (its deploy.sh's `sanitize`, then the plan helper's `shown()`; the helper's own record of
+    the plan), is the deployer's `.review` byte for byte; its CHANGELOG section, which `shown()`
+    alone shows, is the server's perl's `sanitize` of the same bytes; both show HIDDEN as
+    `upgrade.SHOWN`."""
+    good, commit = release
+    scenario.notes.append(f"#963, what shows the plan's text: {upgrade.unicode_versions(server)}")
+    found = json.loads(server.read(f"{RESULTS}/{plan_id}.plan.json"))
+    assert (found.get("ok"), found.get("release"), found.get("commit")) == (True, good, commit), (
+        f"{plan_id}'s record: {str(found.get('message'))[:300]}"
+    )
+    planned = upgrade.planned_review(found["text"])
+    theirs = upgrade.reviewed(out, running, commit)
+    assert planned.encode() == theirs.encode(), upgrade.first_difference(
+        planned, theirs, ("the plan's", "the deployer's")
+    )
+    shown = "\n".join(f"+{line}" for line in upgrade.SHOWN)
+    assert f"\n{shown}\n" in planned, f"the review doesn't show HIDDEN: {planned[-900:]!a}"
+    section = upgrade.planned_changelog(found["text"], good)
+    perl = upgrade.sanitized_on(server, upgrade.sanitize_program(deploy_sh), upgrade.section(good))
+    assert section.encode() == perl.encode(), upgrade.first_difference(
+        section, perl, ("the plan's", "the server's sanitize")
+    )
+    assert section == upgrade.shown_section(good), ascii(section[:900])
+    scenario.notes.append(
+        f"{plan_id}: its review, with non-ASCII text and control characters, is the deployer's "
+        f".review byte for byte ({len(planned.encode())} bytes); its CHANGELOG section, shown by "
+        "shown() alone, is the server's sanitize of the same bytes"
     )

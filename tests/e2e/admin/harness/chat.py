@@ -69,8 +69,13 @@ POST_MARGIN_S = 100.0
 
 def apply_s(plan: Plan) -> float:
     """How long a plan's apply may take, its result posted: its verb's deadline; a `!retire`'s
-    grows with its rows and `export` (`actions._build_retire`'s, Codex on #566)."""
+    grows with its rows and `export` (`actions._build_retire`'s, Codex on #566), a
+    `!trust-fix`'s with its targets (`actions._build_trust_fix`'s, #992)."""
     words = plan.command.removeprefix("!").split(" ")
+    if words[0] == "trust-fix":
+        from zab.admin.actions import TRUST_FIX_FLOOR_S, TRUST_FIX_ROW_S
+
+        return max(TRUST_FIX_FLOOR_S, len(plan.targets) * TRUST_FIX_ROW_S) + POST_MARGIN_S
     if words[0] != "retire":
         return APPLY_S.get(words[0], APPLY_DEFAULT_S)
     from zab.admin.actions import EXPORT_ROW_S, RETIRE_FLOOR_S, RETIRE_ROW_S

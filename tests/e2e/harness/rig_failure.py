@@ -20,6 +20,10 @@ A part that fails so runs once more, with a fresh nonce, after `WAIT_S` (`refusa
 `conftest.pytest_runtest_call`), and its row names the cause (`ScenarioResult.external`). A
 second rig failure is no result for the part (a skip, so the run's verdict is NO-RESULT), never
 a failure: the bridge was not seen to fail.
+
+A wait that succeeds after its calls failed for a while says so too (`Waited`, #943): a timing
+that ends at its result includes the run of failed calls just before it, in which the rig
+couldn't look (`Waited.blind`), and `Timing.outage` keeps those seconds beside the bounds.
 """
 
 from __future__ import annotations
@@ -93,6 +97,10 @@ class Outage:
     errors: int = 0
     last: str = ""  # the last error
     since: float | None = None  # when the run of failures still going began
+    #: When the last answered call began, and when the run of failures it ended began (None
+    #: when the call before it was answered too)
+    answered: float | None = None
+    ended: float | None = None
 
     @property
     def end(self) -> float:
@@ -109,6 +117,7 @@ class Outage:
             self.since = began
 
     def back(self, began: float) -> None:
+        self.answered, self.ended = began, self.since
         if self.since is not None:
             self.lost += max(0.0, min(began, self.end) - self.since)
             self.since = None
@@ -124,6 +133,48 @@ class Outage:
             f"the rig's Zulip connection failed for {lost:.0f} s of the {self.within:.0f} s wait "
             f"({self.errors} error{'s' if self.errors > 1 else ''}, the last {self.last})"
             + (", still at its end" if self.down else "")
+        )
+
+
+@dataclass(frozen=True)
+class Waited:
+    """A wait that found what it waited for (`TestUser.wait_for`, #943), on the rig's clock:
+    from `start` to `found`, when the call that found it began; `retried`, the seconds its calls
+    to Zulip failed and were retried (`Outage`: connection errors, timeouts, 429s, 5xx), in
+    `errors` errors; and `blind_from`, when the run of failed calls that the finding call ended
+    began, or None when the call before it was answered."""
+
+    start: float
+    found: float
+    retried: float = 0.0
+    errors: int = 0
+    blind_from: float | None = None
+
+    @classmethod
+    def of(cls, outage: Outage) -> Waited:
+        found = outage.answered if outage.answered is not None else outage.start
+        return cls(outage.start, found, outage.lost, outage.errors, outage.ended)
+
+    def blind(self, since: float) -> float:
+        """The seconds between `since` (the start of a timing, on the rig's clock) and the
+        result in which the rig couldn't look: the run of failed calls just before the call that
+        found it. What the timing measured may have come that much earlier, and no earlier: an
+        answered poll before the run didn't find it. A run of failures that an answered poll
+        followed delayed nothing, and counts for none."""
+        if self.blind_from is None:
+            return 0.0
+        return max(0.0, self.found - max(self.blind_from, since))
+
+    def text(self) -> str:
+        """For example `found after 95 s, 40 s of them in retries (3 errors), 30 s of those
+        just before it`."""
+        text = f"found after {self.found - self.start:.0f} s"
+        if not self.errors:
+            return text
+        plural = "s" if self.errors > 1 else ""
+        blind = self.blind(self.start)
+        return f"{text}, {self.retried:.0f} s of them in retries ({self.errors} error{plural})" + (
+            f", {blind:.0f} s of those just before it" if blind else ""
         )
 
 

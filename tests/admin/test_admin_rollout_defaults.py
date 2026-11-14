@@ -65,8 +65,8 @@ instance_id = "{C}"
 DEFAULTS = f"--lean-shared-default --idle-stop-default {IDLE_STOP_DEFAULT}"
 IDLE_NOTE = (
     "**Idle stop: 60 min (default)** where the waker is on for the VM and no timer is on, "
-    "unless it was turned off on purpose (`!idle-stop 0`); a timer that is on stays as it is. "
-    "Each row's result says what it found."
+    "unless it was turned off on purpose (`!idle-stop 0`); a timer that is on keeps its minutes, "
+    "and gets this release's idle-stop script (#655). Each row's result says what it found."
 )
 
 

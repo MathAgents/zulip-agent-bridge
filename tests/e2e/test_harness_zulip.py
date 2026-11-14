@@ -207,9 +207,13 @@ async def test_transient_errors_are_retried_until_the_deadline(caplog):
     caplog.set_level("WARNING", logger="zab.e2e")
     got = await tester.wait_reply(dm_narrow(BOT), after_id=mid, senders=[BOT], pattern="PONG",
                                   within=600)  # fmt: skip
-    retries = [r for r in caplog.records if r.name == "zab.e2e"]
+    *retries, found = [r.getMessage() for r in caplog.records if r.name == "zab.e2e"]
     assert got["content"] == "PONG-1" and len(retries) == 3
-    assert "retry 3" in retries[-1].getMessage()
+    assert "retry 3" in retries[-1]
+    assert found == (  # with its retries, just before the call that found it (#943)
+        "e2e: reply matching 'PONG' found after 10 s, 9 s of them in retries (3 errors), 9 s of "
+        "those just before it"
+    )
     fake.failures = [400]
     with pytest.raises(ZulipError):
         await tester.wait_reply(dm_narrow(BOT), after_id=mid, senders=[BOT], pattern="PONG",

@@ -144,6 +144,9 @@ SPECS: dict[str, VerbSpec] = {
         settings=("spares",),
     ),
     "protect": VerbSpec("change", "!protect on|off SEL", ("on",), selection=True),
+    # the VMs' trust stores brought to the current image's (#992; workshop/admin/README.md §10):
+    # on a fleet from an older image, before its rollout
+    "trust-fix": VerbSpec("change", "!trust-fix SEL", selection=True),
     # without `lean-shared` or `idle-stop=`, their defaults (#704; `actions.IDLE_STOP_DEFAULT`):
     # the shared Mathlib where a VM's isn't shared yet; idle stop at 60 minutes where the waker
     # is on and no timer is on, unless it was turned off on purpose: never what `idle-stop=60`

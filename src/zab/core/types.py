@@ -117,13 +117,15 @@ class SessionSpec:
     # "": the backend sets nothing and removes an inherited ZAB_BOT. The core passes it on
     # every spec (create, open and fork), like git_identity.
     bot: str = ""
-    # Issue #655: the zab session's id (`sessions.id`). Backends set it as ZAB_SESSION in every
-    # process the agent's tools run in, next to ZAB_BOT, so that `zab job` knows which session
-    # started a background job (§5.6, §7.14). "": the backend sets nothing and removes an
-    # inherited ZAB_SESSION. The core chooses the id before create_session, fork_session and
-    # an !attach's open_session, so that the first turn has it, and passes it on every spec
-    # (create, attach, reopen, recovery and fork). Like ZAB_BOT it grants nothing: the bridge
-    # checks a job's session itself (§7.14).
+    # Issue #655: the zab session's id (`sessions.id`): the row's uuid4, as `str(uuid4())`
+    # writes it, `[0-9a-f-]{36}`. Backends set it as ZAB_SESSION in every process the agent's
+    # tools run in, next to ZAB_BOT, so that `zab job` knows which session started a background
+    # job (§5.6, §7.14). "": the backend sets nothing and removes an inherited ZAB_SESSION. The
+    # core chooses the id before create_session, fork_session and an !attach's open_session, so
+    # that the first turn has it, and passes it on every spec (create, attach, reopen, recovery
+    # and fork). Like ZAB_BOT it grants nothing: once exported, any tool call can set it, so a
+    # reader checks it (`str(uuid.UUID(value)) == value`), treats it as data and never as a path
+    # component, and the bridge checks a job's session itself (§7.14).
     session: str = ""
 
 

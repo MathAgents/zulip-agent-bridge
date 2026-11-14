@@ -18,6 +18,7 @@ from e2e.admin import test_scenarios_2_bot as bot
 from e2e.admin import test_scenarios_3_defaults as defaults
 from e2e.admin import test_scenarios_3_late_joiner as joiner
 from e2e.admin import test_scenarios_4_grow_disk as grow
+from e2e.admin import test_scenarios_4_trust_fix as trust
 from e2e.admin import test_scenarios_8_later as later
 from e2e.admin import test_scenarios_8_the_end as end
 from e2e.admin import test_scenarios_8_the_end_of_month as month
@@ -27,7 +28,20 @@ from e2e.admin import test_scenarios_9_checks as checks
 #: The scenario parts, in the order pytest runs them (file, then definition order).
 PARTS = [
     fn
-    for module in (server, in_band, bot, defaults, joiner, grow, later, end, month, kept, checks)
+    for module in (
+        server,
+        in_band,
+        bot,
+        defaults,
+        joiner,
+        grow,
+        trust,
+        later,
+        end,
+        month,
+        kept,
+        checks,
+    )
     for name, fn in vars(module).items()
     if name.startswith("test_") and callable(fn)
 ]
@@ -48,7 +62,7 @@ def test_the_parts_run_in_their_files_order():
     after A16; A17 after A9,
     which ends the first workshop's VMs, and before A18, so that each runs at most three
     instances; then the checks that sweep what they did (A12, A13)."""
-    modules = (server, in_band, bot, defaults, joiner, grow, later, end, month, kept, checks)
+    modules = (server, in_band, bot, defaults, joiner, grow, trust, later, end, month, kept, checks)
     assert sorted(m.__name__ for m in modules) == [m.__name__ for m in modules]
 
 
@@ -116,6 +130,8 @@ WHILE_Q9_IS_OPEN = {
     "test_a21_a_size_that_doesnt_grow_is_refused": True,
     "test_a21_a_running_vm_grows_online": True,
     "test_a21_a_stopped_vm_grows_at_its_next_boot": True,
+    # A24 (#992): A4's VMs alone, as A21; it leaves them as A21 does
+    "test_a24_the_trust_fix_as_a_plan": True,
     "test_a16_new_workshop": False,  # the provisioner's key makes its bot and channels
     # A9: the provisioner's key makes the throwaway row's bots, which !deactivate-bots ends; the
     # final sync runs its --strict refusal of a row without a repository, then skips (Q9)

@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 import zipfile
 
 import pytest
@@ -635,6 +636,89 @@ def _user_manager() -> bool:
         return call(argv, capture_output=True).returncode == 0
 
 
+#: What a unit names on the server, which a test's tree stands in for (`run_in_unit`).
+UNIT_PATHS = ("ReadWritePaths", "ReadOnlyPaths", "TemporaryFileSystem", "BindPaths",
+              "BindReadOnlyPaths", "InaccessiblePaths")  # fmt: skip
+#: The start of a script `run_in_unit` runs, `python -I -B -S SCRIPT SRC SPEC REPORT`: this
+#: checkout's src/ on the path, as the helpers' units append the release's, the test's JSON spec,
+#: and what the unit lets it make (#896): an AF_UNIX socket, an AF_INET one, a socketpair and
+#: an io_uring, each "allowed" or the errno's name.
+UNIT_PROBE = """
+import ctypes, errno, json, socket, sys
+
+src, spec, report = sys.argv[1:4]
+sys.path.append(src)
+with open(spec, encoding="utf-8") as f:
+    spec = json.load(f)
+
+
+def tried(call):
+    try:
+        call()
+    except OSError as exc:
+        return errno.errorcode.get(exc.errno, str(exc.errno))
+    return "allowed"
+
+
+def io_uring():  # io_uring_setup (425 on x86_64 and aarch64): its operations make sockets
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.syscall(425, 1, ctypes.create_string_buffer(120)) < 0:
+        raise OSError(ctypes.get_errno(), "io_uring_setup")
+
+
+def pair():  # its datagram end sends to any datagram socket by its path (review of #982, B1)
+    for end in socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM):
+        end.close()
+
+
+made = [
+    tried(lambda: socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).close()),
+    tried(lambda: socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()),
+    tried(pair),
+    tried(io_uring),
+]
+"""
+
+
+def run_in_unit(unit: pathlib.Path, script: str, spec: dict, tree: pathlib.Path) -> tuple:
+    """`script` (UNIT_PROBE's start, then the helper's run) as a oneshot service of this user's
+    manager, under `unit`'s own settings as systemd reads a unit file (`systemd-run -p` refuses
+    `RestrictAddressFamilies=none`): its system call filter, socket families, namespaces and the
+    rest, but for its paths (the sandbox tests cover them), its capability bound and its command,
+    which a user manager can't apply or the test replaces. `tree`, the test's server, is bound
+    read-write, and this interpreter and checkout read-only, /home too (not hidden), so that
+    they run from anywhere. The script's report, or None, and the unit's journal (#896)."""
+    skipped = {"ExecStart", "Type", "CapabilityBoundingSet", *UNIT_PATHS}
+    kept = [
+        line.replace("ProtectHome=true", "ProtectHome=read-only")
+        for line in unit.read_text().split("[Service]", 1)[1].splitlines()
+        if "=" in line and not line.startswith("#") and line.partition("=")[0] not in skipped
+    ]
+    name = f"zab-test-{uuid.uuid4().hex[:12]}.service"
+    code, given, report = (tree / f"{name}.{ext}" for ext in ("py", "json", "report"))
+    code.write_text(script)
+    given.write_text(json.dumps(spec))
+    python, src = os.path.realpath(sys.executable), str(ROOT / "src")
+    argv = [python, "-I", "-B", "-S", str(code), src, str(given), str(report)]
+    assert all(re.fullmatch(r"[\w./+-]+", word) for word in argv), argv  # ExecStart's syntax
+    shown = [os.path.realpath(sys.base_prefix), src]
+    lines = ["[Service]", "Type=oneshot", f"ExecStart={' '.join(argv)}", *kept, "PrivateUsers=yes"]
+    lines += [f"BindReadOnlyPaths={' '.join(shown)}", f"BindPaths={tree}"]
+    units = pathlib.Path(os.environ["XDG_RUNTIME_DIR"]) / "systemd" / "user"
+    units.mkdir(parents=True, exist_ok=True)
+    (units / name).write_text("\n".join(lines) + "\n")
+    try:
+        call(["systemctl", "--user", "daemon-reload"], check=True)
+        call(["systemctl", "--user", "start", name], capture_output=True, timeout=600)
+        journal = call(["journalctl", "--user", "--no-pager", "-o", "cat", "-u", name],
+                       capture_output=True, text=True).stdout  # fmt: skip
+    finally:
+        call(["systemctl", "--user", "reset-failed", name], capture_output=True)
+        (units / name).unlink(missing_ok=True)
+        call(["systemctl", "--user", "daemon-reload"])
+    return (json.loads(report.read_text()) if report.exists() else None), journal
+
+
 #: In the helper's namespace: each path's access; each mount's escapes (replacing, unlinking or
 #: linking a file mount, moving a directory one), by errno; then the helper's own writes.
 HELPER_PROBE = """
@@ -891,6 +975,22 @@ def test_an_upgrade_switches_current_and_keeps_the_old_release(server):
     )
     diff = server.tmp / "out" / "zab-admin-v0.3.0..v0.3.1.diff"
     assert record["diff_sha256"] == hashlib.sha256(diff.read_bytes()).hexdigest()
+
+
+def test_the_bundle_fetch_starts_no_maintenance(server):
+    """#933: from git 2.47 on, the maintenance that a fetch starts runs detached, and from 2.54
+    on, with a long history, it writes a commit-graph, which could be under way in the bundle's
+    repository while the EXIT trap removes it. The server's fetch turns it off on its own
+    command line, writing no config, so the trace of a whole deploy shows that fetch and no
+    `maintenance run` or `gc --auto` (git 2.43 runs one in the foreground without it)."""
+    server.release("v0.3.1")
+    trace = server.tmp / "trace"
+    server.env["GIT_TRACE"] = str(trace)
+    result = server.deploy("v0.3.1")
+    assert result.returncode == 0, result.stderr
+    lines = trace.read_text().splitlines()
+    assert any(re.search(r"git fetch -q \S+/release\.bundle ", line) for line in lines)
+    assert [line for line in lines if re.search("maintenance run|gc --auto", line)] == []
 
 
 def test_the_confirmation_must_name_the_release(server):
@@ -1555,57 +1655,99 @@ def test_a_path_new_to_the_list_is_shown_whole(server):
     assert (server.opt / "releases/v0.3.2/src/zab/telemetry/client.py").exists()
 
 
-def test_review_before_signing_matches_the_deploy(server):
-    """The review ends with the commands to sign, verify and push the commit's own version, in
-    the clone it read (#468). Pasted as printed, in a directory that holds no clone, they make
-    the tag the deploy takes, with the SHA-256 the review printed."""
-    server.release("v0.3.1", signer="light")  # not signed yet: Drew reviews, then signs
-    commit = server.git("rev-parse", "v0.3.1^{commit}")
-    server.git("tag", "-d", "v0.3.1")
-    origin = server.tmp / "origin.git"
-    server.run("git", "init", "-q", "--bare", origin, check=True)
-    server.git("remote", "add", "origin", str(origin))
-    clone = server.tmp / "my zab"  # a path the shell must be given quoted
-    clone.symlink_to(server.repo)
-    where = ["--repo", clone, "--etc", server.etc, "--out", server.tmp / "out"]
-    review = server.run("bash", DEPLOY, *where, "--review", commit, "--since", "v0.3.0")
-    assert review.returncode == 0, review.stderr
-    reviewed = re.search(r"SHA-256 ([0-9a-f]{64})", review.stderr).group(1)
+def review_to_sign(rig):
+    """`--review` of v0.3.1's commit, not signed yet, in a clone with an origin, through a path
+    the shell must be given quoted. Returns the run, the commit, origin, and the three command
+    lines the review must print last, under its two headers (#468, #968)."""
+    rig.release("v0.3.1", signer="light")  # not signed yet: Drew reviews, then signs
+    commit = rig.git("rev-parse", "v0.3.1^{commit}")
+    rig.git("tag", "-d", "v0.3.1")
+    origin = rig.tmp / "origin.git"
+    rig.run("git", "init", "-q", "--bare", origin, check=True)
+    rig.git("remote", "add", "origin", str(origin))
+    clone = rig.tmp / "my zab"
+    clone.symlink_to(rig.repo)
+    where = ["--repo", clone, "--etc", rig.etc, "--out", rig.tmp / "out"]
+    review = rig.run("bash", DEPLOY, *where, "--review", commit, "--since", "v0.3.0")
     git = "git -C " + str(clone).replace(" ", "\\ ")
     printed = [
         f'{git} tag -s v0.3.1 -m "zab v0.3.1" {commit}',
         f"{git} tag -v v0.3.1",
-        f"{git} push origin v0.3.1",
+        f"{git} tag -v v0.3.1 >/dev/null 2>&1 && {git} push origin v0.3.1",
     ]
-    tail = "Sign it once reviewed, then verify and push it:\n" + "".join(
-        f"  {line}\n" for line in printed
-    )
-    assert review.stderr.endswith(f"\n{tail}"), review.stderr
+    return review, commit, origin, printed
+
+
+def commands(stderr: str) -> list[str]:
+    """The command lines the review printed last, from its `Sign it once reviewed` header on:
+    the indented ones, as a deployer copies them."""
+    tail = stderr[stderr.rindex("Sign it once reviewed") :]
+    return [line[2:] for line in tail.splitlines() if line.startswith("  ")]
+
+
+def paste(rig, lines, signingkey) -> subprocess.CompletedProcess:
+    """`lines` pasted at once, as Drew pastes them, in ~/zab-admin (the review's --out), with
+    git signing through `signingkey` and checking by --etc's allowed_signers."""
     signing = {
         "GIT_CONFIG_COUNT": "3",
         "GIT_CONFIG_KEY_0": "gpg.format",
         "GIT_CONFIG_VALUE_0": "ssh",
         "GIT_CONFIG_KEY_1": "user.signingkey",
-        "GIT_CONFIG_VALUE_1": str(server.keys["drew"]),
+        "GIT_CONFIG_VALUE_1": str(signingkey),
         "GIT_CONFIG_KEY_2": "gpg.ssh.allowedSignersFile",
-        "GIT_CONFIG_VALUE_2": str(server.etc / "allowed_signers"),
+        "GIT_CONFIG_VALUE_2": str(rig.etc / "allowed_signers"),
     }
-    for line in printed:  # as Drew pastes them, in ~/zab-admin (the review's --out)
-        done = call(
-            ["bash", "-c", line],
-            env={**server.env, **signing},
-            cwd=server.tmp / "out",
-            input="",
-            capture_output=True,
-            text=True,
-        )
-        assert done.returncode == 0, (line, done.stderr)
+    return call(
+        ["bash", "-c", "\n".join(lines)],
+        env={**rig.env, **signing},
+        cwd=rig.tmp / "out",
+        input="",
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_review_before_signing_matches_the_deploy(server):
+    """The review ends with the commands to sign, verify and push the commit's own version, in
+    the clone it read (#468), the push chained behind `tag -v` under its own header (#968).
+    Pasted as printed, all at once, in a directory that holds no clone, they make and push the
+    tag the deploy takes, with the SHA-256 the review printed."""
+    review, commit, origin, printed = review_to_sign(server)
+    assert review.returncode == 0, review.stderr
+    reviewed = re.search(r"SHA-256 ([0-9a-f]{64})", review.stderr).group(1)
+    tail = (
+        f"Sign it once reviewed, then verify it:\n  {printed[0]}\n  {printed[1]}\n"
+        f"Only after the Good line, push it, chained behind tag -v again:\n  {printed[2]}\n"
+    )
+    assert review.stderr.endswith(f"\n{tail}"), review.stderr
+    assert commands(review.stderr) == printed
+    done = paste(server, printed, server.keys["drew"])
+    assert done.returncode == 0, done.stderr
+    assert 'Good "git" signature for drew@example.org with ED25519 key' in done.stderr
     assert server.run("git", "-C", origin, "rev-parse", "v0.3.1^{commit}").stdout.strip() == commit
     tag = server.git("cat-file", "tag", "v0.3.1")
     assert "\n\nzab v0.3.1\n-----BEGIN SSH SIGNATURE-----\n" in tag
     result = server.deploy("v0.3.1")
     assert result.returncode == 0, result.stderr
     assert server.records()[-1]["diff_sha256"] == reviewed
+
+
+def test_the_reviews_lines_pasted_at_once_never_push_a_tag_that_doesnt_verify(released):
+    """#968: when `tag -s` can't sign, here with a public key whose private half neither an
+    agent nor a file beside it holds, git 2.43 makes an unsigned tag and exits 0. The review's
+    lines, pasted at once, then push nothing: the push runs only behind a `tag -v` that
+    passes."""
+    review, _, origin, _ = review_to_sign(released)
+    assert review.returncode == 0, review.stderr
+    alone = released.tmp / "public-half"  # no private key beside it, and no agent in the env
+    alone.mkdir()
+    shutil.copy(released.keys["drew"].with_suffix(".pub"), alone / "drew.pub")
+    done = paste(released, commands(review.stderr), alone / "drew.pub")  # as it printed them
+    assert done.returncode != 0 and "Good" not in done.stderr, done.stderr
+    made = released.git("for-each-ref", "--format=%(contents:signature)", "refs/tags/v0.3.1")
+    assert "SSH SIGNATURE" not in made  # git 2.43 made it unsigned; a later git, none at all
+    pushed = released.run("git", "ls-remote", "--tags", str(origin))
+    assert pushed.returncode == 0 and pushed.stdout == "", pushed
 
 
 def review(rig, version, since="v0.3.0", edit=None):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
@@ -9,6 +10,8 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from zab.core import types as t
+from zab.core.creation import new_options
+from zab.core.presentation import AGENT_NAMES
 from zab.core.reason import asked_by
 from zab.render.links import upload_file
 from zab.render.mentions import disarm_mentions
@@ -20,6 +23,7 @@ HELP = """In your own channel, `@claude` or `@codex` talks to one agent; naming 
 `!stop` — interrupt the running turn (queued messages are kept), or sub-agents left running.
 `!status` — current state.
 `!queue [clear]` — show or drop messages waiting for the current turn.
+`!stop NAME`, `!stop jobs` — stop this topic's background job NAME, or all; `!stop` alone never.
 `!new [opts] prompt` — start a session (in a new topic; `--model`, `--effort`, `--worktree`, …).
 `!fork [--name NAME] prompt` — run the prompt in parallel, in a new topic, from a copy of this one.
 `!btw question` — ask me about this conversation without adding to it or stopping my work.
@@ -83,6 +87,31 @@ BTW_NO_SESSION = (
     "commands."
 )
 BTW_DM = "!btw works in a topic with a session: send it there, and I answer about that topic."
+
+
+def new_with_session(kind: str, command: str) -> str:
+    """The answer to a `!new` that reaches a bot with a session in the topic, named or as the
+    one bot an unmentioned one reaches (SPEC §4.6, #985): it starts nothing, and a prompt after
+    its options was not sent. With options it can't read, each word after `!new` that isn't an
+    option may be a prompt, so that one is never dropped without a word. `kind` is the bot's
+    backend kind."""
+    agent = AGENT_NAMES.get(kind, kind)
+    try:
+        _, prompt = new_options(command)
+    except (ValueError, argparse.ArgumentError):
+        prompt = " ".join(w for w in command.split()[1:] if not w.startswith("-"))
+    if not prompt.strip():
+        return (
+            f"This topic already has a {agent} session; for a new one, start a new topic, "
+            "or use !detach first."
+        )
+    return (
+        f"This topic already has a {agent} session, so your prompt wasn't sent to {agent}. "
+        "To continue that session, send the prompt again without !new; for a new one, start a "
+        "new topic, or use !detach first."
+    )
+
+
 DM_HINT = (
     "DMs only take commands. Start a topic in your sandbox channel to talk to your "
     "agents; !help lists commands."

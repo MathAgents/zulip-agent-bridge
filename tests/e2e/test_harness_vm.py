@@ -303,9 +303,10 @@ def test_select_scenarios():
         14,
         16,
         17,
-    ]  # 14 fast (#305), 16 (#709), 17 (#660)
-    assert report.select("all") == list(range(1, 18))
-    for bad in ("", "18", "0-2", "x"):
+        18,
+    ]  # 14 fast (#305), 16 (#709), 17 (#660), 18 (#655)
+    assert report.select("all") == list(range(1, 19))
+    for bad in ("", "19", "0-2", "x"):
         with pytest.raises(ValueError):
             report.select(bad)
 

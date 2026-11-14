@@ -33,7 +33,8 @@ def test_select_labels_ranges_and_the_go_criteria():
     assert rigs.select("A22") == [22] and 22 in rigs.select("all") and 22 not in rigs.select("go")
     assert rigs.select("A23") == [23] and 23 in rigs.select("all") and 23 not in rigs.select("go")
     assert rigs.select("A18-A23") == [18, 19, 20, 21, 22, 23]
-    for bad in ("", "A24", "10", "A1-A99"):
+    assert rigs.select("A24") == [24] and 24 in rigs.select("all") and 24 not in rigs.select("go")
+    for bad in ("", "A25", "10", "A1-A99"):
         with pytest.raises(ValueError):
             rigs.select(bad)
 

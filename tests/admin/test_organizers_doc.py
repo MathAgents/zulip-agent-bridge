@@ -69,8 +69,9 @@ CTX = Context(901, BOT, PRODUCTION, ROSTER)
 UPLOAD = " [roster.csv](/user_uploads/2/ab/xyzXYZ_-12/roster.csv)"
 #: Commands of the participants' own bots, which the runbook names.
 PARTICIPANT = frozenset(
-    {"!login", "!tools", "!vm", "!restart", "!restart codex", "!session", "!detach"}
+    {"!login", "!tools", "!vm", "!restart", "!restart codex", "!session", "!detach", "!new"}
     | {"!unmentioned", "!unmentioned all", "!unmentioned last"}  # #878
+    | {"!stop NAME", "!stop jobs"}  # a topic's background jobs (#655), not the admin bot's !stop
 )
 #: A command named by its verb alone, as prose does: `!teardown`, `!roster import`, `!waker on`;
 #: and `!` itself.
@@ -195,15 +196,25 @@ def test_the_rules_the_runbook_states_are_the_bots() -> None:
         "| `!retire`, `!teardown`, `!deactivate-bots` or `!month-end schedule` | 2 different "
         "people, or 1 global admin |" in TEXT
     )
-    assert (TIMEOUT, TIMEOUTS) == (900, {"launch": 3600} | dict.fromkeys(
+    assert (TIMEOUT, TIMEOUTS) == (900, {"launch": 3600, "trust-fix": 3600} | dict.fromkeys(
         ("rollout", "final-sync", "export", "teardown", "upgrade-server"), 1800))  # fmt: skip
     assert (
-        "The limits are 60 minutes for `!launch`; 30 minutes for `!rollout`, `!final-sync`, "
+        "The limits are 60 minutes for `!launch`; for `!trust-fix`, 60 minutes, or 2 minutes a "
+        "row above 30 (§4.4); 30 minutes for `!rollout`, `!final-sync`, "
         "`!export`, `!teardown` and a deployer's `!upgrade-server`; for `!retire`, 60 minutes, "
         "or 20 minutes a row above three, "
         "and 55 minutes more a row with `export` (§5.3); 15 minutes for anything else." in TEXT
     )
-    from zab.admin.actions import EXPORT_ROW_S, RETIRE_FLOOR_S, RETIRE_ROW_S
+    from zab.admin.actions import (
+        EXPORT_ROW_S,
+        RETIRE_FLOOR_S,
+        RETIRE_ROW_S,
+        TRUST_FIX_FLOOR_S,
+        TRUST_FIX_ROW_S,
+    )
+
+    assert (TRUST_FIX_FLOOR_S, TRUST_FIX_ROW_S) == (3600, 120)  # #992, §4.4
+    assert "within 60 minutes, or 2 minutes a row above 30 (82 minutes for 41 rows)" in TEXT
 
     assert (RETIRE_FLOOR_S, RETIRE_ROW_S, EXPORT_ROW_S) == (3600, 1200, 3300)  # the review of #566
     assert "The apply stops at 60 minutes, or 20 minutes a row above three, and 55" in TEXT

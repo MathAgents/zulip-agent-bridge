@@ -2,6 +2,12 @@
 
 Every scenario records its outcome and its timings, each against the issue's threshold. A
 timing marked `target` is recorded and shown but does not fail the run (the waker's 45 s).
+
+A timing taken around a wait that the rig couldn't see through for a while (its calls to Zulip
+failed and were retried just before the result, #943) keeps those seconds as its `outage`: what
+it measured may have taken that much less. It is shown with them, and a bound is decided over
+that range: met at both ends, missed at both, or else undecided, which is no FAIL but no result
+for the scenario either (as a part that failed on the rig's side twice, #877).
 """
 
 from __future__ import annotations
@@ -12,7 +18,8 @@ from pathlib import Path
 from typing import Any
 
 #: The issue's scenarios: number → (title, group). The `slow` ones stop the bridge or the VM,
-#: or wait for minutes, so they run together, once per batch (`run.py --group slow`).
+#: or wait for minutes, so they run together, once per batch (`run.py --scenarios slow`), with
+#: a fast scenario's parts marked `slow` (`conftest.selected`).
 SCENARIOS: dict[int, tuple[str, str]] = {
     1: ("Basics, both agents", "fast"),
     2: ("Catch-up", "fast"),
@@ -31,6 +38,9 @@ SCENARIOS: dict[int, tuple[str, str]] = {
     15: ("zab sentinel: DM !vm and !restart (#204)", "slow"),
     16: ("Commands as people type them (#709)", "fast"),
     17: ("Sub-agents across a turn's end (#660)", "fast"),
+    # its part 6 stops the VM, so it is marked `slow`: it runs with `slow` or `all`, or when 18
+    # is named by number or range (#978), never with `fast` alone (`conftest.selected`)
+    18: ("Background jobs (#655)", "fast"),
 }
 
 
@@ -54,6 +64,24 @@ def select(spec: str) -> list[int]:
     return sorted(chosen)
 
 
+#: How the report names a bound the rig's outage left undecided
+UNDECIDED = "no result for its threshold, which the rig's Zulip outage leaves undecided (#943)"
+
+
+class Took(float):
+    """Seconds measured from a start to a wait's result, with `outage`: those of them in which
+    the rig couldn't look, its calls failing just before the result (`TestUser.blind`, #943).
+    `Chat.reply` gives one, and `ScenarioResult.timing` reads it; any arithmetic on it gives a
+    plain float, with no outage."""
+
+    outage: float
+
+    def __new__(cls, seconds: float, outage: float = 0.0) -> Took:
+        took = super().__new__(cls, seconds)
+        took.outage = outage
+        return took
+
+
 @dataclass
 class Timing:
     name: str
@@ -61,12 +89,37 @@ class Timing:
     low: float | None = None  # at least (idle stop: 10 minutes)
     high: float | None = None  # at most
     target: bool = False  # recorded, never a failure
+    #: Seconds of `seconds` in which the rig couldn't see Zulip (#943): what was measured may
+    #: have taken as little as `seconds - outage`
+    outage: float = 0.0
+
+    def _within(self, seconds: float) -> bool:
+        return (self.low is None or seconds >= self.low) and (
+            self.high is None or seconds <= self.high
+        )
 
     @property
     def ok(self) -> bool:
-        return (self.low is None or self.seconds >= self.low) and (
-            self.high is None or self.seconds <= self.high
+        """Every bound met, at `seconds` and at `seconds - outage`."""
+        return self._within(self.seconds) and self._within(self.seconds - self.outage)
+
+    @property
+    def missed(self) -> bool:
+        """A bound missed whatever the outage: `high` by `seconds - outage` too, `low` by
+        `seconds`."""
+        return (self.high is not None and self.seconds - self.outage > self.high) or (
+            self.low is not None and self.seconds < self.low
         )
+
+    @property
+    def undecided(self) -> bool:
+        """Neither met nor missed for sure: the bound falls within the rig's outage (#943)."""
+        return not self.ok and not self.missed
+
+    @property
+    def failed(self) -> bool:
+        """Missed for sure, and no target: what fails the scenario."""
+        return self.missed and not self.target
 
     def text(self) -> str:
         bounds = []
@@ -75,8 +128,19 @@ class Timing:
         if self.high is not None:
             bounds.append(f"≤ {self.high:g} s")
         limit = f" ({' and '.join(bounds)}{', target' if self.target else ''})" if bounds else ""
-        mark = "" if not bounds else (" ✅" if self.ok else (" ⚠️" if self.target else " ❌"))
-        return f"{self.name} {self.seconds:.1f} s{limit}{mark}"
+        mark = (
+            ""
+            if not bounds
+            else " ✅"
+            if self.ok
+            else " ⚠️"
+            if self.target
+            else " ❔ undecided"
+            if self.undecided
+            else " ❌"
+        )
+        outage = f", {self.outage:.1f} s of it the rig's Zulip outage" if self.outage else ""
+        return f"{self.name} {self.seconds:.1f} s{outage}{limit}{mark}"
 
 
 @dataclass
@@ -114,30 +178,42 @@ class ScenarioResult:
         done = set(self.passed_parts) | set(self.skipped_parts)
         return [p for p in self.parts if p not in done]
 
+    def undecided(self) -> list[Timing]:
+        """The timings whose bound, no target, the rig's outage left undecided (#943)."""
+        return [t for t in self.timings if t.undecided and not t.target]
+
     @property
     def complete(self) -> bool:
-        """Every part of the scenario ran and passed: what `--require` asks for."""
+        """Every part of the scenario ran and passed, every bound decided: what `--require`
+        asks for."""
         return (
             self.effective == "passed"
             and not self.open_skips()
+            and not self.undecided()
             and all(p in self.passed_parts for p in self.parts)
         )
 
     @property
     def partial(self) -> bool:
-        """Nothing failed, but the scenario, or a part of it, was skipped: no result for it."""
+        """Nothing failed, but the scenario, or a part of it, was skipped, or a bound was left
+        undecided by the rig's outage: no result for it."""
         return self.effective == "skipped" or (
-            self.effective == "passed" and bool(self.open_skips())
+            self.effective == "passed" and bool(self.open_skips() or self.undecided())
         )
 
-    def timing(self, name: str, seconds: float, **limits: Any) -> Timing:
-        t = Timing(name, round(seconds, 1), **limits)
+    def timing(
+        self, name: str, seconds: float, *, outage: float | None = None, **limits: Any
+    ) -> Timing:
+        """`seconds` against `limits`; `outage`, the seconds of it in which the rig couldn't
+        look (`TestUser.blind`), by default a `Took`'s own (#943)."""
+        lost = getattr(seconds, "outage", 0.0) if outage is None else outage
+        t = Timing(name, round(seconds, 1), **limits, outage=round(min(lost, seconds), 1))
         self.timings.append(t)
         return t
 
     @property
     def timings_ok(self) -> bool:
-        return all(t.ok or t.target for t in self.timings)
+        return not any(t.failed for t in self.timings)
 
     @property
     def effective(self) -> str:
@@ -146,10 +222,12 @@ class ScenarioResult:
         return "failed" if self.outcome == "passed" and not self.timings_ok else self.outcome
 
     def explanation(self) -> str:
-        missed = [t.text() for t in self.timings if not (t.ok or t.target)]
+        missed = [t.text() for t in self.timings if t.failed]
         over = f"over its threshold: {', '.join(missed)}" if missed else ""
+        undecided = [t.text() for t in self.undecided()]
+        unsure = f"{UNDECIDED}: {', '.join(undecided)}" if undecided else ""
         external = [f"external cause: {e}" for e in self.external]
-        return "; ".join(filter(None, [self.reason, over, *external, *self.notes]))
+        return "; ".join(filter(None, [self.reason, over, unsure, *external, *self.notes]))
 
 
 _RANK = {"skipped": 0, "passed": 1, "failed": 2}
@@ -291,7 +369,10 @@ class Report:
                 parts = f" ({'; '.join(said)})" if said else ""
                 # a refused part is named here too: such a row gets no Details line (#842)
                 external = [f"external cause: {e}" for e in r.external]
-                why = "; ".join([r.reason or "no reason given", *external])
+                undecided = [t.text() for t in r.undecided()]
+                unsure = [f"{UNDECIDED}: {', '.join(undecided)}"] if undecided else []
+                reason = r.reason or ("" if undecided else "no reason given")
+                why = "; ".join(filter(None, [reason, *unsure, *external]))
                 lines.append(f"- **{r.shown}. {r.name}**{parts}: {why}")
         details = [r for r in self.results if r.explanation() and r not in skips]
         if details:

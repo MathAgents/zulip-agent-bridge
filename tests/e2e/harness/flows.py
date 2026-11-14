@@ -9,10 +9,10 @@ The agents are asked to echo tokens, so a reply is recognised by a word nobody e
 from __future__ import annotations
 
 import re
-import time
 from dataclasses import dataclass
 from typing import Any
 
+from e2e.harness.report import Took
 from e2e.harness.zulip_user import TestUser, dm_narrow, mention, topic_narrow
 
 #: How long a short agent answer may take: a new session, one model call, the posting.
@@ -96,7 +96,7 @@ class Turn:
     narrow: list[dict[str, Any]]
     message_id: int
     bot: int
-    sent_at: float
+    sent_at: float  # the test user's clock: `time.monotonic` on the rig
 
 
 class Chat:
@@ -108,24 +108,26 @@ class Chat:
     async def dm(self, kind: str, text: str) -> Turn:
         bot = self.bots[kind]
         mid = await self.user.send_dm(bot, text)
-        return Turn(dm_narrow(bot), mid, bot, time.monotonic())
+        return Turn(dm_narrow(bot), mid, bot, self.user.clock())
 
     async def say(self, kind: str, topic: str, text: str, *, mention_bot: bool = True) -> Turn:
         bot = self.bots[kind]
         content = f"{mention(self.names[kind], bot)} {text}" if mention_bot else text
         mid = await self.user.send(self.stream, topic, content)
-        return Turn(topic_narrow(self.stream, topic), mid, bot, time.monotonic())
+        return Turn(topic_narrow(self.stream, topic), mid, bot, self.user.clock())
 
     async def reply(
         self, turn: Turn, pattern: str, *, within: float = ANSWER_S
-    ) -> tuple[dict[str, Any], float]:
+    ) -> tuple[dict[str, Any], Took]:
         """The bot's message matching `pattern` after the turn's message, and the seconds it
-        took (measured here, so within one poll interval)."""
+        took (measured here, so within one poll interval), with those in which the rig couldn't
+        look just before it (`Took`, `TestUser.blind`, #943)."""
         msg = await self.user.wait_reply(
             turn.narrow, after_id=turn.message_id, senders=[turn.bot], pattern=pattern,
             within=within,
         )  # fmt: skip
-        return msg, time.monotonic() - turn.sent_at
+        took = self.user.clock() - turn.sent_at
+        return msg, Took(took, self.user.blind(turn.sent_at))
 
     async def bot_messages(self, turn: Turn) -> list[dict[str, Any]]:
         return [

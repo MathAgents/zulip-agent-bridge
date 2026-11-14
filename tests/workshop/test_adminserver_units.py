@@ -133,7 +133,12 @@ def test_the_config_helper_starts_on_a_request_and_writes_only_its_paths():
     requests = "-/var/lib/zab-admin-config/requests -/var/lib/zab-admin-upgrade/requests"
     assert bot["ReadWritePaths"] == [f"/var/lib/zab-admin {requests}"]
     assert helper["PrivateNetwork"] == ["true"] and helper["IPAddressDeny"] == ["any"]
-    assert helper["RestrictAddressFamilies"] == ["AF_UNIX"]
+    assert helper["RestrictAddressFamilies"] == ["none"]  # no socket at all (#896)
+    assert helper["SystemCallFilter"] == [
+        "@system-service",
+        "~@aio:EPERM",
+        "~socketpair:EPERM",
+    ]  # nor io_uring, nor socketpair
     assert "Restart" not in helper  # a request's run, then nothing: it restarts no unit
 
 
@@ -164,7 +169,12 @@ def test_the_upgrade_plan_helper_starts_on_a_request_in_its_sandbox():
 
     # review of #893, B1: systemd never stops it before its own limits, so it always answers
     assert int(plan["TimeoutStartSec"][0]) >= GIT_SECONDS + REVIEW_SECONDS + 240
-    assert plan["RestrictAddressFamilies"] == ["AF_UNIX AF_INET AF_INET6"]
+    assert plan["RestrictAddressFamilies"] == ["AF_INET AF_INET6"]  # no AF_UNIX (#896)
+    assert plan["SystemCallFilter"] == [
+        "@system-service",
+        "~@aio:EPERM",
+        "~socketpair:EPERM",
+    ]  # nor io_uring, nor socketpair
     assert "Restart" not in plan and "StateDirectory" not in plan
     tmpfiles = (SERVER / "tmpfiles.conf").read_text()
     for line in ("/var/lib/zab-admin-upgrade 0755 root root",
@@ -177,6 +187,12 @@ def test_the_upgrade_plan_helper_starts_on_a_request_in_its_sandbox():
 #: over SSH has (#569): `test_every_unit_is_hardened` leaves them out, and the next test says
 #: what they keep.
 DEPLOYING = {"zab-admin-upgrade.service"}
+#: Root's one sandboxed unit that may make an AF_UNIX socket: the IMDS loader, which runs nft on
+#: root's own file at boot. As root, such a socket reaches PID 1's private one, the system bus and
+#: the starter's, and a socketpair()'s datagram end any datagram socket by its path, which no
+#: read-only mount stops, so the helpers make none: neither by socket(), nor socketpair(), nor
+#: io_uring, whose operations make one past RestrictAddressFamilies (#896, review of #982, B1).
+ROOT_UNIX = {"zab-admin-imds.service"}
 
 
 def test_the_upgrade_apply_helper_is_the_deploy():
@@ -214,6 +230,11 @@ def test_every_unit_is_hardened(path):
         "",
         CAPABILITIES[path.name],
     )
+    root = found.get("User", ["root"]) == ["root"] and path != CADDY  # Caddy's unit names its own
+    if root and path.name not in ROOT_UNIX:  # #896
+        (families,) = found["RestrictAddressFamilies"]
+        assert "AF_UNIX" not in families.split() and not families.startswith("~"), families
+        assert {"~@aio:EPERM", "~socketpair:EPERM"} <= set(found["SystemCallFilter"])
 
 
 def test_who_runs_what_and_who_reaches_imds():

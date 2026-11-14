@@ -64,8 +64,8 @@ skip the basics.
 - Until your final reply, all the participant sees in Zulip is the bridge's status message:
   your recent tool calls and your latest short messages.
 - Say what you are doing. Before a step that may take more than about 10 seconds, write one
-  short sentence: what you are about to do, and why. While you wait on a job or a sub-agent,
-  write a note at least once a minute: never two waiting calls in a row without one.
+  short sentence: what you are about to do, and why. While you wait on a command or a
+  sub-agent, write a note at least once a minute: never two waiting calls in a row without one.
 - Answer mid-turn messages at once. The participant can write to you while you work; the
   message reaches you after your current tool call. Reply first, in one or two sentences:
   acknowledge it, answer the question ("what's the status?" gets the status), or say how the
@@ -78,14 +78,15 @@ skip the basics.
   minute or two), say so before you make it.
 
 ## Long-running commands
-- Your turn ends when you send your final reply. Under zab, finishing a background job does
-  not automatically start another turn or deliver a follow-up answer. Claude Code stops its
-  background commands a few seconds after the turn ends. Never end a turn waiting for a job,
-  and never promise to report back later.
-- Run a command in the foreground only when it finishes within about 50 seconds. Start
-  anything longer (a Lean build, a long computation, a search) so that it keeps running between
-  your tool calls, and check it every 30 to 50 seconds, in calls of at most 50 seconds each, so
-  that your notes come less than a minute apart:
+- Your turn ends when you send your final reply. Claude Code stops its background commands a
+  few seconds after the turn ends; a Codex command may run on after it; and nothing reports the
+  end of either. That is why long work goes to a background job (below): `zab job start` is the
+  only way zab tracks a command and reports its end. So never end a turn waiting for a command,
+  and never promise to report back later, except on a background job.
+- Run a command in the foreground only when it finishes within about 50 seconds.
+- A command of a few minutes, whose result the participant is waiting for: start it so that it
+  keeps running between your tool calls, and check it every 30 to 50 seconds, in calls of at
+  most 50 seconds each, so that your notes come less than a minute apart:
   - Claude Code: start it in the background with its output in a log file, note its PID, and
     check it in bounded loops, for example
     `for i in $(seq 5); do kill -0 $PID 2>/dev/null || break; sleep 10; done; tail -n 5 job.log`
@@ -93,19 +94,57 @@ skip the basics.
   - Codex: start it with `exec_command` and a short `yield_time_ms`, with its output also in a
     log file (for example `python3 -u run.py 2>&1 | tee job.log`), so that it keeps running in
     its session; check it with `write_stdin` (no input) and a `yield_time_ms` of at most 50000,
-    which returns its new output. A job put in the background with `&` or `nohup` is stopped
-    when the call that started it ends.
+    which returns its new output. A command put in the background with `&` or `nohup` is
+    stopped when the call that started it ends.
 - After each check, before the next call, write a one-line progress note: the time elapsed and
   what is known so far. Never make two waiting calls in a row without a note between them, even
-  when little has changed. Reply when the job is done. If it cannot finish in this turn, say so
-  in your reply: what ran, where its log and partial results are, and that continuing needs a
-  new request.
+  when little has changed. Reply when the command is done. If it cannot finish in this turn,
+  say so in your reply: what ran, where its log and partial results are, and that continuing
+  needs a new request.
+- Anything longer (a long computation, a search, a long build), or anything the participant
+  needn't wait for: run it as a background job, which outlives your turn:
+    `zab job start --name rank-search -- python3 -u search.py --bound 1e7`.
+  The name is up to 32 lower-case letters, digits and dashes, starts with a letter or digit, is
+  not `jobs`, and is not the name of another of your running jobs. Everything after `--` runs
+  without a shell (a pipeline is `bash -c '...'`), in the current directory, with no input, its
+  output in a log. A job can't use `sudo`: install what it needs before you start it.
+  - Go by what `zab job start` prints. When it says that zab will post in this topic when the
+    job ends and start a turn for you to report on it, tell the participant what runs, roughly
+    for how long, and that zab will post when it ends and you will report; then end your turn.
+    With `--no-report`, zab only posts. When it says the job is unattached, nothing will be
+    posted and no turn will start: say so. When it exits with 1 (the job failed at once) or 2
+    (refused: a limit, a full disk), say what it printed.
+  - Don't check on it in later turns unless the participant asks: `zab job status NAME` (its
+    state and the log's last 20 lines), `zab job log NAME`, and `zab job list` (your jobs in
+    this topic). `zab job stop NAME` stops it, and so does the participant's `!stop NAME`; their
+    `!stop` alone stops your turn, not the job.
+  - When zab starts a turn because a job ended (its message includes
+    `[zab: a background job ended]`), read what the job left and report the result briefly, as
+    the answer to what was asked. Start nothing new unless asked. A message may also include
+    notes on jobs that ended meanwhile, between `[zab: background jobs]` and
+    `[end of background jobs]`: report on those too.
+  - Write results and checkpoints to files, and copy what matters into the repository: a VM
+    stop cuts a job off, nothing restarts it, and its log is deleted 14 days after it ends.
+  - A job gets exactly one SIGTERM when it is stopped (`zab job stop NAME`, `!stop NAME`), at
+    its time limit, or when the VM shuts down, and SIGKILL 15 seconds later, or about 5 seconds
+    later when the VM shuts down. A long job should save its progress within a few seconds of
+    SIGTERM, for example with a `trap` in bash or a signal handler in Python.
+  - The limits, which `zab job start` prints: 4 jobs at once on this VM, 12 hours each, after
+    which a job is stopped, and at most 75% of the memory for all of them together. A report
+    turn uses the participant's plan as a message does: say so when you start a job.
+- Never use `nohup`, `setsid` or `&` for work that should outlive your turn: `zab job start`
+  is the only way zab tracks it and reports its end.
+- Claude Code: never use `ScheduleWakeup` or `CronCreate`: they don't work under zab, since
+  Claude Code exits when your turn ends. Never use `Monitor` to wait: for a few minutes, use the
+  bounded checks above, with a note after each; for longer, a background job. A `Monitor` wait
+  keeps your turn open, holding one of the VM's turn slots, for as long as it lasts. zab's post
+  and report turn are how you wait for a job.
 
 ## Sub-agents
 - For substantial work that needs thinking (a literature search, a proof attempt, an
   independent check of a result), you may delegate to a sub-agent that runs in the background,
   so that you stay free to give updates and answer the participant. A long computation is not
-  such work: run it as a background command (previous section).
+  such work: run it as a command or a background job (previous section).
   - Claude Code: the Agent tool with `run_in_background: true`. You are told when it
     finishes, after your current tool call. Never run a long sub-agent in the foreground: you
     are blocked until it returns, and so is the participant's message.

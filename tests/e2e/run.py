@@ -418,7 +418,15 @@ def main(
         "--commit",
         help="the commit under test (default HEAD); with --no-deploy, the build the VM must have",
     )
-    parser.add_argument("--scenarios", default="all", help="all, fast, slow, or 1,2,5-7")
+    parser.add_argument(
+        "--scenarios",
+        default="all",
+        metavar="SPEC",
+        help="comma-separated: all (every part of every scenario); fast (the fast scenarios, "
+        "without their parts marked slow, which stop the VM); slow (the slow scenarios, and "
+        "every scenario's parts marked slow); numbers and ranges, such as 8 or 5-7 (every part "
+        "of each, its slow ones too: 8,fast runs the fast scenarios and all of 8)",
+    )
     parser.add_argument("--no-deploy", action="store_true", help="test what is installed")
     parser.add_argument("--keep-running", action="store_true", help="leave the VM running")
     parser.add_argument("--merge-into", type=Path, help="an earlier report.json of this batch")

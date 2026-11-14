@@ -738,7 +738,9 @@ laptop_main() {
     COMMIT=$(g rev-parse --verify --quiet "$review^{commit}") || die "$review: no such commit"
     present_diff "$since" "$base_commit" "${COMMIT:0:12}"
     # The commands to paste, in any directory (#468): the tag is the version of the commit's
-    # pyproject.toml, as a deploy requires (verify_tag), made in the clone read here.
+    # pyproject.toml, as a deploy requires (verify_tag), made in the clone read here. The push
+    # is chained behind tag -v: git 2.43's tag -s makes an unsigned tag, exit 0, when it can't
+    # sign, so the lines pasted at once never push one (#968).
     local tag repo
     tag=$(g show "$COMMIT:pyproject.toml" 2>/dev/null | sed -n 's/^version = "\(.*\)"$/v\1/p') || true
     printf -v repo %q "$REPO"
@@ -747,10 +749,11 @@ laptop_main() {
     elif g rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
       note "No tag command: $REPO already has a tag $tag"
     else
-      note "Sign it once reviewed, then verify and push it:"
+      note "Sign it once reviewed, then verify it:"
       note "  git -C $repo tag -s $tag -m \"zab $tag\" $COMMIT"
       note "  git -C $repo tag -v $tag"
-      note "  git -C $repo push origin $tag"
+      note "Only after the Good line, push it, chained behind tag -v again:"
+      note "  git -C $repo tag -v $tag >/dev/null 2>&1 && git -C $repo push origin $tag"
     fi
     return
   fi
@@ -1365,7 +1368,7 @@ server_main() {
   mkdir -p "$REPO/info"
   # Above every .gitattributes of the tree: `git archive` then writes each blob as committed.
   echo '* -export-subst -export-ignore -ident -text -eol -filter -working-tree-encoding' >"$REPO/info/attributes"
-  g fetch -q "$PAYLOAD/release.bundle" "refs/tags/$V:refs/tags/$V"
+  g -c maintenance.auto=false fetch -q "$PAYLOAD/release.bundle" "refs/tags/$V:refs/tags/$V"
   # fetch.fsckObjects doesn't apply to a bundle (git 2.43): check every object it brought.
   g -c fsck.hasDotdot=error fsck --strict --no-dangling --no-progress >/dev/null 2>&1 ||
     die "$V: the bundle holds malformed objects"

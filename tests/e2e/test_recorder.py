@@ -29,7 +29,7 @@ def test_recorder_folds_parts_into_one_row():
     rec.finish(2, "test_catchup", "skipped", 0, "bridge unit missing")
     assert rec.rows[2].outcome == "skipped"
     with pytest.raises(ValueError):
-        rec.row(18)
+        rec.row(max(report.SCENARIOS) + 1)
 
 
 def test_scenarios_are_selected_by_number_or_group(monkeypatch):
@@ -49,14 +49,16 @@ def test_scenarios_are_selected_by_number_or_group(monkeypatch):
         return [i.n for i in every], [i.n for i in dropped]
 
     # None: a helper's own test, always kept; (8, True): scenario 8's part that stops the VM,
-    # which runs with the slow group only (codex on #286)
+    # which runs with the slow group, or when 8 is named by number (#978), never with `fast`
+    # alone (codex on #286)
     assert select("slow,5") == ([(3, False), (5, False), (8, True), (None, False)],
                                 [(1, False), (8, False), (14, False)])  # fmt: skip
     kept, _ = select("fast")
     assert (8, False) in kept and (8, True) not in kept
     # scenario 14 stops only the bridge, for seconds: in every fast run (#305)
     assert (14, False) in kept and (14, False) in select("slow")[1]
-    assert (8, True) not in select("8")[0] and (8, True) in select("all")[0]
+    # named by number, a scenario runs every part (#978)
+    assert (8, True) in select("8")[0] and (8, True) in select("all")[0]
     monkeypatch.delenv("ZAB_E2E_SCENARIOS")
     items = [item(1)]
     conftest.pytest_collection_modifyitems(None, items)  # unset: everything stays
@@ -91,8 +93,9 @@ def test_a_failed_teardown_fails_the_scenario():
 
 def test_a_part_left_out_of_the_selection_keeps_a_required_scenario_incomplete(monkeypatch):
     """Codex on #286: `--scenarios 1-13 --require rc` left scenario 8's slow cold import out
-    and still said PASS. Every collected part is expected; a required scenario passes only
-    when all of them did, here or in a merged report of the same build."""
+    and still said PASS (a range now runs it, #978: `fast` leaves it out). Every collected part
+    is expected; a required scenario passes only when all of them did, here or in a merged
+    report of the same build."""
     from e2e.harness import report
 
     def item(name, slow=False):
@@ -101,7 +104,7 @@ def test_a_part_left_out_of_the_selection_keeps_a_required_scenario_incomplete(m
 
     fast_rec, slow_rec = Recorder(), Recorder()
     hook = SimpleNamespace(pytest_deselected=lambda items: None)
-    for rec, spec in ((fast_rec, "1-13"), (slow_rec, "slow")):
+    for rec, spec in ((fast_rec, "fast"), (slow_rec, "slow")):
         monkeypatch.setattr(conftest, "_RECORDER", rec)
         monkeypatch.setenv("ZAB_E2E_SCENARIOS", spec)
         items = [item("test_lean_proof[claude]"), item("test_lean_cold_import", slow=True)]
@@ -116,6 +119,76 @@ def test_a_part_left_out_of_the_selection_keeps_a_required_scenario_incomplete(m
     fast.required = [8]
     fast.merge(report.Report(commit="c", wheel="w", results=slow_rec.report().results))
     assert fast.results[0].complete and fast.verdict == "PASS"
+
+
+#: A fixture set of scenarios, whatever the suite's are (#978): 3 is slow, the others fast
+FIXTURE = {n: (f"scenario {n}", "slow" if n == 3 else "fast") for n in range(1, 19)}
+#: Their parts, (scenario, name, marked `slow`): 8's and 18's `slow` parts stop the VM
+PARTS = [
+    (None, "test_harness", False),  # a harness's own test: always kept
+    (1, "test_basics", False),
+    (3, "test_watchdog", False),
+    (8, "test_lean", False),
+    (8, "test_lean_cold_import", True),
+    (18, "test_job_report", False),
+    (18, "test_job_stop", False),
+    (18, "test_job_lost_at_boot", True),
+]
+EIGHTEEN = {"test_job_report", "test_job_stop", "test_job_lost_at_boot"}
+FAST = {"test_basics", "test_lean", "test_job_report", "test_job_stop"}
+
+
+def part(number: int | None, name: str, slow: bool) -> SimpleNamespace:
+    marks = {"scenario": SimpleNamespace(args=(number,)) if number else None, "slow": slow}
+    return SimpleNamespace(number=number, name=name, get_closest_marker=lambda m: marks.get(m))
+
+
+@pytest.mark.parametrize(
+    ("spec", "runs"),
+    [
+        ("18", EIGHTEEN),
+        ("17-18", EIGHTEEN),
+        ("fast", FAST),
+        ("slow", {"test_watchdog", "test_lean_cold_import", "test_job_lost_at_boot"}),
+        ("all", {name for _, name, _ in PARTS}),
+        ("8", {"test_lean", "test_lean_cold_import"}),
+        ("8,fast", FAST | {"test_lean_cold_import"}),
+    ],
+)
+def test_a_scenario_named_by_number_runs_every_part(monkeypatch, spec, runs):
+    """#978: `--scenarios 18` left out 18's `slow` part, so `--require 18` could never pass. A
+    scenario named by number or range runs every part, its `slow` ones too; `fast` never runs a
+    `slow` part; `slow` and `all` select as before (with every scenario's `slow` parts)."""
+    monkeypatch.setattr(report, "SCENARIOS", FIXTURE)
+    items = [part(*p) for p in PARTS]
+    kept, dropped = conftest.selected(spec, items)
+    assert {i.name for i in kept} == runs | {"test_harness"}
+    assert [i.name for i in items if i not in dropped] == [i.name for i in kept]
+    assert len(kept) + len(dropped) == len(items)
+
+
+def test_require_passes_for_a_scenario_named_by_number_when_every_part_passed(monkeypatch):
+    """#978: `run.py --scenarios 18 --require 18`, every part of 18 passed: PASS. In a `fast`
+    run, 18's `slow` part never runs, and the requirement fails."""
+    from e2e import run
+
+    monkeypatch.setattr(report, "SCENARIOS", FIXTURE)
+    hook = SimpleNamespace(pytest_deselected=lambda items: None)
+    verdicts = {}
+    for spec in ("18", "fast"):
+        rec = Recorder(titles={n: title for n, (title, _) in FIXTURE.items()})
+        monkeypatch.setattr(conftest, "_RECORDER", rec)
+        monkeypatch.setenv("ZAB_E2E_SCENARIOS", spec)
+        items = [part(*p) for p in PARTS]
+        conftest.pytest_collection_modifyitems(SimpleNamespace(hook=hook), items)
+        for item in items:
+            if item.number is not None:
+                rec.finish(item.number, item.name, "passed", 10, "")
+        ran = report.Report(
+            commit="c", wheel="w", results=rec.report().results, required=run.required("18")
+        )
+        verdicts[spec] = (ran.verdict, ran.missed())
+    assert verdicts == {"18": ("PASS", []), "fast": ("FAIL", [18])}
 
 
 IDLE = "idle stop is still installed on the VM"

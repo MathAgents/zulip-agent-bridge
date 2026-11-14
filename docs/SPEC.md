@@ -1,6 +1,6 @@
 # zab — Zulip Agent Bridge: specification
 
-Status: describes v0.2.19.
+Status: describes v0.2.20.
 
 This document is the source of truth for the bridge. Section numbers are stable: cite them in commits and pull requests ("SPEC §7.4"). `#NNN` is an issue or pull request of the private repository where zab is developed (CONTRIBUTING.md; D37). The words *must*, *should* and *may* are used in the RFC 2119 sense. *Phase 1* is the bridge as first built, for a workshop in October 2026, with the amendments since folded in; §18 lists what is deferred, and §16 the history.
 
@@ -301,14 +301,18 @@ store (`kv` key `unmentioned`), so that it holds across a restart, a stop and a 
 - **The record.** Each topic has one addressee record for the VM's bots (`kv` key
   `topic_addressees:<stream>:<topic>`, in `zab.core.unmentioned`), kept under both rules, so
   that a switch to `last` starts from the topic's last mention. Each allowed prompt there (a
-  message that is neither a command nor an aside, `!new <prompt>` included) that mentions one or
-  more of the VM's bots, completed or typed (a typed one names the bots of its kind that allow
-  the sender, a corrected foreign mention its local bot), records them under its message id,
-  written by each bot that reads it, which finds the same ones. A command records nothing: the
-  record is whom the participant talks to, not whom they send a command, so `@codex !usage` in
-  a topic where they talk to Claude leaves the follow-ups with Claude. One command amends the
-  record, and only by removal: each bot that reads a `!detach` records, under the command's id,
-  the newest entry before it without the bots it detaches, an empty entry being no record.
+  message that is neither a command nor an aside, `!new`, with or without a prompt, included)
+  that mentions one or more of the VM's bots, completed or typed (a typed one names the bots of
+  its kind that allow the sender, a corrected foreign mention its local bot), records them under
+  its message id, written by each bot that reads it, which finds the same ones. Any other
+  command records nothing: the record is whom the participant talks to, not whom they send a
+  command, so `@codex !usage` in a topic where they talk to Claude leaves the follow-ups with
+  Claude. A `!new` is a choice of whom they talk to, with a prompt or without: a bare
+  `@codex !new` starts Codex's session in the topic (rule 7), and the follow-ups go to Codex
+  (#955). As every entry, it is recorded from the message's text, whether or not Codex had a
+  session there already. One command amends the record, and only by removal: each bot that
+  reads a `!detach` records, under the command's id, the newest entry before it without the
+  bots it detaches, an empty entry being no record.
   Those are the bots the `!detach` reaches (those it names, in a multi-party channel too;
   without a mention, in a single-human channel, the recorded ones, or else all) for which its
   text, the bot's own completed mentions taken off, is exactly `!detach`, as the bot's actor
@@ -461,10 +465,11 @@ Topic commands (in a session topic, or on the first message of a new one):
 | Command | Effect |
 |---|---|
 | `!help` | List the commands. |
-| `!new [opts]` | Only on the mention that creates a session. Options: `--model M`, `--effort E`, `--approval P`, `--account A` (Claude), `--worktree` or `--shared`, `--subdir PATH` (project-relative working directory). |
+| `!new [opts]` | Only on the mention that creates a session. Options: `--model M`, `--effort E`, `--approval P`, `--account A` (Claude), `--worktree` or `--shared`, `--subdir PATH` (project-relative working directory). Where the bot already has a session in the topic, `!new` starts nothing: the bot answers that the topic has its session, and that a new one takes a new topic, or `!detach` first; where a prompt followed the options, also that the prompt wasn't sent, and that sent again without `!new` it goes to this session (#985; before, "Unknown command", and the prompt was dropped). Without a mention, below. |
 | `!session` | Show backend/machine, native id, workspace/branch, resolved settings, state, turns/tokens and the SSH resume command. |
-| `!status` | Reply with the current state: idle, running and elapsed time, or pending approval. A session in `error`, or waiting for its backend, is reopened first (§7.8.1). |
-| `!stop` | Interrupt the running turn (§7.7). Queued messages are kept. With no turn running, stop the sub-agents an ended Codex turn left running, or answer "No turn is running". |
+| `!status` | Reply with the current state: idle, running and elapsed time, or pending approval. A session in `error`, or waiting for its backend, is reopened first (§7.8.1). Then a line for each of the session's background jobs running or ended in the last 24 hours (§7.14). |
+| `!stop` | Interrupt the running turn (§7.7). Queued messages are kept, and background jobs keep running: the answer names them (§7.14). With no turn running, stop the sub-agents an ended Codex turn left running, or answer "No turn is running". |
+| `!stop NAME`, `!stop jobs` | Stop this bot's running background job NAME in this topic, or all of its running jobs there, and reply when they have stopped (§7.14). `!stop` alone never stops a job. |
 | `!model [M]`, `!effort [E]` | Show the resolved value (label agent defaults), or validate and set it for subsequent turns (§7.9). |
 | `!approve`, `!approve-session`, `!deny` | Answer the oldest pending approval (§7.6). |
 | `!diff` | Post the workspace diff since the session started (§10.5). |
@@ -502,14 +507,26 @@ reaches more than one, so that a bot the command doesn't concern stays quiet (`R
   that stopped nothing says nothing, except that where no turn of the topic runs, one bot with
   a session there answers for the topic: one whose backend stops sub-agents (Codex) before one
   whose doesn't, since only it knows what it found, then the first by name. So the topic gets
-  one line (#847).
+  one line (#847). Each bot whose session has running background jobs adds its line about
+  them (§7.14).
+- `!stop NAME` and `!stop jobs` stop each bot's own such jobs in the topic, and each that
+  stopped one says so. One that has none says nothing, except that where no bot of the topic
+  has one, and no bot stopped one for this message, the bot that answers for the topic
+  (`Delivery.first`, as for `!stop` above: one whose backend stops sub-agents, Codex, before one
+  whose doesn't, then the first by name) answers "No background job `NAME` is running here."
+  (`!stop jobs`: "No background job is running here.") (§7.14). Each bot handles the message in
+  its own actor, in any order, so a bot that stops a job records the message first, in the
+  store the bots share (`job_stop:<message id>`), and the answering bot reads the topic's jobs,
+  then that record, before it says that none runs (#934).
 - `!model M` and `!effort E` set the value on each bot whose backend accepts it; one that
   refuses it says nothing, since the value is the other agent's. So does one whose backend
   can't verify the value, which a named command accepts (Codex without its model list,
   `model/list`, `zab.core.reason.verified_only`): it changes nothing. A value neither knows
   gets no answer: name the agent to see its list (`@claude !model …`). Without a value, each
   shows its own.
-- `!new …` where the bot has a session says nothing; a bot without one starts a session.
+- `!new …` where the bot has a session says nothing; a bot without one starts a session. So where
+  every bot it reaches has a session, it gets no answer. One that reaches that bot alone, as
+  under `last` with the record naming only it, gets its answer as when named (the table, #985).
 - `!handover` where both agents have a session in the topic is refused, once, by the first bot
   by name: both would write `HANDOVER.md` in the topic's one worktree (§10.1), so the reply
   asks to name one (`@claude !handover`). Where one agent has a session, it runs it.
@@ -550,7 +567,7 @@ A window whose reset time is at or before now has reset since it was reported,
 so its row shows no bar and no percentage: "unknown until the next Claude turn"
 (Codex: "unknown; try !usage again"), and "reset at <time>" (issue #647).
 
-Direct-message commands to a bot: `!help` (command list), `!status` (bridge and backend health, and the rule for a message without a mention), `!vm` and `!tools` (as in a topic), `!login [account]` (subscription sign-in, described below), `!unmentioned [all|last]`, and `!restart`, `!restart codex`. `!unmentioned` (#878) sets the VM's rule for a message without a mention (§4.5, "The rule `last`"), for all of its bots, from a sender on the bot's allowlist, and answers in one line what the rule now does; alone, it says which rule is in force and what it does; any other word gets its usage. With `bridge.multi_party` off, whose own rule then applies, each answer says that the setting has no effect, the value being kept for when the switch is on again. In a topic, `!unmentioned` gets a pointer to a DM, from one bot (the first by name, as `!help`). Where `zab-sentinel.service` runs (§13.3), `zab sentinel` answers `!vm` and `!restart` in a one-to-one DM, also while the bridge is down or deaf, and the bridge stays silent on them (issue #204; §13.5). A DM command may follow a leading mention of the bot, typed or completed. The bridge's DM route, its sign-in (`!login`, and `!login cancel` during one) and `zab sentinel` drop a typed mention of the bot's own kind first (`zab.core.addressing.without_typed_address`, #713), then read the rest as people type commands (`as_command`, above), after a completed mention of the bot (`@**Bot name**`, #709). The bridge and the sentinel read a DM with the same kind and mention, the router's, so that both agree on which of them answers. `@claude !login` to Claude's bot is `!login`, and so are `@**Claude · alice** !Login`, ``@claude `!login` `` and `@claude @**Claude · alice** !login`; `@codex !login` to it is no command, and neither is a completed mention followed by a typed one, `@**Claude · alice** @claude !vm`: the typed mention is dropped only first. `zab sentinel`'s `!restart` reads its one word in any case too: `!Restart Codex` is `!restart codex`. A pasted code during a sign-in comes without a leading typed mention: `@claude CODE` passes on `CODE`.
+Direct-message commands to a bot: `!help` (command list), `!status` (bridge and backend health, the rule for a message without a mention, and each bot's count of running background jobs, its unattached ones included, §7.14), `!vm` (as in a topic, with the machine's running background jobs listed, §13.5) and `!tools` (as in a topic), `!login [account]` (subscription sign-in, described below), `!unmentioned [all|last]`, and `!restart`, `!restart codex`. `!unmentioned` (#878) sets the VM's rule for a message without a mention (§4.5, "The rule `last`"), for all of its bots, from a sender on the bot's allowlist, and answers in one line what the rule now does; alone, it says which rule is in force and what it does; any other word gets its usage. With `bridge.multi_party` off, whose own rule then applies, each answer says that the setting has no effect, the value being kept for when the switch is on again. In a topic, `!unmentioned` gets a pointer to a DM, from one bot (the first by name, as `!help`). Where `zab-sentinel.service` runs (§13.3), `zab sentinel` answers `!vm` and `!restart` in a one-to-one DM, also while the bridge is down or deaf, and the bridge stays silent on them (issue #204; §13.5). A DM command may follow a leading mention of the bot, typed or completed. The bridge's DM route, its sign-in (`!login`, and `!login cancel` during one) and `zab sentinel` drop a typed mention of the bot's own kind first (`zab.core.addressing.without_typed_address`, #713), then read the rest as people type commands (`as_command`, above), after a completed mention of the bot (`@**Bot name**`, #709). The bridge and the sentinel read a DM with the same kind and mention, the router's, so that both agree on which of them answers. `@claude !login` to Claude's bot is `!login`, and so are `@**Claude · alice** !Login`, ``@claude `!login` `` and `@claude @**Claude · alice** !login`; `@codex !login` to it is no command, and neither is a completed mention followed by a typed one, `@**Claude · alice** @claude !vm`: the typed mention is dropped only first. `zab sentinel`'s `!restart` reads its one word in any case too: `!Restart Codex` is `!restart codex`. A pasted code during a sign-in comes without a leading typed mention: `@claude CODE` passes on `CODE`.
 
 `!login [account]` in a one-to-one DM starts the CLI's own login flow for an
 allowlisted user (D24); `account` is an optional Claude account alias. One login
@@ -610,7 +627,8 @@ The add-reaction API needs `emoji_name`. Look up the names for these codes in th
   - an approval is needed;
   - a turn fails;
   - a turn finishes after running at least `mention_after_s` seconds (default 120; on a workshop's VMs, the workshop's, from `admin.toml`: ADMIN §2.1, #711);
-  - a side answer (§7.13) took at least 60 s, whatever `mention_after_s` says: the mention is in its first part.
+  - a side answer (§7.13) took at least 60 s, whatever `mention_after_s` says: the mention is in its first part;
+  - a background job of the session ended (§7.14): its end post mentions the job's owner, the sender of the message that started the turn the job started in, whatever the job's length.
 - While a turn runs, the bridge may send a topic typing indicator (`POST /typing`, renewed every 10 s).
 
 ### 4.9 Message formats
@@ -628,7 +646,7 @@ Exact templates for the card, status, approval and final messages are in Appendi
 - **Approval message.** What is being requested (the command and working directory, or the files and a diff in a spoiler), the reason, and the reaction legend. When answered, it is edited to show who decided what; if answered elsewhere, it shows "resolved elsewhere".
 - **Final answer.** The rendered agent text (§11), in one or more parts.
 - **Diff message.** If the turn changed files, one more message follows the final answer: one visible summary line (with the diff attached when it is too large to inline) and one spoiler with the file list and, when it fits, the patch (§11.8). It is always a separate message, never appended to the answer.
-- **Bridge notes (issue #677).** What the bridge says on its own behalf, or passes on from the program the agent runs in, starts with one marker, so that a newcomer never takes it for the agent's words: `⚠️ **Bridge** (not <Agent>): ` for warnings and errors, `🔧 **Bridge** (not <Agent>): ` for information, where `<Agent>` is the bot's agent, Claude or Codex (Appendix B.4). It marks backend `Notice`s (§8.5, §9.4), each by its level; the ⚠️ lines posted into a topic: a failed session operation, a session that needs recovery (§7.3), answer delivery pending, an answer that could not be formatted, a missing diff, a rejected attachment, a failed or refused `!fork` (§7.11), a failed, refused or timed-out `!btw` (§7.13), a failed session creation and an expired message (§7.2, §7.8.1), and the one-time replies to a plain mention in a public channel or an empty topic (§4.3, §4.5); and the bridge's paragraphs inside an answer: a failed turn's error (§7.9), the sign-in guidance, a stop without confirmation, a stale turn that recovery ends (§7.8.1), a lost steer and a stopped background job. The card, the status and ⏳ waiting lines, the approval and diff messages, the `@user turn …` ping, the `⑂` lines, the `💬 btw` answers and replies to `!` commands keep their own forms, as do the sentinel's DMs. Text from elsewhere, such as a notice's, is redacted (§11.6), its NUL characters dropped first, before a marker or prefix goes in front of it, since the zuliprc rule matches whole lines. Peer context (§4.5) skips a message that starts with the marker, as it skips those.
+- **Bridge notes (issue #677).** What the bridge says on its own behalf, or passes on from the program the agent runs in, starts with one marker, so that a newcomer never takes it for the agent's words: `⚠️ **Bridge** (not <Agent>): ` for warnings and errors, `🔧 **Bridge** (not <Agent>): ` for information, where `<Agent>` is the bot's agent, Claude or Codex (Appendix B.4). It marks backend `Notice`s (§8.5, §9.4), each by its level; the ⚠️ lines posted into a topic: a failed session operation, a session that needs recovery (§7.3), answer delivery pending, an answer that could not be formatted, a missing diff, a rejected attachment, a failed or refused `!fork` (§7.11), a failed, refused or timed-out `!btw` (§7.13), a background job's end post (§7.14), a failed session creation and an expired message (§7.2, §7.8.1), and the one-time replies to a plain mention in a public channel or an empty topic (§4.3, §4.5); and the bridge's paragraphs inside an answer: a failed turn's error (§7.9), the sign-in guidance, a stop without confirmation, a stale turn that recovery ends (§7.8.1), a lost steer and a stopped background job. The card, the status and ⏳ waiting lines, the approval and diff messages, the `@user turn …` ping, the `⑂` lines, the `💬 btw` answers and replies to `!` commands keep their own forms, as do the sentinel's DMs. Text from elsewhere, such as a notice's, is redacted (§11.6), its NUL characters dropped first, before a marker or prefix goes in front of it, since the zuliprc rule matches whole lines. Peer context (§4.5) skips a message that starts with the marker, as it skips those.
 
 ### 4.10 Zulip API usage
 
@@ -758,12 +776,19 @@ refserve_owner = "MathAgents"    # the GitHub owner whose repositories it serves
 
 [lean]
 reap_idle_minutes = 30           # stop Codex's idle Lean servers after this long; 0 = off (§7.12)
+
+[jobs]                           # background jobs (§7.14)
+report = true                    # a report turn when a job ends; per job: --no-report
+max_running = 4                  # jobs running on the machine, all bots together: 0 to 64; 0 = off
+max_hours = 12                   # each job's cap (RuntimeMaxSec): above 0, at most 168
+max_memory_percent = 75          # all jobs together (zab-jobs.slice's MemoryMax): 10 to 90
 ```
 
 Rules:
 
 - Empty strings mean "use the agent's own default". The bridge passes only settings that are non-empty.
 - Unknown keys are a fatal error that names the key and its file position.
+- A `[jobs]` value outside the range its comment gives is a configuration error that names the key.
 - Relative paths are resolved against the config file's directory, and `~` is expanded.
 - `allow_user_ids` and `allow_emails` form one explicit allowlist, applying to topics,
   reactions and DMs. Only when both lists are empty does the bot owner apply. A
@@ -825,7 +850,7 @@ session reopened after a restart keeps it. git keeps the original author when an
 cherry-picks, amends or applies (`git am`) someone else's commits, and records the agent only as
 committer; merges, reverts and new commits are the agent's (DECISIONS, 2026-10-11).
 
-### 5.6 The session's bot, `ZAB_BOT` (issue #248)
+### 5.6 The session's bot and id, `ZAB_BOT` and `ZAB_SESSION` (issues #248, #655)
 
 `SessionSpec.bot` is the name (`[[bots]] name`) of the bot the session belongs to. A backend sets
 `ZAB_BOT` to it in every process the agent's tools run in: Claude in the turn's environment
@@ -844,6 +869,18 @@ It is the default bot of `zab history`, the read-only way for an agent to read a
 without the zuliprc (§12.2): `zab history --list-topics [--match TEXT]` and `zab history
 --channel C --topic T`. It is a default, not a permission: `--bot NAME` overrides it, and without
 it `zab history` takes the config's only bot or asks for `--bot`.
+
+`SessionSpec.session` (issue #655) is the zab session's id, `sessions.id` (§6.2). A backend sets
+`ZAB_SESSION` to it the same way, in every process the agent's tools run in, next to `ZAB_BOT`;
+with `""` it sets nothing and removes an inherited `ZAB_SESSION`. The core chooses the id before
+it calls `create_session`, `fork_session` or, for `!attach ID`, `open_session`, so that the first
+turn has it, and passes it on every spec it builds (create, attach, reopen, recovery and fork). The
+same exception holds: a Codex thread loaded before the upgrade that added it runs without it,
+and one reopened for another session keeps the old value, until the app-server restarts. It
+tells `zab job` which session started a job (§7.14; that a Codex sub-agent's commands have it
+too: **VERIFY**, #655 V5), and like `ZAB_BOT` it grants nothing: the
+bridge attaches a job to a session only after its own check (§7.14, "Which topic it belongs
+to"), so a job of such a thread is unattached.
 
 ## 6. State
 
@@ -937,9 +974,34 @@ CREATE TABLE message_finals (            -- those whose final edit went out (§4
   pending     TEXT,                      -- a repeat of it held back, until it is sent
   PRIMARY KEY (bot, message_id)
 );
+CREATE TABLE jobs (                      -- the background jobs the bridge has seen (§7.14, #655)
+  id              TEXT PRIMARY KEY,      -- the job's id: 12 hex digits
+  bot             TEXT NOT NULL,         -- job.json's bot
+  session_id      TEXT,                  -- the session it belongs to; NULL: unattached
+  name            TEXT NOT NULL,
+  state           TEXT NOT NULL,         -- running | ended | lost
+  started_at      REAL NOT NULL,
+  ended_at        REAL,
+  result          TEXT,                  -- how it ended, from ended.json and stopped.json
+  handled_at      REAL,                  -- when the watcher handled its end: posted, or none due
+  end_message_id  INTEGER,               -- the end post, when there is one
+  report_turn_id  INTEGER                -- the report turn (turns.id), when one started
+);
+CREATE TABLE job_posts (                 -- an end post being tried again (§7.14, #655)
+  id          INTEGER PRIMARY KEY,
+  bot         TEXT NOT NULL,
+  session_id  TEXT NOT NULL,
+  job_ids     TEXT NOT NULL,             -- JSON list: the jobs whose ends it posts
+  sends       TEXT NOT NULL,             -- JSON: each send's tag and its jobs
+  first_at    REAL NOT NULL,             -- its first try
+  attempts    INTEGER NOT NULL,          -- the tries counted, each before it goes out
+  next_at     REAL NOT NULL,             -- its next try
+  unknown     INTEGER NOT NULL,          -- 1: the last send's outcome is unknown
+  UNIQUE (bot, session_id)
+);
 ```
 
-`parent_session_id` came after the first release (#202). A store that opens a database without it adds it (`ALTER TABLE … ADD COLUMN`, under `BEGIN IMMEDIATE`) and keeps `user_version` 1: a VM keeps its database across a rollout, and an older zab, after a rollback, still opens it, reading and writing rows by column name. `message_edits` came later still (#757), and is created the same way (`CREATE TABLE IF NOT EXISTS`): an older zab never reads it. `message_finals` came after it (#806), created the same way. It is a table of its own and not a column of `message_edits`, because #757's zab writes `message_edits` rows by position: with a fifth column, a rollback to it would fail every edit-count write, and so every edit. A row of `message_finals` without its `message_edits` row, which #757's zab leaves when it forgets a message after a rollback, is deleted at each start. Columns are named in every write since #806, so that a later column breaks no rollback to it. The rows of `message_edits` are bounded: a bot keeps one for each of the 4096 messages it edited last, and deletes a turn's status message's row once the turn's end is confirmed and its answer delivered. A store write that fails can leave one row more: the 4096 holds at each start, when the bot trims its rows, and within a process a bot may hold 4096 plus one row per failed write (§4.9).
+`parent_session_id` came after the first release (#202). A store that opens a database without it adds it (`ALTER TABLE … ADD COLUMN`, under `BEGIN IMMEDIATE`) and keeps `user_version` 1: a VM keeps its database across a rollout, and an older zab, after a rollback, still opens it, reading and writing rows by column name. `message_edits` came later still (#757), and is created the same way (`CREATE TABLE IF NOT EXISTS`): an older zab never reads it. `message_finals` came after it (#806), created the same way. It is a table of its own and not a column of `message_edits`, because #757's zab writes `message_edits` rows by position: with a fifth column, a rollback to it would fail every edit-count write, and so every edit. A row of `message_finals` without its `message_edits` row, which #757's zab leaves when it forgets a message after a rollback, is deleted at each start. Columns are named in every write since #806, so that a later column breaks no rollback to it. `jobs` and `job_posts` came after it (#655), created the same way: an older zab never reads them. The rows of `message_edits` are bounded: a bot keeps one for each of the 4096 messages it edited last, and deletes a turn's status message's row once the turn's end is confirmed and its answer delivered. A store write that fails can leave one row more: the 4096 holds at each start, when the bot trims its rows, and within a process a bot may hold 4096 plus one row per failed write (§4.9).
 
 ### 6.3 Invariants
 
@@ -1052,7 +1114,7 @@ Approvals come only from backends that declare `capabilities.approvals` (Codex i
 
 ### 7.7 Stopping
 
-- `!stop`, or 🛑 on the status message, calls `backend.interrupt(session)`.
+- `!stop`, or 🛑 on the status message, calls `backend.interrupt(session)`. Neither stops a background job: `!stop NAME` and `!stop jobs` do (§7.14).
 - The status message immediately shows "⏹ stopping…".
 - If no `TurnCompleted` arrives within 30 s, the bridge marks the turn `interrupted` itself, posts a warning, and sets the session state to `error`. A later `!status` probes the backend and clears the error once the backend reports the session idle.
 - **With no turn of the session running** (#847), `!stop` calls `backend.stop_subagents(session)` when `capabilities.stop_subagents` is on (Codex, §8.4): a turn can end while a sub-agent it spawned runs on (§8.5), and its answer would never be posted. The backend stops those sub-agents without loading or resuming the session, and the bot says how many it stopped. Codex finds them among the daemon's loaded threads (§8.4), which hold every running sub-agent, one started before the bridge's last restart included (#858). A backend that can't rule one out, because it can't see them all or a look failed in part after it stopped some, reports `unseen`, and the bot adds that not every one could be checked; with none stopped it then says that no sub-agent the bridge saw start is running, never that none was, and unmentioned that zero is gated like any other (§4.6). Codex reports `unseen` only for a look that failed in part (Codex round 2 on #861). When it stopped none of a thread it started, the bot answers "No turn is running, and no sub-agent was"; a backend that couldn't stop or check every one, and stopped none, raises, and the bot says that one may still run. A turn the core doesn't drive, such as a terminal client's on a thread it loaded (§8.6), may run on the session: its sub-agents are that turn's, so the backend stops nothing and raises `TurnElsewhere`, and the bot says that a turn started outside Zulip is running there. Claude has no such hook: a background sub-agent belongs to its turn's process, which runs until the sub-agent ends or the CLI stops it (§9.7), so it is stopped as a running turn, and with no turn running `!stop` answers "No turn is running". Never "Unknown command". Unmentioned, §4.6 says which bot answers.
@@ -1376,6 +1438,369 @@ running turn goes on, and kept out of every history.
 - **Earlier side questions** are not replayed: each is answered alone, unlike `/btw`, which shows
   the newest 20. Turning a side answer into a fork (`/btw`'s `f`) is `!fork`'s job.
 
+### 7.14 Background jobs (issue #655)
+
+A turn ends when the agent sends its final answer, and what it left running in the background
+either stops or runs on unreported: `-p` stops Claude Code's background commands, and the
+bridge kills the turn's process group 5 s after the CLI exits (§9.6, §9.7); a Codex exec
+command may run on until its thread unloads, and nothing reports its end (DECISIONS, 2026-10-07
+and 2026-11-05). So an agent that waits on a
+long computation stays in its turn and polls it, and a message sent meanwhile waits for its next
+step (#653). A **background job** is a command that outlives its turn, supervised by zab: the
+agent starts it with `zab job start` and ends its turn; `!status` and `!vm` list it; when it ends,
+zab posts in the topic and starts a turn for the agent to report on it (D44).
+
+**Starting one.** The agent runs, as any command:
+
+```sh
+zab job start --name rank-search -- python3 -u search.py --bound 1e7
+zab job start --name build --no-report -- lake build
+zab job list [--all]        # this session's jobs; --all: the machine's
+zab job status NAME         # state, times, exit status, the log's path and its last 20 lines
+zab job log NAME [-n N]     # the log's last N lines (default 100)
+zab job stop NAME
+```
+
+- **The name** matches `^[a-z0-9][a-z0-9-]{0,31}$`, isn't `jobs` (`!stop jobs`, below), and is
+  unique among the session's running jobs; `status`, `log` and `stop` take the session's newest
+  job of that name. The session is `ZAB_SESSION` (§5.6); the jobs started without it share one.
+- **The command** is everything after `--`: an argument list, run without a shell. A pipeline is
+  the agent's own `bash -c '…'`, as in any of its tool calls. Its stdin is `/dev/null`, so a
+  `gp`, GAP or Magma left at its prompt gets EOF instead of waiting (D34); its working directory
+  is the caller's; its environment is the caller's, less the API-key and nesting variables that
+  Claude's turns drop (§9.1; `SCRUBBED_ENV` and `NESTING_ENV` in `zab.backends.claude`) and any
+  whose name contains `TOKEN`, `SECRET`, `KEY` or `PASSWORD`, ignoring case.
+- **No sudo inside a job:** its unit has `NoNewPrivileges=yes` (below), so `sudo` and every other
+  setuid program fail in it. The agent installs what a job needs before `zab job start`.
+- **What `start` prints:** the name, the log's path and the limits, then, for a job attached to
+  a topic (below), "zab will post in this topic when it ends and start a turn for you to report
+  on it. You can end your turn now." (with no report turn due: "zab will post in this topic when
+  it ends."). It waits 3 s first, so that a command that fails at once (a typo, a missing file)
+  is reported there, with its exit status and the log's end, and `start` exits 1; the job then
+  counts as `seen` (below). Whether the job is attached, `start` decides once, by the rule of
+  *Which topic it belongs to* (below), reading the bridge's store read-only as `zab status` does,
+  and records it in `job.json`; for a job that isn't, it promises nothing and prints "This job is
+  unattached (…): nothing will be posted about it, and no turn will start.", and starts it all
+  the same.
+- **It refuses** in one line, exits 2 and starts nothing: inside a background job ("zab job start
+  can't run inside a background job: start the next one from a turn."), which it reads from its
+  own `/proc/self/cgroup`, a path under `zab-jobs.slice`, not from an environment variable that a
+  job could unset (a job would have to move its own processes out of the slice on purpose); when
+  `[jobs] max_running` jobs already run on the machine (below), when the filesystem of
+  `<state_dir>` or of the working directory is 90% full or more, for a name that is invalid or
+  already running in the session, when `max_running` is 0 (jobs off), where it can't write
+  `<state_dir>/jobs/`, and where no systemd user manager answers `systemd-run --user` (not Linux;
+  a user without lingering). The count and the start run under one file lock,
+  `<state_dir>/jobs/.lock`.
+- **Codex's sandbox.** Jobs are tested only under `danger-full-access`, which the workshop VMs
+  use (§5.3). Under `workspace-write`, a personal config's default, which allows writes in the
+  workspace only, `zab job start` may be refused or may not reach the user manager: untested
+  (#655 V5).
+- **Its config** is the bridge's (§5.1): `state_dir` and `[jobs]`. It sets
+  `XDG_RUNTIME_DIR=/run/user/<uid>` when the caller's environment lacks it, so it works from a
+  Codex exec session whatever Codex's environment policy passes: `systemd-run --user` works
+  without `DBUS_SESSION_BUS_ADDRESS`, but not without both ("Failed to connect to bus: No medium
+  found"). Both agents' turns had both on the test VM (#655 V1).
+
+**Where it runs.** A transient service of the user's systemd manager, started with an argument
+list built only from values zab makes itself:
+
+```sh
+systemd-run --user --unit=zab-job-<id> --slice=zab-jobs.slice --collect --quiet \
+  --property=RuntimeMaxSec=<max_hours × 3600> --property=OOMScoreAdjust=500 \
+  --property=Nice=10 --property=NoNewPrivileges=yes --property=TimeoutStopSec=15 \
+  --property=MemoryAccounting=yes --property=CPUAccounting=yes \
+  --property="ExecStopPost=<zab> job _ended <dir>" -- <zab> job _exec <dir>
+```
+
+`<id>` is 12 random hex digits, `<zab>` zab's own executable, by absolute path, and `<dir>` the
+job's directory, `<state_dir>/jobs/<id>`, resolved to an absolute path by `start`. Both helpers
+get `<dir>` on their command lines, as an argument and never in a shell string, and never read
+the config to find it: a service of the user manager doesn't inherit its caller's environment,
+so a `ZAB_CONFIG` that chose another `state_dir` wouldn't reach them, and a config changed during
+the job can't move it. systemd parses `ExecStopPost=` itself (word splitting, `$` and `%`
+expansion), so `start` refuses a `<dir>` of other characters than letters, digits and `._/+-`.
+
+- **A service, not a scope.** A scope keeps its caller as the parent: the turn's shell, in the
+  turn's process group and in the bridge's or the Codex daemon's cgroup. The user manager forks a
+  service, outside all of them, so it survives the turn's end, the bridge's 5 s grace, `-p`'s
+  wind-down, `!stop`, a bridge restart and `!restart codex`. On the test VM (#655 V1, V4, V5),
+  from a Claude turn's `Bash` and from a Codex exec session alike, `systemd-run` returned in
+  about 10 ms, the unit ran outside the turn's cgroup, process group and session, and it ran on
+  after the turn, a restart of `zab.service` and one of the Codex daemon, with no background note
+  in Claude's answer. Its cgroup holds everything it spawns, `setsid` children included, so
+  stopping the unit stops the whole job, which killing a process group can't promise.
+- **`zab job _exec <dir>`** reads `<dir>/job.json`, changes to the job's working directory, sets
+  its environment, runs its argument list with no shell, copies stdout and stderr to the log, up
+  to 1 GiB (then one line saying that the rest was dropped), and exits with the job's status. The
+  agent's arguments, working directory and environment never reach systemd, which can expand
+  `$VAR` in a command line.
+- **`zab job _ended <dir>`** runs as `ExecStopPost`, however the job ended, and writes
+  `<dir>/ended.json`: systemd's `$SERVICE_RESULT`, `$EXIT_CODE` and `$EXIT_STATUS`, the boot id, the
+  user manager's state (`systemctl --user is-system-running`, an argument list), and a copy of
+  `stopped.json` where there is one, so that the watcher reads one file. What systemd 255 gives
+  (`EXIT_CODE`/`EXIT_STATUS`/`SERVICE_RESULT`, #655 V3), and what the end post says:
+  - `exited`/0/`success`: finished, exit 0. `exited`/N/`exit-code`: failed, exit N;
+  - `killed`/SIG/`signal`: killed by that signal;
+  - `killed`/TERM/`timeout`: the cap, `max_hours`;
+  - `killed`/KILL/`oom-kill`: out of memory, with the slice's `MemorySwapMax=0` (below);
+  - a stop: `killed`/TERM/`success`, or `killed`/KILL/`timeout` for one that ignored SIGTERM for
+    `TimeoutStopSec` (15 s: `zab job stop`, `!stop NAME` and the cap each give a job that long
+    between SIGTERM and SIGKILL), which reads like the cap. Only `stopped.json` tells them apart, so whoever
+    stops a job writes it before asking systemd (`!stop NAME`, `zab job stop`; below). A stop
+    without it (a `systemctl --user stop` typed by hand) is "was killed by signal SIGTERM";
+  - an end while the manager is `stopping`, a VM stop or reboot shutting the manager down
+    cleanly: the job is `lost`, as one with no `ended.json` is (*Restarts, wakes and boots*). On
+    an EC2 stop of the test VM, a job's `ExecStopPost` ran during the shutdown, in the boot being
+    stopped, and saw the manager `stopping`, the job ending `killed`/TERM/`success` (#655 V3).
+- **The slice** `zab-jobs.slice` holds every job (§13.3). All of them together get at most
+  `[jobs] max_memory_percent` of the memory and no swap (`MemorySwapMax=0`), `CPUWeight=50` and
+  4096 tasks. With `OOMScoreAdjust=500` the kernel kills a job before the bridge, an agent or a
+  Lean server; with `Nice=10` and the weight, the bridge and the agents stay responsive while
+  jobs keep every CPU busy.
+- **As the bridge's user**, with no new privilege: only the user manager is involved, with no
+  sudo, no system unit and `NoNewPrivileges=yes`. On the workshop VMs `agent` already has
+  passwordless sudo (D22), and zab adds nothing to it. Lingering, which `zab service install`
+  turns on (§13.1), keeps the manager running without a login.
+
+**What zab keeps.** A directory per job, `<state_dir>/jobs/<id>/`, mode 0700, holding:
+
+- `job.json`, mode 0600, `schema: 1`: the id, the name, the bot (`ZAB_BOT`), the session
+  (`ZAB_SESSION`), `attached` (the session's id when `start` attached the job, else null; below),
+  the argument list, the directory, the environment, the start time, the boot id, `report` and
+  `max_hours`. A rollout during a job leaves it the old install's `_exec`, and
+  its `_ended` comes from the new one, which reads the file by its `schema`;
+- `output.log`;
+- `stopped.json` (who: `!stop` or the agent; and when), written before a person (`!stop NAME`,
+  `!stop jobs`) or the agent (`zab job stop`) asks systemd to stop the job, and removed again if
+  the stop fails or the unit wasn't running;
+- `ended.json`, once it has ended (above);
+- `seen`, once `zab job status`, `log` or `list` showed the agent that it had ended (below).
+
+The bridge deletes a job's directory 14 days after the job ended. The agents' instructions tell
+them to copy results into the repository.
+
+**Which topic it belongs to.** A job is **attached** when, at its start, `ZAB_SESSION` names a
+session of `ZAB_BOT`'s bot in the bridge's store, not detached, with a turn running. `start`
+decides it, and records the session's id in `job.json` (`attached`). The attachment holds for the
+job's life: the watcher takes the record after checking that the session is that bot's and that
+a turn of it was running at the job's start, and a `!detach` meanwhile changes only the report
+turn (below), never the end post, which goes to the session's topic, at its card's location.
+Otherwise the job is **unattached**: it runs and DM `!vm` lists it, but nothing is posted about
+it and no turn starts. That covers a `zab job start` typed in a terminal,
+one from a terminal client's turn on a bridged Codex thread (§8.6), a Codex thread loaded before
+the upgrade, which runs without `ZAB_SESSION`, and one reopened for another session, which keeps
+the old value (§5.6). The store records the jobs the bridge has seen (`jobs`, §6.2).
+
+**A job's first seconds.** Until the watcher's next pass makes a job's row (up to 10 s), topic
+`!status` and `!stop` (`!stop NAME`, `!stop jobs`, and the line `!stop` adds) take a job from
+`job.json`'s `attached` and its running unit (`list-units`), each job once, so that it is never
+"not running" just after it started; the store gets its row from the pass, which reads a stop
+made meanwhile as a stop. The watcher alone decides the end post (above).
+
+**How `!status` and `!vm` list them.**
+
+- **Topic `!status`** adds the session's jobs running or ended in the last 24 hours: the newest
+  10 running ones, then the newest 10 ended ones, each with a last line for the rest, so that a
+  busy day still fits one message. A job's name is written as `zab job start` takes it, or else
+  as a safe code span (`presentation.code`):
+  ```text
+  ⚙️ Job `rank-search` · running since <time:2026-11-21T14:02:00Z> · log `/home/agent/.local/state/zab/jobs/3f9c2a7b1d4e/output.log`
+  ⚙️ Job `build` · finished: exit 0 after 41 min · ended <time:2026-11-21T13:20:00Z>
+  … and 12 more ended in the last 24 hours
+  ```
+- **Topic `!vm`** counts the machine's running jobs in its status line, after the turns: "1 turn
+  running · 2 jobs running · up 2 hours · …" (§13.5).
+- **DM `!vm`**, where the bridge answers it, lists the machine's running jobs after its
+  processes: each one's name, its topic as a link ("no topic" for an unattached one), its start
+  and its memory (the unit's `MemoryCurrent`). Never a command line, as in channel replies. Where
+  the sentinel answers DM `!vm` (§13.5), as on the workshop VMs, it lists them too, with their
+  start and memory but without topics, which are in the bridge's store: it reads them from the
+  job directories and systemd, so that it works with the bridge down.
+- **DM `!status`** gives each bot's count of running jobs, its unattached ones included.
+
+**When a job ends.**
+
+1. **Detection.** A watcher, one task per bridge process (`Runtime`) like the Lean reaper
+   (§7.12), reads `<state_dir>/jobs/` every 10 s and finds each new `ended.json`. A job whose unit
+   is gone with no `ended.json` a minute later ended in a way zab can't tell (its `_ended` never
+   ran). At its start, the watcher marks the jobs of an earlier boot that a VM stop cut off
+   `lost` (*Restarts, wakes and boots*), and handles
+   the ends it missed while the bridge was down, once each, as the store records.
+2. **The end post.** One new message in the session's topic, at its card's location (§4.4): a
+   bridge note (§4.9), never edited, mentioning the job's **owner**, the sender of the message
+   that started the turn the job started in (§4.8); a post for several jobs mentions each of
+   their owners once:
+   ```text
+   🔧 **Bridge** (not Claude): @**Alice** background job `rank-search` finished: exit 0 after 2 h 13 min. Claude will report on it.
+   ```
+   The other endings are ⚠️ notes: `failed: exit 1`, `was killed by signal SIGKILL`, `reached
+   its 12-hour limit and was stopped`, `ran out of memory and was stopped`, `was cut off when the
+   VM stopped` and `ended, but zab couldn't tell how`. The last sentence says what follows:
+   "Claude will report on it.", nothing when no report turn is due, or past the cap (below) "Send
+   a message to have Claude report on it."
+   - **Only zab's own words** reach Zulip: the job's name, which the pattern allows, and numbers.
+     No log and no command line.
+   - **Several jobs** of one session whose ends one pass of the watcher finds share one post, a
+     line each, and one report prompt. An end found while the report turn runs reaches it as any
+     message does (step 3).
+   - **A job that ends while the turn that started it still runs** is the agent's to see: it is
+     posted when that turn ends, unless `zab job status`, `log` or `list` showed the agent its end
+     first (`seen`). So a loop of short jobs that the agent checks posts nothing.
+   - **No end post** for an unattached job, for one the agent stopped (it did so in a turn, which
+     says so), and for one stopped with `!stop NAME` or `!stop jobs`, whose reply is its end post
+     (below).
+   - **A post that doesn't go out** (its card unconfirmed, §4.4; Zulip refusing it; an outcome
+     unknown) is tried again at about 1, 3, 7, 15 and 31 minutes, never once a pass (#754), then
+     dropped with a log line within the hour. Its tries are counted in the store before each
+     goes out (`job_posts`, §6.2), so that they survive a restart; a send whose outcome isn't
+     known is first looked for, by the tag it carried, and isn't sent again if found.
+3. **The report turn** (on by default, D44). The end post becomes a message to the session from
+   the job's owner, whose text is Appendix A.3's prompt, delivered as `!handover` delivers its
+   own (§7.3): with the session idle, a turn starts (👀 on the end post); with a turn running, the
+   prompt is steered into it (↪️, then ✅ when the agent takes it in), or held (⏳) for after it
+   (§7.5). Only the post, with no report turn, for a job started with `--no-report`, under
+   `[jobs] report = false`, for a session detached since the job started, and for a job lost at
+   boot, whose note
+   (Appendix A.3) waits for the next turn a person's message starts (below), so that the agent
+   learns of it.
+   - **Never lost to a crash:** the prompt's pending delivery (which a restart delivers again,
+     as any message's), or its note, is written in the transaction that marks the jobs' ends
+     handled, so both commit or neither does; a failed write leaves the end for the post's next
+     try, which first looks for a send that may have landed (best effort, as above) and doesn't
+     send again if it finds it. The prompt goes to the
+     session once that transaction has committed (Codex round 2 on #970).
+   - **One message per end post:** a post that carries several jobs may be found landed for
+     some of them on one try, and for the rest on a later one (the others' records didn't read
+     at the first). The session takes one message per id, and drops a second with the post's
+     id, so a later part's prompt, when one is due, waits as a note (below) if the post's
+     message is pending already or the session has taken it (Codex round 3 on #970). It goes to
+     the session with the post's id otherwise: when the earlier parts delivered no prompt
+     (their jobs `--no-report`, or past the cap), or theirs reached a session that took no turn
+     and waits as a note itself. So no job's report is dropped or given twice: one that waits
+     comes with the next turn a person's message starts, and the watcher logs it
+     (`event="job_report"`).
+   - **The cap:** at most 3 report turns in a row in a session with no message from a person in
+     between. Past it, the end post asks for a message (above), and the prompt waits the same way.
+   - **Notes that wait** (`job_notes:<session id>` in the store's `kv`, a JSON list): a lost job's
+     note, a prompt past the cap, and one whose post went to the session already (above). They
+     never start a turn: not by themselves, nor at
+     `!status`, a start of the bridge or a reopen, and they survive restarts. The next turn the
+     session starts for a person's message, a `!handover` included (a person's command, with its
+     canned text), carries them at its head, between
+     `[zab: background jobs]` and `[end of background jobs]`, before that message's text; a steer
+     doesn't, and leaves them waiting. They are passed on once, when that turn's start is
+     accepted, and a rejected start keeps them. They are not §7.5's held messages, which start a
+     turn as soon as the session is idle.
+4. **Zulip's limits** (§4.10, #754): an end post goes through the poster at the acknowledgement
+   priority; a report turn is an ordinary turn, whose status message has §4.9's bounds; nothing is
+   posted while a job runs, and an end post is never edited.
+
+The watcher logs one line per end, `event="job_ended"`, with the id, the name, the session, the
+result and the duration; never the command line, the environment or the log (§14).
+
+**Idle stop.** A running job holds its VM up, whatever its load: idle stop lists the user's active
+`zab-job-*` units, as it lists the `codex-app-server*` units, and says "stay up: 1 background job
+running" (`workshop/admin/README.md` §8). The cap is each job's own `RuntimeMaxSec`, from `[jobs]
+max_hours`, 12 by default: at the cap systemd stops the job and the end post says so, and once
+the job and its report turn have ended, the VM's timeout runs again. So a job holds its VM up for
+at most `max_hours` VM-hours. Idle stop holds to each unit's own cap too: it ignores a
+`zab-job-*` unit once it has been active for longer than its `RuntimeMaxUSec` plus 15 minutes,
+and one with no finite `RuntimeMaxUSec` (`infinity`: not a unit `zab job` made) at all, reading
+both with `systemctl --user show -p RuntimeMaxUSec,ActiveEnterTimestampMonotonic`, an argument
+list (#924). **The bound per VM** counts from the
+end of the last turn that a person's message started. A job can't start another (`zab job start`
+refuses inside a job, above), and at most 3 report turns follow one another without a person's
+message (the cap), each able to start jobs. So from then on, report turns can keep the VM up for
+at most about 3 × `max_hours`, plus the last job's `max_hours`: about 4 × `max_hours`
+VM-hours, 48 at the default 12, then the VM's idle timeout, at AWS's on-demand price of its type
+(`zab.admin.costs`). Time spent inside a turn
+isn't capped, and comes on top: a turn runs as long as its agent works, and can start and wait
+on one capped job after another meanwhile. A unit the
+agent starts itself, outside `zab job`, isn't bound by this: idle stop counts only `zab-job-*`
+units, and only within their own cap (above), so such a unit holds the VM up only through its
+load, as before.
+
+**Limits, per machine** (`[jobs]`, §5.2). There is no limit per topic or session (D44: a
+participant often works in one topic at a time).
+
+- **Count:** at most `max_running` jobs run on the machine, 4 by default: all bots and sessions
+  together, unattached ones included.
+- **Memory:** all jobs together get at most `max_memory_percent` of it, 75 by default, the
+  slice's `MemoryMax`, and no swap, its `MemorySwapMax=0`. On the test VM, which has 8 GB of
+  swap, a job past `MemoryMax` alone was swapped out and ran on, slowing everything else: at a
+  256 MB limit it sat at 267 MB resident and 825 MB of swap until stopped a minute later; with
+  `MemorySwapMax=0` it was oom-killed in 0.3 s (#655 V2). A job past it ends with `oom-kill`,
+  and the bridge, the agents and their Lean servers run on.
+- **CPU:** `CPUWeight=50` and `Nice=10`. **Tasks:** 4096, all jobs together. **Time:**
+  `max_hours` each.
+- **Disk:** `zab job start` refuses at 90% full, and a log stops at 1 GiB.
+
+**Restarts, wakes and boots.**
+
+- **A bridge restart** (`!restart`, a rollout, the watchdog, a crash) and **`!restart codex`**:
+  jobs run on, outside both units. At its start, the watcher handles any end it missed.
+- **A VM stop, reboot or wake:** jobs die with the VM. A clean shutdown stops the user manager,
+  which stops each job and runs its `_ended` while the manager is `stopping`; a crash runs none.
+  A job then gets about 5 s between SIGTERM and SIGKILL, not 15: Ubuntu's
+  `user@.service.d/timeout.conf` gives the manager `TimeoutStopSec=5`, with `KillMode=mixed`.
+  At its start, the watcher marks each job of an earlier boot (by `job.json`'s boot id) `lost`
+  whose `ended.json` is missing or says it ended while the manager was `stopping`, and posts "was
+  cut off when the VM stopped", with no report turn: its note waits for the next turn a person's
+  message starts (*Notes that wait*). **zab never restarts a job:** running one twice may
+  not be safe. The agent and its user decide, and the instructions ask the agent to write
+  checkpoints. Idle stop never stops a VM while a job runs, so a lost job comes from a person's
+  stop, a reboot or an AWS event. The waker doesn't change.
+
+**`!stop` and `!restart`** (D44).
+
+- **`!stop` and 🛑 stop the turn only;** jobs run on. Where the session has running jobs, the
+  bot's answer to `!stop` (with a turn running, a line of its own) adds: "Background job
+  `rank-search` keeps running: `!stop rank-search` stops it, and `!stop jobs` stops all of this
+  topic's jobs."
+- **`!stop NAME` and `!stop jobs`** stop this bot's running jobs in this topic. NAME must match the
+  pattern and name a running job of the session; the bot then writes `stopped.json` and runs
+  `systemctl --user stop zab-job-<id>.service`, an argument list, which stops the job's whole
+  cgroup, its `setsid` children included (#655 V3), and returns once its `_ended` has run; if the
+  stop fails, or the unit wasn't running, it removes `stopped.json` again. No report turn
+  starts. The reply, once the units have stopped, is the end post, with no mention: "⏹ Stopped
+  background job `rank-search` after 41 min." Without such a job: "No background job `NAME` is
+  running here." Unmentioned, §4.6 says which bot answers.
+- **The sentinel's `!restart`, and `!restart codex`:** jobs survive, and both replies say
+  "background jobs keep running" (§13.5).
+- **`!detach`:** jobs run on, attached as they were at their start, and their ends are posted in
+  the topic, with no report turn.
+- **The agent** stops a job with `zab job stop NAME`, which writes `stopped.json` first the
+  same way.
+
+**The cost on the participants' plans.** A running job costs the plan nothing: it is a process on
+the VM. A report turn costs about one short message: the conversation is read again, by then
+usually past the prompt cache's life, and the log's end. Waiting in the turn instead costs one
+model call every 30 to 50 s: 150 to 240 for a 2-hour job. The bounds: one report turn per end,
+with ends combined; at most 3 in a row; `--no-report`. The instructions tell the agent to say that
+a report turn uses the plan.
+
+**Security** (§12.1).
+
+- **No shell strings:** the argument list goes into JSON, then to `subprocess` with no shell;
+  `systemd-run`'s arguments hold only zab's path, the id and numbers from the config; Zulip text
+  never starts a job; `!stop NAME` runs `systemctl` with an argument list, after the checks above.
+- **No new privilege** (above). `job.json` is mode 0600, its environment scrubbed, and it is never
+  posted or logged.
+- **What reaches Zulip:** the job's name and numbers. The log reaches only the agent, which reads
+  it with its own tools (Appendix A.3).
+- **Another topic:** a stale or wrong `ZAB_SESSION` doesn't make zab post elsewhere: the session
+  must be the bot's own and have had a turn running at the job's start. That guards against
+  mistakes, not against a prompt-injected agent, which runs as the bridge's user and can write
+  any job's files, as it can read the bot's zuliprc (§12.2). A job's processes are the agent's,
+  as its tool calls are, and zab reads no credential file.
+
+**Not yet:** a `jobs` column in
+`status.py`, for the organizers' `!status` and the console; `final_sync.py` and `!retire`
+reporting running jobs; per-job CPU in DM `!vm`; `zab job wait NAME --timeout 50`, for polling
+within a turn; an `admin.toml` key for a workshop's cap. Out of scope: a job that survives a VM
+stop (checkpoints are the agent's), scheduled or recurring jobs, and jobs across machines.
+
 ## 8. Codex backend
 
 The reference is the app-server README for the pinned Codex version, together with its generated schema (§8.3). Every method and notification name below comes from that README. Treat the parameter details as **VERIFY**.
@@ -1656,7 +2081,7 @@ env: CLAUDE_CONFIG_DIR=<account dir> (left unset for the default `~/.claude`, se
      removed: the API-key, token and provider variables (ANTHROPIC_API_KEY,
      ANTHROPIC_AUTH_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_BASE_URL, CLAUDE_CODE_USE_BEDROCK,
      …), CLAUDE_CODE_EFFORT_LEVEL and the nested-session markers;
-     set: the commit identity and ZAB_BOT (§5.5, §5.6), and
+     set: the commit identity, ZAB_BOT and ZAB_SESSION (§5.5, §5.6), and
      ENABLE_CLAUDEAI_MCP_SERVERS=false unless `claudeai_connectors = true`
 cwd: <workspace>
 claude -p --output-format stream-json --verbose --permission-prompts none
@@ -1755,7 +2180,7 @@ The process group id of a running turn is reported to the core, which stores it 
 
 With `[backends.claude] steer = true`, the default (D25; the key was added off by default in the amendment of Fri Oct 9, issue #36), a turn takes its prompt as `--input-format stream-json` and keeps stdin open, `capabilities.steer` is true, and a message that arrives during the turn is written to stdin (↪️). stdin closes once the CLI has taken in every message written (`--replay-user-messages`) and no background sub-agent runs; later messages are held (§7.5). The texts of all the turn's results are posted in order (DECISIONS, 2026-10-09).
 
-**A background sub-agent** (the Agent tool with `run_in_background`; `background_tasks_changed` lists it as a `local_agent` task) outlives the `result` of the loop that started it: the CLI waits for it, and its notification starts a further loop with its own `result` (DECISIONS, 2026-10-25). Until then stdin stays open (#660), so a message sent meanwhile gets a loop of its own and is answered before the sub-agent ends. While only a sub-agent keeps the turn going, stdin closes 10 minutes after the last `result`, and then the CLI's own wait applies: 2.1.283 waits another 10 minutes at most, then stops the sub-agent (DECISIONS, 2026-11-05). A background command (`local_bash`) keeps nothing open: `-p` stops it at the end. `!stop` signals the turn's process group, which holds its sub-agents too, and a turn stopped after one of its `result`s is `INTERRUPTED` (§9.6).
+**A background sub-agent** (the Agent tool with `run_in_background`; `background_tasks_changed` lists it as a `local_agent` task) outlives the `result` of the loop that started it: the CLI waits for it, and its notification starts a further loop with its own `result` (DECISIONS, 2026-10-25). Until then stdin stays open (#660), so a message sent meanwhile gets a loop of its own and is answered before the sub-agent ends. While only a sub-agent keeps the turn going, stdin closes 10 minutes after the last `result`, and then the CLI's own wait applies: 2.1.283 waits another 10 minutes at most, then stops the sub-agent (DECISIONS, 2026-11-05). A background command (`local_bash`) keeps nothing open: `-p` stops it at the end. Work meant to outlive the turn is a background job (§7.14), outside the turn's process group. Two other tools of 2.1.283 don't fit `-p` (#655 V4): `Monitor` holds the turn open until its event, then wakes the agent within the same turn, and `ScheduleWakeup` never fires, since the process has exited. The agents' instructions steer Claude away from `ScheduleWakeup` under zab, and from `Monitor` for waiting on a job or on anything longer than a few minutes; what bounds a `Monitor`'s wait under `-p` is **VERIFY**, #655 V4. `!stop` signals the turn's process group, which holds its sub-agents too, and a turn stopped after one of its `result`s is `INTERRUPTED` (§9.6).
 
 With `steer = false`, `capabilities.steer = false` and a turn runs as it did before steering: the core holds messages that arrive during a turn and coalesces them (§7.5).
 
@@ -1778,7 +2203,7 @@ With `steer = false`, `capabilities.steer = false` and a turn runs as it did bef
 workspace, on its account:
 
 ```
-env: as a turn's (§9.1), without the commit identity and ZAB_BOT, and with
+env: as a turn's (§9.1), without the commit identity, ZAB_BOT and ZAB_SESSION, and with
      ENABLE_CLAUDEAI_MCP_SERVERS=false whatever `claudeai_connectors` says
 claude -p --output-format stream-json --verbose --permission-prompts none
        --resume <session> --fork-session --no-session-persistence
@@ -2103,6 +2528,7 @@ Cost: a text that ends a line where a regular expression's `^` and `$` don't see
 | Shell injection | Argument lists only; no Zulip-supplied string is ever passed to a shell; no command that runs arbitrary input |
 | Unsandboxed app-server APIs | `thread/shellCommand`, `process/spawn` and `command/exec` are never used (§8.9) |
 | Credentials | The bridge never reads agent credential files. API-key variables are scrubbed for Claude (§9.1) and must be absent from the Codex daemon's environment (§8.9). |
+| A background job's end reaches the wrong topic, or its record carries secrets | The bridge attaches a job only to its bot's own session, with a turn running at the job's start (against mistakes: a prompt-injected agent can write the job's files, §12.2); only the job's name and numbers reach Zulip; its saved environment is scrubbed and mode 0600 (§7.14) |
 
 ### 12.2 Known residual risk in Phase 1
 
@@ -2151,6 +2577,7 @@ On a machine where the agent runs under its own account without sudo, real isola
 | `zab preflight [--json]` | Workshop readiness checks (§13.1). Details below. |
 | `zab history (--list-topics [--match TEXT] \| --channel C --topic T) [--limit N] [--before ID] [--bot NAME]` | An agent's read-only view of another topic, as the session's bot (§5.6, §12.2). |
 | `zab share PATH… \| --list \| --revoke LINK\|NAME` | An agent's share link: some files or folders alone, served by the file server until revoked (§10.7, #710). |
+| `zab job start [--no-report] --name NAME -- CMD ARG… \| list [--all] \| status NAME \| log NAME [-n N] \| stop NAME` | An agent's background job, which outlives its turn (§7.14). Linux, under a systemd user manager. `zab job _exec` and `_ended` are its unit's own. |
 | `zab version` | Prints the version. |
 | `waker run \| status \| selfcheck [--config PATH]` | The waker (§13.4): the package's second console script, run by its service on the waker's host. |
 
@@ -2287,6 +2714,36 @@ WantedBy=default.target
   configuration and its code only at start, and keeps no state), and `uninstall` removes it.
   `push_config.py` removes a unit zab wrote before the installed release's own `service install`
   or `uninstall`, so that a rollout of an older release, or its uninstall, leaves none running.
+- `~/.config/systemd/user/zab-jobs.slice` (issue #655) holds every background job (§7.14):
+
+  ```ini
+  [Unit]
+  Description=zab background jobs
+  [Slice]
+  MemoryMax=75%
+  MemorySwapMax=0
+  CPUWeight=50
+  TasksMax=4096
+  ```
+
+  - **Written** by `zab service install` with the other units, its `MemoryMax=` from `[jobs]
+    max_memory_percent`, followed by the manager's reload; a value changed by a reinstall
+    applies to the running slice from that reload (**VERIFY**, #655 V2). Nothing enables or
+    starts it: a job's unit starts it, and it has no `[Install]` section.
+  - **No swap.** `MemorySwapMax=0`: on the test VM, with 8 GB of swap, a job past `MemoryMax`
+    alone was swapped out and ran on, and with no swap allowed it was oom-killed in 0.3 s (§7.14,
+    *Limits*; #655 V2).
+  - **Its limits need the controllers.** The user manager delegates `memory`, `cpu` and `pids`
+    to its units, as systemd's `user@.service` does by default: on the test VM the slice's
+    `memory.max` was 75% of the memory, `cpu.weight` 50 and `pids.max` 4096 (#655 V2). Each job
+    is a transient service in it (§7.14), so `zab.service`'s `KillMode=mixed`, a bridge restart
+    and `!restart codex` never reach a job.
+  - **`uninstall`** disables the services first, then stops the slice, which stops every
+    running job (each one's `ExecStopPost` runs), and removes its file, so that it leaves
+    nothing of zab running: while the bridge stops, a turn could still start a job, and with
+    it the slice again. A stop that fails is said, with the command that finishes it, and the
+    slice's file stays, so that its jobs keep its limits and the next `uninstall` retries
+    (#930).
 - Codex 0.157.1 has its own `app-server daemon start`, which manages a daemon by PID file and advertises no foreground flag, so the unit keeps `codex app-server --listen unix://` (DECISIONS, 2026-09-27, "Daemon subcommand").
 - On macOS in Phase 1, run `codex app-server --listen unix://` and `zab run` in terminals, or under `screen`. launchd support is deferred (§18.1).
 
@@ -2455,13 +2912,16 @@ total is the better input. The disk size is the root filesystem's, to the
 nearest GB. A configured project on another filesystem adds a line labelled with
 its path. A value that can't be read shows "unavailable" instead of a bar. "GB"
 means binary gigabytes. A blank line follows; then one status line, in this
-order: running turns ("no turns running", "1 turn running"), uptime in words
+order: running turns ("no turns running", "1 turn running"), the machine's
+running background jobs when there are any ("2 jobs running", §7.14), uptime in words
 ("up 2 hours"), the agents' sign-in, merged when they agree ("Codex and Claude
 signed in", otherwise "Codex signed in · Claude not signed in"), and
 "zab <version>". The sign-in checks run alongside the collection. Channel
 replies never show process command lines; owner DMs add the processes using the
 most memory or CPU ("Using the most: `sage` 3.2 GB memory, 2.1 CPUs · …", where
-`top` would say 210%). `!usage` ends with one VM line,
+`top` would say 210%), then the machine's running background jobs, each with its name,
+its topic as a link ("no topic" for an unattached one), its start and its memory, the
+unit's `MemoryCurrent` (§7.14). `!usage` ends with one VM line,
 `VM: 0.4 of 8 CPUs · memory 10% · disk 41%`, even when backend usage is
 unavailable: the busy share of all CPUs over a `/proc/stat` sample, times their
 count (the 1-minute load average, capped at the count, where that can't be
@@ -2480,9 +2940,12 @@ queue for DMs only. Its `!vm` has the same lines and processes, then one status
 line: the bridge's state ("bridge running, last Zulip event 40 seconds ago",
 "bridge running, but no Zulip event processed for 7 minutes: send !restart"
 after 3 minutes without one, "bridge not running (failed): send !restart",
-"bridge starting"), uptime and version; it has neither turns nor sign-in, which
-a topic's `!vm` and DM `!status` give. `!restart` replies "🔄 Restarting your
-bridge: running turns will be interrupted.", runs `systemctl --user
+"bridge starting"), uptime and version; it has neither turns nor sign-in, which a topic's
+`!vm` and DM `!status` give. It lists the machine's running background jobs, with their start
+and memory but without topics (§7.14): it reads them from the job directories and systemd
+(`list-units` and each unit's `MemoryCurrent`, argument lists), never through the bridge, so
+that it works with the bridge down. `!restart` replies "🔄 Restarting
+your bridge: running turns will be interrupted; background jobs keep running.", runs `systemctl --user
 reset-failed` and `restart --no-block zab.service`, and confirms ("✅ Your bridge
 is back …") once the heartbeat file moves after systemd shows a new main
 process. Within 2 minutes without that it says the bridge is "starting again
@@ -2490,7 +2953,8 @@ but hasn't processed a Zulip event yet" when a new main process is up, and
 otherwise that the restart failed. `!restart codex` restarts the
 installed `codex-app-server*.service` units (which also ends idle Lean servers
 under the daemon at once, #249; the bridge stops each one itself after
-`[lean] reap_idle_minutes`, §7.12) and confirms with `is-active`. One restart a minute
+`[lean] reap_idle_minutes`, §7.12) and confirms with `is-active`, saying that
+background jobs keep running (§7.14). One restart a minute
 across both bots; fixed argument lists only (CONTRIBUTING.md, rule 3); each command
 logged with the sender's ID, never the text. While the organizers' hold
 `/run/zab-idle-stop.hold` is unexpired (a rollout or a final sync, which may stop
@@ -2500,8 +2964,8 @@ which for `!restart codex` says that they may be restarting Codex themselves)
 and `!vm` doesn't advise one. A command it can't carry out (a `systemctl` that
 can't be started counts as exit 126) gets a short "⚠️ … failed (…)" reply, and a
 `!vm` report that Zulip refuses for good "⚠️ Zulip refused the VM report (…)". It
-reads only the heartbeat files and the hold, and writes only its marks: idle stop
-never counts it (`workshop/admin/README.md` §8).
+reads only the heartbeat files, the hold and the job directories (§7.14), and writes only
+its marks: idle stop never counts it (`workshop/admin/README.md` §8).
 
 The bridge leaves a one-to-one DM `!vm` or `!restart` to the sentinel when the
 sentinel answers it: its mark `<state_dir>/sentinel-<bot>` (JSON: its process
@@ -2726,6 +3190,19 @@ with any other finished work and push. End your reply with a short summary, the 
 ```
 
 The last sentence names the hash and the path explicitly: with "reply with a short summary and the commit hash", haiku left the hash out in three of four live runs (2026-10-03), and the path in backticks is what the renderer turns into the permalink (§11.3).
+
+### A.3 A background job ended (issue #655)
+
+The report turn's prompt (§7.14): one line per job whose end the post reports, then the request once.
+
+```
+[zab: a background job ended] `rank-search`, started 2026-11-21 14:02 UTC in this topic (`python3 -u search.py --bound 1e7`), finished at 16:15 UTC: exit 0 after 2 h 13 min. Its log: /home/agent/.local/state/zab/jobs/3f9c2a7b1d4e/output.log (`zab job status rank-search` shows its last 20 lines).
+Read what the job left, and report the result to the user briefly, as the answer to what they asked. Start nothing new unless they asked for it.
+```
+
+- **Each line** gives the job's name, its start, its command (the argument list on one line, secrets redacted and control characters escaped, newlines included, cut at 200 characters, as a padded code span: `presentation.code`), its end as the end post words it, and its log's path.
+- **No log text.** The prompt arrives as the user's message, and a job's output is no more trusted than any tool's: the agent reads the log with its own tools, where its output is a tool result.
+- **A job lost at boot** gets no report turn. Its note, which waits for the next turn a person's message starts (§7.14, *Notes that wait*), has the same first line, ending "was cut off when the VM stopped; zab doesn't restart it. Its log: …", and no request.
 
 ## Appendix B. Message templates
 

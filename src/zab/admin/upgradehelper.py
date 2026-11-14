@@ -16,9 +16,9 @@ Keep its imports to `confighelper`, `config`, `checks` and the standard library
    `deploy.sh --downgrade` (BOOTSTRAP §13.4);
 2. `admin.toml`, through the strict loader: its `release` pattern and its `release_repo`;
 3. the fetch: exactly two tags, the release asked for and the running one, which is the review's
-   base, from `release_repo`, with the deploy key and GitHub's pinned host keys
-   (`github-known-hosts`), into the helper's own bare repository (`repo.git`, root 0700), under
-   `refs/fetched/`;
+   base, from `release_repo`, into the helper's own bare repository (`repo.git`, root 0700),
+   under `refs/fetched/`: over SSH with the deploy key and GitHub's pinned host keys
+   (`github-known-hosts`), or from a public repository over HTTPS, anonymously (#959);
 4. the checks of deploy.sh's `verify_tag`, made here again: an annotated tag of a commit, signed
    by a key of `allowed_signers`, whose own `tag` header is the name asked for, a name the
    `release` pattern allows, and a `pyproject.toml` of that version; that the release is newer
@@ -90,7 +90,13 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
-from zab.admin.config import AdminConfig, AdminConfigError, parse_admin_config
+from zab.admin.config import (
+    RELEASE_REPO_FORMS,
+    RELEASE_REPO_HTTPS,
+    AdminConfig,
+    AdminConfigError,
+    parse_admin_config,
+)
 from zab.admin.confighelper import Refused, take
 
 USER = "zab-admin"  # who writes the requests
@@ -115,6 +121,15 @@ SIGNATURE = "\n-----BEGIN SSH SIGNATURE-----\n"
 REST = "\n==== The rest ("
 POLICY = "workshop/adminserver/render_policy.py"
 KNOWN_HOSTS = "workshop/adminserver/github-known-hosts"
+#: An HTTPS fetch that GitHub answered as it answers an anonymous reader of a private repository,
+#: or of none (401: git then asks for a user name, and can't): that form reads a public
+#: repository alone (#959). Only that answer gets the hint, never a timeout, DNS or TLS failure
+#: (#976's review, N2).
+ANONYMOUS_401 = "could not read Username for 'https://github.com'"
+HTTPS_HINT = (
+    "; over HTTPS, release_repo must be a public repository: a private one takes the SSH form "
+    "and the deploy key (BOOTSTRAP §13.4)"
+)
 FETCHED = "refs/fetched"  # the remote's tags as last fetched; refs/tags/, the verified ones
 DEPLOYS = "deploys.jsonl"  # under /opt/zab-admin: deploy.sh's record of each install
 GIT_SECONDS, REVIEW_SECONDS = 300, 600
@@ -358,7 +373,8 @@ def ssh_command(job: Run) -> str:
     if not os.path.isfile(job.paths.key):
         raise Refused(
             f"no deploy key at {job.paths.key}: a deployer makes it, and adds its .pub to "
-            "release_repo's deploy keys, read-only (BOOTSTRAP §13.4)"
+            "release_repo's deploy keys, read-only; a public repository needs none by its "
+            "https://github.com/ address (BOOTSTRAP §13.4)"
         )
     if not os.path.isfile(hosts):
         raise Refused(f"no {KNOWN_HOSTS} in the running release")
@@ -377,18 +393,35 @@ def ssh_command(job: Run) -> str:
 def fetch(job: Run, url: str, names: tuple[str, ...]) -> None:
     """Exactly `names`, tags, from `url`, into `refs/fetched/`: each forced there, so that it
     holds the remote's tags as they are now; the server's own `refs/tags/` takes a tag only once
-    it has verified, and never moves it (`adopt`)."""
-    protocol = "file" if job.paths.fetch_url else "ssh"
+    it has verified, and never moves it (`adopt`). Over SSH with the deploy key (`ssh_command`);
+    or, for `release_repo`'s HTTPS form, a public repository (#959), anonymously: no key, no
+    credential helper and no prompt, the system's CA certificates, and no HTTP redirect
+    followed. That doesn't pin the repository: GitHub serves a renamed or transferred one under
+    its old name with no redirect at all, over either transport (#976's review, N3). The
+    signatures, checked against allowed_signers whatever the transport or repository
+    (`verify`), are what the server trusts."""
+    if job.paths.fetch_url:
+        protocol = "file"
+    elif url.startswith(RELEASE_REPO_HTTPS):
+        protocol = "https"
+    elif url.startswith("git@github.com:"):
+        protocol = "ssh"
+    else:  # the loader takes no other form (RELEASE_REPO); never quoted, as it doesn't
+        raise Refused(f"release_repo is not one of {RELEASE_REPO_FORMS}")
     setting = ["-c", "fetch.fsckObjects=true", "-c", "transfer.fsckObjects=true"]
     setting += ["-c", "protocol.allow=never", "-c", f"protocol.{protocol}.allow=always"]
     if protocol == "ssh":
         setting += ["-c", f"core.sshCommand={ssh_command(job)}"]
+    if protocol == "https":
+        setting += ["-c", "credential.helper=", "-c", "http.followRedirects=false"]
+        setting += ["-c", "http.sslVerify=true"]
     specs = [f"+refs/tags/{name}:{FETCHED}/{name}" for name in names]
     flags = ["--quiet", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules"]
     try:
         git(job, *setting, "fetch", *flags, url, *specs)
     except Refused as exc:
-        raise Refused(f"the fetch of {', '.join(names)} from {url} failed: {exc}") from None
+        hint = HTTPS_HINT if protocol == "https" and ANONYMOUS_401 in str(exc) else ""
+        raise Refused(f"the fetch of {', '.join(names)} from {url} failed: {exc}{hint}") from None
 
 
 def verify(
@@ -576,14 +609,17 @@ def sanitized(data: bytes) -> list[str]:
     """`data`'s lines as deploy.sh's `sanitize` shows them (review of #893, N-a): split on `\n`
     alone, as `perl -n` splits, so that CR, VT, FF, NEL and U+2028/U+2029 stay in their line,
     shown, and never start one (a `## ` after a U+2028 is no heading); a line that is not UTF-8
-    with each byte above 0x7F as `<XX>`; then `shown`."""
+    with each byte above 0x7F as `<XX>`; then `shown`. An encoded surrogate (`ED A0 80`) is
+    decoded, as perl's lax `utf8::decode` decodes it, so that both show `<U+D800>` (#963's
+    review, B1). Perl also decodes code points above U+10FFFF, and `sanitize` then passes their
+    bytes through raw; here such a line stays undecoded, its bytes shown as `<XX>`."""
     lines = data.split(b"\n")
     if lines[-1] == b"":
         lines.pop()  # a final newline ends the last line; it doesn't start another
     out = []
     for raw in lines:
         try:
-            line = raw.decode("utf-8")
+            line = raw.decode("utf-8", "surrogatepass")
         except UnicodeDecodeError:
             line = "".join(f"<{b:02X}>" if b > 0x7F else chr(b) for b in raw)
         out.append(shown(line))

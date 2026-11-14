@@ -1,5 +1,290 @@
 # Changelog
 
+## 0.2.20
+
+What is new since 0.2.19: background jobs that outlive a turn, with a post and a report turn when
+one ends, idle stop held off while one runs, and `!stop NAME` (#655); the admin server's first
+in-band upgrade, `!upgrade-server`, which installs this release (#569); the VMs' trust fix as an
+approved plan, `!trust-fix` (#992); `release_repo` by a public repository's HTTPS address, fetched
+anonymously (#959); root's helpers without Unix sockets (#896); an answer to a `!new` where the
+agent has a session already (#985); `deploy.sh --review`'s push chained behind `tag -v` (#968),
+and its bundle fetch without git maintenance (#933); end-to-end timings that count the rig's own
+Zulip outage (#943); and documentation. Each change cites its issue and then its pull request.
+
+**Upgrade notes.**
+
+- **This release is the first one deployed in-band** (#569; ADMIN §1.6, BOOTSTRAP §13.4), on a
+  server that runs 0.2.19 with `release_repo` set, as 0.2.19's notes describe. Review it with
+  0.2.19's own `deploy.sh --review <commit> --since v0.2.19`. Once its signed tag is in
+  `release_repo` (for the public repository, once the release is published there), send
+  `!upgrade-server v0.2.20 sha256=<the review's SHA-256>` to the global admin bot, and approve its
+  plan, which takes one deployer. The server fetches and checks the release, builds its fleet
+  wheel, installs it and restarts its units, and the bots restart themselves into it: nothing
+  reaches the server over SSH. The deploy takes no new `admin.toml` key and changes no IAM policy
+  (`render_policy.py` is unchanged). It changes two of the server's units, the config helper's and
+  the plan helper's, which can no longer make a Unix socket (#896, below). The plan of this upgrade
+  is 0.2.19's helper's: the plan helper's changes below show from the next upgrade on. A server
+  that runs an older release, or 0.2.19 without `release_repo`, takes this release from
+  `deploy.sh`, as before (BOOTSTRAP §13.4, *When `deploy.sh` is still the way*). The files host
+  has nothing to deploy: what it runs, `workshop/files/` and `zab.workspace`, is unchanged.
+- **`release_repo` may name a public repository by its HTTPS address,**
+  `https://github.com/<OWNER>/<REPO>.git`, which `!upgrade-server` fetches anonymously, with no
+  deploy key (#959, PR #976; BOOTSTRAP §13.4): for the public zab repository,
+  `release_repo = "https://github.com/MathAgents/zulip-agent-bridge.git"`, once the server runs
+  this release. The SSH form, `git@github.com:<OWNER>/<REPO>.git` with the deploy key, keeps
+  working, and is the one for a private repository. Either way the tags are verified against
+  `allowed_signers`. An earlier release's loader refuses the HTTPS form: before a downgrade to
+  one, change the line back to the SSH form, or delete it (§13.4).
+- **On a fleet launched from an image older than 0.2.19's, `!trust-fix all` before the rollout**
+  (#992, PR #994; ORGANIZERS §4.4), in each workshop's organizers channel, once the admin server
+  runs this release: it does what 0.2.19's notes had `workshop/admin/trust_fix.py` do in a shell
+  on the server, as a plan an organizer approves, and changes nothing on a VM already fixed. A
+  fleet that skipped 0.2.19's rollout gets 0.2.19's changes with this one, `restart-codex`
+  included: read 0.2.19's upgrade notes for the VMs too.
+- **Background jobs that outlive a turn** (#655; SPEC §7.14, D44; ORGANIZERS §4.1, §4.2). An
+  agent asked for a long computation now runs it as a background job,
+  `zab job start --name NAME -- COMMAND ARG…`, and ends its turn, so it answers other messages
+  meanwhile. When an attached job (one started in a turn; SPEC §7.14) ends, the bot posts in the
+  topic, mentioning the person who asked, and starts a turn for the agent to report the result
+  (`--no-report` leaves only the post). For organizers:
+
+  - **Idle stop:** a running job holds its VM up, whatever its load, for at most its cap, 12 hours
+    (`[jobs] max_hours`). From the end of the last turn a person's message started, report turns
+    that start further jobs can hold a VM for at most about 4 × the cap, 48 VM-hours with the
+    default, plus the time the turns themselves run, which isn't capped. Idle stop counts a job
+    only within its own cap plus 15 minutes (#924).
+  - **Limits, per VM:** at most 4 jobs at once, and 75% of the memory for all of them together, with
+    no swap (`zab-jobs.slice`); no limit per topic. A job can't start another.
+  - **Stopping:** `!stop` stops the turn only, and names the jobs that keep running; `!stop NAME`
+    and `!stop jobs` stop jobs. A VM stop (`!stop alice`, `!retire`, a reboot) cuts jobs off, and
+    nothing restarts them: when the VM next starts, the topic says "was cut off when the VM
+    stopped".
+  - **Inside a job:** no `sudo` (`NoNewPrivileges`) and no input (`/dev/null`), which the agents'
+    instructions say, and a log of at most 1 GiB.
+  - **The rollout:** `!rollout vX.Y.Z all restart-codex`, rerun for a VM whose Codex turns kept its
+    daemon, as for 0.2.19 (#830). The rollout's `zab service install` writes the slice and its
+    idle-stop step brings the script with the job rule (#924), with no other step. `restart-codex`
+    matters for the jobs, which find their topic by `ZAB_SESSION` (§5.6), set since 0.2.19: a
+    Codex thread a daemon loaded under a bridge older than 0.2.19 runs without it, and one
+    reopened for another session keeps the old value, until the daemon restarts. A job its agent
+    starts then is unattached, with no end post and no report turn.
+- **On your own machines, run `zab service install` again** once zab is upgraded (#655, PR #930):
+  it writes `zab-jobs.slice`, the jobs' limits. Until then `zab job start` refuses, with
+  `background jobs are off here: zab-jobs.slice isn't installed with its memory limits`, rather
+  than run a job without them. A workshop VM gets the slice at its rollout (above).
+
+**Changes since 0.2.19**
+
+**The bridge, on the participants' VMs and your own machines**
+
+- **Background jobs that outlive a turn** (#655, PRs #923, #928, #932, #940, #934, #941, #942; SPEC
+  §7.14, Appendix A.3). `zab job start --name NAME [--no-report] -- COMMAND ARG…` runs a command
+  as a transient systemd unit of the bridge's user (`agent` on the workshop VMs), in
+  `zab-jobs.slice`, with its output in a log and its own cap; `zab job list`, `status`, `log` and
+  `stop` see the jobs of the turn's session (`list --all`: the machine's). The bridge watches the
+  machine's jobs: when an attached one ends (started in a turn; SPEC §7.14), the topic's bot posts
+  its end, mentioning the person who asked, and starts a turn for the agent to report, at most 3 in
+  a row with no message from a person between; a job cut off by a VM stop is a note for the next
+  turn a person's message starts. Topic `!status` and the sentinel's `!vm` list the running jobs;
+  `!stop NAME` and `!stop jobs` stop them, and `!stop` stops the turn only, naming the jobs that run
+  on.
+- **The background jobs' slice and limits** (#655, PR #930; SPEC §5.2, §13.3).
+  `zab service install` writes `zab-jobs.slice`: all background jobs together get at most
+  `[jobs] max_memory_percent` of the memory (75 by default) and no swap. `[jobs]` also takes
+  `report`, `max_running` (4 per machine) and `max_hours` (12 per job). `uninstall` stops the slice
+  last, and every job in it. **Before rolling a VM back below this release,** run
+  `systemctl --user stop zab-jobs.slice` as `agent`: an older release's `uninstall` doesn't know the
+  slice, and leaves its jobs running.
+- **The agents run long work as background jobs** (#655, PR #926; the agents' instructions,
+  *Long-running commands*; SPEC §7.14). Up to about 50 seconds a command still runs in the
+  foreground, and a command of a few minutes whose result the participant waits for still runs in
+  the turn, checked every 30 to 50 seconds with a note after each check. Anything longer, or
+  anything the participant needn't wait for, now goes to
+  `zab job start --name NAME -- COMMAND ARG…`: the agent says what runs, for roughly how long, and
+  that zab will post when it ends and start a turn for it to report, then ends its turn;
+  `--no-report` leaves only the post. The text names `zab job status`, `log`, `list` and `stop`,
+  says that the participant's `!stop` stops the turn and `!stop NAME` the job, asks for results and
+  checkpoints in files, since a VM stop cuts a job off and nothing restarts it, and gives the VM's
+  limits (4 jobs at once, 12 hours each, 75% of the memory together) and that a report turn uses the
+  plan. It also says that a job can't use `sudo`, that a job gets exactly one SIGTERM when it is
+  stopped, at its time limit or at a VM shutdown, and SIGKILL 15 seconds later (about 5 seconds
+  later at a VM shutdown), so that a long job saves its progress within a few seconds of SIGTERM,
+  what to say when `zab job start` reports the job unattached or fails, and how zab's report prompt
+  and its waiting notes are marked (`[zab: a background job ended]`, `[zab: background jobs]`). It
+  no longer says that a command started in a turn ends with it: Claude Code stops its background
+  commands, a Codex command may run on, and nothing reports either's end. `nohup`, `setsid` and `&`
+  are never for work that should outlive the turn. Claude is told never to use `ScheduleWakeup` or
+  `CronCreate`, which don't work under `-p`, since the CLI has exited by then, and never to wait
+  with `Monitor`: under `-p` it keeps the turn open until its event, however long (#655's VERIFY
+  V4). Both agents get the same text, at their VM's next `!rollout`.
+- **`!new` where the agent already has a session in the topic gets an answer** (#985, PR #986;
+  SPEC §4.6). `@codex !new`, with or without options or a prompt, where Codex already has a session
+  in the topic, answered "Unknown command; use !help.", and its prompt was dropped without a
+  word. Now Codex answers that the topic already has a Codex session, and that a new one takes
+  a new topic, or `!detach` first; with a prompt, also that the prompt wasn't sent to Codex, and
+  that sent again without `!new` it continues the session. The same holds for Claude, and for a
+  `!new` without a mention that reaches that agent alone (under `!unmentioned last`, the topic's
+  last mention naming it). One without a mention that reaches both agents still gets no answer
+  from an agent with a session here, while one without a session starts its own.
+- **Closing the Codex backend in spawn mode ends its app-server** (#967, PR #971; SPEC §8.1,
+  §8.2). With `connect = "spawn"`, where the bridge runs its own `codex app-server` child, a close
+  that came while a failed connection still waited for its reader stopped, since #965, before
+  the child's `terminate()`, and the child ran on. The child now gets its SIGTERM before that
+  wait. On a close that isn't cancelled, the wait for its exit and a `kill()` after 5 s follow, as
+  before; on one that is, nothing follows the SIGTERM. The default, `connect = "daemon"`, which
+  the workshop VMs run, is unchanged.
+
+**The admin server and its bots**
+
+- **`!trust-fix SEL`: the VMs' trust fix as a plan, with no shell on the server** (#992, PR #994;
+  ADMIN §2.2, §2.4, §3; ORGANIZERS §4.4). On a fleet from an older image,
+  `workshop/admin/trust_fix.py` (its README's §10) ran in a shell on the admin server, over SSH
+  opened for it. Now an organizer sends `!trust-fix all`, or slugs, in the workshop's organizers
+  channel, before the release's rollout. Its plan is the script's dry run, one row per VM, then
+  the status table; its approval applies it, as the bots' own user with the fleet key and pinned
+  host keys that `!rollout` uses; its result is the script's table, each row's outcome. A stopped
+  VM is shown `not reached`, never started, and fails the apply, whose last lines name the
+  `!trust-fix` to send for the rows not done. One approver, no phrase; `all` is the rows with a
+  VM; 60 minutes at most, or 2 minutes a row above 30. Each VM's outcome is printed as it ends (the
+  progress message shows the latest), so a timeout keeps the VMs done (ORGANIZERS §4.4 says what
+  to send then). It is refused at its request while a `!rollout` or `!final-sync` of the workshop
+  is approved or applying, and they while it is: they share each VM's idle-stop hold. The bot
+  runs the script with its new `--admin-bot`, whose dry run exits 0 once the table is printed,
+  and whose printed reruns are `!trust-fix <slugs>`; its commands for a deployer start
+  `sudo -u zab-admin`.
+- **`release_repo` takes a public repository's HTTPS form** (#959, PR #976; ADMIN §1.6,
+  BOOTSTRAP §13.4). `admin.toml`'s loader takes `https://github.com/` and the repository alone:
+  no user, token, port or other host. A refused `release_repo` is never shown, since it could
+  hold a credential. The plan helper fetches that form over HTTPS with no credential helper,
+  prompt or redirect, and its unit needs no new access.
+- **`!upgrade-server`'s plan shows an encoded surrogate as `deploy.sh`'s review does** (#963,
+  PR #973; ADMIN §1.6). The plan helper reads back the review the server's `deploy.sh` wrote
+  through its `sanitize`, through `sanitized()`, which now decodes a line with `surrogatepass`,
+  as perl's lax `utf8::decode` does: an encoded surrogate (`ED A0 80`) shows as `<U+D800>` on both
+  sides, where the helper showed each high byte of its line as `<XX>`. A10b now compares the two
+  byte for byte (below).
+- **Root's helpers can make no Unix socket** (#896, PR #982; ADMIN §1.2). A read-only mount stops
+  neither a `connect()` nor a `sendto()` on a socket. So as root, the config helper and the
+  upgrade's plan helper could reach PID 1's private socket, the system bus and the starter's
+  socket from their sandboxes through `socket(AF_UNIX)`, and any datagram socket on the host
+  (journald's, chronyd's where chrony runs) from a `socketpair()`'s datagram end. Now the config
+  helper may call `socket()` for no family (`RestrictAddressFamilies=none`) and the plan helper
+  for `AF_INET` and `AF_INET6` alone; neither may call `socketpair()`
+  (`SystemCallFilter=~socketpair:EPERM`) or use io_uring, whose operations make sockets past
+  `RestrictAddressFamilies` (`SystemCallFilter=~@aio:EPERM`). Each helper's own run is tested
+  under its unit's settings.
+
+**Deploying**
+
+- **The self-check runs the upgrade helpers' commands too** (#896, PR #982; ADMIN §1.6). Before the
+  switch, `selfcheck` ran the config helper's command, as its unit gives it, with `--help`; it
+  now runs the plan helper's and the apply helper's as well, asking each for its help inside
+  the call, which names the action. So a release whose `upgradehelper` imports from the venv,
+  or whose unit calls the wrong action, fails before it becomes current, not at the next
+  `!upgrade-server`.
+- **`deploy.sh --review` prints the tag's push chained behind `tag -v`** (#968, PR #972;
+  BOOTSTRAP §9). Its last lines are now `Sign it once reviewed, then verify it:`, with the
+  `tag -s` and `tag -v` lines, then `Only after the Good line, push it, chained behind tag -v
+  again:`, with `git -C … tag -v vX.Y.Z >/dev/null 2>&1 && git -C … push origin vX.Y.Z`. git
+  2.43's `tag -s` makes an unsigned tag and exits 0 when it can't sign, as when the agent no
+  longer holds the key, so the three lines pasted at once could push an unsigned tag; now they
+  push nothing unless the tag verifies.
+- **`upgrade.py` says that it publishes nothing** (#960, PR #974; the adminserver README,
+  BOOTSTRAP §13.4). `!upgrade-server` fetches the release's tags from `release_repo`; with the
+  public repository, those are the tags of the release's publication there, which its maintainer
+  signs and pushes before the upgrade. `upgrade.py` signs the tag in your clone and pushes it to
+  that clone's origin at most, so it never makes them, and won't: 0.2.19's note said "yet". Its
+  docstring and the adminserver README say so, and its last lines no longer point to a deploy
+  with `deploy.sh` from its copy: they say that nothing is published, and point to BOOTSTRAP
+  §13.4. BOOTSTRAP §13.4 says the same, and that the plan refuses (`the fetch of … failed`)
+  until the new release's public tag is there.
+- **`deploy.sh`'s bundle fetch starts no git maintenance** (#933, PR #984; ADMIN §1.6). On the
+  server, `deploy.sh` fetches the release's bundle into a temporary repository that it removes at
+  exit. From git 2.47 on, the maintenance a fetch starts runs in the background, and from 2.54 on,
+  with a long history, it writes a commit-graph, which could still be under way there as the
+  repository is removed. The fetch now passes
+  `-c maintenance.auto=false` on its own command line, writing no config. The server's git
+  (2.43) runs that maintenance in the foreground, where it can't race the removal; it now
+  skips it too.
+
+**Workshop scripts**
+
+- **Idle stop keeps a VM with a running background job up** (#655, PR #924; SPEC §7.14,
+  `workshop/admin/README.md` §8). While one of `agent`'s `zab-job-*` units (`zab job start`'s
+  transient units) is active, the VM stays up whatever its load, so a job that sleeps or waits on
+  the network or the disk isn't powered off under it. The verdict says
+  `stay up: 1 background job running`. Each job's own cap, `[jobs] max_hours` (12 hours by default),
+  stops it, and the timeout counts again once it has ended. No hold outlasts a cap: a unit holds
+  only while it has been active for less than its own cap (`RuntimeMaxUSec`) and 15 minutes, and one
+  without a cap (made by hand) never does; a `systemctl` that can't list the units holds the VM up
+  (`background jobs unknown`) only until that has lasted the bridge's `[jobs] max_hours` (12 by
+  default) and 15 minutes in a row. The verdict says what it ignores. A power-off's verdict now
+  reads `(no turn, no job, no login, …)`. **Every VM whose idle stop is on gets the rule at its
+  next `!rollout`, its minutes kept:** a rollout without `idle-stop=`
+  (`push_config.py --idle-stop-default`) now replaces a running timer's `idle_stop.py` with the
+  release's, and leaves its units as they are, where it left the old script, which would power the
+  VM off under a job whose load is under 0.5. Only `idle-stop=N` and `!idle-stop N` change the
+  minutes, or turn idle stop on or off. A spare gets the rule at its next `!start`.
+
+**Docs**
+
+- SPEC §4.5 now describes `!unmentioned last` as it has worked since 0.2.19 (#955, PR #981): a
+  `!new` that names an agent counts as a prompt to it, with or without a prompt of its own, so
+  after a bare `@codex !new` the messages without a mention go to Codex. The SPEC counted only
+  `!new <prompt>`; 0.2.19's notes described the behavior. ORGANIZERS §3.8 and the quick-start
+  say so too. Nothing changes on the VMs.
+- SPEC and ADMIN describe v0.2.20.
+
+**Tests and CI**
+
+- **End-to-end scenario 18, background jobs** (#655, PRs #935, #938), in the fast group. For each
+  agent, a job started with `zab job start` outlives its turn: the turn ends at once, `!status` and
+  `!vm` list the job, a message meanwhile gets a turn of its own, and the end post, with its
+  `(job <id>)` tag, and the report turn follow. It also checks a job ending during a turn (steered
+  in), `!stop` against `!stop NAME` (a `setsid` child included), a job across a bridge and a Codex
+  daemon restart (its end posted once), the VM's limits (a fifth job refused, a job past the memory
+  share killed, the bridge untouched) and, with the slow group, a job cut off by a VM stop. Scenario
+  11's part 2: a sleeping job holds the VM up past idle stop's timeout, and the VM stops one idle
+  timeout after it ends. Each part skips on a build that lacks what it tests. In every scenario, a
+  429 refusal or a rig failure after a part missed a bound, in its first run or its rerun, now fails
+  the part, the timing kept, where it used to run the part again, or skip it, and drop the timing.
+- An end-to-end wait that succeeds after its calls to Zulip failed and were retried
+  (connection errors, 429s) reports that time beside its own (#943, PR #983). A timing that ends
+  at its result keeps the run of failures just before it, in which the rig couldn't look. The
+  report shows the timing with those seconds; a hard bound missed only within them is undecided,
+  no FAIL but no result, and one missed before them still fails. In a scenario that
+  `run.py --require` names, an undecided bound leaves the scenario not passed, as a skipped part
+  does. An undecided bound before a 429 or a rig failure is no miss: the part runs again, as
+  after a bound met.
+- `run.py --scenarios` with a scenario's number, or a range, runs every part of it, its `slow`
+  parts too, such as 8's cold import and 18's VM stop (#978, PR #979), so that `--require` with
+  the same numbers can pass. `fast` still runs none of those parts, and `slow` and `all` select
+  as before.
+- Admin end-to-end A10b's good release candidate carries a review with non-ASCII text and hidden
+  characters (C0 and C1 controls, format characters, line and paragraph separators, non-ASCII
+  spaces, default-ignorable and private-use code points, encoded surrogates, a line that isn't
+  UTF-8), in a privileged file and as its CHANGELOG section (#963, PR #973; ADMIN §7). The plan's
+  review, as the server shows it, must be the deployer's `.review` byte for byte, and its
+  CHANGELOG section the server's perl's `sanitize` of the same bytes.
+- A10b plans and applies its good release candidate over `release_repo`'s HTTPS form, from a
+  public test repository that `ZAB_ADMIN_E2E_PUBLIC_RELEASE_REPO` names
+  (`MathAgents/zab-test-release-*`), with the server's deploy key set aside, its refusals still
+  over SSH (#959, PR #977; ADMIN §7). That repository gets only the run's exports of the commit
+  under test, each tree first checked as `tools/publish` checks a release's. Unset, A10b runs
+  over SSH alone, as before.
+
+**Known limits**
+
+- **Background jobs, not yet** (#655; SPEC §7.14, *Not yet*; PR #936): the sentinel's `!vm`, which
+  answers a DM on the workshop VMs, lists the running jobs with their start and memory but without
+  their topics, which a topic's `!status` gives; `status.py`, and so the admin bot's `!status` and
+  the console, has no jobs column; `!final-sync` and `!retire` don't report running jobs, which
+  `!retire` then cuts off; a workshop's cap can't be set from `admin.toml` yet.
+- **A code point above U+10FFFF in a review** (#963, #975; DECISIONS, verification log,
+  2026-11-08), which perl's lax `utf8::decode` accepts: `deploy.sh`'s `sanitize` writes it back
+  raw, and `!upgrade-server`'s plan shows its line's bytes as `<XX>`. Both stay visible, but the
+  plan's review then differs from the deployer's `.review` on that line.
+
 ## 0.2.19 — 2026-11-07
 
 What is new since 0.2.18: the admin server's in-band upgrade, `!upgrade-server`, for the releases

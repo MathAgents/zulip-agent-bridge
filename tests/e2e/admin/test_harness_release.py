@@ -10,8 +10,10 @@ import subprocess
 import pytest
 
 from e2e.admin.harness import rig as rigs
+from e2e.admin.harness import upgrade
 from e2e.admin.harness.gate import Gate
 from e2e.admin.harness.release import (
+    IDENTITY,
     Releases,
     dropped,
     ensure_keys,
@@ -76,6 +78,31 @@ def test_a_signed_release_of_the_commit_under_test(made):
     assert git(rel.checkout, "tag").stdout == ""  # no test tag in the zab repository
 
 
+def test_a_release_carries_files_of_any_bytes_as_they_are(made):
+    """#963: A10b's good rc carries files besides its version, each written whole, its bytes
+    as they are (a CR, controls, a line that isn't UTF-8): a file it adds and one it replaces.
+    The version's own two files are its alone."""
+    rel, base, _ = made
+    (rel.checkout / "CHANGELOG.md").write_text("# Changelog\n\n## 0.2.3\n")
+    git(rel.checkout, "add", "-A")
+    git(rel.checkout, "commit", "-q", "-m", "a changelog")
+    rel.git("fetch", "-q", str(rel.checkout), "HEAD:refs/heads/main")
+    base = rel.commit_of("HEAD")
+    added = b"cr\r\nesc \x1b[0m\n\xff\xe2\x80\n"
+    files = {"workshop/adminserver/a.md": added, "CHANGELOG.md": b"x"}
+    commit = rel.release(base, "v0.2.4rc1", files=files)
+    for path, data in files.items():
+        argv = ["git", "-C", str(rel.rig.repo), "cat-file", "blob", f"{commit}:{path}"]
+        blob = subprocess.run(argv, capture_output=True, check=True)  # noqa: S603
+        assert blob.stdout == data, path
+    changed = rel.git("diff", "--name-only", base, commit).split()
+    assert changed == ["CHANGELOG.md", "pyproject.toml", "src/zab/__init__.py",
+                       "workshop/adminserver/a.md"]  # fmt: skip
+    assert 'version = "0.2.4rc1"' in rel.git("show", f"{commit}:pyproject.toml")
+    with pytest.raises(ValueError, match="the version's own files"):
+        rel.release(base, "v0.2.4rc2", files={"pyproject.toml": b"x"})
+
+
 def test_the_bad_tags_of_a10(made):
     rel, base, signers = made
     rel.release(base, "v0.2.4rc1", signer=None)
@@ -133,6 +160,87 @@ def test_a_public_release_is_the_export_of_the_private_one(made):
     assert sorted(tags.stdout.split("\n")[:-1]) == sorted(
         [f"v0.2.4rc1 {first}", f"v0.2.4rc2 {p2}"]  # the private base, and the public tags
     ), tags.stdout
+
+
+def _commit(rel, files: dict[str, str], message: str) -> str:
+    """`files` written into the checkout and committed, then fetched into the rig's repository:
+    a new commit under test."""
+    for name, text in files.items():
+        (rel.checkout / name).parent.mkdir(parents=True, exist_ok=True)
+        (rel.checkout / name).write_text(text)
+    git(rel.checkout, "add", "-A")
+    git(rel.checkout, "commit", "-q", "-m", message)
+    rel.git("fetch", "-q", str(rel.checkout), "HEAD:refs/heads/main")
+    return rel.commit_of("HEAD")
+
+
+def test_a_fresh_export_starts_the_public_history_and_only_exports_of_the_base_pass(made):
+    """#977's review, B1: A10's export starts the public history afresh, as a root commit, and
+    what a push of two tags would send is then this run's exports alone, each a test release of
+    the commit under test (`exports_of`). An earlier run's export of another commit, or a commit
+    that is no export, is refused, before anything is pushed."""
+    rel, earlier, _ = made
+    old = rel.export("v0.2.4rc1", rel.release(earlier, "v0.2.4rc1"))  # an earlier run's
+    base = _commit(rel, {"later.txt": "the commit under test\n"}, "later")
+    running = rel.export("v0.2.4rc2", rel.release(base, "v0.2.4rc2"), fresh=True)  # A10's
+    assert rel.public_git("rev-list", "--parents", "-n", "1", running).split() == [running]
+    assert rel.public_git("rev-parse", "refs/heads/main") == running
+    unsigned = rel.export("v0.2.4rc3", rel.release(base, "v0.2.4rc3"), signer=None)  # A10b's
+    good = rel.export("v0.2.4rc3", rel.release(base, "v0.2.4rc3"))
+    refs = ("refs/tags/v0.2.4rc2", "refs/tags/v0.2.4rc3")
+    assert {public for public, _ in rel.exports_of(base, *refs)} == {good, unsigned, running}
+    for _, private in rel.exports_of(base, *refs):
+        assert rel.git("rev-parse", f"{private}^") == base
+    with pytest.raises(ValueError, match=rf"{old[:12]} is an export of .*, no test release of"):
+        rel.exports_of(base, "refs/tags/v0.2.4rc1", *refs)
+    with pytest.raises(ValueError, match="run A10 first"):
+        rel.exports_of(earlier, *refs)
+    tree = rel.public_git("rev-parse", f"{good}^{{tree}}")
+    stray = rel.public_git(*IDENTITY, "commit-tree", tree, "-p", good, "-m", "no export")
+    rel.public_git("update-ref", "refs/tags/v0.2.4rc4", stray)
+    with pytest.raises(ValueError, match=rf"{stray[:12]} is no export of a test release"):
+        rel.exports_of(base, "refs/tags/v0.2.4rc4")
+
+
+@pytest.mark.parametrize("bad", ["tree", "blob", "unchecked", "nested"])
+def test_a_ref_that_isnt_a_checked_export_or_its_tag_is_refused(made, tmp_path, bad):
+    """#977's review round 2, N1: `rev-list` lists nothing for a tag of a tree or a blob, so
+    each ref must itself be one of the commits checked, or a tag of one. A tag of a tree, a tag
+    of a blob, a lightweight tag at a commit that is no export, and a tag of a tag are each
+    refused, with or beside the good refs, and `publish` then pushes nothing and asks GitHub
+    nothing."""
+    rel, _, _ = made
+    base = _commit(rel, {"later.txt": "the commit under test\n"}, "later")
+    rel.export("v0.2.4rc1", rel.release(base, "v0.2.4rc1"), fresh=True)
+    good = rel.export("v0.2.4rc2", rel.release(base, "v0.2.4rc2"))
+    refs = ("refs/tags/v0.2.4rc1", "refs/tags/v0.2.4rc2")
+    assert len(rel.exports_of(base, *refs)) == 2
+    tree = rel.public_git("rev-parse", f"{good}^{{tree}}")  # the rig's identity, never the user's
+    lightweight = rel.public_git(*IDENTITY, "commit-tree", tree, "-m", "no export")
+    target = {
+        "tree": rel.public_git("rev-parse", f"{good}^{{tree}}"),
+        "blob": rel.public_git("rev-parse", f"{good}:pyproject.toml"),
+        "nested": "refs/tags/v0.2.4rc2",
+    }
+    if bad == "unchecked":
+        rel.public_git("update-ref", "refs/tags/v9.9.9", lightweight)
+    else:
+        rel.public_git(*IDENTITY, "tag", "-a", "--no-sign", "-m", bad, "v9.9.9", target[bad])
+    why = {
+        "tree": "is a tag of a tree",
+        "blob": "is a tag of a blob",
+        "unchecked": "is no export of a test release",
+        "nested": "is a tag of a tag",
+    }[bad]
+    for asked in (("refs/tags/v9.9.9",), (*refs, "refs/tags/v9.9.9")):
+        with pytest.raises(ValueError, match=f"{why}.*nothing pushed"):
+            rel.exports_of(base, *asked)
+    runs = []
+    with pytest.raises(ValueError, match=why):
+        upgrade.publish(rel, "MathAgents/zab-test-release-public", upgrade.Token("t" * 30), base,
+                        (*refs, "refs/tags/v9.9.9"), tmp_path, run=lambda *a, **k: runs.append(a),
+                        scan=lambda tree, where: [])  # fmt: skip
+    assert runs == []  # neither GitHub nor a push
 
 
 def test_an_unsigned_tag_stays_unsigned_whatever_the_users_git_config(made, monkeypatch):

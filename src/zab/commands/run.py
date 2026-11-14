@@ -15,6 +15,8 @@ from zab.core import logging as log_setup
 from zab.core import types as t
 from zab.core.backends import make_backend
 from zab.core.bridge import BotBridge
+from zab.core.jobreport import ReportHook
+from zab.core.jobwatch import JobWatcher
 from zab.core.links import WorkspaceLinks
 from zab.core.session import Reopen, SessionActor
 from zab.core.store import BotLock, Store
@@ -33,6 +35,15 @@ class Runtime:
         self.recoveries: dict[int, asyncio.Task] = {}
         self.watchdog: asyncio.Task | None = None
         self.lean_reaper: asyncio.Task | None = None
+        # The machine's background jobs (SPEC §7.14, #655): one watcher for every bot, which is
+        # also their `JobControl` for `!stop NAME`
+        self.jobs = JobWatcher(
+            config.bridge.state_dir,
+            self.store,
+            self.bridges,
+            hook=ReportHook(self.store, self.bridges),  # the report turn (§7.14 step 3)
+        )
+        self.job_watch: asyncio.Task | None = None
 
     async def start(self) -> None:
         from zab.workspace.manager import LocalWorkspaceManager
@@ -73,6 +84,8 @@ class Runtime:
             for peer in peers:
                 peer.peers = peers
         for bridge in self.bridges:
+            # before `initialize()`, which makes the actors that copy it (#934's N3)
+            bridge.jobs = self.jobs
             await bridge.initialize()
             bridge.manager.max_upload_bytes = min(
                 bridge.manager.max_upload_bytes,
@@ -96,6 +109,7 @@ class Runtime:
         # Codex threads' idle Lean servers (SPEC §7.12, #249): one reaper for the machine
         if reaper := lean_reaper.for_config(self.config):
             self.lean_reaper = asyncio.create_task(reaper.run())
+        self.job_watch = asyncio.create_task(self.jobs.run())
 
     async def pump(self, name: str, backend: t.Backend) -> None:
         async for event in backend.events():
@@ -160,6 +174,8 @@ class Runtime:
             tasks.append(self.watchdog)
         if self.lean_reaper:
             tasks.append(self.lean_reaper)
+        if self.job_watch:
+            tasks.append(self.job_watch)
         for task in tasks:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

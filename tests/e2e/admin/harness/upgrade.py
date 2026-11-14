@@ -19,21 +19,44 @@ each change on GitHub (`guard`), which also asks GitHub that the repository is p
 the one named, not a redirect from an old name to another repository.
 
 Either unset, A10b skips, naming what it needs.
+
+**The HTTPS form** (#959): with `ZAB_ADMIN_E2E_PUBLIC_RELEASE_REPO`, a **public** test repository,
+`MathAgents/zab-test-release-*` alone (`allowed_public`), which the same token may push to, the
+good rc is planned and applied from there, `release_repo` in its anonymous form (`https_url`),
+and the server's deploy key set aside meanwhile (`KEY_ASIDE`, `KEY_BACK`), as a server that
+reads a public repository has none. Unset, A10b runs over SSH alone, and says so. What is pushed
+there is public at once, so `publish` pushes only exports of the commit under test, this run's
+(`Releases.exports_of`), each tree first checked as a real publication checks it, with
+`tools/publish/export.py`'s own functions (`publication_problems`: the dropped-path links and
+the rest of `check_tree`, the pinned gitleaks with both configurations and its canaries); then
+`guard` asks GitHub that the repository is public (#977's review, B1). So the HTTPS case runs
+from the private tree alone: a public export's tree has no `tools/publish/` (`export_tool`).
+
+**The review's text** (#963): the good rc carries `HIDDEN`, non-ASCII text and control
+characters, in a privileged file and as its CHANGELOG section. The plan's review, as the server
+showed it (its deploy.sh's `sanitize`, then the helper's `shown()`), must be the deployer's own
+`.review` byte for byte (`planned_review`, `reviewed`); its CHANGELOG section, which `shown()`
+alone shows, the server's perl's `sanitize` of the same bytes (`sanitized_on`); both, `SHOWN`.
 """
 
 from __future__ import annotations
 
+import base64
 import errno
+import importlib.util
 import os
 import re
 import shutil
 import stat
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from types import ModuleType
 
 from e2e.admin.harness.release import Local, local
+from zab.admin.upgradehelper import REST
 
 ENV = "ZAB_ADMIN_E2E_RELEASE_REPO"
+PUBLIC_ENV = "ZAB_ADMIN_E2E_PUBLIC_RELEASE_REPO"  # #959: the HTTPS form's, public
 TOKEN_ENV = "ZAB_ADMIN_E2E_RELEASE_TOKEN_FILE"  # noqa: S105 - a variable's name, not a token
 NO_REPO = (
     f"A10b needs {ENV}=OWNER/NAME, a private test release repository (MathAgents/zab-test*), "
@@ -44,12 +67,21 @@ _REPO = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_][A-Za-z0-9._-]{0,99}"
 )
 KEY = "/etc/zab-admin/secrets/release-key"
-#: As root on the server: the deploy key, made once (BOOTSTRAP §13.4), then its public half.
+#: As root on the server: the deploy key back, if a run that set it aside (`KEY_ASIDE`) ended
+#: before it could put it back; then made once (BOOTSTRAP §13.4), then its public half.
 MAKE_KEY = r"""set -eu
+[ -e "$1" ] || [ ! -e "$1.aside" ] || mv -T -- "$1.aside" "$1"
 [ -e "$1" ] || ssh-keygen -q -t ed25519 -N '' -C zab-admin-e2e-release -f "$1"
 chmod 0600 "$1"
 cat -- "$1.pub"
 """
+#: As root on the server (#959): the deploy key set aside, so that a fetch over SSH would fail,
+#: never over a key set aside before (#977's review, N3), and put back, never over a key there.
+KEY_ASIDE = (
+    'set -eu\n[ ! -e "$1.aside" ] || { echo "$1.aside is there already" >&2; exit 1; }\n'
+    'mv -T -- "$1" "$1.aside"\n'
+)
+KEY_BACK = 'set -eu\n[ -e "$1" ] || [ ! -e "$1.aside" ] || mv -T -- "$1.aside" "$1"\n'
 #: git's credential helper for an HTTPS push: the development machine's gh sign-in, as
 #: `gh auth setup-git` configures it (a fixed command, never one built from anything here).
 CREDENTIAL = "!gh auth git-credential"
@@ -68,15 +100,33 @@ def allowed(repo: str) -> bool:
     )
 
 
-def release_repo(env: Mapping[str, str] | None = None) -> str:
-    """`OWNER/NAME`, one of `MathAgents/zab-test*`, or "" when the rig has none (A10b skips)."""
-    value = (os.environ if env is None else env).get(ENV, "").strip()
+#: The HTTPS form's public test repository (#959): `MathAgents/zab-test-release-public`, or
+#: another `MathAgents/zab-test-release-*`, never a participant's `zab-test*` (#977's review, N2).
+PUBLIC_PREFIX = "zab-test-release-"
+
+
+def allowed_public(repo: str) -> bool:
+    """Whether `repo` may be the HTTPS form's public test repository: `allowed`, and named
+    `MathAgents/zab-test-release-*`."""
+    return allowed(repo) and repo.partition("/")[2].lower().startswith(PUBLIC_PREFIX)
+
+
+def release_repo(env: Mapping[str, str] | None = None, name: str = ENV) -> str:
+    """`OWNER/NAME`, one of `MathAgents/zab-test*`, or "" when the rig has none (A10b skips);
+    with `name`, `PUBLIC_ENV`'s (#959; unset, the HTTPS form isn't covered), which must be
+    `allowed_public` and another repository than `ENV`'s."""
+    given = os.environ if env is None else env
+    value = given.get(name, "").strip()
     if value and not _REPO.fullmatch(value):
-        raise ValueError(f"{ENV}: not OWNER/NAME: {value!r}")
+        raise ValueError(f"{name}: not OWNER/NAME: {value!r}")
     if value and not allowed(value):
         raise ValueError(
-            f"{ENV}: {value!r} is not one of MathAgents/zab-test*: A10b changes no other"
+            f"{name}: {value!r} is not one of MathAgents/zab-test*: A10b changes no other"
         )
+    if value and name != ENV and not allowed_public(value):
+        raise ValueError(f"{name}: {value!r} is not one of MathAgents/{PUBLIC_PREFIX}*")
+    if value and name != ENV and value.lower() == given.get(ENV, "").strip().lower():
+        raise ValueError(f"{name}: {value!r} is {ENV}'s too: the HTTPS form takes a public one")
     return value
 
 
@@ -216,40 +266,153 @@ def _tools(run: Local) -> None:
             raise RuntimeError(f"A10b needs {' and '.join(missing)} on PATH")
 
 
-def guard(repo: str, token: Token, run: Local = local) -> None:
+def guard(repo: str, token: Token, run: Local = local, *, private: bool = True) -> None:
     """Before any change on GitHub: `repo` is a test participant's, by its name and by GitHub's
-    own (a renamed repository's old name redirects to it), and private. Raises otherwise."""
-    if not allowed(repo):
-        raise ValueError(f"{repo!r} is not one of MathAgents/zab-test*: A10b changes no other")
+    own (a renamed repository's old name redirects to it), and private; or, `private` False,
+    public and `allowed_public` (#959's, `PUBLIC_ENV`). Raises otherwise."""
+    fits = allowed if private else allowed_public
+    if not fits(repo):
+        names = "MathAgents/zab-test*" if private else f"MathAgents/{PUBLIC_PREFIX}*"
+        raise ValueError(f"{repo!r} is not one of {names}: A10b changes no other")
     _tools(run)
     ask = ["gh", "api", f"repos/{repo}", "--jq", "[.full_name, .private] | @tsv"]
     seen = run(ask, env=_token_env(token), timeout=60)
     if not seen.ok:
         raise RuntimeError(f"gh api repos/{repo}: {seen.stderr.strip()[-300:]}")
-    full, _, private = seen.stdout.strip().partition("\t")
-    if full.lower() != repo.lower() or not allowed(full):
+    full, _, said = seen.stdout.strip().partition("\t")
+    if full.lower() != repo.lower() or not fits(full):
         raise ValueError(
             f"{repo} is {full or 'nothing'} on GitHub: A10b changes only the one named"
         )
-    if private != "true":
+    if private and said != "true":
         raise ValueError(f"{repo} is not private: A10b pushes its test tags only to a private one")
+    if not private and said != "false":
+        raise ValueError(f"{repo} is not public: the HTTPS form ({PUBLIC_ENV}) reads a public one")
 
 
 def ssh_url(repo: str) -> str:
-    """What `release_repo` in the server's admin.toml says."""
+    """What `release_repo` in the server's admin.toml says, over SSH."""
     return f"git@github.com:{repo}.git"
 
 
+def https_url(repo: str) -> str:
+    """What it says in its anonymous form, for a public repository (#959)."""
+    return f"https://github.com/{repo}.git"
+
+
 def push(repo_dir: Path, repo: str, token: Token, *refs: str, run: Local = local) -> None:
-    """`refs` (`refs/tags/vX`, or `:refs/tags/vX` to delete one) pushed to the test release
-    repository, forced: each case of A10b signs one release name again."""
+    """`refs` (`refs/tags/vX`, or `:refs/tags/vX` to delete one) pushed to the private test
+    release repository, forced: each case of A10b signs one release name again."""
     guard(repo, token, run)
+    _send(repo_dir, repo, token, refs, run)
+
+
+def _send(repo_dir: Path, repo: str, token: Token, refs: tuple[str, ...], run: Local) -> None:
+    """The push itself, once its caller's checks passed."""
     argv = ["git", "-C", str(repo_dir), "-c", "credential.helper=", "-c",
             f"credential.helper={CREDENTIAL}", "push", "-q", "--force",
-            f"https://github.com/{repo}.git", *refs]  # fmt: skip
+            https_url(repo), *refs]  # fmt: skip
     done = run(argv, env=_token_env(token), timeout=600)
     if not done.ok:
         raise RuntimeError(f"git push to {repo}: {done.stderr.strip()[-300:]}")
+
+
+#: The publication tool of this checkout: its own checks run on what A10b makes public.
+EXPORT_TOOL = Path(__file__).resolve().parents[4] / "tools" / "publish" / "export.py"
+#: Where it keeps the pinned gitleaks archive, as its own `--cache` default.
+GITLEAKS_CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "zab-publish"
+
+
+def export_tool(path: Path = EXPORT_TOOL) -> ModuleType:
+    """`tools/publish/export.py`, loaded by its path (it is no package). A public export's tree
+    has no `tools/publish/` (`DROP`), so the HTTPS case's publication needs the private tree,
+    and says so (#977's Codex round 2)."""
+    if not path.is_file():
+        raise RuntimeError(
+            f"{path}: no publication tool in this tree (a public export drops tools/publish/): "
+            "A10b's HTTPS case publishes only from the private tree"
+        )
+    spec = importlib.util.spec_from_file_location("zab_publish_export", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"{path}: not loadable")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    return tool
+
+
+#: A scan of one tree, into a directory of its own: its findings, as problems.
+Scan = Callable[[Path, Path], list[str]]
+
+
+def gitleaks_scan(tool: ModuleType, work: Path) -> Scan:
+    """The publication's scan: the pinned gitleaks (its archive checked against its pinned
+    SHA-256), its canaries first, then each tree with both configurations; a tree with a
+    `.gitleaksignore` at its root is refused, as the tool refuses one. `work` is made first:
+    the tool unpacks the binary into it, and its canaries go there (#977's Codex round 1)."""
+    work.mkdir(parents=True, exist_ok=True)
+    binary, _ = tool.gitleaks(GITLEAKS_CACHE, work)
+    configs = [tool.HERE / name for name in tool.CONFIGS]
+    tool.canary_check(binary, configs, work)
+
+    def scan(tree: Path, where: Path) -> list[str]:
+        if (tree / ".gitleaksignore").exists():
+            return ["the tree has a .gitleaksignore at its root, which gitleaks honours"]
+        found = tool.scan_both(binary, configs, tree, where, "gitleaks")
+        return [f"scan: {f['RuleID']} {f['File']}:{f['StartLine']}" for f in found]
+
+    return scan
+
+
+def publication_problems(
+    rel, exports: list[tuple[str, str]], work: Path, tool: ModuleType | None = None,
+    scan: Scan | None = None,
+) -> list[str]:  # fmt: skip
+    """What a real publication (`tools/publish/export.py`) would refuse in the trees of
+    `exports`, `(public, private)` pairs, each tree once, with the tool's own functions: the
+    public tree must be the private commit's less `DROP` (`expected_tree_id`); `check_tree`
+    (the required files, no Markdown link into a dropped path, nothing the tree's .gitignore
+    keeps out); the tool must be the commit's own (`tool_problems`); and the scan (`scan`, the
+    pinned gitleaks by default). Not its run of the offline suite, which CI ran on the commit."""
+    tool = tool or export_tool()
+    if scan is None:
+        scan = gitleaks_scan(tool, work)
+    problems: list[str] = []
+    seen: set[str] = set()
+    for public, private in exports:
+        tree_id = rel.public_git("rev-parse", f"{public}^{{tree}}")
+        if tree_id in seen:
+            continue
+        seen.add(tree_id)
+        where = work / tree_id[:12]
+        (where / "tree").mkdir(parents=True)
+        _, gone = tool.build_tree(rel.rig.repo, private, where / "tree")
+        said = []
+        if tool.expected_tree_id(rel.rig.repo, private) != tree_id:
+            said.append(f"its tree is not the export of {private[:12]}")
+        said += tool.check_tree(where / "tree", gone)
+        said += tool.tool_problems(rel.rig.repo, private, [])
+        said += scan(where / "tree", where)
+        problems += [f"{public[:12]}: {line}" for line in said]
+    return problems
+
+
+def publish(rel, repo: str, token: Token, base: str, refs: tuple[str, ...], work: Path,
+            run: Local = local, tool: ModuleType | None = None,
+            scan: Scan | None = None) -> list[tuple[str, str]]:  # fmt: skip
+    """`refs` pushed to the HTTPS form's public test repository (#959), forced, and public at
+    once (#977's review, B1): only when every commit they reach is an export of a test release
+    of `base`, the commit under test (`Releases.exports_of`), and each tree has passed a real
+    publication's checks (`publication_problems`); then `guard`, which asks GitHub that the
+    repository is public. ValueError otherwise, with nothing pushed. The exports pushed."""
+    if not allowed_public(repo):
+        raise ValueError(f"{repo!r} is not one of MathAgents/{PUBLIC_PREFIX}*: nothing pushed")
+    exports = rel.exports_of(base, *refs)
+    problems = publication_problems(rel, exports, work, tool, scan)
+    if problems:
+        raise ValueError(f"not published, nothing pushed: {'; '.join(problems)[:2000]}")
+    guard(repo, token, run, private=False)
+    _send(rel.public, repo, token, refs, run)
+    return exports
 
 
 def deploy_key(server, repo: str, token: Token, run: Local = local) -> str:
@@ -273,11 +436,11 @@ def deploy_key(server, repo: str, token: Token, run: Local = local) -> str:
     return body
 
 
-def with_release_repo(toml: str, repo: str) -> str:
-    """The rig's admin.toml with `release_repo` for the test release repository, once."""
+def with_release_repo(toml: str, url: str) -> str:
+    """The rig's admin.toml with `release_repo = "<url>"`, once (`ssh_url`, `https_url`)."""
     kept = [line for line in toml.splitlines() if not line.startswith("release_repo ")]
     head = next(i for i, line in enumerate(kept) if line.startswith("["))
-    kept.insert(head, f'release_repo = "{ssh_url(repo)}"')
+    kept.insert(head, f'release_repo = "{url}"')
     return "\n".join(kept) + "\n"
 
 
@@ -294,3 +457,154 @@ def reviewed_sha256(script: Path, repo_dir: Path, etc: Path, commit: str, base: 
     if not done.ok or found is None:
         raise RuntimeError(f"the review of {commit[:12]}: {done.stderr.strip()[-300:]}")
     return found.group(1)
+
+
+# ------------------------------------------------------------------ the review's text (#963)
+
+#: What the good rc's review holds (#963): non-ASCII text that `sanitize` and `shown()` both keep
+#: (`·`, `—`), and characters of the classes they both make visible, each class here:
+#: C0 controls, on an ASCII line and on a non-ASCII one, C1 controls, format characters, line
+#: and paragraph separators, spaces other than ASCII's, default-ignorable code points, private
+#: use, encoded surrogates, which perl's lax `utf8::decode` takes and so does the helper
+#: (#963's review, B1), and a line that isn't UTF-8. A tab stays. No NUL: deploy.sh would take
+#: the file for a binary one. Not here: a code point above U+10FFFF, which perl decodes too and
+#: `sanitize` writes back raw, where the helper shows its bytes as `<XX>`: both visible, apart.
+HIDDEN = (
+    "Non-ASCII text, kept: a middle dot \u00b7 and an em dash \u2014; "
+    "on their line, CR \r and ESC \x1b[1m.\n"
+    "C0 controls: ESC \x1b[0m, BEL \x07, VT \x0b, FF \x0c, CR \r, DEL \x7f; a tab\tkept.\n"
+    "C1 controls: NEL \x85, CSI \x9b.\n"
+    "Format: ZWSP \u200b, RLO \u202e, LRI \u2066, BOM \ufeff, soft hyphen \xad, tag \U000e0001.\n"
+    "Separators: line \u2028## no heading, paragraph \u2029.\n"
+    "Spaces: no-break \xa0, ideographic \u3000.\n"
+    "Ignorable: CGJ \u034f, fillers \u115f \u3164, selectors \ufe0f \U000e0100.\n"
+    "Private use: \ue000.\n"
+).encode() + (
+    b"Surrogates, encoded: \xed\xa0\x80 and \xed\xbf\xbf, beside a \xc2\xb7.\n"
+    b"Not UTF-8: \xff, and a cut sequence \xe2\x80.\n"
+)
+#: HIDDEN's lines as both show them: deploy.sh's `sanitize` and the plan helper's `sanitized()`.
+SHOWN = (
+    "Non-ASCII text, kept: a middle dot \u00b7 and an em dash \u2014; "
+    "on their line, CR ^M and ESC ^[[1m.",
+    "C0 controls: ESC ^[[0m, BEL ^G, VT ^K, FF ^L, CR ^M, DEL ^?; a tab\tkept.",
+    "C1 controls: NEL <U+0085>, CSI <U+009B>.",
+    "Format: ZWSP <U+200B>, RLO <U+202E>, LRI <U+2066>, BOM <U+FEFF>, soft hyphen <U+00AD>, "
+    "tag <U+E0001>.",
+    "Separators: line <U+2028>## no heading, paragraph <U+2029>.",
+    "Spaces: no-break <U+00A0>, ideographic <U+3000>.",
+    "Ignorable: CGJ <U+034F>, fillers <U+115F> <U+3164>, selectors <U+FE0F> <U+E0100>.",
+    "Private use: <U+E000>.",
+    "Surrogates, encoded: <U+D800> and <U+DFFF>, beside a \u00b7.",
+    "Not UTF-8: <FF>, and a cut sequence <E2><80>.",
+)
+#: As any user on the server: deploy.sh's `sanitize`, its perl program `$1`, of the bytes on
+#: standard input, in base64; perl with a clean environment, as the plan helper runs deploy.sh
+#: (its PATH, LANG, and the LC_ALL deploy.sh sets), never the login's: a PERL5OPT or a
+#: PERL_UNICODE there would change what perl shows (#963's review, N2).
+SANITIZE = (
+    'set -euo pipefail\nbase64 -d | env -i PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C perl -ne "$1"\n'
+)
+#: Each side's perl, and the python3 the plan helper runs, with their Unicode versions.
+PERL_UNICODE = ["perl", "-MUnicode::UCD", "-e",
+                'print "perl $^V, Unicode ", Unicode::UCD::UnicodeVersion()']  # fmt: skip
+PYTHON_UNICODE = ["/usr/bin/python3", "-I", "-c", "import sys, unicodedata; print(f'python3 "
+                  "{sys.version.split()[0]}, Unicode {unicodedata.unidata_version}')"]  # fmt: skip
+_REVIEW_HEAD = re.compile(r"^==== The review(?: \([^\n]*\))? ====\n", re.M)
+
+
+def section(version: str) -> bytes:
+    """The CHANGELOG section a plan of `version` shows (the helper's `changelog`): `## X.Y.Z`,
+    the release's own for an rc too, then HIDDEN."""
+    return _heading(version).encode() + HIDDEN
+
+
+def shown_section(version: str) -> str:
+    """`section` as the plan must show it, HIDDEN as SHOWN."""
+    return _heading(version) + "\n".join(SHOWN) + "\n"
+
+
+def _heading(version: str) -> str:
+    final = re.sub(r"rc[0-9]+$", "", version.removeprefix("v"))
+    return f"## {final} \u2014 A10b's review (#963)\n\n"
+
+
+def review_file(version: str) -> str:
+    """Where the good rc `version` carries HIDDEN in its review: a privileged file (the plan
+    leaves out the review's unprivileged rest), which nothing on the server reads; named for
+    the release, so that every good rc adds one, `P A` with HIDDEN's lines as `+`, even after
+    an earlier A10b's good rc, which held its own, now `P D` (#963's review, B2)."""
+    return f"workshop/adminserver/a10b-review-{version.removeprefix('v')}.md"
+
+
+def hidden_files(version: str) -> dict[str, bytes]:
+    """The good rc's files besides its version (`Releases.release`): HIDDEN in `review_file`,
+    and a CHANGELOG.md of one section, `section`. Neither reaches the server's release but as a
+    file nothing reads: CHANGELOG.md is no release path."""
+    return {review_file(version): HIDDEN, "CHANGELOG.md": b"# Changelog\n\n" + section(version)}
+
+
+def planned_review(text: str) -> str:
+    """The review in a plan's text (the helper's `plan_text`): what follows its `==== The review`
+    line, up to the blank line before the CHANGELOG's section."""
+    head = _REVIEW_HEAD.search(text)
+    end = text.find("\n\n==== CHANGELOG.md, ", head.end()) if head else -1
+    if head is None or end < 0:
+        raise ValueError("the plan's text has no review followed by a CHANGELOG section")
+    return text[head.end() : end]
+
+
+def planned_changelog(text: str, version: str) -> str:
+    """The CHANGELOG section in a plan's text of `version`: all that follows its heading."""
+    head = f"\n==== CHANGELOG.md, {version.removeprefix('v')} ====\n"
+    if head not in text:
+        raise ValueError(f"the plan's text has no CHANGELOG section for {version}")
+    return text.split(head, 1)[1]
+
+
+def reviewed(out: Path, base: str, commit: str) -> str:
+    """The review a deployer's `deploy.sh --review <commit> --since <base> --out <out>` wrote,
+    `zab-admin-<base>..<12 hex>.review`, as a plan shows it: up to its unprivileged rest, the
+    newlines before that left out (`plan_text`). Its bytes, decoded strictly."""
+    data = (out / f"zab-admin-{base}..{commit[:12]}.review").read_bytes()
+    return data.decode("utf-8").split(REST, 1)[0].rstrip("\n")
+
+
+def sanitize_program(deploy_sh: str) -> str:
+    """The perl program of deploy.sh's `sanitize`, from the script's text."""
+    _, head, rest = deploy_sh.partition("\nsanitize() {\n")
+    found = re.search(r"\bperl -ne '([^']+)'", rest.split("\n}\n", 1)[0]) if head else None
+    if found is None:
+        raise ValueError("deploy.sh has no sanitize() with a perl program")
+    return found.group(1)
+
+
+def sanitized_on(server, program: str, data: bytes) -> str:
+    """`data` as deploy.sh's `sanitize` (`program`) shows it with the server's perl."""
+    sent = base64.b64encode(data).decode("ascii")
+    return server.script(SANITIZE, program, input=sent).stdout
+
+
+def first_difference(ours: str, theirs: str, names: tuple[str, str]) -> str:
+    """Where two texts first differ, by line, each side's line quoted in ASCII."""
+    a, b = ours.split("\n"), theirs.split("\n")
+    n = 0
+    while n < len(a) and n < len(b) and a[n] == b[n]:
+        n += 1
+
+    def quoted(lines: list[str]) -> str:
+        return ascii(lines[n]) if n < len(lines) else "(none: the text ends)"
+
+    return f"line {n + 1}: {names[0]} {quoted(a)}, {names[1]} {quoted(b)}"
+
+
+def unicode_versions(server, run: Local = local) -> str:
+    """What decides how each side shows text: the server's perl (deploy.sh's `sanitize`) and
+    the python3 its plan helper runs (`shown()`), and the development machine's perl (the
+    deployer's review), each with its Unicode version; `?` for one that didn't answer."""
+
+    def said(done) -> str:
+        return done.stdout.strip() if done.ok and done.stdout.strip() else "?"
+
+    there = [said(server.run(argv, check=False)) for argv in (PERL_UNICODE, PYTHON_UNICODE)]
+    return f"the server: {there[0]}, {there[1]}; the development machine: {said(run(PERL_UNICODE))}"

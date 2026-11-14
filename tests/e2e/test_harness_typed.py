@@ -16,7 +16,7 @@ from zab.backends.claude_login import INSTRUCTIONS
 from zab.backends.codex import device_code_reply
 from zab.core.addressing import mention
 from zab.core.command_text import as_command
-from zab.core.commands import DM_HELP, HELP
+from zab.core.commands import DM_HELP, HELP, UNKNOWN, new_with_session
 from zab.core.router import Router
 from zab.core.store import Store
 from zab.tools import sentinel
@@ -62,6 +62,33 @@ def test_each_form_sent_reads_as_its_command(tmp_path):
     text = s16.prompt("TOKEN")
     assert as_command(text) == text and "TOKEN" in text  # delivered to the agent as it is
     assert s16.typed("claude", text) == f"@claude {text}"
+
+
+def test_the_new_it_sends_reads_as_a_new_with_a_prompt(tmp_path):
+    """#985's step: Claude's router reads the typed `@claude !new …` in its session's topic as
+    the command `!new …`, which the actor answers, saying that the prompt wasn't sent."""
+    assert "new_with_session" in installed.NEW_WITH_SESSION
+    text = s16.new_again("TOKEN")
+    store = Store(tmp_path)
+    try:
+        store.insert(
+            "sessions", id="s", bot="claude", backend="claude", native_id="n",
+            card_message_id=1, stream_id=1, topic="t", workspace="/repo",
+            workspace_mode="shared", repo_root="/repo", settings_json="{}", state="idle",
+            shared=0, created_at=0, updated_at=0,
+        )  # fmt: skip
+        router = Router(
+            store, "claude", IDS["claude"], NAMES["claude"], frozenset({20}), kind="claude"
+        )
+        content = s16.typed("claude", text)
+        message = dict(id=2, sender_id=20, stream_id=1, subject="t", content=content, type="stream")
+        route = router.route(message, flags=[], sender_is_bot=False, private=True)
+    finally:
+        store.close()
+    assert (route.action, route.text, route.quiet) == ("command", text, False)
+    said = new_with_session("claude", route.text)
+    assert "already has a Claude session, so your prompt wasn't sent" in said
+    assert UNKNOWN not in said
 
 
 def test_the_reply_patterns_match_the_products_replies():

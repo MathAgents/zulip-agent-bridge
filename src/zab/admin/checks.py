@@ -53,6 +53,7 @@ SCRIPTS = (
     "admin/roster_sync.py",  # #627
     "admin/scan_hosts.py",
     "admin/status.py",
+    "admin/trust_fix.py",  # #992
     "admin/upgrade_server.py",  # zab.admin.upgradeserver's (#569)
     "admin/zulip_provision.py",
     "aws/adopt_spare.py",

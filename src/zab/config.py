@@ -13,6 +13,10 @@ from typing import Any
 
 from zab.core.types import SessionSettings
 
+#: A bot's name: filename-safe, as the state files and `ZAB_BOT` take it (#655 shares it, so that
+#: a background job's record accepts every name the config does)
+BOT_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
+
 
 class ConfigError(ValueError):
     """A configuration error safe to display without credential contents."""
@@ -142,6 +146,22 @@ class LeanConfig:
     reap_idle_minutes: int = 30
 
 
+#: `[jobs]`'s ranges (SPEC §5.2): a value outside them is a configuration error.
+JOBS_MAX_RUNNING = 64
+JOBS_MAX_HOURS = 168.0
+JOBS_MEMORY_PERCENT = (10, 90)
+
+
+@dataclass
+class JobsConfig:
+    # Background jobs that outlive their turn (SPEC §7.14, #655), limited per machine, all bots
+    # and sessions together; there is no limit per topic (D44).
+    report: bool = True  # a report turn when a job ends; per job: `zab job start --no-report`
+    max_running: int = 4  # jobs running at once, 0 to JOBS_MAX_RUNNING; 0 turns jobs off
+    max_hours: float = 12.0  # each job's cap, systemd's RuntimeMaxSec; an integer is accepted
+    max_memory_percent: int = 75  # all jobs together: zab-jobs.slice's MemoryMax (§13.3)
+
+
 @dataclass
 class Config:
     path: Path
@@ -151,6 +171,7 @@ class Config:
     projects: list[ProjectConfig]
     render: RenderConfig
     lean: LeanConfig = field(default_factory=LeanConfig)
+    jobs: JobsConfig = field(default_factory=JobsConfig)
 
 
 def load_config(path: str | Path | None = None) -> Config:
@@ -176,6 +197,12 @@ def load_config(path: str | Path | None = None) -> Config:
             default = getattr(defaults, name)
             if cls is ProjectConfig and name == "channel":
                 good = type(item) in (str, int)
+            elif cls is JobsConfig and name == "max_hours":
+                good = type(item) in (int, float)  # `12` as well as `0.05`
+                try:
+                    item = float(item) if good else item
+                except OverflowError:  # an integer of some 309 digits, which TOML allows
+                    fail(f"{key}.{name}", f"must be above 0 and at most {JOBS_MAX_HOURS:g}")
             else:
                 good = type(item) is type(default)
             if not good:
@@ -205,11 +232,12 @@ def load_config(path: str | Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{source}: invalid TOML: {exc}") from exc
     for key in raw:
-        if key not in {"bridge", "bots", "backends", "projects", "render", "lean"}:
+        if key not in {"bridge", "bots", "backends", "projects", "render", "lean", "jobs"}:
             fail(key, "unknown key")
     bridge = table(BridgeConfig, raw.get("bridge", {}), "bridge")
     render = table(RenderConfig, raw.get("render", {}), "render")
     lean = table(LeanConfig, raw.get("lean", {}), "lean")
+    jobs = table(JobsConfig, raw.get("jobs", {}), "jobs")
     for path in bridge.service_path_prepend:
         if not path or ":" in path or any(ord(c) < 32 for c in path):
             fail(
@@ -245,6 +273,13 @@ def load_config(path: str | Path | None = None) -> Config:
         fail("render.max_text_uploads", "must be nonnegative")
     if lean.reap_idle_minutes < 0:
         fail("lean.reap_idle_minutes", "must be nonnegative")
+    if not 0 <= jobs.max_running <= JOBS_MAX_RUNNING:
+        fail("jobs.max_running", f"must be from 0 to {JOBS_MAX_RUNNING}")
+    if not 0 < jobs.max_hours <= JOBS_MAX_HOURS:  # NaN fails too
+        fail("jobs.max_hours", f"must be above 0 and at most {JOBS_MAX_HOURS:g}")
+    low, high = JOBS_MEMORY_PERCENT
+    if not low <= jobs.max_memory_percent <= high:
+        fail("jobs.max_memory_percent", f"must be from {low} to {high}")
     if bridge.mention_after_s < 0:
         fail("bridge.mention_after_s", "must be nonnegative")
     if bridge.status_edit_interval_s < 60:
@@ -280,7 +315,7 @@ def load_config(path: str | Path | None = None) -> Config:
     bots = [table(BotConfig, x, "bots") for x in raw.get("bots", [])]
     names = set()
     for bot in bots:
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", bot.name) or bot.name in names:
+        if not BOT_NAME_RE.fullmatch(bot.name) or bot.name in names:
             fail("bots.name", "expected a unique filename-safe bot name")
         names.add(bot.name)
         if not bot.zuliprc:
@@ -309,7 +344,7 @@ def load_config(path: str | Path | None = None) -> Config:
             if name not in backends:
                 fail(f"projects.backend_defaults.{name}", "unknown backend")
             settings(value, f"projects.backend_defaults.{name}")
-    return Config(source, bridge, bots, backends, projects, render, lean)
+    return Config(source, bridge, bots, backends, projects, render, lean, jobs)
 
 
 def merge_settings(*layers: dict[str, str]) -> SessionSettings:

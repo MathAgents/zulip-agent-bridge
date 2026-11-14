@@ -417,7 +417,8 @@ async def test_claude_steer_while_a_subagent_works(chat: Chat, vm, scenario, non
         )
         await chat.user.wait_reaction(mid, emoji_code=STEER_CODE, user_id=turn.bot, within=30)
         await chat.user.wait_reaction(mid, emoji_code=READ_CODE, user_id=turn.bot, within=60)
-        scenario.timing("claude: steer taken in (✅)", time.monotonic() - sent, high=15)
+        scenario.timing("claude: steer taken in (✅)", time.monotonic() - sent, high=15,
+                        outage=chat.user.blind(sent))  # fmt: skip
         held = [
             r for r in (await chat.user.message(mid)).get("reactions", [])
             if r.get("emoji_code") == HELD_CODE
@@ -466,7 +467,8 @@ async def test_claude_stop_while_a_subagent_works(chat: Chat, vm, scenario, nonc
         await chat.user.send(chat.stream, topic, "!stop")
         await chat.reply(turn, STOPPED, within=60)
         over = True
-        scenario.timing("claude: ⏹ after !stop", time.monotonic() - sent, high=30)
+        scenario.timing("claude: ⏹ after !stop", time.monotonic() - sent, high=30,
+                        outage=chat.user.blind(sent))  # fmt: skip
         # SIGINT, SIGTERM 5 s later, SIGKILL 5 s after that (SPEC §9.6)
         with contextlib.suppress(TimeoutError):
             await poll(lambda: not marked(vm, marker), within=20, what="end of the command")
@@ -544,7 +546,8 @@ async def test_codex_stop_with_a_subagent_running(chat: Chat, vm, scenario, nonc
         await chat.user.send(chat.stream, topic, "!stop")
         await chat.reply(turn, STOPPED, within=60)
         over = True
-        scenario.timing("codex: ⏹ after !stop", time.monotonic() - sent, high=30)
+        scenario.timing("codex: ⏹ after !stop", time.monotonic() - sent, high=30,
+                        outage=chat.user.blind(sent))  # fmt: skip
         await turn_aborted(vm, scenario, marker, sent, "codex")
     finally:
         await clean_up(chat, vm, topic, marker, running=not over)

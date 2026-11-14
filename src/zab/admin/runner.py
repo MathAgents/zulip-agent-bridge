@@ -153,6 +153,7 @@ TIMEOUTS = {
     "export": 1800.0,
     "teardown": 1800.0,
     "upgrade-server": 1800.0,  # #569: a review, or a build and its wheels; its helper stops at 1500
+    "trust-fix": 3600.0,  # #992: its dry runs; its apply's grows with its rows (Action.timeout)
 }
 TIMEOUT = 900.0  # every other verb, `!status` included
 GRACE = 30.0  # at a timeout: SIGTERM, then SIGKILL this much later (§2.4)

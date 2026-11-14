@@ -4,8 +4,12 @@
     python3 -I ~/zab-vP/workshop/adminserver/upgrade.py --setup     once on each machine
     python3 -I ~/zab-vP/workshop/adminserver/upgrade.py vN --commit C --review-sha256 SHA
 
-It reaches no server. The server is upgraded to the release it signs from the copy ~/zab-vN it
-makes, by the adminserver README's deploy, and by `!upgrade-server` once #569 adds that.
+It reaches no server, and it publishes nothing: it signs the tag in your clone and pushes it to
+that clone's origin at most (#960). `!upgrade-server` fetches the release's tags from the
+server's `release_repo` (BOOTSTRAP §13.4, *Each release*): where that is origin, origin's tag
+serves it; where it is the public repository, the tags there are the release's publication's,
+signed and pushed by its maintainer before the upgrade, never by this tool. `deploy.sh` from
+the copy ~/zab-vN it makes stays the bootstrap and the fallback (BOOTSTRAP §13.4).
 
 vP is the release the server runs. Run the copy of its signed tag: a clean worktree of your zab
 clone, at a commit on which exactly one release tag verifies against your allowed_signers. The
@@ -726,12 +730,14 @@ class Upgrade:
             self.say(f"[{n}/{len(self.phases)}] {phase.title}")
             phase.run()
         self.say(f"done: {self.v} is signed and verified on {self.commit[:12]}, and its copy is")
-        self.say(f"{self.copy_of(self.v)}. Upgrade the server to it from that copy (the")
+        self.say(f"{self.copy_of(self.v)}. Nothing is published: this run pushed to your clone's")
+        self.say("origin at most, and !upgrade-server fetches the tags from release_repo; the")
+        self.say("public repository's are its maintainer's publication's, not this tool's (#960).")
         if self.compared:  # the review phase compares it on every run
-            self.say(f"adminserver README's deploy), with the review's SHA-256, {self.compared},")
-            self.say("which this run compared with the release message's.")
+            self.say("Upgrade the server as BOOTSTRAP §13.4 says, with the review's SHA-256,")
+            self.say(f"{self.compared}, which this run compared with the release message's.")
         else:
-            self.say("adminserver README's deploy).")
+            self.say("Upgrade the server as BOOTSTRAP §13.4 says.")
 
     def finish(self) -> None:
         """The clean-ups, on every exit, last first, with the signals held off until they end."""

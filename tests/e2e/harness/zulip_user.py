@@ -8,7 +8,9 @@ anything else, or anything before it, raises `PostingRefused`, as `TestEc2` refu
 instances. A transient Zulip or network error during a wait is retried with backoff until the
 deadline, each retry logged. A wait that times out says for how long the rig's calls failed, and
 one that failed on the rig's side, not the bridge's, is a `RigTimeout` (`harness.rig_failure`,
-#877). The zuliprc is read by `zab.zulip.client`; its key is never printed.
+#877); one that succeeded after a run of failed calls keeps how long it couldn't look, for a
+timing that ends at its result (`TestUser.blind`, #943). The zuliprc is read by
+`zab.zulip.client`; its key is never printed.
 """
 
 from __future__ import annotations
@@ -19,13 +21,23 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Iterable
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, TypeVar
 
 import httpx
 
 from e2e.harness.refusal import Refused, refusal
-from e2e.harness.rig_failure import Outage, RigFailure, RigTimeout, earlier, shown, stamp, utc
+from e2e.harness.rig_failure import (
+    Outage,
+    RigFailure,
+    RigTimeout,
+    Waited,
+    earlier,
+    shown,
+    stamp,
+    utc,
+)
 from e2e.harness.secret_files import label_of, read_secret
 from zab.zulip.client import ZulipClient, ZulipError
 
@@ -37,6 +49,8 @@ BACK_S = 120.0
 #: The key under which a message read from Zulip (`after`, `message`) carries the rig's time
 #: (epoch seconds) just before the request that read it: what `settled` sets an edit beside
 ASKED = "_asked"
+#: The last wait that succeeded in this task (`TestUser.blind`, #943)
+_WAITED: ContextVar[Waited | None] = ContextVar("e2e_waited", default=None)
 
 
 class PostingRefused(RuntimeError):
@@ -276,7 +290,11 @@ class TestUser:
         A transient error is retried (`retrying`). The timeout is a `RigTimeout` when `missed`,
         asked once the connection is back, names something that matched between the wait's
         start and its deadline (epoch seconds) and was never seen; or when the calls still
-        failed at the deadline and Zulip couldn't be reached after it: the rig couldn't look."""
+        failed at the deadline and Zulip couldn't be reached after it: the rig couldn't look.
+        A wait that finds it keeps its time and its retries' (`Waited`, #943), which `blind`
+        reads, and logs them if a call failed; any other wait leaves none, so that `blind` never
+        reads an earlier wait's."""
+        _WAITED.set(None)
         outage, since = Outage(self.clock(), within), self.wall()
         while True:
             try:
@@ -286,6 +304,10 @@ class TestUser:
                     raise
                 break  # `retrying` gives up on a transient error only at the deadline
             if found is not None:
+                waited = Waited.of(outage)
+                _WAITED.set(waited)
+                if waited.errors:
+                    LOG.warning("e2e: %s %s", what, waited.text())
                 return found
             if self.clock() >= outage.end:
                 break
@@ -308,6 +330,15 @@ class TestUser:
         if down:
             raise RigTimeout(f"{lost}: the rig couldn't look; {saw}")
         raise TimeoutError(f"{lost}; {saw}" if lost else saw)
+
+    def blind(self, since: float) -> float:
+        """The seconds after `since` (on this user's clock) in which the rig couldn't look before
+        the result of the last wait that succeeded in this task (`Waited.blind`, #943): what a
+        timing from `since` to that result may hold of the rig's outage. A task's waits run one
+        after another, so an answered poll of an earlier one came before that run of failures;
+        another task's waits are its own (a context variable)."""
+        waited = _WAITED.get()
+        return waited.blind(since) if waited is not None else 0.0
 
     async def retrying(
         self,

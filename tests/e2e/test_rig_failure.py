@@ -6,6 +6,7 @@ failure is no result, not a FAIL."""
 
 from __future__ import annotations
 
+import asyncio
 import calendar
 import re
 
@@ -13,7 +14,7 @@ import httpx
 import pytest
 
 from e2e.harness import refusal, report, rig_failure
-from e2e.harness.flows import DONE
+from e2e.harness.flows import DONE, Chat, Turn
 from e2e.harness.recorder import Recorder
 from e2e.harness.refusal import Refused
 from e2e.harness.rig_failure import Outage, RigFailure, RigTimeout
@@ -357,6 +358,103 @@ async def test_only_the_awaited_senders_messages_are_read_for_what_was_missed():
     assert not isinstance(caught.value, RigFailure) and zulip.histories == 1
 
 
+def reply_in(user: TestUser, clock: Clock):
+    """`Chat.reply` for the turn of message `TURN`, sent at the fake clock's now."""
+    chat = Chat(user, {"claude": BOT}, {"claude": "Claude"}, 5)
+    return chat.reply(Turn(NARROW, TURN, BOT, clock()), WORKING, within=240)
+
+
+async def test_a_timing_through_an_outage_is_marked_and_a_bound_it_hides_undecided(
+    caplog, tmp_path
+):
+    """#943, criteria 1 to 3: the status showed at 62 s, while the rig's calls failed from 60 s
+    until the call at 102 s found it, so the rig couldn't look for the last 42 s. The answer's
+    timing keeps them: a bound of 60 s, missed by them alone, is undecided, no FAIL but no
+    result; a bound of 59 s was missed before the rig's calls failed, a FAIL as before."""
+    clock, zulip, user = rig()
+    zulip.post((5, STARTED), (62, SLEEPING))
+    zulip.down = [(60, 100)]
+    with caplog.at_level("WARNING", logger="zab.e2e"):
+        _, took = await reply_in(user, clock)
+    assert (took, took.outage) == (102, 42)
+    assert caplog.messages[-1] == (
+        f"e2e: reply matching {WORKING!r} found after 102 s, 42 s of them in retries (3 errors), "
+        "42 s of those just before it"
+    )
+    row = report.ScenarioResult(5, "Steering", parts=["p"], passed_parts=["p"])
+    timing = row.timing("claude: the answer", took, high=60)
+    assert timing.undecided and not timing.failed and not row.complete
+    assert timing.text() == (
+        "claude: the answer 102.0 s, 42.0 s of it the rig's Zulip outage (≤ 60 s) ❔ undecided"
+    )
+    run = report.Report(commit="c", wheel="w", results=[row])
+    assert (row.effective, run.verdict) == ("passed", "NO-RESULT")
+    assert f"- **5. Steering**: {report.UNDECIDED}: claude: the answer 102.0 s" in run.markdown()
+    run.write(tmp_path / "report.json")
+    assert report.Report.read(tmp_path / "report.json").results[0].timings == [timing]
+    row.timing("claude: the answer, ≤ 59 s", took, high=59)  # missed by 1 s before the outage
+    assert (row.effective, run.verdict) == ("failed", "FAIL")
+    assert "over its threshold: claude: the answer, ≤ 59 s 102.0 s, 42.0 s" in row.explanation()
+
+
+async def test_an_outage_that_answered_polls_followed_delayed_nothing(caplog):
+    """The rig's calls failed from 20 s to 63 s, then its polls were answered every 3 s until
+    the status showed at 150 s: the wait reports the 42 s of retries, but the rig saw the
+    status as soon as it showed, so a bound it missed stays a FAIL."""
+    clock, zulip, user = rig()
+    zulip.post((5, STARTED), (150, SLEEPING))
+    zulip.down = [(20, 40)]
+    with caplog.at_level("WARNING", logger="zab.e2e"):
+        _, took = await reply_in(user, clock)
+    assert (took, took.outage) == (150, 0)
+    assert caplog.messages[-1].endswith("found after 150 s, 42 s of them in retries (3 errors)")
+    row = report.ScenarioResult(5, "Steering")
+    assert row.timing("claude: the answer", took, high=120).failed and row.effective == "failed"
+
+
+async def test_a_wait_in_another_task_is_that_tasks_own():
+    """A wait gathered in a task of its own (scenario 17's three topics) counts only there:
+    the task that gathered it reads no outage of it. A timing from after the run of failures
+    began counts only its part of it. A wait that then fails leaves none: never the earlier
+    wait's (review N2)."""
+    clock, zulip, user = rig()
+    zulip.post((5, STARTED), (62, SLEEPING))
+    zulip.down = [(60, 100)]
+    (found,) = await asyncio.gather(reply_in(user, clock))
+    assert found[1].outage == 42 and user.blind(0) == 0
+    await wait(user)  # in this task, at 102 s, found at once
+    assert user.blind(0) == 0
+    clock, zulip, user = rig()
+    zulip.post((5, STARTED), (62, SLEEPING))
+    zulip.down = [(60, 100)]
+    await wait(user)
+    assert (user.blind(0), user.blind(90), user.blind(110)) == (42, 12, 0)
+    with pytest.raises(TimeoutError):
+        await wait(user, r"never", within=30)
+    assert user.blind(0) == 0
+
+
+def test_a_bound_is_decided_over_the_outage():
+    """At most: met at both ends of the range the outage leaves, missed at both, or undecided;
+    at least, the same, the outage making a time that met it unsure (idle stop's 10 minutes);
+    a target is never a failure; a timing with no outage is as before."""
+    timing = report.Timing
+    assert timing("t", 50, high=60, outage=20).ok
+    assert timing("t", 70, high=60, outage=20).undecided
+    assert timing("t", 81, high=60, outage=20).failed
+    assert timing("t", 70, low=60, outage=20).undecided
+    assert timing("t", 59, low=60, outage=20).failed
+    assert timing("t", 81, low=60, outage=20).ok
+    target = timing("t", 70, high=60, target=True, outage=20)
+    assert target.undecided and not target.failed and target.text().endswith(" ⚠️")
+    assert [(t.ok, t.failed, t.undecided) for t in (timing("t", 60, high=60), timing("t", 61,
+            high=60))] == [(True, False, False), (False, True, False)]  # fmt: skip
+    row = report.ScenarioResult(5, "Steering")
+    assert row.timing("t", report.Took(30.04, 99), outage=4).outage == 4  # given, it wins
+    assert row.timing("t", report.Took(30.04, 99)).outage == 30.0  # never more than the time
+    assert row.timing("t", 30.04).outage == 0 and not row.undecided()
+
+
 def test_a_rig_failure_runs_the_part_again():
     """Criterion 3, the retry: after `rig_failure.WAIT_S`, with fresh inputs; a second rig
     failure is raised again, marked; a refusal after it is its own (#842 fails it)."""
@@ -434,6 +532,18 @@ def test_btw(scenario):
 @pytest.mark.scenario(13)
 def test_negative():
     raise asyncio.run(outage_in_the_middle(answer("DONE-084500-abcdef")))
+
+
+@pytest.mark.scenario(18)
+@pytest.mark.parametrize("bound", ("hard", "target"))
+def test_job_report(bound, scenario, nonce):  # a bound missed, then the rig fails
+    with open(f"runs-{bound}", "a") as f:
+        f.write(nonce + " ")
+    first = len(open(f"runs-{bound}").read().split()) == 1
+    seconds = 40.0 if first else 12.0
+    scenario.timing(f"{bound}: the end post", seconds, high=25, target=bound == "target")
+    if first:
+        raise rig_failure.RigTimeout("the rig couldn't look")
 """
 
 
@@ -474,3 +584,95 @@ def test_the_suite_runs_a_rig_failure_again_and_a_second_is_no_result(tmp_path):
     )
     assert f"external cause: {ran_again}" in summary
     assert re.search(r"- \*\*12\. .*\*\* \(skipped: test_btw\): test_btw: no result", summary)
+    # #935's review, B3: a bound missed before a rig failure fails the part, its timing kept;
+    # a target missed is no failure, and the part runs again
+    assert (tmp_path / "runs-hard").read_text().split().__len__() == 1
+    assert len((tmp_path / "runs-target").read_text().split()) == 2
+    assert rows[18].effective == "failed"
+    assert rows[18].reason.startswith(
+        "test_job_report[hard]: Failed: hard: the end post 40.0 s (≤ 25 s) ❌, missed before a "
+        "rig failure: the rig couldn't look"
+    )
+    assert [(t.name, t.seconds) for t in rows[18].timings] == [
+        ("hard: the end post", 40.0),
+        ("target: the end post", 12.0),
+    ]
+    assert rows[18].external == [
+        "test_job_report[hard]: the rig couldn't look; not run again: a bound was missed",
+        "test_job_report[target]: the rig couldn't look; the part ran again after 0 s",
+    ]
+
+
+ROUND_2 = """
+import pytest
+from e2e.harness import refusal, report, rig_failure
+
+pytestmark = pytest.mark.e2e
+refusal.WAIT_S = rig_failure.WAIT_S = 0.0
+
+
+def runs(name, nonce):
+    with open(name, "a") as f:
+        f.write(nonce + " ")
+    return len(open(name).read().split())
+
+
+@pytest.mark.scenario(18)
+def test_job_report(scenario, nonce):  # rerun, rightly; then a bound missed, then the rig fails
+    if runs("runs-second", nonce) == 1:
+        raise rig_failure.RigTimeout("the rig couldn't look, before any timing")
+    scenario.timing("the end post", 40.0, high=25)
+    raise rig_failure.RigTimeout("the rig couldn't look, after the bound was missed")
+
+
+@pytest.mark.scenario(17)
+def test_refused(scenario, nonce):  # a bound missed, then a 429
+    first = runs("runs-refused", nonce) == 1
+    scenario.timing("the notes", 130.0 if first else 40.0, high=65)
+    if first:
+        raise refusal.Refused("429 Too Many Requests")
+
+
+@pytest.mark.scenario(5)
+def test_undecided(scenario, nonce):  # a bound the outage leaves undecided, then the rig fails
+    runs("runs-undecided", nonce)
+    scenario.timing("steer taken in", report.Took(40.0, 30.0), high=15)
+    raise rig_failure.RigTimeout("the rig couldn't look, after an undecided bound")
+"""
+
+
+def test_a_bound_missed_before_a_refusal_or_in_a_second_run_fails_the_part(tmp_path):
+    """#935's review, round 2, through the e2e conftest in a run of its own (each run has its
+    own retry budgets): a hard bound missed in a rerun's second attempt, then a rig failure,
+    fails the part, not a skip; one missed before a 429 fails it too, not a rerun that drops
+    the timing. Both keep the timing. A bound the rig's outage left undecided (#943) before a
+    rig failure is no miss: the part runs again, and is a skip after a second one."""
+    done = inner_pytest(tmp_path, ROUND_2)
+    assert done.returncode == 1, done.stdout[-2000:] + done.stderr[-2000:]
+    rows = {r.number: r for r in report.Report.read(tmp_path / "r.json").results}
+    assert len((tmp_path / "runs-second").read_text().split()) == 2
+    assert rows[18].effective == "failed" and not rows[18].skipped_parts
+    assert rows[18].reason.startswith(
+        "test_job_report: Failed: the end post 40.0 s (≤ 25 s) ❌, missed before a rig failure: "
+        "the rig couldn't look, after the bound was missed"
+    )
+    assert [(t.name, t.seconds) for t in rows[18].timings] == [("the end post", 40.0)]
+    assert rows[18].external[-1] == (
+        "test_job_report: the rig couldn't look, after the bound was missed; in its second run: "
+        "a bound was missed"
+    )
+    assert len((tmp_path / "runs-refused").read_text().split()) == 1  # not run again
+    assert rows[17].effective == "failed"
+    assert rows[17].reason.startswith(
+        "test_refused: Failed: the notes 130.0 s (≤ 65 s) ❌, missed before a refusal: 429"
+    )
+    assert [(t.name, t.seconds) for t in rows[17].timings] == [("the notes", 130.0)]
+    # A bound the rig's outage left undecided (#943) is no miss (#983's review, M1): the rig
+    # failure after it reruns the part, and a second one is a skip, no result, not a FAIL
+    assert len((tmp_path / "runs-undecided").read_text().split()) == 2
+    assert rows[5].effective == "skipped" and rows[5].skipped_parts == ["test_undecided"]
+    assert rows[5].partial and not rows[5].complete
+    assert [(t.name, t.seconds, t.outage, t.undecided) for t in rows[5].timings] == [
+        ("steer taken in", 40.0, 30.0, True)
+    ]
+    assert not any("a bound was missed" in line for line in rows[5].external)

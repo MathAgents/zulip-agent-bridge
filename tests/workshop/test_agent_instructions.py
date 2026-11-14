@@ -240,8 +240,8 @@ def test_the_agents_stay_visible_and_responsive_during_a_turn():
         # item 1
         "Before a step that may take more than about 10 seconds, write one short sentence: "
         "what you are about to do, and why.",
-        "While you wait on a job or a sub-agent, write a note at least once a minute: never two "
-        "waiting calls in a row without one.",
+        "While you wait on a command or a sub-agent, write a note at least once a minute: never "
+        "two waiting calls in a row without one.",
         # item 2
         "Answer mid-turn messages at once.",
         "the message reaches you after your current tool call",
@@ -263,8 +263,8 @@ def test_the_agents_stay_visible_and_responsive_during_a_turn():
         "Codex: start it with `exec_command` and a short `yield_time_ms`, with its output also in "
         "a log file (for example `python3 -u run.py 2>&1 | tee job.log`)",
         "`write_stdin` (no input) and a `yield_time_ms` of at most 50000",
-        "A job put in the background with `&` or `nohup` is stopped when the call that started "
-        "it ends.",
+        "A command put in the background with `&` or `nohup` is stopped when the call that "
+        "started it ends.",
         "After each check, before the next call, write a one-line progress note: the time "
         "elapsed and what is known so far.",
         # the sanity check of the review round: Claude checked a sub-agent's log three times
@@ -272,13 +272,15 @@ def test_the_agents_stay_visible_and_responsive_during_a_turn():
         "Never make two waiting calls in a row without a note between them, even when little "
         "has changed.",
         "Write the note right after each check's result, before the next check",
-        "Never end a turn waiting for a job, and never promise to report back later.",
+        # a command in a turn ends with it; a background job (#655) outlives it
+        "So never end a turn waiting for a command, and never promise to report back later, "
+        "except on a background job.",
         "continuing needs a new request",
         # item 4, for both agents
         "## Sub-agents",
         "For substantial work that needs thinking (a literature search, a proof attempt, an "
         "independent check of a result)",
-        "A long computation is not such work: run it as a background command",
+        "A long computation is not such work: run it as a command or a background job",
         "the Agent tool with `run_in_background: true`",
         "Never run a long sub-agent in the foreground",
         "`spawn_agent`, then `wait_agent` with a timeout of at most 50 seconds per call",
@@ -327,6 +329,87 @@ def test_the_agents_note_progress_while_a_subagent_runs():
     assert "\n    `for i in $(seq 4); do sleep 10; done; tail -n 5 sub.log`." in doc
     fixture = FILES.parents[2] / "tests/fixtures/claude/2.1.283/subagent_background.jsonl"
     assert "do not report, assume, or predict them" in fixture.read_text()  # what it answers
+
+
+def test_the_agents_run_long_work_as_background_jobs():
+    """#655 (design 6687462623, PR 8; Drew, Nov 7: J1-J4 (a), and only the VM's limits): work
+    longer than a few minutes, or that the participant needn't wait for, goes to
+    `zab job start` (SPEC §7.14), after which the agent ends its turn; zab posts when it ends
+    and starts a report turn. A few minutes' command the participant waits for stays in the
+    turn, checked with a note after each check (#653, #668)."""
+    doc = (FILES / "agent-instructions.md").read_text()
+    section = doc.split("## Long-running commands")[1].split("\n## ")[0]
+    flat = " ".join(section.split())
+    for needle in (
+        # #926's review, B2: a Codex exec session runs on until its thread unloads (SPEC §7.14)
+        "Claude Code stops its background commands a few seconds after the turn ends; a Codex "
+        "command may run on after it; and nothing reports the end of either.",
+        "`zab job start` is the only way zab tracks a command and reports its end.",
+        "A command of a few minutes, whose result the participant is waiting for: start it so "
+        "that it keeps running between your tool calls",
+        "Anything longer (a long computation, a search, a long build), or anything the "
+        "participant needn't wait for: run it as a background job, which outlives your turn:",
+        "`zab job start --name rank-search -- python3 -u search.py --bound 1e7`.",
+        # #932's NAME_RE
+        "The name is up to 32 lower-case letters, digits and dashes, starts with a letter or "
+        "digit, is not `jobs`, and is not the name of another of your running jobs.",
+        "Everything after `--` runs without a shell (a pipeline is `bash -c '...'`), in the "
+        "current directory, with no input, its output in a log.",
+        # #928's unit: NoNewPrivileges=yes
+        "A job can't use `sudo`: install what it needs before you start it.",
+        # J1 (a): a report turn by default, `--no-report` per job
+        # #926's review, N1: what `start` prints decides what to say
+        "Go by what `zab job start` prints.",
+        "tell the participant what runs, roughly for how long, and that zab will post when it "
+        "ends and you will report; then end your turn.",
+        "With `--no-report`, zab only posts.",
+        "When it says the job is unattached, nothing will be posted and no turn will start: say "
+        "so.",
+        "When it exits with 1 (the job failed at once) or 2 (refused: a limit, a full disk), say "
+        "what it printed.",
+        "Don't check on it in later turns unless the participant asks: `zab job status NAME`",
+        "`zab job log NAME`, and `zab job list` (your jobs in this topic).",
+        # J3 (a): `!stop` stops the turn only
+        "`zab job stop NAME` stops it, and so does the participant's `!stop NAME`; their `!stop` "
+        "alone stops your turn, not the job.",
+        # #942's prompt (Appendix A.3) and its notes that wait
+        "When zab starts a turn because a job ended (its message includes "
+        "`[zab: a background job ended]`), read what the job left and report the result "
+        "briefly, as the answer to what was asked. Start nothing new unless asked.",
+        "notes on jobs that ended meanwhile, between `[zab: background jobs]` and "
+        "`[end of background jobs]`: report on those too.",
+        # #655's VERIFY V4 (6707114729): under `-p` a `Monitor` holds the turn open until its
+        # event, unbounded, and `ScheduleWakeup` never fires (the CLI has exited by then)
+        # only `ScheduleWakeup` was measured (V4); a `CronCreate` saved to disk might fire in a
+        # later turn, so "don't work", not "never fire" (#926's approval, 6711824077)
+        "Claude Code: never use `ScheduleWakeup` or `CronCreate`: they don't work under zab, "
+        "since Claude Code exits when your turn ends.",
+        "Never use `Monitor` to wait: for a few minutes, use the bounded checks above, with a "
+        "note after each; for longer, a background job.",
+        "A `Monitor` wait keeps your turn open, holding one of the VM's turn slots, for as long "
+        "as it lasts. zab's post and report turn are how you wait for a job.",
+        # #926's review, N6
+        "Write results and checkpoints to files, and copy what matters into the repository: a "
+        "VM stop cuts a job off, nothing restarts it, and its log is deleted 14 days after it "
+        "ends.",
+        # #928's unit: KillMode=control-group, TimeoutStopSec=15, the wrapper ignoring TERM; at
+        # a VM shutdown, Ubuntu's `user@.service` gives 5 s (#926's review, B1)
+        "A job gets exactly one SIGTERM when it is stopped (`zab job stop NAME`, `!stop NAME`), "
+        "at its time limit, or when the VM shuts down, and SIGKILL 15 seconds later, or about 5 "
+        "seconds later when the VM shuts down.",
+        "A long job should save its progress within a few seconds of SIGTERM, for example with a "
+        "`trap` in bash or a signal handler in Python.",
+        # J2 (a), and the VM's limits only: no limit per topic
+        "The limits, which `zab job start` prints: 4 jobs at once on this VM, 12 hours each, "
+        "after which a job is stopped, and at most 75% of the memory for all of them together.",
+        "A report turn uses the participant's plan as a message does: say so when you start a job.",
+        "Never use `nohup`, `setsid` or `&` for work that should outlive your turn: "
+        "`zab job start` is the only way zab tracks it and reports its end.",
+    ):
+        assert needle in flat, needle
+    assert "per topic" not in flat and "2 jobs" not in flat  # Drew, Nov 7: the VM's limits only
+    # the example stays one code span on one line, as the shell loop does
+    assert "\n    `zab job start --name rank-search -- python3 -u search.py --bound 1e7`." in doc
 
 
 def test_the_agents_write_times_as_zulip_times():

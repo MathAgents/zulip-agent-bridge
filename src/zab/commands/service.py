@@ -23,6 +23,19 @@ MARKER = "# Managed by zab service install\n"
 #: `zab sentinel`'s unit (#204; SPEC §13.3): `!vm` and `!restart` in a DM, also while the bridge
 #: is down. No tie to `zab.service`, so that it keeps running while the bridge doesn't.
 SENTINEL = "zab-sentinel.service"
+#: The slice of the background jobs (#655; SPEC §7.14, §13.3): `zab job start` runs each job as
+#: a transient service in it, so that their memory together stays within `[jobs]
+#: max_memory_percent`, their CPU weight under the bridge's and the agents', and their tasks
+#: bounded. Nothing enables or starts it: a job's unit starts it, and no install restarts it,
+#: which would stop every running job; the manager's reload is meant to hand it a changed
+#: limit (not checked yet: VERIFY #655 V2, open). `uninstall` stops it last, and the jobs with
+#: it. `MemorySwapMax=0`: with `MemoryMax` alone, a job
+#: past it on a VM with swap (the test VM's 8 GB) was swapped out, not killed: at a 256 MB limit
+#: it sat at 267 MB resident and 825 MB of swap until stopped a minute later; with no swap it was
+#: oom-killed in 0.3 s, `SERVICE_RESULT=oom-kill` (the #655 probe, DECISIONS' verification log).
+JOBS_SLICE = "zab-jobs.slice"
+JOBS_CPU_WEIGHT = 50
+JOBS_TASKS_MAX = 4096
 #: The bridge's restarts back off (#806; SPEC §13.3): `RestartSteps` and `RestartMaxDelaySec`.
 #: A bridge that dies at every start, as one killed while delivering an answer, started again
 #: every 5 s (`RestartSec`), each start with its Zulip requests. Now the delay grows from 5 s to
@@ -193,6 +206,12 @@ def units(config: Config, *, nofile: int = CODEX_NOFILE) -> dict[str, str]:
         + "KillMode=mixed\nTimeoutStopSec=30\n"
         + "[Install]\nWantedBy=default.target\n"
     )
+    result[JOBS_SLICE] = (
+        MARKER
+        + "[Unit]\nDescription=zab background jobs\n[Slice]\n"
+        + f"MemoryMax={config.jobs.max_memory_percent}%\nMemorySwapMax=0\n"
+        + f"CPUWeight={JOBS_CPU_WEIGHT}\nTasksMax={JOBS_TASKS_MAX}\n"
+    )
     result[SENTINEL] = (
         MARKER
         + "[Unit]\nDescription=zab sentinel: !vm and !restart in direct messages\n[Service]\n"
@@ -211,10 +230,16 @@ def units(config: Config, *, nofile: int = CODEX_NOFILE) -> dict[str, str]:
 def managed_units(directory: Path) -> list[Path]:
     return sorted(
         p
-        for p in directory.glob("*.service")
+        for p in [*directory.glob("*.service"), directory / JOBS_SLICE]
         if (p.name in ("zab.service", SENTINEL) or p.name.startswith("codex-app-server"))
-        and p.read_text().startswith(MARKER)
+        or p.name == JOBS_SLICE
+        if p.is_file() and p.read_text().startswith(MARKER)
     )
+
+
+def services(names: Sequence[str]) -> list[str]:
+    """The units that are enabled, started and restarted: every one but the jobs' slice."""
+    return [name for name in names if name != JOBS_SLICE]
 
 
 def run(argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
@@ -269,6 +294,10 @@ def main(argv: list[str]) -> int:
                 path = directory / name
                 if path.exists() and not path.read_text().startswith(MARKER):
                     raise ValueError(f"refusing to overwrite unmanaged unit: {path}")
+                if name == JOBS_SLICE:
+                    # never restarted, which would stop its jobs; the reload is meant to
+                    # update a running one (VERIFY #655 V2, open)
+                    continue
                 if path.exists() and path.read_text() != rendered[name]:
                     state = run(
                         [binary("systemctl"), "--user", "is-active", "--quiet", name], check=False
@@ -300,7 +329,7 @@ def main(argv: list[str]) -> int:
             for name in limited:
                 if not raise_limit(name, nofile):
                     print(limit_note(name, nofile))
-            control("enable", "--now", "--no-block", *rendered)
+            control("enable", "--now", "--no-block", *services(list(rendered)))
             user = pwd.getpwuid(os.getuid()).pw_name
             linger = run([binary("loginctl"), "enable-linger", user], check=False)
             if linger.returncode:
@@ -313,16 +342,41 @@ def main(argv: list[str]) -> int:
                 "Run zab service status, then zab doctor --service-env once active."
             )
         elif args.action == "uninstall":
+            # The services first, the slice last: while the bridge stops (up to its 30 s), a
+            # turn can still `zab job start`, which would start the slice again, from no file
+            # and with no limit, and leave that job running. A failed stop of the slice is
+            # said, and leaves the services stopped all the same (§13.3).
+            jobs = [path for path in existing if path.name == JOBS_SLICE]
             for path in existing:
-                control("disable", "--now", path.name)
-                path.unlink()
+                if path.name != JOBS_SLICE:
+                    control("disable", "--now", path.name)
+                    path.unlink()
+            failed = ""
+            for path in jobs:
+                try:
+                    control("stop", JOBS_SLICE)  # every running job with it
+                except (OSError, subprocess.SubprocessError) as exc:
+                    # Its file stays: the jobs still run under its limits, and another
+                    # `uninstall` stops them, as the command printed below does.
+                    failed = f"{type(exc).__name__}: {exc}"
+                else:
+                    path.unlink()
             control("daemon-reload")
+            if failed:
+                print(
+                    f"zab service: the services are stopped, but stopping {JOBS_SLICE} failed "
+                    f"({failed}): background jobs may still run; stop them with "
+                    + shlex.join(["systemctl", "--user", "stop", JOBS_SLICE]),
+                    file=sys.stderr,
+                )
+                return 1
         else:
+            # Not the jobs' slice: it is inactive until a job runs, and `systemctl status` exits
+            # 3 for an inactive unit, whatever the others' states, which would fail a healthy
+            # machine's status (#655).
+            shown = services([p.name for p in existing]) or ["zab.service"]
             result = run(
-                [binary("systemctl"), "--user", "status", "--no-pager", *(p.name for p in existing)]
-                if existing
-                else [binary("systemctl"), "--user", "status", "--no-pager", "zab.service"],
-                check=False,
+                [binary("systemctl"), "--user", "status", "--no-pager", *shown], check=False
             )
             print(result.stdout, end="")
             return result.returncode
