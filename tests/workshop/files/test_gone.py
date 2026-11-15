@@ -94,6 +94,8 @@ def site(tmp_path):
         shas[name] = git(work, "rev-parse", "HEAD")
         git(work, "push", "-q", str(remote), f"HEAD:refs/zab/turns/s/{len(shas)}")
     store = server.Store(tmp_path / "cache", org=ORG, test_remotes=remotes.parent)
+    # a miss after a check fetches at once, not 5 s after the check's fetch (#473, #988)
+    store.fetch_interval = 0.01
     http = server.Server(("127.0.0.1", 0), store)
     thread = threading.Thread(target=http.serve_forever, args=(0.01,), daemon=True)
     thread.start()

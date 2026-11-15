@@ -4,7 +4,7 @@
         --security-group-id sg-… [--key-name NAME] --region REGION \\
         [--instance-type m7a.2xlarge] [--subnet-id subnet-…] [--spares N] [--only SLUG …] \\
         [--admin-key FILE.pub …] --tag KEY=VALUE [--tag …] [--ssh-from CIDR …] [--protect] \\
-        [--spares-file FILE] [--dry-run]
+        [--spares-file FILE] [--init-rate MIB_S] [--dry-run]
 
 Standalone script (boto3 is not a zab dependency), run by the admin bot or a deployer with AWS
 credentials; agents run it only for test infrastructure, with `--tag zab-role=test` among the
@@ -29,6 +29,9 @@ development machine's address). `--only` is repeatable and names roster slugs or
 (`zab-spare-N`, within `--spares N`); a name that is neither is refused before any AWS call.
 `--spares-file` says where the spares are recorded (default `workshop/admin/out/spares.json`;
 the admin server keeps it outside the release tree, docs/ADMIN.md §2.6).
+`--init-rate` is EBS's provisioned rate for each new root volume's initialization (#1007;
+default `aws_common.INIT_RATE`, 200 MiB/s; 0 is EBS's default rate), which the output and the
+summary name: a new VM's disk is whole within minutes, not block by block on first reads.
 """
 
 from __future__ import annotations
@@ -44,12 +47,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aws_common import (
+    INIT_RATE,
+    INIT_RATES,
+    ROOT_GB,
     Ec2,
     Scope,
     add_tag_argument,
     column_snapshot,
     console_host_keys,
     has_participant,
+    init_rate_params,
+    init_rate_text,
     is_spare,
     only_slugs,
     parse_cidr,
@@ -114,9 +122,16 @@ def instance_params(row: dict[str, str], opts: argparse.Namespace) -> dict[str, 
         "BlockDeviceMappings": [
             {
                 "DeviceName": "/dev/sda1",
-                # 200 GB: a Lean project unpacks its own ~8 GB Mathlib build in each topic's
-                # worktree, and a 100 GB VM filled up during the workshop (issue #205)
-                "Ebs": {"VolumeSize": 200, "VolumeType": "gp3", "DeleteOnTermination": True},
+                # ROOT_GB, 80: the shared Mathlib is the default, where each topic once built
+                # its own (200 GB, #205), and a filling disk grows by itself (#998); or the
+                # image's own root where it is larger (`root_gb`); initialized at `--init-rate`
+                # (#1007), or block by block on first reads at 0
+                "Ebs": {
+                    "VolumeSize": getattr(opts, "root_gb", ROOT_GB),
+                    "VolumeType": "gp3",
+                    "DeleteOnTermination": True,
+                    **init_rate_params(getattr(opts, "init_rate", INIT_RATE)),
+                },
             }
         ],
         "MetadataOptions": {"HttpTokens": "required", "HttpEndpoint": "enabled"},
@@ -195,12 +210,15 @@ class Summary:
     held: dict[str, str] = field(default_factory=dict)  # row -> what to check, left alone
     # row -> the stale ip cleared, which the write clears only if the file still has it (Codex)
     cleared: dict[str, str] = field(default_factory=dict)
+    init_rate: int = INIT_RATE  # `--init-rate` (#1007), named when anything was launched
 
     def text(self) -> str:
         lines = [
             f"launched {len(self.launched)}, existing {len(self.existing)}, "
             f"skipped {len(self.skipped)}, failed {len(self.failed)}"
         ]
+        if self.launched:
+            lines.append(f"  volume initialization: {init_rate_text(self.init_rate)}")
         lines += [
             f"  {n}: the previous name {old!r} may still have a VM (none after a dry run); "
             f"check with teardown.py --only {old} --dry-run"
@@ -262,6 +280,7 @@ def launch(
     """
     ssh_ready = ssh_ready or wait_for_ssh
     summary = summary if summary is not None else Summary()
+    summary.init_rate = getattr(opts, "init_rate", INIT_RATE)
     workshop = workshop_of(opts)
     only = set(only_slugs(getattr(opts, "only", None)))
     pending: list[tuple[dict[str, str], str, bool]] = []
@@ -281,6 +300,21 @@ def launch(
             pending.append((row, *instance_id))
     collect_host_keys(pending, ec2, summary, log=log, sleep=sleep, clock=clock)
     return rows
+
+
+def root_gb(ec2: Any, image: str, log: Callable[[str], None] = print) -> int:
+    """The root volume's size: `ROOT_GB`, or the image's own root where it is larger, since EC2
+    refuses a volume smaller than its image's snapshot (an image built before #998 has 100 GB).
+    An image EC2 doesn't describe gets `ROOT_GB`, and its launch says why it fails, if it does."""
+    try:
+        size = ec2.image_root_gb(image)
+    except Exception as exc:  # botocore: no such image, no permission
+        log(f"image {image}: its root's size not read ({type(exc).__name__}): {ROOT_GB} GB")
+        return ROOT_GB
+    if size is not None and size > ROOT_GB:
+        log(f"image {image}: its root is {size} GB, so each VM's is too, not {ROOT_GB} GB")
+        return size
+    return ROOT_GB
 
 
 def _forget_stale(
@@ -450,11 +484,15 @@ def _launch_one(
         if row.get("host_keys") and not is_spare(row):
             return None
         return (str(inst["InstanceId"]), False)
+    if getattr(opts, "root_gb", None) is None:  # read once, at the first VM to launch
+        opts.root_gb = root_gb(ec2, opts.ami, log)
     params = instance_params(row, opts)
+    rate = init_rate_text(getattr(opts, "init_rate", INIT_RATE))
     if opts.dry_run:
         log(
             f"[{name}] would run_instances {params['ImageId']} {params['InstanceType']} "
-            f"tags={[t['Value'] for t in params['TagSpecifications'][0]['Tags']]}"
+            f"tags={[t['Value'] for t in params['TagSpecifications'][0]['Tags']]} "
+            f"volume initialization {rate}"
         )
         log(f"[{name}] would allocate and associate an Elastic IP, then wait for SSH")
         # nothing is recorded for a VM that does not exist: a saved `host` would make the next
@@ -467,7 +505,7 @@ def _launch_one(
     row["host_keys"] = ""  # a previous VM's keys must never vouch for this one
     if region:
         row["region"] = region  # recorded at once: a later failure must not hide the VM's region
-    log(f"[{name}] launched {instance_id}; waiting for it to run")
+    log(f"[{name}] launched {instance_id}, volume initialization {rate}; waiting for it to run")
     ec2.wait_running(instance_id)
     ip = ensure_elastic_ip(ec2, name, instance_id, workshop=workshop, log=log)
     row["host"] = f"ws-{name}"
@@ -553,6 +591,14 @@ def main(argv: list[str] | None = None) -> int:
         help="termination protection on the new instances (kept VMs, issue #207; protect.py "
         "--off lifts it)",
     )
+    parser.add_argument(
+        "--init-rate",
+        type=int,
+        default=INIT_RATE,
+        metavar="MIB_S",
+        help=f"EBS's provisioned rate for each new root volume's initialization (#1007): "
+        f"{INIT_RATES}, 0 being EBS's default rate (default {INIT_RATE})",
+    )
     parser.add_argument("--dry-run", action="store_true")
     opts = parser.parse_args(argv)
     try:
@@ -564,6 +610,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"scope: {scope_text(scope)}")
     if opts.spares < 0:
         print("--spares must be 0 or more", file=sys.stderr)
+        return 1
+    try:
+        init_rate_params(opts.init_rate)
+    except ValueError:
+        print(f"--init-rate: {INIT_RATES}, got {opts.init_rate}", file=sys.stderr)
         return 1
     try:
         opts.admin_keys = [parse_public_key(_read(path), path) for path in opts.admin_key]
@@ -721,6 +772,9 @@ class _DryRunEc2:
 
     def describe_security_group(self, group_id: str) -> dict[str, Any] | None:
         return self._real.describe_security_group(group_id) if self._real else None
+
+    def image_root_gb(self, image_id: str) -> int | None:
+        return self._real.image_root_gb(image_id) if self._real else None
 
     def console_output(self, instance_id: str) -> str:
         return self._real.console_output(instance_id) if self._real else ""

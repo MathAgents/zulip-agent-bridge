@@ -28,9 +28,10 @@ inside the bot's process, through the bot's `PlanStore`.
   run that says there is nothing to change (`Prepared.unchanged`, #708) is no refusal: the plan
   is UNCHANGED, with an `unchanged` record, and the answer is a success, `☑`, with no plan.
 - **Approve, reject.** The sender is looked up afresh (`GET /users/{id}`: human, active). An
-  approval of a plan whose workshop has one applying, or handed to the runner, is answered
-  "busy" and not recorded (§2.4 step 5); that check and `Approvals` follow the lookup with
-  no await in between, and an APPROVED plan's workshop is marked busy at once. `Approvals`
+  approval of a plan whose workshop has one applying, or handed to the runner, or a disk
+  growing (`growths`, #998), is answered "busy" and not recorded (§2.4 step 5); that check
+  and `Approvals` follow the lookup with no await in between, and an APPROVED plan's workshop
+  is marked busy at once. `Approvals`
   makes every other check. Each answer is audited (`approval`, `reject` or `refused`) and
   shows the chain head. An APPROVED plan is rebuilt from its record, against the fleet as it
   is now, and handed to `Runner.apply` (`Job`); a plan that no longer builds is STALE.
@@ -59,7 +60,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import httpx
 
 import zab
-from zab.admin import monthend, newworkshop, upgradeserver
+from zab.admin import fleetwide, inflight, monthend, newworkshop, setworkshop, upgradeserver
 from zab.admin.actions import Action, ActionError, Fleet, Layout, Live, build, protect_applying
 from zab.admin.approvals import SERVER, Received, Requirement, Sender, requirement, takes
 from zab.admin.collector import cost_line, note_status
@@ -109,6 +110,22 @@ READING = 3
 #: own, "already as wanted"; never `✅`, which says that something was done. U+2611 alone, as
 #: `⚠` and `⏱` are here: the scrubber deletes a variation selector, an invisible character.
 UNCHANGED_MARK = "☑"
+
+
+#: The verbs approved while a disk of the workshop grows, unless they name the VM growing
+#: (#998; the review of #1003, N1): an urgent `!stop` or `!start` of another VM touches nothing
+#: of the growth's, and a burst of growths could hold the workshop for 20 minutes or more.
+BESIDE_GROWTH = frozenset({"stop", "start"})
+
+
+def growth_busy(slug: str, plan: str) -> str:
+    """The answer to an approval while a disk of the workshop grows (#998, ADMIN §3.4)."""
+    return (
+        f"busy: {slug}'s disk is growing (ADMIN §3.4). Nothing was recorded: send the approval "
+        f"again once its line is in the alerts channel, before {plan} expires."
+    )
+
+
 #: Kept free below Zulip's message limit, and for the attachment's line.
 MARGIN, NOTE_ROOM = 200, 300
 #: The audit footer under a `!status` answer, at most: its line break, `audit #seq · chain` and
@@ -120,6 +137,9 @@ FOOTER_ROOM = 64
 DRY_LINES, STATUS_LINES = 40, 50
 #: The status table's columns (§2.4 step 2), from `status.py --json`'s schema 1.
 STATUS_COLUMNS = ("VM", "state", "zab", "idle stop", "running turns")
+#: The column of a plan whose apply starts stopped VMs (#995): what it will do with each VM, by
+#: the state read, which the apply reads again from EC2, VM by VM (`actions.STARTS_STOPPED`).
+POWER_COLUMN, START_THEN_STOP, LEFT_RUNNING = "power", "start, then stop", "left running"
 _STATUS_START = re.compile(r'\{\s*"schema":')
 #: roster_import.py's refusal of a slug that another workshop has (`taken_refusal`), which
 #: names the workshop only: the bot adds its own hint to it, naming the real bot, under §2.1's
@@ -209,6 +229,9 @@ class Job:
     command: Command
     action: Action
     fleet: Fleet | None  # None for a server plan (`!new-workshop`), which acts on no fleet
+    #: The workshop of a part of a plan of every workshop (#995), as the runner applies it:
+    #: `action` is that part, under its own records and result; "" for any other apply.
+    part: str = ""
 
 
 class Runner(Protocol):
@@ -398,26 +421,50 @@ def _turns(value: object, scrub: Scrub) -> str:
     return ", ".join([*(f"{n} {b}" for b, n in sorted(backends.items())), *more]) or "0"
 
 
-def status_view(text: str, scrub: Scrub) -> list[str]:
+#: The line that heads each workshop's status read in a plan of every workshop (#995).
+PART = "── workshop "
+
+
+def status_view(text: str, scrub: Scrub, *, power: bool = False) -> list[str]:
     """The plan's status read as shown (§2.4 step 2): from `status.py --json`, a table with one
-    line per VM (slug, state, zab version, idle stop, running turns), then any other line the
-    read printed (a failed EC2 lookup, a failed exit); when `text` holds no such answer, its own
-    lines. `text` is scrubbed; each value decoded from its JSON is scrubbed again (`_cell`)."""
-    return _view(text, _status_json(text), scrub)
+    line per VM (slug, state, zab version, idle stop, running turns, and with `power` what the
+    apply will do with a stopped VM, #995), then any other line the read printed (a failed EC2
+    lookup, a failed exit); when `text` holds no such answer, its own lines. `text` is
+    scrubbed; each value decoded from its JSON is scrubbed again (`_cell`). A plan of every
+    workshop's has one read per workshop, each after its `PART` line: a table each, under it."""
+    if not text.startswith(PART):
+        return _view(text, _status_json(text), scrub, power=power)
+    out: list[str] = []
+    for chunk in text.split("\n" + PART):
+        name, _, read = chunk.removeprefix(PART).partition("\n")
+        out += [f"{name}:", *_view(read, _status_json(read), scrub, power=power)]
+    return out
 
 
-def _view(text: str, found: tuple[dict[str, Any], int, int] | None, scrub: Scrub) -> list[str]:
+def _power(state: str) -> str:
+    """A VM's `POWER_COLUMN` cell, from its state cell: `?` where its power is unknown, its
+    state or `unreachable`, which status.py reads `stopped` only when its EC2 lookup worked
+    (review of #1027, N1)."""
+    if state in ("stopped", "stopping"):
+        return START_THEN_STOP
+    return "?" if state in ("?", "unreachable") else LEFT_RUNNING
+
+
+def _view(
+    text: str, found: tuple[dict[str, Any], int, int] | None, scrub: Scrub, *, power: bool = False
+) -> list[str]:
     if found is None:
         return text.removesuffix("\n").split("\n")
     answer, start, end = found
     vms = [vm for vm in answer["vms"] if isinstance(vm, dict)]
-    rows = [list(STATUS_COLUMNS)] + [
-        [_cell(vm.get("slug"), scrub), _cell(vm.get("bridge"), scrub),
+    columns = [*STATUS_COLUMNS, *([POWER_COLUMN] if power else [])]
+    rows = [columns] + [
+        [_cell(vm.get("slug"), scrub), state := _cell(vm.get("bridge"), scrub),
          _cell(vm.get("zab_version"), scrub), _idle(vm.get("idle_stop")),
-         _turns(vm.get("running_turns"), scrub)]
+         _turns(vm.get("running_turns"), scrub), *([_power(state)] if power else [])]
         for vm in vms[:STATUS_ROWS]
     ]  # fmt: skip
-    widths = [max(len(row[i]) for row in rows) for i in range(len(STATUS_COLUMNS))]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(columns))]
     table = [
         "  ".join(c.ljust(w) for c, w in zip(row, widths, strict=True)).rstrip() for row in rows
     ]
@@ -437,9 +484,9 @@ class StatusRead:
     text: str
 
     @classmethod
-    def of(cls, text: str, scrubber: Scrubber) -> StatusRead:
+    def of(cls, text: str, scrubber: Scrubber, *, power: bool = False) -> StatusRead:
         text = scrubber.json_text(text or "(no output)")
-        return cls(tuple(status_view(text, scrubber)), text)
+        return cls(tuple(status_view(text, scrubber, power=power)), text)
 
 
 def _said(value: object, scrub: Scrub) -> str:
@@ -817,6 +864,10 @@ class Planning:
         #: tries (`_key`; Codex rounds 2 and 5 on #829: a new end or recipient is a new warning,
         #: with tries its own; #883: so is a new approval, which tries a refused one again)
         self.tries: dict[tuple[str, str, str, float, str, int], int] = {}
+        #: workshop → the rows whose disk the automatic growth grows now (#998, `autogrow`):
+        #: each holds its workshop as an applying plan does (§2.4 step 5; Codex round 1 on
+        #: #1003), from the start of its script to its end
+        self.growths: dict[str, set[str]] = {}
 
     @property
     def server(self) -> AdminServer:
@@ -1078,7 +1129,7 @@ class Planning:
         # From here to the busy mark: no await.
         now = server.clock()
         due = monthend.due_rows(monthend.entries(store.db, ws.name), now)
-        if not due or self.busy(ws.name) is not None:
+        if not due or self.busy(ws.name) is not None or self.growing(ws.name) is not None:
             return
         if fleet.protection is not None and fleet.protection.wait(now):
             return
@@ -1255,16 +1306,23 @@ class Planning:
             self.spawn(self.status(bot, m, command, fleet))
         elif command.verb == "console":
             await self.sign_in(bot, m, command)
-        elif command.verb == "new-workshop":  # the grammar gives it to the [global] bot only
+        elif command.verb in ("new-workshop", "set-workshop"):  # the [global] bot's (#1043)
             if m.sender_id in self.server.config.admins:
                 self.spawn(self.request(bot, m, command, None))
             else:  # a deployer, whom the [global] bot recognizes too (§2.9)
-                await bot.say(m, "❌ only a global admin requests `!new-workshop`")
+                await bot.say(m, f"❌ only a global admin requests `!{command.verb}`")
         elif command.verb == "upgrade-server":  # the [global] bot's alone, too (§1.6, #569)
             if m.sender_id in self.server.config.deployers:
                 self.spawn(self.request(bot, m, command, None))
             else:  # a global admin who is not a deployer
                 await bot.say(m, "❌ only a deployer requests `!upgrade-server`")
+        elif command.selection is not None and command.selection.every_workshop:  # #995
+            if m.sender_id in self.server.config.admins:  # the grammar's: the [global] bot's
+                self.spawn(self.request(bot, m, command, None))
+            else:  # a deployer, whom the [global] bot recognizes too
+                await bot.say(
+                    m, f"❌ only a global admin requests `!{command.verb} every-workshop`"
+                )
         elif fleet is None:  # the grammar gives workshop verbs to workshop bots only
             await bot.say(m, f"❌ `!{command.verb}` is a workshop's command")
         else:
@@ -1327,13 +1385,16 @@ class Planning:
             except (httpx.HTTPError, TimeoutError) as exc:  # so may theirs: the type alone
                 return f"the CSV could not be downloaded: {type(exc).__name__}", ""
         try:
-            action = self._build(plan, command, fleet, upload)
-        except ActionError as exc:
+            fleets = await self._fleets(command)
+            action = self._build(plan, command, fleet, upload, fleets)
+        except (ActionError, FleetError) as exc:
             return str(exc), ""
         if action.verb == "month-end schedule":
             action = await self._noted(action, fleet)
         elif action.verb == "keep-until" and command.until != "none":
             action = self._kept(action, command.until)
+        elif action.verb == "upgrade-server":
+            action = self._flying(action, plan)
         if action.verb in ("teardown", "retire") and (why := self._protecting(bot.where)):
             return why, ""
         if why := self._excluded(bot.where, action.verb):
@@ -1344,12 +1405,18 @@ class Planning:
             await self._unchanged(plan, action, prepared, where=(m.stream, m.topic))
             return "", ""
         if not prepared.ok:
-            return prepared.why or "the dry run failed", prepared.output
+            why = prepared.why or "the dry run failed"
+            if action.parts and "too long" in why:  # every workshop's (#995): the way round
+                why += ": roll out through each workshop's own bot instead"
+            return why, prepared.output
         digest = fingerprint(action, release=server.release, live=prepared.live)
         needs = requirement(action, fleet, server.config)
         read = None  # its scrub and its table's cells, a scrub each: in a thread
-        if action.status:
-            read = await asyncio.to_thread(StatusRead.of, prepared.status, server.scrubber)
+        if action.status or action.parts:  # one that starts stopped VMs says which (#995)
+            power = any("--start-stopped" in step.argv for step in action.applied)
+            read = await asyncio.to_thread(
+                StatusRead.of, prepared.status, server.scrubber, power=power
+            )
         head = await server.audit(
             "plan",
             **self._fields(plan),
@@ -1460,18 +1527,50 @@ class Planning:
             ]
         return dataclasses.replace(action, notes=(*action.notes, *notes))
 
+    def _flying(self, action: Action, plan: Plan) -> Action:
+        """`!upgrade-server`'s plan with the plans in flight on every bot named in its notes
+        (`inflight.notes`, #989; §2.4 step 6): those applying or approved, for which its approval
+        is answered `busy:`; the pending ones, which the bots' restart leaves STALE; and those
+        being planned, which it interrupts. As they are when it is planned. Notes are shown,
+        never hashed; one that can't be read leaves the plan as it is."""
+        assert self.server.store is not None
+        try:
+            found = inflight.flights(self.server.store.db, self.server.clock())
+        except sqlite3.Error as exc:
+            LOG.warning("%s: the plans in flight can't be read (%s)", plan.name, type(exc).__name__)
+            return action
+        notes = inflight.notes([f for f in found if f.id != plan.id])
+        return dataclasses.replace(action, notes=(*action.notes, *notes))
+
+    async def _fleets(self, command: Command) -> list[Fleet]:
+        """Every workshop's fleet, as it is now, for a command of every workshop (#995); none
+        for any other."""
+        if command.selection is None or not command.selection.every_workshop:
+            return []
+        return [await self.server.read_fleet(ws) for ws in self.server.config.workshops]
+
     def _build(
-        self, plan: Plan, command: Command, fleet: Fleet | None, upload: str | None = None
-    ) -> Action:
-        """The plan's action: against the bot's own fleet, or, for a server verb (`fleet`
-        None), against admin.toml (`newworkshop`, §2.9)."""
+        self, plan: Plan, command: Command, fleet: Fleet | None, upload: str | None = None,
+        fleets: list[Fleet] | None = None,
+    ) -> Action:  # fmt: skip
+        """The plan's action: against the bot's own fleet; for a command of every workshop
+        (#995), against each of `fleets` (`fleetwide`); or, for a server verb (`fleet` None),
+        against admin.toml (`newworkshop`, §2.9)."""
         server = self.server
         if fleet is not None:
             return build(command, fleet, layout=server.paths.layout, upload=upload, plan=plan.name)
+        if command.selection is not None and command.selection.every_workshop:
+            layout = server.paths.layout
+            return fleetwide.build_fleetwide(command, fleets or [], layout=layout, bot=plan.bot)
         if command.verb == "upgrade-server":  # §1.6, #569
             return upgradeserver.build(
                 command, server.config, plan=plan.name, bot=plan.bot, layout=server.paths.layout
             )
+        if command.verb == "set-workshop":  # #1043
+            return setworkshop.build(
+                command, server.config, plan=plan.name, bot=plan.bot, layout=server.paths.layout,
+                config_path=server.config_path,
+            )  # fmt: skip
         return newworkshop.build(
             command,
             server.config,
@@ -1610,6 +1709,32 @@ class Planning:
                 return found
         return None
 
+    def growing(self, workshop: str, plan: Plan | None = None) -> str | None:
+        """A row of `workshop` whose disk grows now (`growths`); for a server plan (""), of any
+        workshop, since it needs every workshop's lock. For `plan`, a `!stop` or `!start`
+        (`BESIDE_GROWTH`), only one it names: it waits for that VM's growth alone."""
+        names = [workshop] if workshop else sorted(self.growths)
+        rows = {row for name in names for row in self.growths.get(name, ())}
+        verb = (plan.command.removeprefix("!").split() or [""])[0] if plan is not None else ""
+        if workshop and plan is not None and verb in BESIDE_GROWTH:
+            rows &= set(plan.targets)
+        return min(rows, default=None)
+
+    def hold_growth(self, workshop: str, slug: str) -> bool:
+        """Hold `workshop` for the growth of `slug`'s disk, unless a plan of it, or a server
+        plan, applies or is approved and handed over (`busy`). No await between the check and
+        the mark, here or in an approval's: neither can slip between the other's."""
+        if self.busy(workshop) is not None:
+            return False
+        self.growths.setdefault(workshop, set()).add(slug)
+        return True
+
+    def release_growth(self, workshop: str, slug: str) -> None:
+        rows = self.growths.get(workshop, set())
+        rows.discard(slug)
+        if not rows:
+            self.growths.pop(workshop, None)
+
     def _protecting(self, workshop: str) -> str:
         """#378: why a `!teardown` or `!retire` plan waits while the workshop's busy plan changes
         termination protection (`fleet.protects`), however long it applies; "" otherwise. After
@@ -1669,11 +1794,20 @@ class Planning:
         if command.verb == "approve" and plan is not None and plan.bot == bot.user_id:
             busy = self.busy(plan.workshop)
             if busy is not None and busy != plan.id:
+                # its bot, when another's: the server's, or a workshop's for a server plan (#989)
+                other = server.store.get(busy)
+                there = "" if other is None or other.workshop == plan.workshop else (
+                    f" on {inflight.bot_name(other.workshop)}"
+                )  # fmt: skip
                 await bot.say(
                     m,
-                    f"busy: P-{busy} is applying. Nothing was recorded: send the approval "
+                    f"busy: P-{busy} is applying{there}. Nothing was recorded: send the approval "
                     f"again once it is done, before {plan.name} expires.",
                 )
+                return
+            grows = self.growing(plan.workshop, plan)  # a disk growing holds it too (#998)
+            if grows is not None:
+                await bot.say(m, growth_busy(grows, plan.name))
                 return
         sender = Sender(m.sender_id, user.get("is_bot") is not False, user.get("is_active") is True)
         received = Received(m.id, bot.user_id, m.stream, sender)
@@ -1865,7 +1999,8 @@ class Planning:
             parsed = parse(plan.command, bot.context(None))
             if not isinstance(parsed, Command):
                 raise ActionError(getattr(parsed, "reason", "the command no longer parses"))
-            return parsed, self._build(plan, parsed, None), None
+            fleets = await self._fleets(parsed)  # every workshop's, as they are now (#995)
+            return parsed, self._build(plan, parsed, None, fleets=fleets), None
         fleet = await self.server.read_fleet(bot.workshop)
         upload = None
         if plan.command == "!roster import":
@@ -1901,20 +2036,20 @@ class Planning:
         return True
 
     def _applied(self, plan: Plan) -> None:
-        """The apply's task has ended. A `!new-workshop` that is DONE has had its entry written
-        by the config helper: the bots restart, which loads it (§2.9), and every workshop stays
-        busy until then. Otherwise the workshop is free again."""
+        """The apply's task has ended. A `!new-workshop` or `!set-workshop` that is DONE has had
+        its entry written by the config helper: the bots restart, which loads it (§2.9, #1043),
+        and every workshop stays busy until then. Otherwise the workshop is free again."""
         store = self.server.store
         try:  # a done-callback: the store may be closing with the bot
             done = store is not None and store.need(plan.id).state == DONE
         except Exception:
             done = False
-        if done and plan.command.startswith("!new-workshop "):
+        if done and plan.command.startswith(("!new-workshop ", "!set-workshop ")):
             if self.restart is not None:
-                LOG.info("%s added a workshop: the bots restart to load it", plan.name)
+                LOG.info("%s wrote admin.toml: the bots restart to load it", plan.name)
                 self.restart()
                 return
-            LOG.warning("%s added a workshop: restart the bots to load it", plan.name)
+            LOG.warning("%s wrote admin.toml: restart the bots to load it", plan.name)
         if plan.command.startswith("!upgrade-server ") and release_moved(self.server.paths.layout):
             # whatever the outcome (#569): this process runs another release than `current`,
             # whose scripts its argument lists name, so it restarts into it; until then every

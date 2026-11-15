@@ -59,6 +59,7 @@ from admin_common import (
     DEFAULT_KNOWN_HOSTS,
     IDLE_HOLD_OFF_CMD,
     IDLE_HOLD_ON_CMD,
+    ConnectRetry,
     Runner,
     RunResult,
     first_line,
@@ -69,6 +70,7 @@ from admin_common import (
     select_rows,
     slug_of,
     ssh_argv,
+    stderr_line,
     subprocess_runner,
 )
 from provision_repos import GitHub, repo_gone
@@ -269,11 +271,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     script = REMOTE_SCRIPT.read_text(encoding="utf-8")
     gh = github()
+    runner = ConnectRetry(subprocess_runner, log=stderr_line)  # one per run (#1009)
     results = run_parallel(
         rows,
         lambda row: sync_vm(
             row,
-            subprocess_runner,
+            runner,
             dry_run=args.dry_run,
             script=script,
             known_hosts=args.known_hosts,

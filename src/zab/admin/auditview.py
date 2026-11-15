@@ -41,7 +41,9 @@ KEEP = 200
 QUIET = frozenset({"retire_step"})
 #: How long an applying plan is shown without its end: longer than any apply's timeout (§2.4).
 APPLYING_MAX = 6 * 3600.0
-CLOSING = frozenset({"apply_end", "reject", "expired", "stale", "interrupted", "unchanged"})
+CLOSING = frozenset(
+    {"apply_end", "reject", "expired", "stale", "interrupted", "unchanged", "plan_end"}
+)
 _PLAN = re.compile(r"P-[1-9][0-9]{0,17}", re.ASCII)
 _TEXT = {"verb": 40, "outcome": 40, "code": 40, "reason": 200}
 
@@ -193,7 +195,9 @@ class View:
                     entry["state"], entry["since"] = "approved", shown["ts"]
             elif event == "apply_start":
                 entry["state"], entry["since"] = "applying", shown["ts"]
-            elif event in CLOSING or (event == "refused" and "sender" not in record):
+            elif (event in CLOSING and record.get("part") is not True) or (
+                event == "refused" and "sender" not in record
+            ):  # a part's `apply_end` (#995): the plan of every workshop goes on
                 del self.open[plan]
 
     def records(self) -> list[dict[str, Any]]:

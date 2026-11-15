@@ -22,8 +22,15 @@ image's smoke test's, fails where something is still to do. With `--apply`, each
 off its idle stop (idle stop's hold file), from inside its lock on the VM: the remote half
 writes it, renews it and removes it, so no other run can. A row without an `ip` has no VM and
 is skipped. A stopped VM can't be
-reached: `!start` it first. `--upgrade-left-pips` also upgrades the pips an agent installed in
-`~/venv` or a uv tool's environment, which the check found holding the root (README.md §10).
+reached: `!start` it first, or, with `--apply`, give `--start-stopped N --region R --scope-tag
+K=V…` (#995, `power.StartStop`, as `push_config.py`'s): each row's stopped VM is started for its
+fix, at most N at a time, and stopped again once it is done, unless it was used since its start,
+its use can't be read, or its fix may still be running there (`FixResult.held`); a `power`
+column and a line under the table say what became of each. The commands printed under the
+table for a VM stopped again begin with `!start <slug>` (#1031). Its dry run starts nothing,
+and prints one fixed line.
+`--upgrade-left-pips` also upgrades the pips an agent installed in `~/venv` or a uv tool's
+environment, which the check found holding the root (README.md §10).
 
 One table, a row per VM: each step's outcome, and the check; then, per VM, what the check found,
 what was left, and the commands that look into a run that ended badly. Exit 0 when every VM
@@ -57,7 +64,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from admin_common import (
     DEFAULT_KNOWN_HOSTS,
+    HALTED_EXIT,
+    HALTED_FAILED_EXIT,
+    ConnectRetry,
     Runner,
+    add_start_stopped,
     first_line,
     format_table,
     host_of,
@@ -67,10 +78,17 @@ from admin_common import (
     select_rows,
     slug_of,
     ssh_argv,
+    start_stop,
+    start_stopped_line,
+    stderr_line,
     subprocess_runner,
 )
 
 REMOTE = pathlib.Path(__file__).resolve().parent / "trust_fix_remote.py"
+#: The `power` cells of a VM this run started and stopped again, or whose stop failed and which
+#: the cell says to `!stop` (`power.STOPPED_AGAIN` and `power.NOT_STOPPED_AGAIN`, which a test
+#: holds equal): the commands under the table begin with `!start` for it (#1031).
+AGAIN, NOT_AGAIN = "started, stopped again", "started, NOT stopped again"
 TRUST_STORES = pathlib.Path(__file__).resolve().parents[1] / "ami/files/bin/trust_stores.py"
 PLACEHOLDER = 'TRUST_STORES = ""  # trust_fix.py replaces this line\n'
 #: The rollout's repair of an older image's expired apt source (#947), which the remote half runs
@@ -83,6 +101,11 @@ PROBE_CMD = "true"  # an --apply's first connection: the VM is reached, before a
 PIPS = "--upgrade-left-pips"
 #: A VM takes minutes; this bounds one that hangs, inside the idle-stop hold's hour.
 TIMEOUT_S = 3000
+#: Why a VM that `--start-stopped` started is left running (#995; `FixResult.held`): its fix
+#: was cut short, or apt-get killed mid-install, so it may still be running there, and a stop
+#: would cut apt, dpkg or conda off. One whose other commands under the table look into it over
+#: SSH is stopped as usual, and those commands begin with `!start <slug>` (#1031).
+STILL_RUNNING = "its repair may still be running there"
 SSH_FAILED = 255  # ssh's own exit status: no connection, or one cut
 STEPS = ["ca-certificates", "uv", "venv", "certbot", "uv tools", "conda", "claude store"]
 COLUMNS = ["participant", "host", *STEPS, "check"]
@@ -157,6 +180,40 @@ class FixResult:
 
     def left(self) -> list[dict[str, str]]:
         return [x for x in self.report.get("left") or [] if isinstance(x, dict)]
+
+    def apt_killed(self) -> bool:
+        """apt-get install was killed at its timeout: its dpkg may still run, or be left
+        half-configured (`recovery`'s `sudo dpkg --configure -a`)."""
+        return self.steps().get("ca-certificates", "").startswith("FAILED: apt-get install killed")
+
+    def conda_failed(self) -> list[str]:
+        """The conda environments whose install failed, for `recovery`'s transactions."""
+        return [env for env in CONDA_PREFIXES if f"FAILED: {env}:" in self.steps().get("conda", "")]
+
+    def managed(self) -> str:
+        """Claude Code's managed settings that `recovery` looks into: `left` (step 5 left them
+        as they are, not being a JSON object), `absent`, or ""."""
+        claude = self.steps().get("claude store", "")
+        if claude.startswith(f"FAILED: {MANAGED} left as it is"):
+            return "left"
+        return "absent" if claude.startswith("absent") else ""
+
+    def still_running(self) -> bool:
+        """The fix may still be running there: cut short, or apt-get killed mid-install."""
+        return self.cut or self.apt_killed()
+
+    def looked_into(self) -> bool:
+        """`recovery` prints commands that look into this VM over SSH: exactly its tests."""
+        return self.still_running() or bool(self.conda_failed()) or bool(self.managed())
+
+    def held(self) -> str:
+        """Why `power.StartStop` leaves this VM up if the run started it (#995; review round 3 of
+        #1028), or "": the fix may still be running there (`still_running`, `STILL_RUNNING`),
+        which a stop would cut off. Any other VM whose commands `recovery` prints look into it
+        (`looked_into`: conda's transactions, Claude Code's managed settings) is stopped as
+        usual, and those commands begin with `!start <slug>` (#1031): so no command it prints
+        is for a VM this run stopped without it."""
+        return STILL_RUNNING if self.still_running() else ""
 
     def pips_left(self) -> bool:
         return any(x.get("kind") == "pip" for x in self.left())
@@ -257,9 +314,10 @@ def cause(res: Any) -> str:
     return scrub(first_line(lines[-1], 100)) if lines else f"ssh exit {res.exit_code}"
 
 
-def summary(result: FixResult, args: argparse.Namespace) -> list[str]:
+def summary(result: FixResult, args: argparse.Namespace, *, stopped: bool = False) -> list[str]:
     """Under the table, for one VM: a failed check's lines that name a store, or all of them,
-    but what is left; what is left; and the commands that look into a run that ended badly."""
+    but what is left; what is left; and the commands that look into a run that ended badly,
+    after `!start` for a VM this run `stopped` again (#1031)."""
     out = []
     left_files = {str(x.get("file", "")) for x in result.left()}
     lines = [str(x).strip() for x in result.report.get("check") or []]
@@ -283,20 +341,25 @@ def summary(result: FixResult, args: argparse.Namespace) -> list[str]:
     if apt and not apt.startswith("apt: nothing to repair"):  # silent, as in the rollout's row
         out += [f"\n{result.slug}: the apt source, before ca-certificates' apt-get update:"]
         out += [f"  {scrub(apt)}"]
-    return out + recovery(result, args)
+    return out + recovery(result, args, stopped=stopped)
 
 
-def recovery(result: FixResult, args: argparse.Namespace) -> list[str]:
+def recovery(result: FixResult, args: argparse.Namespace, *, stopped: bool = False) -> list[str]:
     """For a run that ended badly, the pinned-SSH commands that look into it (README.md §10):
-    fixed literals, with the roster's address and conda's fixed prefixes."""
+    fixed literals, with the roster's address and conda's fixed prefixes. Printed exactly when
+    `result.looked_into()`; for a VM this run `stopped` again after its fix, or whose cell says
+    to `!stop` it since its stop failed, which is never one whose fix may still run
+    (`FixResult.held`), `!start <slug>` comes first (#1031; harmless on a VM running)."""
 
     def ssh(remote: str) -> str:
         argv = ssh_argv(result.host, remote, known_hosts=args.known_hosts)
         return as_run(argv, bot=getattr(args, "admin_bot", False))
 
-    steps, out = result.steps(), []
-    apt_killed = steps.get("ca-certificates", "").startswith("FAILED: apt-get install killed")
-    conda = [e for e in CONDA_PREFIXES if f"FAILED: {e}:" in steps.get("conda", "")]
+    out: list[str] = []
+    if stopped and result.looked_into():  # #1031: up again first, for the commands below
+        out += [f"\n{result.slug}: stopped after its fix (its `power` cell); start it first:"]
+        out += [f"  !start {result.slug}"]
+    apt_killed, conda = result.apt_killed(), result.conda_failed()
     if result.cut or apt_killed or conda:
         out += [f"\n{result.slug}: to see what still runs there, until it reads `none running`:"]
         out += [f"  {ssh(LOOK_CMD)}"]
@@ -310,13 +373,13 @@ def recovery(result: FixResult, args: argparse.Namespace) -> list[str]:
         out += [f"  {ssh(CONDA_LIST.format(prefix))}"]
         out += ["  if it broke the environment, back to the one before it, N from that list:"]
         out += [f"  {ssh(CONDA_BACK.format(prefix))}"]
-    claude = steps.get("claude store", "")
-    if claude.startswith(f"FAILED: {MANAGED} left as it is"):
+    managed = result.managed()
+    if managed == "left":
         out += [f"\n{result.slug}: Claude Code's managed settings, which step 5 left as they are:"]
         out += [f"  {ssh(MANAGED_LOOK)}"]
         out += ["  once you know what the file held, the image's in its place, then the dry run:"]
         out += [f"  {ssh(MANAGED_PUT)}"]
-    elif claude.startswith("absent"):  # step 5 writes its key alone (review round 1, N5)
+    elif managed == "absent":  # step 5 writes its key alone (review round 1, N5)
         out += [f"\n{result.slug}: Claude Code's managed settings were missing, and with them"]
         out += ["  the image's other keys: the image's file in its place, then the dry run:"]
         out += [f"  {ssh(MANAGED_PUT)}"]
@@ -340,6 +403,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--parallel", type=int, default=6)
     parser.add_argument("--known-hosts", default=str(DEFAULT_KNOWN_HOSTS))
     parser.add_argument("--admin-bot", action="store_true", help="as !trust-fix runs it")
+    add_start_stopped(parser)  # #995: with --apply only; a dry run starts nothing
     args = parser.parse_args(argv)
     if args.upgrade_left_pips and not args.apply:
         parser.error(f"{PIPS} needs --apply")
@@ -351,30 +415,54 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     stream, said = args.admin_bot and args.apply, threading.Lock()
 
+    def say(line: str) -> None:
+        with said:  # whole lines, one at a time
+            print(line, flush=True)
+
     def ended(result: FixResult) -> FixResult:
         if stream:  # as it ends, whole lines, one VM at a time
-            with said:
-                print(done_line(result), flush=True)
+            say(done_line(result))
         return result
+
+    runner = ConnectRetry(subprocess_runner, log=stderr_line)  # one per run (#1009)
+    window = None
+    if args.start_stopped is not None:  # #995: power.StartStop, around each VM's fix
+        try:
+            window = start_stop(args, rows, runner, log=say) if args.apply else None
+        except ValueError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
+        say(start_stopped_line(args.start_stopped))
+        if window is not None and window.off:
+            say(f"start/stop off: {window.off}; stopped VMs are not started")
+        elif window is not None and window.halted:  # #1031: an earlier workshop's run halted
+            say(f"start/stop halted: {window.halted}; stopped VMs are not started")
+
+    def one(row: dict[str, str]) -> FixResult:
+        def work() -> FixResult:
+            kh, pips = args.known_hosts, args.upgrade_left_pips
+            return ended(fix_vm(row, runner, apply=args.apply, script=script, known_hosts=kh,
+                                pips=pips))  # fmt: skip
+
+        if window is None:
+            return work()
+        slug = slug_of(row)
+        refused = lambda why: ended(FixResult(slug=slug, problem=why))  # noqa: E731
+        return window.around(row, work, refused, keep=FixResult.held)
 
     results = run_parallel(
         rows,
-        lambda row: ended(
-            fix_vm(
-                row,
-                subprocess_runner,
-                apply=args.apply,
-                script=script,
-                known_hosts=args.known_hosts,
-                pips=args.upgrade_left_pips,
-            )
-        ),
+        one,
         parallel=args.parallel,
         on_error=lambda row, exc: ended(FixResult(slug=slug_of(row), problem=f"{exc!r}")),
     )
-    print(format_table(COLUMNS, [r.row() for r in results]))
+    power = window.cells if window is not None and not window.off else None
+    columns = [*COLUMNS, *(["power"] if power is not None else [])]
+    cells = [[*r.row(), *([power.get(r.slug, "-")] if power is not None else [])] for r in results]
+    print(format_table(columns, cells))
     for r in results:
-        if lines := summary(r, args):
+        cell = power.get(r.slug, "") if power is not None else ""
+        if lines := summary(r, args, stopped=cell == AGAIN or cell.startswith(NOT_AGAIN)):
             print(*lines, sep="\n")
     bad = [r.slug for r in results if not r.passed(args.apply)]
     skipped = sum(r.skipped for r in results)
@@ -384,6 +472,8 @@ def main(argv: list[str] | None = None) -> int:
         + (f"; not done: {', '.join(bad)}" if bad else "")
         + (f"; {skipped} row(s) without a VM" if skipped else "")
     )
+    if window is not None and window.summary():
+        print("\n" + window.summary())
     pips(results, args)
     # A run that may still be going is never rerun beside itself (Codex round 3 on #856): it
     # gets its dry run, once the look above reads `none running`.
@@ -404,11 +494,15 @@ def main(argv: list[str] | None = None) -> int:
     # not reached (stopped since the dry run, say), failed, or with a step blocked or failed
     again = [r.slug for r in results if (not r.passed(args.apply) or r.unfinished()) and not r.cut]
     if args.apply and again:
+        # #995: a VM it started was reached; one it couldn't look up (`off`) was started by none
+        start = "`!start` a VM not reached; " if window is None or window.off else ""
         print(
-            f"\nNot done on {', '.join(again)}: `!start` a VM not reached; wait out apt's lock"
+            f"\nNot done on {', '.join(again)}: {start}wait out apt's lock"
             " where a step names it (unattended upgrades: a few minutes); fix any other cause the"
             f" rows give. Then rerun them:\n  {rerun(args, again)}"
         )
+    if window is not None and window.tripped:  # #1031: a plan's later workshops start none
+        return HALTED_FAILED_EXIT if bad else HALTED_EXIT
     # the bot's plan shows every row, those not reached too; its apply fails on them
     return 1 if bad and (args.apply or not args.admin_bot) else 0
 
@@ -436,14 +530,21 @@ def pips(results: list[FixResult], args: argparse.Namespace) -> None:
 def rerun(
     args: argparse.Namespace, slugs: list[str], *, pips: bool | None = None, apply: bool = True
 ) -> str:
-    """This run's command again for SLUGS, as it was given, through `sudo -u` if sudo ran it;
-    without APPLY, its dry run. With `--admin-bot`, the bot's command, whose plan is the dry run
-    and whose approval the apply; but for the pips, which it doesn't take (README §10)."""
+    """This run's command again for SLUGS, as it was given, through `sudo -u` if sudo ran it,
+    its `--start-stopped` with its region and scope too (#995: the VMs it started are stopped
+    again, and would be `not reached` without them); without APPLY, its dry run. With
+    `--admin-bot`, the bot's command, whose plan is the dry run and whose approval the apply;
+    but for the pips, which it doesn't take (README §10)."""
     pips = apply and (args.upgrade_left_pips if pips is None else pips)
     if args.admin_bot and not pips:  # the slugs are the roster's, as the table shows them
         return f"!trust-fix {' '.join(slugs)}"
     argv = [sys.executable, "-E", "-s", sys.argv[0]]  # this script, as the command named it
     argv += ["--roster", args.roster, "--known-hosts", args.known_hosts]
+    start = getattr(args, "start_stopped", None)  # a namespace of before #995 has none
+    if start is not None:  # #995: a VM this run started is stopped again since
+        argv += ["--start-stopped", str(start)]
+        argv += ["--region", args.region] if args.region else []
+        argv += [x for tag in args.scope_tag for x in ("--scope-tag", tag)]
     argv += [x for slug in slugs for x in ("--only", slug)]
     tail = [*(["--apply"] if apply else []), *([PIPS] if pips else [])]
     return as_run([*argv, *tail], bot=args.admin_bot)

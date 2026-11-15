@@ -1,5 +1,343 @@
 # Changelog
 
+## 0.2.21
+
+What is new since 0.2.20: a participant's disk that grows by itself, online, once it is 85% used
+(#998), from the collector's sweep of every running VM (#998); new VMs on an 80 GB root (#998),
+whole within minutes of their launch (#1007); a workshop's image and gift step changed from Zulip,
+`!set-workshop` (#1043); `!rollout` and `!trust-fix` that start the stopped VMs they need and stop
+them again, and one rollout of every workshop from `#zab-admins` (#995); an agent's job killed for
+memory that no longer takes the bridge with it, and a smaller image (#997); the waker's journal of
+its starts (#1017), and its wakes through a Zulip outage (#1022); deploys that check for the plans
+in flight themselves (#989); the maintainer's release in one command, `upgrade.py --publish` (#991);
+a job stopped as it starts (#1020); SSH connects retried (#1009); and tests, CI and documentation.
+Each change cites its issue and then its pull request.
+
+**Upgrade notes.**
+
+- **The upgrade from 0.2.20 is in-band** (#569; ADMIN §1.6, BOOTSTRAP §13.4), as 0.2.20's was
+  from 0.2.19. Review this release with 0.2.20's own `deploy.sh --review <commit> --since
+  v0.2.20`. Once its signed tag is in `release_repo` (for the public repository, once the
+  release is published there), send `!upgrade-server v0.2.21 sha256=<the review's SHA-256>` to
+  the global admin bot, and approve its plan, which takes one deployer. The deploy takes no new
+  `admin.toml` key and changes no IAM policy: `render_policy.py` is unchanged, since the
+  automatic growth runs with `!grow-disk`'s `ModifyVolume` and the launch's initialization rate
+  needs no other permission. Two of the server's units change, the config helper's service and
+  path unit, in their comments and `Description=` alone (#1043). The plan and the approval of
+  this upgrade are 0.2.20's, so the plan names no plan in flight (#989, below): send `!plans`
+  to every bot first, as for 0.2.20. The waker restarts on this release (#1017, #1022). The
+  files host has nothing to deploy: what it runs, `workshop/files/` and `zab.workspace`, is
+  unchanged.
+- **The release is published with its own `upgrade.py`, this once by its `--since`** (#991,
+  below; BOOTSTRAP §13.4). 0.2.20's `upgrade.py` has no `--publish`: review this release with
+  0.2.20's `deploy.sh`, sign its private tag by hand without pushing it, check it out, then run
+  that checkout's `workshop/adminserver/upgrade.py v0.2.21 --since v0.2.20 --commit <commit>
+  --review-sha256 <the review's SHA-256> --publish`. From 0.2.22 on, the running release's copy
+  reviews, signs and publishes in that one command.
+- **Automatic disk growth starts with the upgrade** (#998, below; ADMIN §3.4), in each
+  workshop whose entry has an `alerts_channel`: within minutes of the bots' restart, once the
+  collector has read it, a running VM whose root file system is 85% used or more grows by half,
+  and its line comes in the workshop's alerts channel, topic `disk`. A workshop without an
+  `alerts_channel` gets none: `!grow-disk` stays the way there.
+- **An existing workshop's image or gift step changes in Zulip** (#1043, below; ADMIN §2.10):
+  `!set-workshop <ws> ami=newest` once a newer image is copied into its region's scope, or
+  `gifts_step="…"`, from a global admin in `#zab-admins`, in place of BOOTSTRAP §6.5's hand edit
+  of `admin.toml` over SSH, which stays the way on an older server.
+- **No `!start all` before a rollout or a trust fix** (#995, below; ORGANIZERS §3.5, §4.4): each
+  starts the stopped VMs it needs and stops them again. A fleet on 0.2.19 or older takes the
+  notes of each release it skipped for its VMs too: 0.2.20's `!trust-fix all` before the rollout
+  on a fleet from an image older than 0.2.19's, and `restart-codex` (0.2.19, #830).
+- **The bridge's units outlive a job killed for memory** (#997, below). On the VMs, the
+  release's rollout rewrites `zab.service` and the Codex daemon's unit with
+  `OOMPolicy=continue`: the bridge restarts, as at every rollout; the Codex daemon isn't
+  restarted for it, and its running turns go on. A VM keeps its swap file as its first boot made
+  it, 8 GiB on every VM launched before this release. **On your own machines, run `zab service
+  install` again** once zab is upgraded: it writes the line, and a running Codex daemon takes it
+  at the reload, without a restart (SPEC §13.3). Until then the units are as before.
+- **No `!plans` round before an upgrade from this release on** (#989, below). `!upgrade-server`
+  was already refused `busy:` while a plan applied, and now its plan names the plans in flight
+  on every bot; `deploy.sh` waits for a plan applying or approved, or refuses: an upgrade from
+  0.2.21 no longer starts with `!plans` to every bot. The upgrade to 0.2.21 still does, since
+  0.2.20 plans it, and so does a downgrade to 0.2.20 or older: that release's server half has
+  no check.
+- **New VMs get an 80 GB root, from an image built with this release** (#998;
+  `workshop/aws/README.md`, "The VMs"). `launch.py` gives 80 GB, not 200, and `build_ami.py`
+  builds on 80 GB, since EC2 launches no volume smaller than the image's snapshot. An image
+  built before, whose root is 100 GB, still launches, with 100 GB: `launch.py` says so. Build
+  the next workshop's image with this release for 80 GB roots. Running VMs keep their volumes;
+  a filling disk now grows by itself (ADMIN §3.4). The image is smaller too (#997, below):
+  `workshop/ami/build.sh` (#997) and `build_ami.py` (#998, its 80 GB root snapshot) changed, so
+  a new image needs a build; running VMs need none. The 5 GiB swap file is the launch's first
+  boot's, so a VM this release launches from an older image gets it too.
+
+**Changes since 0.2.20**
+
+**The bridge, on the participants' VMs and your own machines**
+
+- **An agent's job killed for memory no longer takes the bridge with it** (#997, PR #1006;
+  SPEC §13.3).
+  The agents' commands run in the bridge's unit (Claude's) and the Codex daemon's, and systemd
+  stops a unit whenever the kernel's OOM killer kills one of its processes: a Magma or Sage job
+  that ran the VM out of memory took the bridge and every Claude turn down with it, or the
+  daemon and every Codex turn, until the unit's restart. Both units now set
+  `OOMPolicy=continue`: the job alone ends, and its turn sees it killed. `zab service install`
+  hands a running Codex daemon the new line at its reload, without a restart, as it does a new
+  open-file limit.
+- **A job stopped as it starts no longer runs on** (#1020, PR #1021; SPEC §7.14). A stop (a `!stop
+  jobs`, say) that came in the millisecond or so while `zab job _exec` started the job, before the
+  job's process existed, reached the wrapper alone, which takes no action on a stop's signal: the
+  job then ran without ever getting its SIGTERM, until systemd killed it 15 s later. Such a stop now
+  ends the job's process before its program runs. The end post doesn't change: the job was stopped.
+
+**The admin server and its bots**
+
+- **A workshop's image and gift step change in Zulip** (#1043, PRs #1046, #1048; ADMIN §2.10;
+  NEW-WORKSHOP §6). `!set-workshop <ws> ami=newest|ami-… gifts_step="…"|none`, from a global
+  admin in `#zab-admins`, changes those two keys of an existing workshop's entry, which took an
+  SSH session before (BOOTSTRAP §6.5's steps 2 and 4). Its plan shows each line old and new and
+  what it affects (an image: the VMs launched from now on; a gift step: "Start here" posted from
+  now on), and checks the image as `!new-workshop` checks a region: `newest` is the region's
+  newest image in the fleet's scope, picked by the same code, once, at the plan, and that image
+  is the one the apply sets; a DryRun launch of the workshop's instance types from it must pass.
+  One global admin approves it; the config helper writes the two lines alone, keeps
+  `admin.toml.bak` and records each value old and new in its `changes.jsonl`, copied into the
+  audit chain; then the bots restart. A key that changes nothing, any other key, a gift step with
+  a mention or a backtick, and a message of more than one line are refused. `!show-workshop <ws>`
+  shows the entry as the bots loaded it. Both are the server's bot's alone. The config helper,
+  which root runs, is in the release's privileged diff.
+- **`!rollout` starts the stopped VMs it needs, and stops them again** (#995, PRs #1026, #1027,
+  #1028; ADMIN §3, action 4; ORGANIZERS §3.5). A rollout of a fleet with idle stop used to need
+  `!start all` first, then an hour of idle stop for each VM it woke. Now `push_config.py
+  --start-stopped 8`, which the bot always passes, starts a row's stopped VM when the apply gets to
+  its row, at most 8 at a time, rolls it out, and stops it again at once, unless it was used since
+  its start (a turn or a message taken in since then, or a background job or a login still open,
+  read on the VM by `idle_stop.py --in-use`) or that can't be read: then it is left running, for
+  its idle stop where that is on, and otherwise until `!stop`. After 3 VMs in a row whose use can't
+  be read, it starts no more. A VM that was running stays running, and so does one the waker
+  started first. The plan's status table has a `power` column (`start, then stop` or `left
+  running`), and the result's table one with each VM's outcome (`started, stopped again`, …); a
+  failed start fails its row alone. The rollout's deadline grows with its rows: 30 minutes, or a
+  minute a row. **`!trust-fix` does the same** (`trust_fix.py --start-stopped 6`, six at a time):
+  its dry run still reads a stopped VM `not reached`, and its apply starts it for its fix and stops
+  it again, unless it was used since its start, its use can't be read, or its fix may still be
+  running there (cut short, or apt-get killed mid-install); the commands printed under its table
+  for a VM stopped again begin with `!start <slug>` (#1031, PR #1033). A VM left running on a fleet
+  never rolled out has no idle stop, and stays up until `!stop`. Its deadline is now an hour, or
+  2.5 minutes a row.
+- **One rollout of every workshop, from `#zab-admins`** (#995, PR #1030; ADMIN §2.2). `!rollout
+  VERSION every-workshop [the rollout's words]` and `!trust-fix every-workshop`, to the server's
+  bot, from a global admin: one plan, whose part for each workshop with a VM is exactly that
+  workshop's own `!rollout VERSION all …` (or `!trust-fix all`), with a status table each;
+  approved once, with the phrase `rollout <n>` for the rollout. Its apply holds every workshop's
+  lock, runs the parts in turn, each with its own records and result in the plan's topic, one that
+  fails not stopping the next, then one line for them all. Once a part halts its starts (3 VMs in
+  a row whose use can't be read), the later parts start no VM (#1031, PR #1033). A rollout or
+  trust fix that halts so now ends `❌` (its script exits 3, or 4 with a row not done), even with
+  every row done; after an exit 3, the rollout's status read still runs and its release is
+  recorded. The ledger reads each part as that workshop's rollout of `all`, which `!adopt-spare`
+  replays. `every-workshop` is reserved: no roster slug may be it.
+
+- **`!launch` gives each VM an 80 GB root, not 200** (#998, PR #1004; `workshop/aws/README.md`,
+  "The VMs"): the shared Mathlib is the default, where each topic once built its own (#205), and a
+  filling disk grows by itself (below). `launch.py` takes an older image's own root where it
+  is larger (100 GB before this release), which EC2 requires, and `build_ami.py` builds on
+  80 GB. The cost estimate prices a volume whose size it hasn't read at 80 GB too (ADMIN
+  §11.2); a read one, at its size, as before.
+- **A new VM's disk is whole within minutes of its launch** (#1007, PR #1008;
+  `workshop/aws/README.md`, "The VMs"; ORGANIZERS §3.2). A volume made from the image fetched each
+  block from S3 on its first read, at about 5 MiB/s: on a VM whose first boot's warm-up hadn't read
+  it yet, such as a spare handed over the day it was launched, the first `import Mathlib` took about
+  half an hour (#999). `launch.py` now asks EBS to initialize each new root volume at 200 MiB/s
+  (`--init-rate`, new: 0, or 100 to 300; 0 keeps EBS's default rate), spares included, and its
+  output and summary name the rate. `!launch` takes the default. The cost estimate prices it once
+  per volume, at AWS's list price per GB, on the volume's size: an upper bound, since EBS charges
+  for the snapshot's data (ADMIN §11.2).
+- **A participant's disk grows by itself** (#998, PRs #1002, #1003; ADMIN §3.4, ORGANIZERS
+  §4.1). When a running
+  VM's root file system is 85% used or more, by the collector's last read, the workshop's bot
+  grows its volume by half, rounded up to whole GB, to at most 400 GB, then its partition and
+  file system online, with `!grow-disk`'s script (`grow_disk.py --auto-cap 400`, new) and
+  permissions: no plan, no restart, and its running turns go on. One line in the workshop's
+  alerts channel (topic `disk`) says what grew, from what to what, and why, and a `disk_grow`
+  audit record keeps it; a line Zulip never took is posted again at each look until it lands,
+  without another resize. EBS's one change of a volume every 6 hours is kept: the next growth
+  waits for the time the script names, and the line says so when the disk is still above 85%.
+  A failure is said and tried again 30 minutes later, 3 tries in all; at 400 GB it says so
+  once; either way nothing more is tried until the disk is below 85%. A stopped VM is never
+  grown, nor started for it. A workshop without an `alerts_channel` gets no automatic growth.
+  A growth holds its workshop as a plan's apply does: an approval meanwhile is answered
+  `busy:`, unless it is a `!stop` or `!start` that doesn't name the VM growing; and a growth
+  waits while a plan applies.
+  `!grow-disk` stays for a step by hand, sooner, larger, or past 400 GB.
+- **The collector sweeps every running VM** (#998, PR #1001; ADMIN §4.1). It read only VMs whose
+  idle stop was off, every 10 minutes, so the console's values of every VM whose idle stop was on,
+  every workshop VM in practice, its disk use among them, came from `!status` alone. Now every other
+  running VM is read every 10 minutes too, as the read user alone (`status.py --read-user-only`),
+  whose sessions idle stop doesn't count as logins; a VM that user can't read, whose idle stop
+  predates #507, is left out of that read and keeps its last values. Each read names the instance it
+  reached (`status.py`'s new `instance`), and the console no longer shows a row's old VM's values
+  for a VM handed over to it since.
+
+- **The waker's journal says why it started each VM** (#1017, PR #1019; SPEC §13.4, ADMIN
+  §1.2). It
+  logged nothing about its starts, so nobody could tell why a VM kept coming back. Each start
+  request now has an INFO line after it, `Wake start:` with `result=ok` or the code of a
+  refusal or a failure, and each wake given up before its request a `Wake not started:` line
+  with the reason. The line names the workshop, the VM, the bot, the message's and its
+  sender's IDs, never the text, and why the message counts: a DM, a mention or a channel
+  message without one (`why`), the VM's state when the waker first saw it (`seen`: `running`
+  for a message sent just before a stop, kept for the next poll), `live` or `catch-up` (`via`),
+  and its age.
+
+- **A Zulip outage no longer drops a wake** (#1022, PR #1023; SPEC §13.4.1). Just before a start
+  request the waker checks the VM's owner once more, with Zulip, and any error there ended the
+  wake: during a 502 outage a participant's DM to a stopped VM got no answer, and the VM stayed
+  stopped until their next message. Now a 5xx, a 429, a response that isn't JSON, a timeout or a
+  connection error is tried again, from the VM's state, after 5 s, then twice as long each time up
+  to a minute, for five minutes; the last try comes at least 5 s before they end. An owner check
+  Zulip hasn't answered by their end is cut off, and none begins that a 429's long `Retry-After`
+  would hold past it. The messages keep waiting meanwhile, and those that arrive join them. The
+  first failure logs `Wake delayed: … (Zulip unavailable: <kind>)`; a wake still without Zulip
+  after five minutes logs `Wake not started:` with the same reason, and its messages are dropped,
+  as before. A refusal, such as a deactivated bot's 401, still ends the wake at once, with no
+  start.
+
+**Deploying**
+
+- **The deploy clone's fetch starts no git maintenance** (#1024, PR #1025; BOOTSTRAP §13.4, *Onto
+  the public repository's commits*). Step 2 fetches the running release's tag and `C` from `~/zab`
+  into a clone of the public repository, which brings the private history in as a second pack. From
+  git 2.54 on, the maintenance that a fetch starts then goes on writing in the clone in the
+  background, while you check it and deploy from it: a commit-graph of that history, and a repack
+  when neither of the two packs holds twice as many objects as the other. The step's fetch now
+  passes `-c maintenance.auto=false`, as `deploy.sh`'s fetch on the server does (#933).
+- **The maintainer's release in one command: `upgrade.py --publish`** (#991, PRs #1035, #1037,
+  #1038; BOOTSTRAP §13.4; the adminserver README). Run from the copy of the running release, it
+  does all of this:
+  - it reviews the release with that copy's `deploy.sh`, compares the review's SHA-256 with the
+    release message's, and asks once before it signs;
+  - it signs and verifies the private tag;
+  - it exports the release with the release's own export tool, then commits and signs the
+    public tag;
+  - it pushes the public `main` and the tag together (`git push --atomic`), and the private tag
+    last;
+  - it ends with the `!upgrade-server` line to send.
+
+  Every refusal comes before any push: the export's, a tag that doesn't verify, a public `main`
+  that moved, a missing identity, or `gh`'s token without the `workflow` scope. A run that
+  stopped goes on from where it stopped when the same command runs again. Without `--publish`,
+  a deployer's run is unchanged. `--since vP` lets the new release's own copy finish a run once
+  its tag verifies. That is how v0.2.21, the first release with `--publish`, is published.
+- **A hand deploy checks for the plans in flight itself** (#989, PR #1034; ADMIN §2.4 step 6,
+  BOOTSTRAP §13.4). An upgrade or a downgrade by `deploy.sh` restarts the bots, which interrupts
+  every plan being planned, approved or applying: a deployer had to send `!plans` to every bot
+  first, and watch for a progress message. Now its server half, once the release is built and before
+  anything is installed, reads the bots' `state.db` read-only, as `zab-admin` (`python -m
+  zab.admin.inflight`), and waits for any plan applying or approved, a month-end run included, up to
+  `--plan-wait MINUTES` (15), then refuses, naming each plan with its bot: nothing is deployed. A
+  plan pending or being planned is named and doesn't hold it: the restart interrupts one being
+  planned, and a pending one, whose hash names the old release, is found stale at its approval.
+  `--interrupt-plans REASON` goes on for a plan that is stuck, and the deploy record, which the bot
+  copies into the audit log, keeps the reason and the plans cut (`unknown` when they couldn't be
+  read). A deploy of a release without the check, 0.2.20 or older, a downgrade's target say, runs
+  that release's server half, which has none: send `!plans` to every bot first, as before. This
+  release's `deploy.sh` says so and refuses the two options for it; the target's own, as a rollback
+  runs it, says nothing, and refuses them as unknown options.
+- **`!upgrade-server` names the plans in flight** (#989, PR #1036; ADMIN §2.4 steps 5 and 6). Its
+  plan's notes name the plans applying or approved on every bot, until each of which its approval is
+  answered `busy:` and not recorded, and those pending or being planned, with what the bots' restart
+  does to each. A `busy:` answer names the bot of the plan that holds the lock when it is another
+  bot's: `busy: P-41 is applying on the server's bot` to an organizer while an upgrade or a plan of
+  every workshop applies, and `… on <workshop>'s bot` to the upgrade's own approval.
+
+**Workshop scripts**
+
+- **A VM's first day takes up to about 5.6 GB less disk** (#997, PR #1006; `workshop/ami/README.md`,
+  "The image's footprint"). The first boot makes a 5 GiB swap file instead of 8 GiB, which `df`
+  counted as used, sized for SPEC §7.10's busiest moment, and leaves a VM's active one alone. The
+  image leaves out conda's package cache (`conda clean -afy`) and apt's, before the smoke test, each
+  saving in the build's log; Mathlib's downloaded archives (`~/.cache/mathlib`), in a step of their
+  own; and package documentation, through a dpkg filter that keeps copyright files and Macaulay2's
+  tree, from which its `help` databases are built. The filter stays on the image, so `texdoc` loses
+  the manuals the TeX Live packages shipped, such as biblatex's (`texlive-bibtex-extra`'s 107 MB):
+  use CTAN, or bring a package's back on a VM with `sudo rm /etc/dpkg/dpkg.cfg.d/zab-no-doc` and
+  `sudo apt-get install --reinstall PACKAGE`. Both smoke tests run a new project's first `lake
+  build` with no network, which must fetch nothing and run no Mathlib cache. The volume warm-up no
+  longer reads the archives.
+
+- **A failed SSH connect is tried again, to a VM that answered earlier in the run** (#1009,
+  PR #1013; `workshop/admin/README.md`, "Either way"). An adoption of a spare failed when one of its
+  connections, `push_config.py`'s staging directory, timed out at the TCP connect between
+  calls that reached the VM. Now `push_config.py`, `final_sync.py`, `trust_fix.py` and
+  `provision_repos.py` try such a connect twice more, 5 s and then 15 s later, which covers
+  about 50 s; a call to a VM that stays dark then fails after up to about 65 s, not 15 s, and
+  later calls to it at once. Only ssh's own connect failure is retried (exit 255, with
+  `Connection timed out`, `Connection refused` or `No route to host` for the VM's address and
+  nothing else), not a command whose connection was cut: no command of these scripts prints
+  that line itself. A VM that hasn't answered in the run, stopped or at a wrong address,
+  fails at its first try as before. The VM's row notes a retry that connected
+  (`ssh: connected on try 2 (…)`), and a failed connect's line says when it began, UTC
+  (`… Connection timed out (began 09:31:05Z)`).
+
+**Docs**
+
+- SPEC §7.10, §7.14 and §13.3 say that the kernel's OOM killer is weighted to take a background
+  job first, not that it always does (#997): its `OOMScoreAdjust=500`, 300 above the agents'
+  commands, adds 0.3 × (memory + swap) to its score, so a process that much larger goes first.
+- DECISIONS' verification log has three rows from live runs (PR #1010): `!upgrade-server` from
+  an anonymous HTTPS `release_repo`, in admin end-to-end A10 and A10b (#959); a new VM's first
+  `import Mathlib` at EBS's default initialization rate and at 200 and 300 MiB/s (#1007); and
+  what a VM's snapshot holds, and a restore's time, for block-level cold storage (#999).
+- SPEC and ADMIN describe v0.2.21.
+
+**Tests and CI**
+
+- End-to-end parts that stop the test VM tolerate the test waker (#1017, PR #1019). Scenario 8's
+  cold import timed out when the waker started the VM again 18 s after the part's stop, for an owner
+  message it saw just before: the polls never read `stopped`. The new `TestEc2.wait_stopped` takes
+  `pending`, or `running` after `stopping`, as the stop followed by such a start, and polls every 2
+  s. Scenario 8's cold import and 18's job cut off by a stop take that start as their own, noted,
+  and start the VM only if it is still stopped. Scenarios 10 and 11, which need the VM stopped for
+  their wake, fail at once on such a start, pointing at the waker's `Wake start:` line, where they
+  timed out after 5 or 10 minutes.
+- A test that runs BOOTSTRAP §13.4's step 2 twice makes its second deploy clone in a fresh `HOME`,
+  where it removed the first one (#1024, PR #1025). Under git 2.56, the background repack that the
+  step's fetch started could refill the clone's `.git` as `shutil.rmtree` emptied it (`Directory not
+  empty`). A new test traces the step: its fetch, and no `maintenance run`.
+- **Admin end-to-end A26: a filling disk grows by itself, online** (#998, PR #1045; ADMIN §7),
+  on the rig, after A21. `zab-test-b`'s disk is filled past 85% over SSH while a process writes
+  to it every 2 s, and the workshop's bot grows its volume by half: its line in the alerts
+  channel, EC2's modification, `df` below 85% after, one `disk_grow` audit record, no restart of
+  the bridge or the VM, and the writer one process throughout. A second fill at once, within
+  EBS's 6 hours, grows nothing and says nothing more.
+- **Admin end-to-end, the other new parts** (ADMIN §7): A25, a stopped VM that `!rollout`
+  starts, rolls out and stops again, beside a running one it leaves running (#995, PR #1027);
+  A24 does the same for `!trust-fix` (#995, PR #1028); A10, a deploy refused after its build
+  while a plan applies, naming the plan with its bot, the release directory gone and the plan
+  ending `✅` (#989, PR #1034); and A27, `!set-workshop` and `!show-workshop` on the rig's
+  second workshop: its refusals, `ami=newest` with a gift step, applied and read back, the
+  helper's record and the audit chain's, then the gift step removed (#1043, PR #1048).
+- **CI's pull-request run is shorter** (#988, PRs #1014, #1015, #1016; AGENTS.md §4.3, §4.4).
+  The deploy rig's tests (marked `deploy_rig`) run once per pull request, under 3.12, the admin
+  server's Python, in a job of their own, `rigs (3.12)`, and a push to `main` runs them under
+  every version; each process bootstraps the rig once, and its releases carry stand-ins for
+  the self-check's scripts, the real ones checked by a `shipped` rig. A test helper no longer
+  reads a half-written line of a fake script's calls, and two fixed waits are shorter.
+- The release tests' checkout is on `main` whatever the maintainer's `init.defaultBranch` (#1042,
+  PR #1044): with `init.defaultBranch = main` in the global git config, seven tests of
+  `tests/e2e/admin/test_harness_release.py` failed, and with them the offline suite that
+  `tools/publish/export.py` runs, so the export refused.
+
+**Known limits**
+
+- **The collector's sweep at scale** (#998, PR #1001; ADMIN §4.1): one `status.py` run per
+  workshop, 8 VMs at a time, one workshop after another, each cut off at 15 minutes. At about
+  7 s a read, a workshop of about 1,000 running VMs outruns that and merges nothing, every
+  cycle; its disk reads then come from `!status` alone, and nothing grows there by itself.
+- **A VM the sweep doesn't read** (#998): beside a VM whose idle stop predates #507, a VM with
+  no read user whose last read predates a change of its idle stop (after `!idle-stop 0`, or
+  launched and not rolled out yet) is left out until a `!status` reads it.
+
 ## 0.2.20
 
 What is new since 0.2.19: background jobs that outlive a turn, with a post and a report turn when

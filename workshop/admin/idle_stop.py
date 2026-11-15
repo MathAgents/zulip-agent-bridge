@@ -91,6 +91,11 @@ Connect key, which gets no `restrict`, may forward ports and sockets, and use sf
 serves it itself (`internal-sftp`), as it may for `ubuntu`).
 `--setup-read-user` (push_config.py, as root) creates the user, or resets one that exists.
 
+**`--in-use`** (#995) prints, as JSON, what says whether anyone used the VM since its boot, and
+changes nothing: `push_config.py --start-stopped` and `trust_fix.py` send this script on stdin,
+as root, to a VM they started for their work (`use_facts`), and stop it again unless `in_use`,
+on the admin server, finds a reason in that answer to leave it running.
+
 Every run prints its verdict, which goes to the journal (`journalctl -u zab-idle-stop`).
 `/var/log/zab-idle-stop.log` gets a line only when the verdict changes, and before each power-off,
 so it stays short. The database is read as `agent`, read-only, so root never creates files
@@ -111,7 +116,7 @@ import subprocess
 import sys
 import time
 import tomllib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -294,11 +299,11 @@ def read_load5(proc: str = "/proc") -> float:
     return float(Path(proc, "loadavg").read_text().split()[1])
 
 
-def ssh_sessions(proc: str = "/proc") -> list[str]:
-    """`user@tty` of every SSH session, from the sshd process titles."""
+def ssh_sessions(proc: str = "/proc", skip: Collection[int] = ()) -> list[str]:
+    """`user@tty` of every SSH session, from the sshd process titles; not those of `skip`."""
     found = []
     for entry in os.scandir(proc):
-        if not entry.name.isdigit():
+        if not entry.name.isdigit() or int(entry.name) in skip:
             continue
         try:
             cmdline = Path(entry.path, "cmdline").read_bytes()
@@ -707,6 +712,120 @@ def gather(
     return facts
 
 
+# ------------------------------------------------------------- used since its boot (#995)
+
+#: `--in-use`'s read of zab's state, as `agent`: the bridge's own reader, whose newest activity
+#: is counted as here (`zab.commands.status.LAST_ACTIVITY_SQL`); run from stdin, this script has
+#: no file of its own to read the database through (`read_db_as_agent`).
+ZAB_STATUS = ["/home/agent/.local/bin/zab", "status", "--json"]
+AGENT_ENV = {"HOME": "/home/agent", "PATH": "/home/agent/.local/bin:/usr/bin:/bin",
+             "LANG": "C.UTF-8"}  # fmt: skip
+#: `--in-use`'s `activity` when `zab status --json` has no `last_activity` (zab up to 0.2.3):
+#: not a number, so `in_use` reads it as unknown.
+NO_ACTIVITY_KEY = "no last_activity"
+#: A login as `in_use` names it: `ubuntu@pts/0`; any other is only counted.
+_LOGIN_NAME = re.compile(r"[A-Za-z0-9_.-]{1,32}@[A-Za-z0-9/]{1,16}")
+#: `in_use`'s reasons when its answer, or one of its facts, can't be read, and only those
+#: (`UNREAD`): `power.StartStop` takes them as its `unread_reasons` (`admin_common.start_stop`)
+#: and counts each towards its breaker, so `in_use` words no other reason this way (#1031).
+USE_UNREAD = "its use can't be read"
+UNKNOWN = {"uptime": "its uptime unknown", "turns": "turns unknown",
+           "jobs": "background jobs unknown", "activity": "zab's activity unknown",
+           "logins": "logins unknown"}  # fmt: skip
+UNREAD = frozenset({USE_UNREAD, *UNKNOWN.values()})
+
+
+def ancestors(pid: int, proc: str = "/proc") -> set[int]:
+    """`pid` and every process above it, from `/proc/<pid>/stat`: the check's own SSH session
+    among them, which is no one's login."""
+    out: set[int] = set()
+    while pid > 1 and pid not in out:
+        out.add(pid)
+        try:
+            pid = int(Path(proc, str(pid), "stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return out
+
+
+def use_facts(
+    run: Run, proc: str = "/proc", *, now: float | None = None, pid: int | None = None,
+    monotonic: float | None = None, config: str = CONFIG,
+) -> dict[str, object]:  # fmt: skip
+    """What `--in-use` prints, as root, writing nothing (#995): the time and the uptime, zab's
+    running turns and newest activity (`ZAB_STATUS`), the background jobs that hold the VM up
+    (`jobs_running`), and the logins: `who`'s, and the SSH sessions but this check's own and
+    the status reads'. None for what can't be read. A VM whose zab has no config yet, never
+    rolled out (a trust fix before its first rollout), runs no bridge: no turn, no activity."""
+    facts: dict[str, object] = dict.fromkeys(("uptime", "turns", "activity", "jobs", "logins"))
+    facts["now"] = time.time() if now is None else now
+    try:
+        facts["uptime"] = read_uptime(proc)
+    except (OSError, ValueError, IndexError):
+        pass
+    if not os.path.lexists(config):  # `zab status` would refuse it: nothing runs to read
+        facts["turns"] = 0
+    else:
+        try:
+            res = run(ZAB_STATUS, user=AGENT, group=AGENT, extra_groups=[], env=AGENT_ENV,
+                      capture_output=True, text=True, timeout=60, cwd="/")  # fmt: skip
+            status = json.loads(res.stdout) if res.returncode == 0 else None
+            if isinstance(status, dict) and isinstance(status.get("running_turns"), list):
+                facts["turns"] = len(status["running_turns"])
+                # as it is, so that `in_use` reads anything but a number or null as unknown:
+                # zab up to 0.2.3 has no `last_activity` (review of #1026, B1)
+                facts["activity"] = status.get("last_activity", NO_ACTIVITY_KEY)
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            pass  # KeyError: no user `agent`
+    try:
+        jobs = jobs_running(run, time.monotonic() if monotonic is None else monotonic)
+        facts["jobs"] = None if jobs is None else jobs[0]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        mine = ancestors(os.getpid() if pid is None else pid, proc)
+        sessions = [s for s in ssh_sessions(proc, mine) if s != READ_SESSION]
+        facts["logins"] = who_logins(run) + sessions
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return facts
+
+
+def _finite(value: object) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)  # type: ignore[arg-type]
+
+
+def in_use(facts: object) -> list[str]:
+    """Why a VM that a rollout started was used since its boot, from `use_facts`'s answer (#995):
+    a turn running now, zab's activity since the boot (a message taken in, a turn started or
+    ended), a background job running now, a login open now. Its owner controls that answer, so
+    whatever is missing or not of its form is a reason too, one of `UNREAD`: the VM is left
+    running. Empty: nobody used it, and it may be stopped again."""
+    if not isinstance(facts, dict):
+        return [USE_UNREAD]
+    now, up = facts.get("now"), facts.get("uptime")
+    timed = _finite(now) and _finite(up)
+    reasons = [] if timed else [UNKNOWN["uptime"]]
+    for key, what in (("turns", "turn(s)"), ("jobs", "background job(s)")):
+        count = facts.get(key)
+        if type(count) is not int or count < 0:
+            reasons.append(UNKNOWN[key])
+        elif count:
+            reasons.append(f"{count} {what} running")
+    last = facts.get("activity", NO_ACTIVITY_KEY)  # null: no activity ever; missing: unknown
+    if last is not None and not _finite(last):
+        reasons.append(UNKNOWN["activity"])
+    elif last is not None and timed and last >= now - up:  # type: ignore[operator]
+        reasons.append("zab active since its start")
+    logins = facts.get("logins")
+    if not isinstance(logins, list):
+        reasons.append(UNKNOWN["logins"])
+    elif logins:
+        names = sorted({x for x in logins if isinstance(x, str) and _LOGIN_NAME.fullmatch(x)})
+        reasons.append("logged in: " + (", ".join(names[:3]) or f"{len(logins)} session(s)"))
+    return reasons
+
+
 # ------------------------------------------------------------------- the read user (#507)
 
 
@@ -897,9 +1016,16 @@ def main(
     parser.add_argument(
         "--setup-read-user", action="store_true", help=f"as root: set up {READ_USER} (#507)"
     )
+    parser.add_argument(
+        "--in-use", action="store_true", help="as root: what says whether anyone used this VM "
+        "since its boot, as JSON; changes nothing (#995)"
+    )  # fmt: skip
     args = parser.parse_args(argv)
     if args.read_db:  # the child of read_db_as_agent
         print(json.dumps(read_db(args.read_db)))
+        return 0
+    if args.in_use:  # a rollout's VM, before it stops it again (`in_use`)
+        print(json.dumps(use_facts(run, proc, now=now, monotonic=monotonic, config=config)))
         return 0
     if args.setup_read_user:
         setup_read_user(run, home=read_home, src=ubuntu_keys, owner=keys_owner)

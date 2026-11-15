@@ -407,9 +407,8 @@ def test_housekeeping_runs_last_and_apt_is_non_interactive():
     assert "grep -q '/opt/magma' /usr/local/magma/magma" in text
     # the Magma check runs as agent; image hygiene in the housekeeping
     assert 'if as_agent bash -c \'test "$(echo "print 2+2;" | timeout 120 magma -b' in text
-    for needle in (
+    for needle in (  # conda's cache goes before the smoke test (#997, test_ami_footprint.py)
         "$APT clean",
-        'conda" clean -a -y',
         "journalctl --rotate --vacuum-time=1s",
         'uv" cache clean',
     ):

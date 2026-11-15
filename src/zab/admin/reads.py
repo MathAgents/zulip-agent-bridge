@@ -1,5 +1,5 @@
 """The read commands a bot answers itself (docs/ADMIN.md §2.2): `!help`, `!version`, `!plans`,
-`!plan P-n`, `!audit [n]` and `!roster show [slug]`.
+`!plan P-n`, `!audit [n]`, `!roster show [slug]`, `!month-end show` and `!show-workshop NAME`.
 
 Each returns the reply's text; the bot audits a `read` record and adds its chain head (§2.8).
 A workshop's bot shows only its own workshop: its plans, its records, its roster. Text from
@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from zab.admin import fleet, monthend
+from zab.admin import fleet, monthend, setworkshop
 from zab.admin.actions import Fleet
 from zab.admin.approvals import Approvals
 from zab.admin.audit import Head
@@ -234,6 +234,16 @@ async def month_end(
     return text.replace(monthend.ATTACH, f"[month-end.txt]({url}).")
 
 
+async def show_workshop(server: AdminServer, bot: AdminBot, m: Incoming, c: Command, _: Any) -> str:
+    """`!show-workshop NAME` (#1043), on the `[global]` bot: the entry as the bots loaded it,
+    scrubbed and fenced, its files named by their paths alone (`setworkshop.show`)."""
+    assert c.workshop is not None  # the grammar's
+    text = setworkshop.show(server.config, c.workshop)
+    if not text:
+        return f"❌ `{c.workshop}` is not a workshop of this server: `!version` lists them."
+    return f"**{c.workshop}**, as the bots loaded it:\n{server.scrubber.block(text).inline}"
+
+
 async def _name(server: AdminServer, bot: AdminBot, user_id: int) -> str:
     user = await server.user(bot, user_id)
     name = user.get("full_name") if user else None
@@ -248,4 +258,5 @@ READS: dict[str, Read] = {
     "audit": audit,
     "roster show": roster,
     "month-end show": month_end,
+    "show-workshop": show_workshop,
 }

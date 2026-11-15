@@ -141,6 +141,9 @@ SCENARIOS: dict[int, tuple[str, str, int]] = {
     22: ("A22", "The roster from the workshop's channel", 1),
     23: ("A23", "The rollout's defaults: the shared Mathlib and idle stop", 4),
     24: ("A24", "!trust-fix on a VM of the participants' image", 1),
+    25: ("A25", "!rollout starts a stopped VM and stops it again", 1),
+    26: ("A26", "A filling disk grows by itself, online", 1),
+    27: ("A27", "!set-workshop and !show-workshop", 7),  # #1043
     110: ("A10b", "!upgrade-server", 6),
 }
 #: The go criteria (ADMIN §8.2): A1 to A7, A10 and A12 to A15.
@@ -157,7 +160,7 @@ def select(spec: str) -> list[int]:
             continue
         lo, _, hi = part.partition("-")
         if lo not in LABELS or (hi and hi not in LABELS):
-            raise ValueError(f"no scenario {part!r}: A1-A24, A10b, go or all")
+            raise ValueError(f"no scenario {part!r}: A1-A27, A10b, go or all")
         first, last = LABELS[lo], LABELS[hi or lo]
         numbers = {n for n in SCENARIOS if first <= n <= last and n < 100} | {first, last}
         chosen |= numbers

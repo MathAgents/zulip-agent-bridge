@@ -5,21 +5,28 @@ the bot's keys used read-only. Every `INTERVAL` it reads, for each workshop of a
 - **EC2,** in the workshop's region, through the role: its VMs as the starter decides a fleet VM
   (`starter.fleet_vm`), their state, launch time and type, every `PROTECT_EVERY` each one's
   termination protection (`DescribeInstanceAttribute`, §5's Lifecycle statement), and every
-  `VOLUME_EVERY` the size of their volumes (`DescribeVolumes`, §5's Read statement, #553), for
-  the cost; where that read fails, the cost takes 200 GB (`costs.VOLUME_GB`); matched to
-  the roster's rows by `participant` tag or address, as the plans' target sets are
-  (`provider.targets`), and to the spares of `spares.json`;
+  `VOLUME_EVERY` the size of their volumes (`DescribeVolumes`, §5's Read statement, #553), and
+  the provisioned rate each was created at, if any (#1007), for the cost; where that read
+  fails, the cost takes `launch.py`'s (`costs.VOLUME_GB`); matched to the roster's rows by
+  `participant` tag or address, as the plans' target sets are (`provider.targets`), and to the
+  spares of `spares.json`;
 - **the waker's status file** (§1.2): which VMs are opted in, the state it saw last, its last
   wake attempt;
-- **the status values,** with their age: its own sweep, `status.py --json` every `SWEEP_EVERY`,
-  since a sweep's SSH session restarts the grace period of an idle stop set up before #507
-  (§4.1), only of a running VM whose last read shows its idle-stop timer neither enabled nor
-  active, made since the VM's current boot and since the last plan that could change its idle
-  stop (`IDLE_VERBS`) started or ended (`due`; the review of #494). A VM with no such read is
-  never swept. A sweep that gets no answer for a VM notes the try, so it waits `SWEEP_EVERY`
-  too. Every `!status` the bots answer feeds it (`note_status`), and is all it has of most
-  VMs, since every fleet runs idle stop (Q14). A read that found the VM down keeps the values
-  it last gave;
+- **the status values,** with their age: its own sweep, `status.py --json` of each running VM
+  of the roster every `SWEEP_EVERY` (`due`). A sweep's SSH session as `ubuntu` restarts the
+  grace period of an idle stop (§4.1), so only a VM whose last read shows its idle-stop timer
+  neither enabled nor active, made since the VM's current boot and since the last plan that
+  could change its idle stop (`IDLE_VERBS`) started or ended (the review of #494), is read as
+  `!status` reads it; every other one as the read user alone, `--read-user-only` (#998), whose
+  sessions idle stop doesn't count, and which leaves out a VM it can't read (an idle stop set up
+  before #507). A VM swept waits `SWEEP_EVERY` for the next, answered or not (`swept`); one
+  read as `!status` reads it that gets no answer has the try noted on its values too. Every
+  `!status` the bots answer feeds it as well (`note_status`). A read that found the VM down
+  keeps the values it last gave. Each read names the VM it reached (`instance`, `status.py`'s
+  EC2 lookup); values of another instance than the row's VM now (a spare handed over) are not
+  that VM's (`of`): neither shown for it nor read for its idle stop (Codex round 4 on #1003).
+  The automatic growth of a filling root volume reads the disk's use from the snapshot
+  (`autogrow`, ADMIN §3.4);
 - **the audit log,** from where it left off: the audit view (`auditview`) and the open plans.
 
 Then it writes `console/snapshot.json`, and `console/audit-view.jsonl` when it changed, both
@@ -49,7 +56,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from zab.admin import auditview, fleet, provider, starter, wakerdown
 from zab.admin.actions import LAYOUT, ActionError, Layout, build
@@ -74,10 +81,11 @@ FRESH = 600.0
 DOWN = frozenset({"unreachable", "stopped", "stopping", "starting"})
 #: The values of `status.py --json`'s VM (schema 1) that the console shows. `disk` is new in
 #: #552: a read kept from before it has none, and the console shows its percentage alone;
-#: `sentinel` in #588: none (null) reads `?`.
+#: `sentinel` in #588: none (null) reads `?`; `instance` in #998, the VM the read reached
+#: (`status.py`'s EC2 lookup), none (null) before it or without the lookup.
 STATUS_KEYS = (
-    "slug", "bridge", "sentinel", "zab_version", "codex_login", "claude_login", "git_push",
-    "math_tools", "active_sessions", "running_turns", "last_activity", "load", "memory",
+    "slug", "instance", "bridge", "sentinel", "zab_version", "codex_login", "claude_login",
+    "git_push", "math_tools", "active_sessions", "running_turns", "last_activity", "load", "memory",
     "disk_percent", "disk", "strained", "idle_stop", "doctor_failures", "last_error",
 )  # fmt: skip
 MAX_ITEMS = 20  # list items kept of a VM's values
@@ -280,6 +288,16 @@ def cost_line(state: str, workshop: str, now: float) -> str | None:
     return f"cost ({label}): {shown} · {fleet}"
 
 
+class Volume(NamedTuple):
+    """What the cost takes of DescribeVolumes' volume: its size in GB, and, for its
+    initialization's (#1007), when it was created and the provisioned rate it was created at,
+    in MiB/s, None at EBS's default rate."""
+
+    gb: int
+    created: float | None = None
+    rate: int | None = None
+
+
 class Aws:
     """EC2 through the role, read only: one client per region (`provider.ec2`'s settings)."""
 
@@ -297,16 +315,19 @@ class Aws:
     def describe(self, region: str, filters: list[dict]) -> list[dict]:
         return starter.Ec2(self.client(region)).describe(filters)
 
-    def volumes(self, region: str, ids: list[str]) -> dict[str, int]:
-        """The size in GB of each volume of `ids` that EC2 shows."""
-        sizes: dict[str, int] = {}
+    def volumes(self, region: str, ids: list[str]) -> dict[str, Volume]:
+        """Each volume of `ids` that EC2 shows with a size."""
+        sizes: dict[str, Volume] = {}
         pages = self.client(region).get_paginator("describe_volumes")
         for at in range(0, len(ids), VOLUME_CHUNK):
             chunk = [{"Name": "volume-id", "Values": ids[at : at + VOLUME_CHUNK]}]
             for page in pages.paginate(Filters=chunk):
                 for volume in page.get("Volumes") or []:
                     if isinstance(volume.get("Size"), int):
-                        sizes[str(volume.get("VolumeId"))] = volume["Size"]
+                        rate = volume.get("VolumeInitializationRate")
+                        rate = rate if type(rate) is int else None
+                        created = _epoch(volume.get("CreateTime"))
+                        sizes[str(volume.get("VolumeId"))] = Volume(volume["Size"], created, rate)
         return sizes
 
     def protected(self, region: str, instance: str) -> bool:
@@ -431,8 +452,9 @@ class Collector:
         self.ec2: dict[str, dict[str, Any]] = {}
         self.protection: dict[str, tuple[float, bool | None]] = {}
         #: per workshop: when its volumes were last read, the IDs asked, and the sizes then
-        self.sizes: dict[str, tuple[float, frozenset[str], dict[str, int]]] = {}
+        self.sizes: dict[str, tuple[float, frozenset[str], dict[str, Volume]]] = {}
         self.reads: dict[str, int] = {}  # a feed file's mtime, once merged
+        self.swept: dict[str, float] = {}  # "<ws>/<slug>" → its last sweep, with values or not
         #: "<ws>/<slug>" (or "<ws>/*", for a record without its targets) → the time of the last
         #: `apply_start` or `apply_end` of `IDLE_VERBS` naming it, from every record of the log,
         #: which the view reads whole at each start (Codex round 4 on #494)
@@ -513,11 +535,16 @@ class Collector:
             vm["protected"] = self._protected(ws, vm["instance"], now)
             known = [sizes[v] for v in vm["volumes"] if v in sizes]
             whole = bool(known) and len(known) == len(vm["volumes"])
-            vm["volume_gb"] = sum(known) if whole else None  # else VOLUME_GB, in the cost
+            vm["volume_gb"] = sum(v.gb for v in known) if whole else None  # else VOLUME_GB
+            vm["inits"] = [  # priced once each, in the month of its creation (#1007)
+                [v, sizes[v].created, sizes[v].gb, sizes[v].rate]
+                for v in vm["volumes"]
+                if v in sizes and sizes[v].rate and sizes[v].created is not None
+            ]
             self.history.observe(vm["instance"], ws.name, vm["slug"], vm, now)
         self.vms[ws.name], self.ec2[ws.name] = vms, {"at": now, "error": None}
 
-    def _sizes(self, ws: Workshop, vms: list[dict[str, Any]], now: float) -> dict[str, int]:
+    def _sizes(self, ws: Workshop, vms: list[dict[str, Any]], now: float) -> dict[str, Volume]:
         """The workshop's volumes' sizes, read again every `VOLUME_EVERY`, and at once for a
         volume the last read didn't ask for; a failed read keeps the last ones (none:
         `costs.VOLUME_GB`)."""
@@ -527,7 +554,7 @@ class Collector:
             return sizes
         try:
             sizes = self.aws.volumes(ws.aws.region, ids) if ids else {}
-        except Exception as exc:  # no DescribeVolumes yet (ADMIN §8.4, v0.2.9): 200 GB each
+        except Exception as exc:  # no DescribeVolumes yet (ADMIN §8.4, v0.2.9): VOLUME_GB each
             LOG.warning("%s: volume sizes not read (%s)", ws.name, starter.aws_code(exc))
         self.sizes[ws.name] = (now, frozenset(ids), sizes)
         return sizes
@@ -581,29 +608,32 @@ class Collector:
 
     # ------------------------------------------------------------------------- the sweep
 
-    def due(self, ws: Workshop, now: float) -> list[str]:
-        """The roster slugs to sweep now (module doc): running; their last read shows the
+    def due(self, ws: Workshop, now: float) -> tuple[list[str], list[str]]:
+        """The roster slugs to sweep now (module doc), each running and read, tried or swept
+        `SWEEP_EVERY` ago or more: those read as `!status` reads them, whose last read shows the
         idle-stop timer neither enabled nor active, and was made after the VM's current boot
         and after every `apply_start` and `apply_end` of `IDLE_VERBS` that names the VM
-        (`idle_changed`); read or tried `SWEEP_EVERY` ago or more."""
-        slugs = []
+        (`idle_changed`); and every other one, read as the read user alone (#998)."""
+        plain, user = [], []
         for vm in self.vms.get(ws.name, []):
-            values = self.status.get(f"{ws.name}/{vm['slug']}")
+            key = f"{ws.name}/{vm['slug']}"
+            values = self.status.get(key)
             idle = values.get("idle_stop") if values else None
             read = _time(values.get("at")) if values else 0.0
-            if (
-                vm["state"] == "running"
-                and vm["kind"] == "participant"
-                and isinstance(idle, dict)
+            last = max(_tried(values) if values else 0.0, self.swept.get(key, 0.0))
+            if vm["state"] != "running" or vm["kind"] != "participant" or now - last < SWEEP_EVERY:
+                continue
+            off = (
+                isinstance(idle, dict)
+                and of(values, vm["instance"])  # another VM's says nothing of this one's
                 and idle.get("enabled") is False
                 and idle.get("active") is False
                 and read > _time(vm.get("launched"))
-                and read > self.idle_changed.get(f"{ws.name}/{vm['slug']}", 0.0)
+                and read > self.idle_changed.get(key, 0.0)
                 and read > self.idle_changed.get(f"{ws.name}/*", 0.0)
-                and now - _tried(values) >= SWEEP_EVERY
-            ):
-                slugs.append(vm["slug"])
-        return sorted(slugs)
+            )
+            (plain if off else user).append(vm["slug"])
+        return sorted(plain), sorted(user)
 
     def _noted(self, record: dict[str, Any]) -> None:
         """An audit record, whole (`auditview.View`'s hook): an `apply_start` or `apply_end` of
@@ -630,7 +660,12 @@ class Collector:
     def _sweep(self, now: float) -> None:
         if self.sweep is not None and not self.sweep.done():
             return
-        work = [(ws, slugs) for ws in self.config.workshops if (slugs := self.due(ws, now))]
+        work = [
+            (ws, slugs, user)
+            for ws in self.config.workshops
+            for slugs, user in zip(self.due(ws, now), (False, True), strict=True)
+            if slugs
+        ]
         if not work:
             return
         if self.sweeps is None:
@@ -638,35 +673,40 @@ class Collector:
         else:
             self.sweep = self.sweeps.submit(self._sweep_all, work)
 
-    def _sweep_all(self, work: list[tuple[Workshop, list[str]]]) -> None:
-        """Each workshop's sweep. A VM it gets no answer for (status.py failed, timed out,
+    def _sweep_all(self, work: list[tuple[Workshop, list[str], bool]]) -> None:
+        """Each workshop's sweep, of its VMs read as `!status` reads them, then of those read as
+        the read user alone (`due`). A VM it gets no answer for (status.py failed, timed out,
         printed no JSON, or left it out) has the try noted, so that it waits `SWEEP_EVERY`
-        before the next (the review of #494)."""
-        for ws, slugs in work:
+        before the next (the review of #494); read as the read user, which leaves out a VM it
+        can't read, no try is noted on its values, and `swept` alone holds it back."""
+        for ws, slugs, user in work:
             if self.gate.closed:  # closing: no next workshop (Codex on #494)
                 return
             at, vms = self.clock(), []
+            with self.lock:
+                self.swept.update((f"{ws.name}/{slug}", at) for slug in slugs)
             try:
-                vms = self._read(ws, slugs)
+                vms = self._read(ws, slugs, user)
             except Exception as exc:
                 LOG.warning("%s: the sweep failed (%s)", ws.name, type(exc).__name__)
             vms = vms if isinstance(vms, list) else []
             self._merge(ws.name, vms, at, "sweep")
             answered = {vm.get("slug") for vm in vms if isinstance(vm, dict)}
             with self.lock:
-                for slug in slugs:
+                for slug in slugs if not user else ():  # left out: it may lack the read user
                     old = self.status.get(f"{ws.name}/{slug}")
                     if slug not in answered and old is not None and _tried(old) < at:
                         tried = {"at": at, "bridge": "no answer"}
                         self.status[f"{ws.name}/{slug}"] = {**old, "tried": tried}
 
-    def _read(self, ws: Workshop, slugs: list[str]) -> Any:
-        """`!status`'s own argument list (`actions.build`) for `slugs`, run as the runner would
-        (§2.3), its answer's VMs."""
+    def _read(self, ws: Workshop, slugs: list[str], user: bool = False) -> Any:
+        """`!status`'s own argument list (`actions.build`) for `slugs`, `--read-user-only` with
+        `user`, run as the runner would (§2.3), its answer's VMs."""
         current = fleet.read_fleet(self.config, ws, fleet.Ledger(), now=self.clock())
         command = Command("status", selection=Selection(slugs=tuple(slugs)))
         try:
             argv = list(build(command, current, layout=self.paths.layout).steps[0].argv)
+            argv += ["--read-user-only"] if user else []
         except ActionError as exc:
             LOG.warning("%s: no sweep (%s)", ws.name, exc)
             return []
@@ -715,11 +755,13 @@ class Collector:
             cost = entry.cost(now, True, ws.aws.region) if entry else None
             waker = None if opted is None else opted.get(vm["instance"], {"opted_in": False})
             row = vm["kind"] == "participant"
+            status = self.status.get(f"{ws.name}/{vm['slug']}") if row else None
             listed.append({
                 "slug": vm["slug"], "kind": vm["kind"], "instance": vm["instance"],
                 "state": vm["state"], "type": vm["type"], "launched_at": iso(vm["launched"]),
                 "protected": vm["protected"], "waker": waker,
-                "status": self.status.get(f"{ws.name}/{vm['slug']}") if row else None,
+                # another VM's read (one handed over since) is not this one's (#998)
+                "status": status if status and of(status, vm["instance"]) else None,
                 "cost": cost.to_json() if cost else None,
             })  # fmt: skip
         launched = {vm["slug"] for vm in listed if vm["kind"] == "participant"}
@@ -774,6 +816,14 @@ class Collector:
         self.gate.close()
         if self.sweeps is not None:
             self.sweeps.shutdown(wait=False, cancel_futures=True)
+
+
+def of(values: dict[str, Any] | None, instance: str) -> bool:
+    """Whether a VM's values were read from `instance`, or from a VM unknown (`instance` null:
+    a read before #998, or without status.py's EC2 lookup): not when they name another (Codex
+    round 4 on #1003: a spare handed over to the row since its last read)."""
+    read = (values or {}).get("instance")
+    return read is None or read == instance
 
 
 def _tried(values: dict[str, Any]) -> float:

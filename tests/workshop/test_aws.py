@@ -88,6 +88,7 @@ class FakeEc2:
         self.console_reads: list[str] = []
         self.attributes: dict[str, list] = {}  # instance id -> [protected, shutdown behavior]
         self.broken: set[str] = set()  # instance ids whose attribute reads fail
+        self.image_gb: int | None = None  # the image's root, as DescribeImages gives it
 
     def console_output(self, iid):
         """What cloud-init printed: by default the block at once (AMI v3's format)."""
@@ -113,6 +114,9 @@ class FakeEc2:
             for a in self.addresses.values()
             if all(ac.tags_of(a).get(k) == v for k, v in tags.items())
         ]
+
+    def image_root_gb(self, image_id):
+        return self.image_gb
 
     def describe_security_group(self, group_id):
         self.calls.append(("describe_security_group", group_id))
@@ -416,12 +420,13 @@ def test_user_data_runs_every_step_without_set_e():
 
 
 def test_first_boot_applies_swap_pins_and_mcp():
-    """Drew's decisions relayed on issue #36 (Fri 02:45 and 03:10): an 8 GiB swap file, Claude
-    Code's auto-updater off through managed settings, Codex's update check off, and the LMFDB MCP
-    server for both CLIs, applied idempotently at first boot on participant and spare VMs."""
+    """Drew's decisions relayed on issue #36 (Fri 02:45 and 03:10): a swap file (5 GiB since
+    #997, 8 GiB before), Claude Code's auto-updater off through managed settings, Codex's update
+    check off, and the LMFDB MCP server for both CLIs, applied idempotently at first boot on
+    participant and spare VMs."""
     for row in (fresh_row(), ac.spare_rows(1)[0]):
         script = ac.render_user_data(row)
-        assert "fallocate -l 8G /swapfile" in script
+        assert "fallocate -l 5G /swapfile" in script and "8G" not in script
         assert (
             "'/swapfile none swap sw,nofail 0 0'" in script
         )  # nofail: a lost swap file must not block boot
@@ -445,13 +450,37 @@ def test_first_boot_applies_swap_pins_and_mcp():
     # the image's README describes the same block ("First boot")
     doc = (ac_dir().parent / "ami" / "README.md").read_text()
     for needle in (
-        "fallocate -l 8G /swapfile",
+        "fallocate -l 5G /swapfile",
         "DISABLE_AUTOUPDATER",
         "check_for_update_on_startup = false",
         "[mcp_servers.lmfdb]",
         "mcp add --transport http --scope user lmfdb",
     ):
         assert needle in doc, needle
+
+
+@pytest.mark.parametrize(
+    ("active", "made"),
+    [
+        ("", ["fallocate -l 5G /swapfile", "mkswap /swapfile", "swapon /swapfile"]),
+        ("/swapfile", []),
+    ],
+    ids=["no swap", "a swap file on already"],
+)
+def test_first_boot_makes_the_swap_file_only_where_none_is_on(tmp_path, active, made):
+    """#997: the first boot makes a 5 GiB swap file where `/swapfile` isn't on, and leaves an
+    active one alone, whatever its size: a VM launched before keeps its 8 GiB. The block is run
+    as the user data runs it, with the commands that would change the machine recorded."""
+    block = ac.COMMON_FIRST_BOOT.split("\nfi\n", 1)[0] + "\nfi\n"
+    calls = tmp_path / "calls"
+    stubs = (
+        f'swapon() {{ if [ "$1" = --show=NAME ]; then printf "%s" "{active}"; '
+        f'else echo "swapon $*" >> {calls}; fi; }}\n'
+        f'fallocate() {{ echo "fallocate $*" >> {calls}; }}\nchmod() {{ :; }}\n'
+        f'mkswap() {{ echo "mkswap $*" >> {calls}; }}\n'
+    )
+    subprocess.run(["bash", "-c", stubs + block], check=True)  # noqa: S603, S607
+    assert (calls.read_text().splitlines() if calls.exists() else []) == made
 
 
 @pytest.mark.parametrize(
@@ -622,6 +651,107 @@ def test_main_requires_and_checks_the_security_group(tmp_path, capsys, monkeypat
 # ------------------------------------------------------------------------------------- launch
 
 
+def test_the_root_is_80_gb_or_an_older_images_own():
+    """#998: 80 GB (`ROOT_GB`), the image's and the cost estimate's too; an image built before
+    it, whose snapshot is 100 GB, launches with its own, since EC2 refuses a smaller volume."""
+    from zab.admin import costs
+
+    assert ac.ROOT_GB == costs.VOLUME_GB == 80
+    log: list[str] = []
+    ec2 = FakeEc2()
+    assert launch.root_gb(ec2, "ami-123", log.append) == 80 and not log
+    for size in (30, 80):
+        ec2.image_gb = size
+        assert launch.root_gb(ec2, "ami-123", log.append) == 80 and not log
+    ec2.image_gb = 100
+    assert launch.root_gb(ec2, "ami-123", log.append) == 100
+    assert log == ["image ami-123: its root is 100 GB, so each VM's is too, not 80 GB"]
+
+    class Unread(FakeEc2):
+        def image_root_gb(self, image_id):
+            raise RuntimeError("InvalidAMIID.NotFound")
+
+    assert launch.root_gb(Unread(), "ami-9", log.append) == 80
+    assert log[-1] == "image ami-9: its root's size not read (RuntimeError): 80 GB"
+    rows = [{"slug": "alice", "email": "a@example.org"}]
+    ec2.image_gb = 100
+    launch.launch(rows, ec2, opts(), log=log.append, ssh_ready=lambda ip: True)
+    (params,) = [c[1] for c in ec2.calls if c[0] == "run_instance"]
+    assert params["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"] == 100
+
+
+def test_an_images_root_is_its_root_devices_snapshot():
+    class Client:
+        def describe_images(self, ImageIds):
+            root = {"DeviceName": "/dev/sda1", "Ebs": {"VolumeSize": 100, "SnapshotId": "s"}}
+            other = {"DeviceName": "/dev/sdb", "Ebs": {"VolumeSize": 500}}
+            return {"Images": [{"RootDeviceName": "/dev/sda1",
+                                "BlockDeviceMappings": [other, root]}]}  # fmt: skip
+
+    ec2 = object.__new__(ac.Ec2)
+    ec2._ec2 = Client()
+    assert ec2.image_root_gb("ami-1") == 100
+    ec2._ec2.describe_images = lambda ImageIds: {"Images": []}
+    assert ec2.image_root_gb("ami-1") is None
+
+
+def test_the_root_is_initialized_at_the_launch_rate():
+    """#1007: every VM launched, a spare too, asks EBS for 200 MiB/s by default; `--init-rate 0`
+    leaves the parameter out (EBS's default rate), and the output names the rate."""
+    assert ac.INIT_RATE == 200
+    key = "VolumeInitializationRate"
+    assert ac.init_rate_params(200) == {key: 200} and ac.init_rate_params(0) == {}
+    for bad in (-1, 1, 99, 301, True, "200", 200.0):
+        with pytest.raises(ValueError, match="0, or 100 to 300 MiB/s"):
+            ac.init_rate_params(bad)
+    for rate, want in ((None, {key: 200}), (300, {key: 300}), (0, {})):
+        ec2, log, summary = FakeEc2(), [], launch.Summary()
+        kw = {} if rate is None else {"init_rate": rate}
+        launch.launch([fresh_row()], ec2, opts(spares=1, **kw), log=log.append,
+                      ssh_ready=lambda ip: True, summary=summary,
+                      spares=ac.spare_rows(1))  # fmt: skip
+        mappings = [c[1]["BlockDeviceMappings"] for c in ec2.calls if c[0] == "run_instance"]
+        assert len(mappings) == 2  # the row's and the spare's
+        for (mapping,) in mappings:
+            assert {k: v for k, v in mapping["Ebs"].items() if k == key} == want
+        said = "200 MiB/s" if rate is None else ac.init_rate_text(rate)
+        assert sum(f"volume initialization {said}; waiting" in line for line in log) == 2
+        assert f"  volume initialization: {said}\n" in summary.text() + "\n"
+    assert "EBS's default" in ac.init_rate_text(0)
+    assert "volume initialization" not in launch.Summary().text()  # nothing launched
+
+
+def test_main_refuses_an_init_rate_outside_ebss_range(tmp_path, capsys, monkeypatch):
+    path = tmp_path / "roster.csv"
+    path.write_text(ROSTER)
+    ec2 = FakeEc2()
+    monkeypatch.setattr(launch, "Ec2", lambda region: ec2)
+    base = ["--roster", str(path), "--ami", "ami-1", "--security-group-id", "sg-1"]
+    assert with_scope(launch.main, [*base, "--init-rate", "50"]) == 1
+    assert "--init-rate: 0, or 100 to 300 MiB/s, got 50" in capsys.readouterr().err
+    assert ec2.calls == []  # before any AWS call
+    rc = with_scope(launch.main, [*base, "--init-rate", "300", "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0 and "volume initialization 300 MiB/s" in out
+
+
+def test_botocore_takes_the_rate_in_both_calls():
+    """The installed botocore's EC2 model has `VolumeInitializationRate` in RunInstances' EBS
+    mapping and in CreateVolume (#999), and accepts launch.py's parameters as they are."""
+    session = pytest.importorskip("botocore.session")
+    validate = pytest.importorskip("botocore.validate")
+    model = session.get_session().get_service_model("ec2")
+    params = launch.instance_params(fresh_row(), opts(init_rate=300))
+    params["MinCount"] = params["MaxCount"] = 1  # Ec2.run_instance's
+    checks = [("RunInstances", params),
+              ("CreateVolume", {"AvailabilityZone": "us-east-2a", "SnapshotId": "snap-1",
+                                **ac.init_rate_params(200)})]  # fmt: skip
+    for operation, given in checks:
+        shape = model.operation_model(operation).input_shape
+        report = validate.ParamValidator().validate(given, shape)
+        assert not report.has_errors(), report.generate_report()
+
+
 def test_launch_is_idempotent_and_fills_the_roster(tmp_path):
     path = tmp_path / "roster.csv"
     path.write_text(ROSTER)
@@ -647,7 +777,7 @@ def test_launch_is_idempotent_and_fills_the_roster(tmp_path):
     assert params["MetadataOptions"]["HttpTokens"] == "required"
     assert "IamInstanceProfile" not in params
     ebs = params["BlockDeviceMappings"][0]["Ebs"]
-    assert (ebs["VolumeSize"], ebs["VolumeType"], ebs["DeleteOnTermination"]) == (200, "gp3", True)
+    assert (ebs["VolumeSize"], ebs["VolumeType"], ebs["DeleteOnTermination"]) == (80, "gp3", True)
     tags = ac.tags_of({"Tags": params["TagSpecifications"][0]["Tags"]})
     assert tags == {"Name": "ws-alice", "workshop": "nt-agents-2026", "participant": "alice"}
     assert params["KeyName"] == "drew" and params["SecurityGroupIds"] == ["sg-1"]

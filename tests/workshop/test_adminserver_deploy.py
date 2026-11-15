@@ -7,8 +7,10 @@ half runs unprivileged under ZAB_DEPLOY_PREFIX, which roots every server path in
 directory and skips the steps that need root (apt, systemd, chown) while logging them. No
 network, server or AWS account is touched.
 
-A bootstrapped server (`server`) is bootstrapped once per module and process, and each test
-gets its own copy of that directory, at the path where it was bootstrapped (#473).
+A bootstrapped server (`server`) is bootstrapped once per process, for this module and the
+others that use it, and each test gets its own copy of that directory, at the path where it was
+bootstrapped (#473, #988). The rig's releases carry stand-ins for the scripts whose `--help` the
+release's selfcheck runs (`STAND_IN`); the `shipped` rig's carry the real ones.
 """
 
 import base64
@@ -24,8 +26,11 @@ import sys
 import tempfile
 import uuid
 import zipfile
+from collections.abc import Iterator
 
 import pytest
+
+from zab.admin.checks import SCRIPTS
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "workshop" / "adminserver" / "deploy.sh"
@@ -43,6 +48,13 @@ def covered(path: str, paths) -> bool:
 
 
 RELEASE_PATHS = listed(LIST)
+#: What the rig's releases carry in place of each script whose `--help` the release's selfcheck
+#: runs (`zab.admin.checks.SCRIPTS`), at its path (#988). A real one's `--help` is a fresh
+#: interpreter and the script's imports, about 50 ms, 21 times in every deploy that builds: a
+#: sixth of these modules' time. The real ones still run in a built release on every pull
+#: request, in the `shipped` rig: its bootstrap's selfcheck and the two tests that use it
+#: (`test_the_self_check_runs_the_release_as_shipped`, `test_a_list_without_a_script_…`).
+STAND_IN = "import sys\nsys.exit(0 if sys.argv[1:] == ['--help'] else 3)\n"
 #: Stand-ins the rig commits outside the release paths (#432): none may reach the server.
 OUTSIDE = (
     "workshop/files/server.py",
@@ -82,7 +94,12 @@ def _tools_missing() -> str:
     return ""
 
 
-pytestmark = pytest.mark.skipif(bool(_tools_missing()), reason=_tools_missing() or "ok")
+pytestmark = [
+    pytest.mark.skipif(bool(_tools_missing()), reason=_tools_missing() or "ok"),
+    # a pull request runs it in CI's rigs (3.12) job; the laptop half's Python programs run on
+    # every version in test_deploy_sh_python (#988)
+    pytest.mark.deploy_rig,
+]
 
 
 # --- wheels and a local index ---------------------------------------------------------------
@@ -153,13 +170,12 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
 """
 
 
-@pytest.fixture(scope="module")
-def index(tmp_path_factory):
-    """A PEP 503 index on disk: `fakecli` (with a console script), `fakebackend`, and stand-ins
-    for `boto3` and `botocore`, enough for the release's `selfcheck` (`starter.sdk()`), and for
-    `httpx`, which the bot's Zulip client and `zulip_provision.py` import (#341): importable,
-    which is all the selfcheck's imports and the scripts' `--help` need."""
-    root = tmp_path_factory.mktemp("index")
+def make_index(root: pathlib.Path) -> dict:
+    """A PEP 503 index on disk in `root`: `fakecli` (with a console script), `fakebackend`, and
+    stand-ins for `boto3` and `botocore`, enough for the release's `selfcheck` (`starter.sdk()`),
+    and for `httpx`, which the bot's Zulip client and `zulip_provision.py` import (#341):
+    importable, which is all the selfcheck's imports and the scripts' `--help` need. The
+    `index` fixture, one per process (tests/conftest.py)."""
     wheels = root / "wheels"
     wheels.mkdir()
     built = {
@@ -252,9 +268,16 @@ exec sh -c "$1"
 
 
 class Rig:
-    def __init__(self, tmp: pathlib.Path, index: dict) -> None:
+    """A release repository, its signers' keys, a server's directory and deploy.sh's
+    environment. Its releases carry `STAND_IN` for each script of `SCRIPTS` unless `stand_ins`
+    is false: then they ship the real ones, as the `shipped` rig does."""
+
+    def __init__(self, tmp: pathlib.Path, index: dict, *, stand_ins: bool = True) -> None:
         self.tmp = tmp
         self.index = index
+        self.stand_ins = stand_ins
+        #: what `bootstrap_template`'s bootstrap printed, for the tests of its output
+        self.bootstrap: subprocess.CompletedProcess | None = None
         self.repo = tmp / "repo"
         self.prefix = tmp / "server"
         self.etc = tmp / "etc"
@@ -340,6 +363,9 @@ class Rig:
         (repo / "src/zab/bridge.py").write_text(
             "raise SystemExit('the bridge never runs on the server')\n"
         )
+        if self.stand_ins:
+            for script in SCRIPTS:
+                (repo / "workshop" / script).write_text(STAND_IN)
         for outside in OUTSIDE:  # #432: the files host's, the AMI build's, the laptop's
             (repo / outside).parent.mkdir(parents=True, exist_ok=True)
             (repo / outside).write_text(f"# {outside}: never on the server\n")
@@ -423,39 +449,62 @@ def rig(tmp_path, index):
     return Rig(tmp_path, index)
 
 
-@pytest.fixture(scope="module")
-def bootstrapped(tmp_path_factory, index):
-    """A rig whose server was bootstrapped with v0.3.0, and a copy of its directory kept aside.
+def bootstrap_template(base: pathlib.Path, index: dict, **kw) -> tuple[Rig, pathlib.Path]:
+    """A rig whose server was bootstrapped with v0.3.0, and a copy of its directory kept aside:
+    the `bootstrapped` and `shipped` fixtures, one of each per process, made when a test first
+    asks (tests/conftest.py; one per module before #988).
 
-    A bootstrap takes about 2.5 s, most of it the self-check; a copy of the directory takes
-    0.02 s (#473). The rig lives at `base/rig` and its copy at `base/template`: `server` puts
-    a fresh copy back at `base/rig` for each test. Each test so starts from the very files a
-    bootstrap left, every absolute path in them (the venv's interpreter, the .pth, `current`,
-    the records) still true, with their modes, symlinks and mtimes; hard links become copies.
-    A module's tests run one at a time in a process (under xdist too), never two in `base/rig`.
+    A bootstrap takes about 2.5 s; a copy of the directory takes 0.02 s (#473). The rig lives at
+    `base/rig` and its copy at `base/template`: `served` puts a fresh copy back at `base/rig` for
+    each test. Each test so starts from the very files a bootstrap left, every absolute path in
+    them (the venv's interpreter, the .pth, `current`, the records) still true, with their
+    modes, symlinks and mtimes; hard links become copies. A process runs one test at a time
+    (under xdist too), so never two in `base/rig`.
     """
-    base = tmp_path_factory.mktemp("bootstrapped")
     (base / "rig").mkdir()
-    rig = Rig(base / "rig", index)
+    rig = Rig(base / "rig", index, **kw)
     rig.release("v0.3.0")
-    result = rig.deploy("v0.3.0", "--bootstrap")
-    assert result.returncode == 0, result.stderr
+    rig.bootstrap = rig.deploy("v0.3.0", "--bootstrap")
+    assert rig.bootstrap.returncode == 0, rig.bootstrap.stderr
     template = base / "template"
     (base / "rig").rename(template)
     return rig, template
 
 
-@pytest.fixture
-def server(bootstrapped, request):
-    """A rig whose server was bootstrapped with v0.3.0: a copy of `bootstrapped`'s, its own."""
-    rig, template = bootstrapped
+def served(template: tuple[Rig, pathlib.Path], request) -> Iterator[Rig]:
+    """A copy of a `bootstrap_template` rig's directory at its own path, for one test."""
+    rig, kept = template
     name = re.sub(r"\W", "_", request.node.name)[:40]
     if rig.tmp.exists():  # a copy that failed part way, before its test
         rig.tmp.rename(tempfile.mkdtemp(prefix=f"{name}-before-", dir=rig.tmp.parent))
-    shutil.copytree(template, rig.tmp, symlinks=True)
+    shutil.copytree(kept, rig.tmp, symlinks=True)
     yield copy.deepcopy(rig)
     # out of the next test's way, kept under the test's name as its tmp_path would be
     rig.tmp.rename(tempfile.mkdtemp(prefix=f"{name}-", dir=rig.tmp.parent))
+
+
+@pytest.fixture
+def index(deploy_rig_index):
+    """`make_index`'s index, one per process (tests/conftest.py)."""
+    return deploy_rig_index
+
+
+@pytest.fixture
+def bootstrapped(deploy_rig_bootstrapped):
+    """`bootstrap_template`'s rig, with the `STAND_IN` scripts; one per process."""
+    return deploy_rig_bootstrapped
+
+
+@pytest.fixture
+def server(bootstrapped, request):
+    """A rig whose server was bootstrapped with v0.3.0: a copy of `bootstrapped`'s, its own."""
+    yield from served(bootstrapped, request)
+
+
+@pytest.fixture
+def shipped(deploy_rig_shipped, request):
+    """As `server`, but its releases ship the real scripts of `SCRIPTS`, not `STAND_IN`."""
+    yield from served(deploy_rig_shipped, request)
 
 
 @pytest.fixture
@@ -823,10 +872,9 @@ def test_the_config_helpers_mounts_are_systemds(server):
     assert report["steps"] == ["ok"] * 8
 
 
-def test_bootstrap_logs_the_root_steps_it_skips_in_tests(rig):
-    rig.release("v0.3.0")
-    result = rig.deploy("v0.3.0", "--bootstrap")
-    assert result.returncode == 0, result.stderr
+def test_bootstrap_logs_the_root_steps_it_skips_in_tests(server):
+    result = server.bootstrap  # the one that made the copy (#988: no bootstrap of its own)
+    assert result is not None and result.returncode == 0
     for step in (
         "apt-get",
         "systemd-sysusers",
@@ -1380,18 +1428,21 @@ def test_a_list_without_a_waker_module_fails_the_self_check(server):
     assert server.current().endswith("v0.3.0")
 
 
-def test_a_list_without_a_script_the_bot_runs_fails_the_self_check(server):
+def test_a_list_without_a_script_the_bot_runs_fails_the_self_check(shipped):
     """#432: the scripts' `--help`, which the self-check runs, stop a release whose narrowed list
     lost one of them, or a module they import. (A file they only copy, such as the template, is
-    the static test's to catch: test_the_release_paths_hold_what_the_server_runs….)"""
+    the static test's to catch: test_the_release_paths_hold_what_the_server_runs….) The real
+    scripts: a `STAND_IN` imports nothing."""
 
     def drop(repo):
         path = repo / LIST.relative_to(ROOT)
         path.write_text(path.read_text().replace("workshop/aws/aws_common.py\n", ""))
 
-    server.release("v0.3.1", edit=drop)
-    refused(server.deploy("v0.3.1"), r"selfcheck failed")
-    assert server.current().endswith("v0.3.0")
+    shipped.release("v0.3.1", edit=drop)
+    result = shipped.deploy("v0.3.1")
+    refused(result, r"selfcheck failed")
+    assert re.search(r"selfcheck: \S+\.py --help exited 1: ModuleNotFoundError", result.stdout)
+    assert shipped.current().endswith("v0.3.0")
 
 
 def test_a_list_without_the_server_files_is_refused(server):
@@ -1509,18 +1560,21 @@ def test_a_deny_file_without_a_final_newline_keeps_its_last_name(rig):
     assert (rig.prefix / "etc/at.deny").read_text() == "zab-build\n"
 
 
-def test_the_self_check_runs_the_release_as_shipped(server):
-    """The rig ships exactly release-paths, so the real `selfcheck` ran at the bootstrap: the
-    strict loader, `from zab.admin import audit, starter`, and `starter.sdk()` (boto3)."""
-    py = server.opt / "current/.venv/bin/python"
-    out = server.run(
+def test_the_self_check_runs_the_release_as_shipped(shipped):
+    """The `shipped` rig ships exactly release-paths, the real scripts among them, so the real
+    `selfcheck` ran at its bootstrap: the strict loader, `from zab.admin import audit, starter`,
+    `starter.sdk()` (boto3), and each script's `--help` in the built release."""
+    py = shipped.opt / "current/.venv/bin/python"
+    for script in SCRIPTS:
+        assert (shipped.opt / "current/workshop" / script).read_text() != STAND_IN, script
+    out = shipped.run(
         py,
         "-I",
         "-m",
         "zab.admin",
         "selfcheck",
         "--config",
-        server.prefix / "etc/zab-admin/admin.toml",
+        shipped.prefix / "etc/zab-admin/admin.toml",
         check=True,
     )
     assert out.stdout.strip() == "selfcheck: OK"
@@ -3088,8 +3142,6 @@ def _entry_points() -> set[str]:
     """The workshop/ paths the server runs: the bot's scripts (zab.admin.checks.SCRIPTS, which
     test_admin_bot keeps equal to the steps of actions.py and newworkshop.py), what the units and
     deploy.sh run or install from the release, and the runbooks' commands on the server."""
-    from zab.admin.checks import SCRIPTS
-
     found = {f"workshop/{script}" for script in SCRIPTS}
     tail = r"(workshop/[\w./@-]*[\w@-])"
     for unit in (ROOT / "workshop" / "adminserver").glob("zab-*"):

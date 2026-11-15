@@ -211,3 +211,33 @@ def cpu_ratio_below() -> Callable[..., float]:
     """`cpu_ratio_below(call, reference, text, bound, repeat=1)`, for a test marked `timing`
     (#707)."""
     return _cpu_ratio_below
+
+
+# deploy.sh's rig (tests/workshop/test_adminserver_deploy.py), one of each per process for every
+# module that uses it: the deploy, upgrade and public-release tests and the admin harness's. Each
+# module made its own before #988, each worker running a bootstrap per module; its tests use
+# them through that module's `index`, `bootstrapped`, `server` and `shipped`.
+
+
+@pytest.fixture(scope="session")
+def deploy_rig_index(tmp_path_factory):
+    from workshop.test_adminserver_deploy import make_index
+
+    return make_index(tmp_path_factory.mktemp("index"))
+
+
+@pytest.fixture(scope="session")
+def deploy_rig_bootstrapped(tmp_path_factory, deploy_rig_index):
+    from workshop.test_adminserver_deploy import bootstrap_template
+
+    return bootstrap_template(tmp_path_factory.mktemp("bootstrapped"), deploy_rig_index)
+
+
+@pytest.fixture(scope="session")
+def deploy_rig_shipped(tmp_path_factory, deploy_rig_index):
+    """Its releases ship the real scripts whose `--help` the selfcheck runs: the bootstrap's
+    selfcheck runs them in a built release, as the `STAND_IN`s of the others' don't."""
+    from workshop.test_adminserver_deploy import bootstrap_template
+
+    base = tmp_path_factory.mktemp("shipped")
+    return bootstrap_template(base, deploy_rig_index, stand_ins=False)

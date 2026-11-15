@@ -31,9 +31,12 @@ if [ "${#members[@]}" -eq 0 ]; then
   exit 1
 fi
 
-# Build trees are left out: each Lean project's .lake holds a full Mathlib (about 8 GB, rebuilt
-# from the local cache with `lake exe cache get`), and topic worktrees each have their own (PM,
-# Sat Oct 10: one participant's archive would have been about 40 GB)
+# Build trees are left out: a Lean project's .lake holds its build, and a full Mathlib (about
+# 8 GB) unless it links the VM's shared one, and topic worktrees each have their own (PM, Sat
+# Oct 10: one participant's archive would have been about 40 GB). An unpacked project gets
+# Mathlib back from `lean-project --repair` on a VM, or elsewhere from `lake exe cache get`,
+# which downloads it: images since #997 keep no local copy of the archives
+# (workshop/ami/README.md, "The image's footprint").
 tar --create --gzip --file "$out" \
   --exclude='.lake' \
   --exclude='__pycache__' \

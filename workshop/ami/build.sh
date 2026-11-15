@@ -189,6 +189,16 @@ apt_update() {
     sleep 15
   done
 }
+# No documentation from the packages installed from here on (#997; README.md, "The image's
+# footprint"): dpkg leaves /usr/share/doc out, but for each package's copyright file and
+# Macaulay2's tree, from whose dumps the macaulay2 package's postinst builds `help`'s databases
+# (checked in step 1d). Debian policy keeps what a program needs out of /usr/share/doc (§12.3),
+# and a scan of every package these steps install found nothing else there that one reads
+# (DECISIONS, 2026-11-08). The file stays on the image, for what an agent installs later too.
+sudo install -d -m 0755 /etc/dpkg/dpkg.cfg.d
+printf '%s\n' '# zab workshop image: no package documentation (workshop/ami/build.sh, #997)' \
+  'path-exclude=/usr/share/doc/*' 'path-include=/usr/share/doc/*/copyright' \
+  'path-include=/usr/share/doc/Macaulay2/*' | sudo tee /etc/dpkg/dpkg.cfg.d/zab-no-doc >/dev/null
 apt_update
 # python3-dev: cypari2 ships manylinux wheels for CPython 3.12 (checked on PyPI, 2.2.4), but if
 # pip ever falls back to the sdist it compiles against the Python headers and the PARI built
@@ -290,6 +300,10 @@ for deb in "${m2_install[@]}"; do
   esac
 done
 $APT install -y --no-install-recommends "${m2_install[@]/#/$m2/}"  # held in step 14
+# macaulay2's postinst loads each package's documentation dump, under /usr/share/doc/Macaulay2,
+# into the database `help` reads; without the dumps it builds none and says nothing (#997)
+sudo test -s /usr/lib/x86_64-linux-gnu/Macaulay2/Macaulay2Doc/cache/rawdocumentation-dcba-8.db \
+  || { echo "Macaulay2's help database is missing: did dpkg leave /usr/share/doc/Macaulay2 out?" >&2; exit 1; }
 sudo install -d -m 0755 /usr/src/macaulay2-ppa
 while read -r _sum name; do
   case $name in *.deb) ;; *) sudo install -m 0644 "$m2/$name" /usr/src/macaulay2-ppa/ ;; esac
@@ -649,8 +663,8 @@ fi
 # writes `rev = "v4.34.1"` and fetches the cache itself; `cache get` is retried for mirror
 # failures; `lake build Mathlib` then writes the few trace files the cache lacks, without which
 # comparator's read-only sandboxed build fails with "permission denied" (rehearsed on
-# the development machine: 127 s from scratch, .lake 7.7 GB, ~/.cache/mathlib 449 MB, kept for offline
-# `cache get` in new projects at the same rev).
+# the development machine: 127 s from scratch, .lake 7.7 GB, ~/.cache/mathlib 449 MB, the
+# archives `cache get` unpacked, which step 12c deletes).
 ELAN_VERSION=v4.2.4
 ELAN_SHA256=42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63
 LEAN_TOOLCHAIN=leanprover/lean4:v4.34.1
@@ -805,6 +819,48 @@ sudo install -d -o "$AGENT" -g "$AGENT" -m 0755 "$AGENT_HOME/.claude"
 sudo install -o "$AGENT" -g "$AGENT" -m 0644 "$FILES/agent-instructions.md" "$AGENT_HOME/.claude/CLAUDE.md"
 sudo install -o "$AGENT" -g "$AGENT" -m 0644 "$FILES/agent-instructions.md" "$AGENT_HOME/.codex/AGENTS.md"
 
+# --- 12b. package caches (#997; README.md, "The image's footprint") ---------------------------
+# Before the smoke test, which then checks every tool without them. Each is measured as the root
+# file system's used space before and after, which counts a hard-linked file once. conda's whole
+# package cache (`-f`): its environments hold hard links or copies of its files, never symlinks
+# into it (conda's default), and a symlink in ~/miniforge that dangles only after the clean
+# stops the build. The cache's own extracted packages hold links that dangle by design (libblas'
+# to a file of libopenblas, resolved once both are linked into an environment): they go with
+# it, and don't count.
+log "package caches"
+used_mib() { df -BM --output=used / | tail -n1 | tr -dc 0-9; }
+freed() { echo "freed $(($1 - $(used_mib))) MiB: $2"; }
+before=$(used_mib)
+$APT clean
+freed "$before" "apt's package cache"
+echo "/usr/share/doc holds $(sudo du -sxm /usr/share/doc | cut -f1) MiB (the dpkg filter of step 1)"
+if as_agent test -x "$AGENT_HOME/miniforge/bin/conda"; then
+  dangling() { sudo find "$AGENT_HOME/miniforge" -xtype l | sort; }
+  had=$(dangling)
+  before=$(used_mib)
+  as_agent "$AGENT_HOME/miniforge/bin/conda" clean -afy -q >/dev/null
+  freed "$before" "conda's package cache"
+  left=$(comm -13 <(printf '%s\n' "$had") <(dangling))
+  if [ -n "$left" ]; then
+    echo "conda clean -f left links dangling in ~/miniforge:" >&2
+    printf '%s\n' "$left" >&2
+    exit 1
+  fi
+fi
+
+# --- 12c. Mathlib's downloaded archives (#997): delete ~/.cache/mathlib -----------------------
+# The 8,908 `.ltar` files (449 MB) that `cache get` (step 10) unpacked into the workspace, now
+# the shared Mathlib. A project on the shared Mathlib builds from the unpacked files and never
+# reads them; only `lake exe cache get`, which the agents' instructions forbid in such a project
+# and lean-lsp-mcp's `lean_build` runs only when asked (`fetch_cache`, off by default), reads
+# them, and without them downloads them again. The smoke test builds a fresh project with no
+# network to show that nothing is fetched; if it ever fails for want of them, drop this step.
+log "Mathlib's archives"
+before=$(used_mib)
+as_agent rm -rf "$AGENT_HOME/.cache/mathlib"
+freed "$before" "Mathlib's downloaded archives, ~/.cache/mathlib"
+echo "the root file system holds $(used_mib) MiB"
+
 # --- 13. smoke test (workshop/ami/README.md) ---------------------------------------------------
 log "smoke test"
 fail=0
@@ -883,6 +939,15 @@ check as_lean bash -c "$CMP_SMOKE"
 # a Mathlib comparator challenge go through it.
 check as_agent test -L "$AGENT_HOME/lean/workspace/.lake/packages"
 check as_lean lean-project --check --comparator --max-seconds 120
+# #997: a fresh project's first `lake build` (lean-project's template imports Mathlib.Tactic)
+# in a network namespace of its own, so with no network at all: Lake fetched nothing, and
+# ~/.cache/mathlib, deleted in step 12c, didn't come back, so nothing ran Mathlib's cache. The
+# scratch project goes at the exit, passed or not: its link first, never what it points to.
+LAKE_FRESH='d=$(mktemp -d) || exit 1
+end() { cd / && rm -f "$d/fresh/.lake/packages" && rm -rf "$d"; }; trap end EXIT
+lean-project "$d/fresh" && cd "$d/fresh" && timeout 900 lake build && test ! -e ~/.cache/mathlib'
+check sudo unshare --net -- runuser -u "$AGENT" -- env -i HOME="$AGENT_HOME" \
+  PATH="$AGENT_HOME/.elan/bin:/usr/local/bin:/usr/bin:/bin" bash -c "$LAKE_FRESH"
 # AMI v3: Julia on the services' PATH, Oscar precompiled (no "Precompiling" on load), Hecke works:
 # the class number of Q(sqrt(-5)) is 2. certbot with IP address support.
 check bash -c "test \"\$(julia --version)\" = 'julia version $JULIA_VERSION'"
@@ -966,12 +1031,10 @@ sudo rm -f /home/ubuntu/.bash_history "$AGENT_HOME/.bash_history"
 # snapshots and an expired one fails every `apt-get update`.
 sudo apt-mark hold macaulay2 macaulay2-common gfan msolve libmsolve3 >/dev/null
 sudo rm -f /etc/apt/sources.list.d/macaulay2.sources
-# Image hygiene: package caches, the journal, build leftovers (PM note on #56).
+# Image hygiene: package caches, the journal, build leftovers (PM note on #56); conda's went in
+# step 12b, and apt's goes again here.
 $APT clean
 as_agent "$AGENT_HOME/.local/bin/uv" cache clean -q 2>/dev/null || true
-if as_agent test -x "$AGENT_HOME/miniforge/bin/conda"; then
-  as_agent "$AGENT_HOME/miniforge/bin/conda" clean -a -y -q >/dev/null 2>&1 || true
-fi
 sudo rm -rf /tmp/pari-src.* /tmp/zab-wheel.* "$AGENT_HOME/.cache/pip"
 sudo journalctl --rotate --vacuum-time=1s >/dev/null 2>&1 || true
 # The smoke test ran claude as agent, which writes fresh machine/user ids into ~/.claude.json:

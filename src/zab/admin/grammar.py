@@ -40,6 +40,8 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 
+from zab.admin.config import _GIFTS_STEP, GIFTS_STEP_BYTES
+
 SLUG_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?", re.ASCII)
 WS_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,45}[a-z0-9])?", re.ASCII)  # §2.2, §2.9
 SPARE_RE = re.compile(r"zab-spare-[0-9]{1,3}", re.ASCII)
@@ -84,6 +86,26 @@ CHANNEL_RULE = (
     "a channel's name in double quotes, 1 to 60 characters: letters, digits, single inner "
     "spaces, and - _ . , ' & ( ) + : ! ? /"
 )
+#: `!set-workshop … gifts_step="…"` (#1043): a workshop's free text (ADMIN §2.1), so in quotes
+#: and last on the line, where it runs to the line's last quote: it may hold quotes itself.
+_GIFTS_QUOTED = re.compile(f" gifts_step=[{_QUOTES}](.*)[{_QUOTES}]$")
+GIFTS_RULE = (
+    f"its text in double quotes, last on the line: the loader's rule (one line, at most "
+    f"{GIFTS_STEP_BYTES} bytes, no outer space, not starting with -), no mention and no "
+    "backtick; or none, which removes it"
+)
+#: Why a backtick is refused (review of #1046, N1): the plan's header shows the command as code.
+NO_BACKTICK = (
+    "`gifts_step=` takes no backtick: the plan shows the command as code, which one would cut "
+    "short. A deployer can still set one in admin.toml by hand"
+)
+#: Why a `!set-workshop` takes one line (review of #1046, N5): only the first line is read, and
+#: a gift step cut at its first line's last quote would be applied short.
+ONE_LINE = (
+    "`!set-workshop` is one line: its gift step's text, quotes included, must end on it, and "
+    "no other line may follow"
+)
+_AMI_RE = re.compile(r"ami-[0-9a-f]{8,17}", re.ASCII)  # zab.admin.config's
 _UPLOAD_PATH = re.compile(
     r"/user_uploads/[0-9]{1,10}(?:/[A-Za-z0-9_-]{1,64}){1,3}/[A-Za-z0-9_][A-Za-z0-9_.-]{0,200}"
     r"\.(?:csv|CSV)",
@@ -208,6 +230,20 @@ SPECS: dict[str, VerbSpec] = {
         only_global=True,
         optional=("channel",),
     ),
+    # #1043: an existing workshop's entry, its `ami` and `gifts_step` alone, at least one; and
+    # its reading, as the bots loaded it
+    "set-workshop": VerbSpec(
+        "server",
+        '!set-workshop NAME [ami=ami-…|newest] [gifts_step="…"|none]',
+        ("workshop",),
+        settings=("ami", "gifts_step"),
+        server=True,
+        only_global=True,
+        optional=("ami", "gifts_step"),
+    ),
+    "show-workshop": VerbSpec(
+        "read", "!show-workshop NAME", ("workshop",), server=True, only_global=True
+    ),
     # §1.6, #569: the server's own upgrade, to a newer signed release; `sha256=`, required, is
     # the reviewed diff's, as the deployer's own review printed it, which the plan must match.
     # It only goes forward: `downgrade` is refused, with the way back (`_FORWARD_ONLY`)
@@ -228,9 +264,13 @@ SPECS: dict[str, VerbSpec] = {
 LATER = frozenset({"rebind", "cancel"})
 _GROUPS = frozenset(key.split()[0] for key in SPECS if " " in key)  # roster, provision, month-end
 _TOPICS = frozenset(key.split()[0] for key in SPECS) | LATER
+#: The selection of every workshop's rows (#995): `!rollout VERSION every-workshop …` and
+#: `!trust-fix every-workshop`, on the server's bot alone, from a global admin (ADMIN §2.2).
+EVERY_WORKSHOP = "every-workshop"
+FLEETWIDE = frozenset({"rollout", "trust-fix"})
 #: Words that are keywords or setting names wherever a slug may stand (`steer` included, so that
 #: a bare `steer` can't select a participant of that name): no roster slug may be one of them.
-RESERVED = frozenset({"all", "spares"}).union(  # not !new-workshop's: it takes no slug
+RESERVED = frozenset({"all", "spares", EVERY_WORKSHOP}).union(  # not !new-workshop's: no slug
     *(spec.keywords + spec.settings for spec in SPECS.values() if not spec.only_global)
 )
 #: How a reason names each fixed argument it expected.
@@ -246,6 +286,7 @@ _EXPECTED = {
     "size": f"a size like 300GB, at most {MAX_DISK_GB}GB",
     "topic": "a command name",
     "ws-name": "a new workshop's name: a-z, 0-9 and '-', at most 47 characters",
+    "workshop": "a workshop's name",
     "new-slug": "a new slug: a-z, 0-9 and inner '-', at most 32 characters, not a keyword",
     "until": "a date like 2026-11-30, or 2026-11-30T15:00 (UTC), or none",
 }
@@ -295,6 +336,7 @@ class Context:
 class Selection:
     """SEL, within the bot's workshop. `all` is every participant row, never the spares;
     `spares` every available spare. Named slugs and spares keep roster and spares order.
+    `every_workshop` (#995), alone, on the server's bot: every workshop's `all`.
 
     Never empty (§2.2: no implicit "everyone"): the scripts read a missing `--only` as every
     participant, so an empty selection, or one that resolves to no target, is an error."""
@@ -303,19 +345,26 @@ class Selection:
     spares: bool = False
     slugs: tuple[str, ...] = ()
     spare_names: tuple[str, ...] = ()
+    every_workshop: bool = False
 
     def __post_init__(self) -> None:
         names = (self.slugs, self.spare_names)
         if not (
             isinstance(self.all, bool)
             and isinstance(self.spares, bool)
+            and isinstance(self.every_workshop, bool)
             and all(isinstance(n, tuple) and all(isinstance(s, str) for s in n) for n in names)
         ):  # a truthy "false" read back from a stored plan must not mean `all`
-            raise ValueError("a selection is two bools and two tuples of names")
-        if not (self.all or self.spares or self.slugs or self.spare_names):
+            raise ValueError("a selection is three bools and two tuples of names")
+        some = self.all or self.spares or self.slugs or self.spare_names
+        if not (some or self.every_workshop):
             raise ValueError("an empty selection")
+        if some and self.every_workshop:
+            raise ValueError(f"`{EVERY_WORKSHOP}` stands alone")
 
     def tokens(self) -> tuple[str, ...]:
+        if self.every_workshop:
+            return (EVERY_WORKSHOP,)
         people = ("all",) if self.all else self.slugs
         return people + (("spares",) if self.spares else self.spare_names)
 
@@ -324,6 +373,8 @@ class Selection:
         ValueError when `all` or `spares` finds nothing there, rather than return a list that
         selects less than was asked, or nothing, and when a named slug or spare isn't the
         roster's own (it may have changed since the command was parsed)."""
+        if self.every_workshop:  # each workshop's own `all` (#995): never one roster's rows
+            raise ValueError(f"`{EVERY_WORKSHOP}` names no row of one workshop")
         if (self.all and not roster.slugs) or (self.spares and not roster.spares):
             raise ValueError("`all` or `spares` selects nothing in this roster")
         if not (
@@ -367,6 +418,9 @@ class Command:
     organizers: tuple[int, ...] | None = None  # !new-workshop organizers=: Zulip user IDs
     channel: str | None = None  # !new-workshop channel="…": the participants' channel (#627)
     sha256: str | None = None  # !upgrade-server sha256=: the reviewed diff's (#569)
+    workshop: str | None = None  # !set-workshop, !show-workshop: a workshop's name (#1043)
+    ami: str | None = None  # !set-workshop ami=: `ami-…`, or "newest"
+    gifts_step: str | None = None  # !set-workshop gifts_step=: its text, "" to remove it
 
     def __post_init__(self) -> None:
         """A `Command` built directly is held to what `parse` guarantees: a verb of SPECS, and
@@ -445,6 +499,8 @@ def _render(kind: str, value: object) -> list[str]:
         return [",".join(map(str, value))]  # type: ignore[call-overload]
     if kind == "channel":  # always quoted, so that `parse` reads `text()` back (#627)
         return [f'"{value}"']
+    if kind == "gifts_step":  # quoted, and last of the settings: `parse` reads it back (#1043)
+        return [f'"{value}"' if value else "none"]
     return list(value) if isinstance(value, tuple) else [str(value)]
 
 
@@ -518,6 +574,16 @@ def channel_name(value: str) -> str | None:
     return value
 
 
+def gifts_step(value: str) -> str | None:
+    """`value` as `!set-workshop`'s `gifts_step="…"` takes it (`GIFTS_RULE`), or None (#1043):
+    the loader's rule, and no mention (`@**…**`, `@_**…**`, `@*…*`), which "Start here" would
+    make in every sandbox, nor a second `gifts_step=`, nor a backtick (`NO_BACKTICK`)."""
+    if not _GIFTS_STEP.fullmatch(value) or len(value.encode("utf-8")) > GIFTS_STEP_BYTES:
+        return None
+    bad = re.search(r"@_?\*", value) or " gifts_step=" in value or "`" in value
+    return None if bad else value
+
+
 #: `key=value` options: each value's parser (None when invalid) and its rule, for the reason.
 _SETTINGS = {
     "spares": (lambda v: _number(v, 0, 10), "0 to 10"),
@@ -533,6 +599,10 @@ _SETTINGS = {
     "channel": (channel_name, CHANNEL_RULE),
     # !upgrade-server's (#569): the reviewed diff's SHA-256, whole, as deploy.sh prints it
     "sha256": (lambda v: v if _SHA256_RE.fullmatch(v) else None, "the 64 hex digits of a SHA-256"),
+    # !set-workshop's (#1043): an image, or the region's newest; the gift step's text is read
+    # before the words (`_command`), so a word here can only be `none`
+    "ami": (lambda v: v if v == "newest" or _AMI_RE.fullmatch(v) else None, "ami-<hex>, or newest"),
+    "gifts_step": (lambda v: "" if v == "none" else None, GIFTS_RULE),
 }
 
 
@@ -562,6 +632,7 @@ def _head(kind: str, word: str, ctx: Context, roster: Roster) -> object:
         "size": lambda: _size(word),
         "topic": lambda: word if word in _TOPICS else None,
         "ws-name": lambda: word if WS_NAME_RE.fullmatch(word) else None,
+        "workshop": lambda: word if _NAME_RE.fullmatch(word) else None,  # admin.toml's, #1043
         # `!roster rename`'s (#627): its shape here; roster_sync.py checks it is free
         "new-slug": lambda: word if _new_slug(word) else None,
         "until": lambda: "none" if word == "none" else keep_until_value(word),
@@ -569,7 +640,10 @@ def _head(kind: str, word: str, ctx: Context, roster: Roster) -> object:
     return lookup[kind]()
 
 
-def _arguments(spec: VerbSpec, args: list[str], ctx: Context, roster: Roster) -> dict[str, object]:
+def _arguments(
+    spec: VerbSpec, args: list[str], ctx: Context, roster: Roster, verb: str = ""
+) -> dict[str, object]:
+    every = ctx.roster is None and verb in FLEETWIDE  # the server's bot's `every-workshop`
     fields: dict[str, object] = {}
     for kind in spec.head:
         name = kind.rstrip("?*")
@@ -606,13 +680,18 @@ def _arguments(spec: VerbSpec, args: list[str], ctx: Context, roster: Roster) ->
             word in spec.keywords
             or (spec.selection and (word == "all" or word in roster.slugs))
             or (spec.spares and (word == "spares" or word in roster.spares))
+            or (every and word == EVERY_WORKSHOP)
         ):
             raise _unexpected(word, spec)
     keywords = [word for word in spec.keywords if word in seen]
     if spec.exclusive and len(keywords) > 1:
         raise _Reject(f"give one of {' or '.join(spec.keywords)}")
     fields["keywords"] = frozenset(keywords)
-    if spec.selection:
+    if spec.selection and EVERY_WORKSHOP in seen:  # the server's bot's (#995), alone
+        if seen & {"all", "spares"}:
+            raise _Reject(f"`{EVERY_WORKSHOP}` already selects every workshop's rows: name none")
+        fields["selection"] = Selection(every_workshop=True)
+    elif spec.selection:
         fields["selection"] = _selection(spec, seen, roster)
     return fields
 
@@ -678,6 +757,15 @@ def _command(body: str, content: str, ctx: Context, dm: bool) -> Command:
         if channel_name(quoted[0]) is None:
             raise _Reject(f"`channel=` takes {CHANNEL_RULE}")
         body = _CHANNEL_QUOTED.sub("", body, count=1)
+    if body.startswith("set-workshop ") and content.strip(" \n").count("\n"):
+        raise _Reject(ONE_LINE)  # only the first line is read: never a gift step cut short
+    gifts = _GIFTS_QUOTED.search(body) if body.startswith("set-workshop ") else None
+    if gifts is not None:  # the free text: read before the words, never split (#1043)
+        if "`" in gifts[1]:
+            raise _Reject(NO_BACKTICK)
+        if gifts_step(gifts[1]) is None:
+            raise _Reject(f"`gifts_step=` takes {GIFTS_RULE}")
+        body = body[: gifts.start()]
     words = body.split(" ")
     if not words[0]:
         raise _Reject("the command follows `!` directly, as in `!help`")
@@ -696,19 +784,34 @@ def _command(body: str, content: str, ctx: Context, dm: bool) -> Command:
     spec = SPECS[verb]
     if dm and not spec.dm:
         raise _Reject("only !help and !console work in a direct message; use the channel")
-    if ctx.roster is None and not spec.server:
-        raise _Reject("this is the server's bot: send workshop commands to the workshop's bot")
+    if ctx.roster is not None and EVERY_WORKSHOP in args:
+        raise _Reject(f"`{EVERY_WORKSHOP}` is the server's bot's: send it in its channel")
+    if (
+        ctx.roster is None
+        and not spec.server
+        and not (verb in FLEETWIDE and EVERY_WORKSHOP in args)
+    ):
+        hint = f", or `{EVERY_WORKSHOP}` in place of SEL here" * (verb in FLEETWIDE)
+        raise _Reject(
+            f"this is the server's bot: send workshop commands to the workshop's bot{hint}"
+        )
     if ctx.roster is not None and spec.only_global:
         raise _Reject(f"`!{verb}` is the server's: send it to the server's bot, in its channel")
-    fields = _arguments(spec, args, ctx, ctx.roster or Roster())
+    fields = _arguments(spec, args, ctx, ctx.roster or Roster(), verb)
     if quoted:
         if "channel" in fields:
             raise _Reject("`channel=` is given twice")
         fields["channel"] = quoted[0]
+    if gifts is not None:
+        if "gifts_step" in fields:
+            raise _Reject("`gifts_step=` is given twice")
+        fields["gifts_step"] = gifts[1]
     required = [key for key in spec.settings if key not in spec.optional]
     if spec.only_global and any(_field(key) not in fields for key in required):
         but = f" but {', '.join(spec.optional)}" if spec.optional else ""
         raise _Reject(f"each setting{but} is required: {spec.usage}")
+    if verb == "set-workshop" and not {"ami", "gifts_step"} & set(fields):
+        raise _Reject(f"name what changes, ami= or gifts_step= or both: {spec.usage}")
     if verb == "roster import":
         fields["upload"] = _upload(content)
     return Command(verb, **fields)

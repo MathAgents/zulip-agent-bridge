@@ -125,6 +125,66 @@ def test_wait_state_times_out():
     assert ec2.wait_while("i-test", "stopping") == "running"
 
 
+class Scripted(FakeClient):
+    """EC2 whose test instance reads the states of `script` in turn, one a describe, then the
+    last one for ever."""
+
+    def __init__(self, *script: str) -> None:
+        super().__init__()
+        self.script, self.reads = list(script), 0
+
+    def describe_instances(self, InstanceIds):
+        self.instances["i-test"]["State"]["Name"] = self.script[
+            min(self.reads, len(self.script) - 1)
+        ]
+        self.reads += 1
+        return super().describe_instances(InstanceIds)
+
+
+@pytest.mark.parametrize(
+    ("script", "ends", "reads"),
+    [
+        (["running", "stopping", "pending", "running"], "pending", 3),  # #1017: the waker's start
+        (["stopping", "stopping", "running"], "running", 3),  # its `pending` missed too
+        (["stopping", "stopped", "pending"], "stopped", 2),  # stopped: the caller starts it
+        (["running", "running", "stopping", "stopped"], "stopped", 4),  # the stop shown late
+        (["pending", "running"], "pending", 1),
+    ],
+)
+def test_wait_stopped_takes_a_start_after_the_stop_as_a_stop(script, ends, reads):
+    """A stop, then a start by someone else (the test waker, #1017) before a poll saw it
+    `stopped`, is a stop; a `running` read before any `stopping`, a stop not shown yet. On a
+    fake clock that the pauses move, with a timeout of 10 polls: a rule broken fails at once,
+    by its TimeoutError or by the state it returns."""
+    client, slept, now = Scripted(*script), [], [0.0]
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        now[0] += seconds
+
+    ec2 = TestEc2("us-east-1", SCOPE, client=client, sleep=sleep, clock=lambda: now[0])
+    assert ec2.wait_stopped("i-test", timeout=20) == ends
+    assert client.reads == reads and slept == [2] * (reads - 1)
+
+
+def test_wait_stopped_after_the_callers_read_of_stopping():
+    """A caller that read `stopping` itself (idle stop, scenario 11) says so: a `running` at
+    the first read is then a start again; without it, a stop not shown yet, until the timeout.
+    On a fake clock that the pauses move, as above: a caller's `stopping` ignored fails at once,
+    by its TimeoutError."""
+    now = [0.0]
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    ec2 = TestEc2("us-east-1", SCOPE, client=Scripted("running"), sleep=sleep, clock=lambda: now[0])
+    assert ec2.wait_stopped("i-test", timeout=20, stopping=True) == "running"
+    assert now[0] == 0  # at the first read
+    with pytest.raises(TimeoutError, match="i-test still running after 60 s"):
+        ec2.wait_stopped("i-test", timeout=60)
+    assert now[0] == 60
+
+
 def test_describe_refuses_an_answer_about_another_instance():
     """Reviewer on #286: the tags checked must be the requested instance's own."""
     client = FakeClient()

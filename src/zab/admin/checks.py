@@ -39,8 +39,8 @@ from pathlib import Path
 import zab
 from zab.admin.config import AdminConfig
 
-#: Every script `actions.py`, `newworkshop.py` and `upgradeserver.py` run, relative to the
-#: release's `workshop/` (a test keeps it equal to the `run(...)` calls there).
+#: Every script `actions.py`, `newworkshop.py`, `setworkshop.py` and `upgradeserver.py` run,
+#: relative to the release's `workshop/` (a test keeps it equal to the `run(...)` calls there).
 SCRIPTS = (
     "admin/collect_exports.py",
     "admin/final_sync.py",
@@ -52,6 +52,7 @@ SCRIPTS = (
     "admin/roster_import.py",
     "admin/roster_sync.py",  # #627
     "admin/scan_hosts.py",
+    "admin/set_workshop.py",  # zab.admin.setworkshop's (#1043)
     "admin/status.py",
     "admin/trust_fix.py",  # #992
     "admin/upgrade_server.py",  # zab.admin.upgradeserver's (#569)

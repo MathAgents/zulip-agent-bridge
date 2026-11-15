@@ -270,6 +270,18 @@ def error_kind(exc: BaseException) -> str:
     return exc.why if isinstance(exc, ZuliprcError) else type(exc).__name__
 
 
+def transient(exc: BaseException) -> bool:
+    """Whether Zulip didn't answer, or asked for a retry, so that the request may pass once it
+    answers again: a transport error (refused, reset, timed out), a rate limit (429), a server
+    error (5xx) or a response that isn't JSON. Any other error is Zulip refusing the request,
+    as it will on every retry. `zab.core.bridge.zulip_unreachable`'s rule, less the event
+    queue's own error; the sentinel's and the waker's (#1022)."""
+    return isinstance(exc, httpx.TransportError) or (
+        isinstance(exc, ZulipError)
+        and (exc.status == 429 or exc.status >= 500 or exc.code == "INVALID_RESPONSE")
+    )
+
+
 _TLS: ssl.SSLContext | None = None
 
 

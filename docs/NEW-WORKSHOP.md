@@ -68,3 +68,33 @@ The answer is `✅ P-12 approved (a global admin's approval)`, and the apply run
 - **No answer from the config helper** within 60 seconds: the apply withdraws its request, and the result says `the request is withdrawn, and nothing was added`; send the command again once a deployer has found why (`systemctl status zab-admin-config.path`). If the helper had taken the request already, the result says `the entry may be added`: a deployer reads `/var/lib/zab-admin-config/result.json` and the journal before anyone sends it again.
 - **Undoing a workshop** is not offered through the bots. A deployer restores `/etc/zab-admin/admin.toml.bak`, removes `secrets/bots/<name>.zuliprc` and restarts the bots ([`workshop/adminserver/README.md`](../workshop/adminserver/README.md#processes), "The config helper"); in Zulip, the bot is deactivated and the channels archived. The name stays used.
 - **Changing the organizers** later is a deployer's edit of the configuration ([ADMIN §2.9](ADMIN.md#29-adding-a-workshop-new-workshop)).
+
+## 6. Later: its image and its gift step, `!set-workshop`
+
+A workshop's entry keeps the image `!new-workshop` found, and has no gift step for "Start here" ([ORGANIZERS §1.6](ORGANIZERS.md#16-what-participants-need)). Both change in `#zab-admins`, with no SSH session, from release 0.2.21 ([ADMIN §2.10](ADMIN.md#210-changing-a-workshops-entry-set-workshop-show-workshop-1043)). Do it before the workshop's VMs are launched, and before `!provision zulip` posts "Start here": a VM keeps the image it was launched from, and a "Start here" posted stays as it is.
+
+- **Read the entry first:**
+
+  ```
+  !show-workshop harvard-2026
+  ```
+
+  The answer is the entry as the bots run with it: `ami = "…"` under `[workshop.aws]`, and `gifts_step = "…"` if it has one.
+- **Change it,** in a topic of its own, in a message of one line. Either key, or both; the gift step in double quotes and last on the line, one line in Markdown with no mention and no backtick (preview it in a message to yourself first, ADMIN §2.1; a gift step with code in it is a deployer's edit by hand):
+
+  ```
+  !set-workshop harvard-2026 ami=newest gifts_step="Accept your gift subscriptions: Claude Max through the invitation Anthropic e-mailed you."
+  ```
+
+  `ami=newest` is the region's newest image, as `!new-workshop` picks it, picked once by the plan: the apply sets that image, even if a newer one is tagged before it (its result then says so); `ami=ami-0123456789abcdef0` names one, which must be the region's and in the fleet's scope. `gifts_step=none` removes the gift step.
+- **Read the plan,** `**P-13** · server · …`: under each key, its line old (`-`) and new (`+`) and what it affects; under *Checks*, `ok:` for the image and for a DryRun launch of the workshop's instance types from it. A `MISSING:` line refuses the plan: fix what it names, then send the command again. A change that changes nothing (the image it has, the gift step it has) is refused, saying so.
+- **Approve** it: one global admin, the requester's own approval included, with no phrase, within the plan's 10 minutes:
+
+  ```
+  !approve P-13 4b7e1d
+  ```
+
+  The result ends `harvard-2026's entry changed in admin.toml; admin.toml.bak kept`; then the bots restart, about 10 seconds, as after `!new-workshop` (§2: the same waits and the same advice on a busy hour).
+- **Check:** `!show-workshop harvard-2026` again shows the new values once the bots are back.
+
+A refused change writes nothing. If the server's configuration changed since the plan (a deployer's edit, another plan), the approval normally finds the plan STALE, since the file is one of its inputs: request it again. Only a change in the seconds between that check and the apply reaches the config helper, whose result then says `harvard-2026's entry changed since the plan: request it again`.

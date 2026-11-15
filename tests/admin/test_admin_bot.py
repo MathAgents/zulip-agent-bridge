@@ -20,7 +20,7 @@ import httpx
 import pytest
 
 from zab.admin import bot as botmod
-from zab.admin import checks, fleet, newworkshop, upgradeserver
+from zab.admin import checks, fleet, newworkshop, setworkshop, upgradeserver
 from zab.admin.audit import verify
 from zab.admin.bot import ADDRESSED, FOREIGN, PLACES, WINDOW, StartupError
 from zab.admin.fleet import ApplyEnd, Ledger
@@ -1176,6 +1176,7 @@ def test_selfcheck_scripts_are_the_actions_scripts():
     source = Path(fleet.__file__).with_name("actions.py").read_text()
     found = set(re.findall(r'run\(\s*"([a-z_/]+\.py)"', source)) | {
         newworkshop.SCRIPT,
+        setworkshop.SCRIPT,
         upgradeserver.SCRIPT,
     }
     assert found == set(checks.SCRIPTS)

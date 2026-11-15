@@ -4,6 +4,7 @@
     {
       "slug": "alice",
       "host": "203.0.113.5",
+      "instance": null,
       "bridge": "active, sign-in pending",
       "sentinel": "ok",
       "zab_version": "0.2.4",
@@ -47,6 +48,7 @@
     {
       "slug": "bob",
       "host": "203.0.113.6",
+      "instance": null,
       "bridge": "no zab",
       "sentinel": null,
       "zab_version": null,
@@ -88,6 +90,7 @@
     {
       "slug": "carol",
       "host": "203.0.113.7",
+      "instance": "i-carol",
       "bridge": "stopped",
       "sentinel": null,
       "zab_version": null,
@@ -110,6 +113,7 @@
     {
       "slug": "dave",
       "host": "203.0.113.8",
+      "instance": "i-dave",
       "bridge": "active, doctor FAIL",
       "sentinel": null,
       "zab_version": "0.2.3",

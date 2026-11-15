@@ -74,7 +74,9 @@ def test_the_plans_command_is_the_apply_as_the_bot_renders_it():
     `--admin-bot`, ending `--apply`."""
     talk = Talk([])
     plan = asyncio.run(a24.plan_of(talk, f"!trust-fix {B}", [B]))
-    assert plan.commands[0].endswith(f"--admin-bot --only {B} --apply"), plan.commands
+    words = plan.commands[0].split()
+    assert words[-3:] == ["--only", B, "--apply"] and "--admin-bot" in words, plan.commands
+    assert words[words.index("--start-stopped") + 1] == "6", plan.commands  # #995
 
 
 @pytest.fixture

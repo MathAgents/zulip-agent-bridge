@@ -507,7 +507,11 @@ async def test_job_lost_at_boot(chat: Chat, vm, ec2, instance_id, scenario, nonc
             chat, "claude", topic, marker, name, computation(900, value_of(nonce), marker)
         )
         ec2.stop(instance_id)
-        ec2.wait_state(instance_id, "stopped", timeout=600)
+        # the test waker may start it again for the turn's message, sent just before (#1017):
+        # a stop all the same; `vm_up` starts it only if it is still stopped
+        if (state := ec2.wait_stopped(instance_id, timeout=600)) != "stopped":
+            scenario.notes.append(f"the VM was started again after the stop (EC2 {state}), "
+                                  "not by this part: the test waker, #1017")  # fmt: skip
         await vm_up(ec2, instance_id, vm)
         post = await chat.user.wait_reply(
             turn.narrow, after_id=turn.message_id, senders=[turn.bot], pattern=cut, within=600

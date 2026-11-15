@@ -705,7 +705,7 @@ Once per organization, an owner checks these, besides §5.2's e-mail visibility.
 **Each region the workshops use is set up once,** by the account owner (ADMIN §5, "Setting up a region"): a security group and an AMI copy for the fleet's VMs, both tagged `zab-scope=$SCOPE` (§6.1). Nothing is made per workshop by hand: the server imports each workshop's key pair itself, at the bootstrap for the first workshop (`deploy.sh`'s `fleet_key`, §6.3) and through `!new-workshop` for the others.
 - **At the bootstrap:** the first workshop's region, `$WR`, with §6.1; its IDs for `admin.toml` with §6.2.
 - **A region added later,** for a later workshop: §6.5, which runs §6.1 there, adds the region to `admin.toml`'s `[global] regions` and the role's policy, and checks it with `!new-workshop`.
-- **A new image** in a region already set up: only §6.1's copy and its tag, with the new image as the source; the group exists already. `!new-workshop` uses the region's newest image tagged `zab-scope=$SCOPE`, and shows it in its plan; an existing workshop keeps the image its entry names. Once no workshop needs the older image, remove its tag: `aws ec2 delete-tags --profile "$P" --region "$R" --resources <older-ami> --tags Key=zab-scope`.
+- **A new image** in a region already set up: only §6.1's copy and its tag, with the new image as the source; the group exists already. `!new-workshop` uses the region's newest image tagged `zab-scope=$SCOPE`, and shows it in its plan; an existing workshop keeps the image its entry names until a global admin moves it to the newest, in `#zab-admins`, with no SSH session: `!set-workshop <ws> ami=newest`, approved (ADMIN §2.10; NEW-WORKSHOP §6). Only VMs launched afterwards use it. Once no workshop needs the older image, remove its tag: `aws ec2 delete-tags --profile "$P" --region "$R" --resources <older-ami> --tags Key=zab-scope`.
 
 ### 6.1 The fleet's security group and image, per region
 
@@ -852,14 +852,14 @@ git -C ~/zab tag -v "$V" 2>&1 | grep Good                                # Good 
 ```
 
 1. **The region's AWS resources,** by the account owner: §6.1 in the new region, with `R` as set above, the group `zab-fleet`, the image copied from a region set up already, and the check at its end. Then §6.4's quotas, with `$R` for `$WR`.
-2. **`admin.toml`: the server's, plus the region,** on the laptop. Start from the server's file, not your copy: `!new-workshop` adds its entries on the server alone, and a copy installed without them would remove those workshops.
+2. **`admin.toml`: the server's, plus the region,** on the laptop. Start from the server's file, not your copy: `!new-workshop` adds its entries on the server alone, and `!set-workshop` changes its lines there alone, so a copy installed without them would remove those workshops or undo those changes.
 
    ```sh
    scp "$HOST:/etc/zab-admin/admin.toml" ~/zab-admin/etc/admin.toml.server
    diff -u ~/zab-admin/etc/admin.toml ~/zab-admin/etc/admin.toml.server && echo same
    ```
 
-   It prints `same`, or a diff whose changed lines are all `+`: the `[[workshop]]` entries `!new-workshop` added since your copy was made. Then take the server's, and add the region to `[global] regions`, keeping the others, as `regions = ["<a region>", "<the new region>"]`:
+   It prints `same`, or a diff of `+` lines, the `[[workshop]]` entries `!new-workshop` added since your copy was made, and of `-`/`+` pairs, each an `ami` or `gifts_step` line that `!set-workshop` changed (ADMIN §2.10): the server's is right. Then take the server's, and add the region to `[global] regions`, keeping the others, as `regions = ["<a region>", "<the new region>"]`:
 
    ```sh
    cp ~/zab-admin/etc/admin.toml.server ~/zab-admin/etc/admin.toml
@@ -868,7 +868,7 @@ git -C ~/zab tag -v "$V" 2>&1 | grep Good                                # Good 
    cd ~/zab-"$V" && uv run python -m zab.admin.config --config ~/zab-admin/etc/admin.toml check && echo ok
    ```
 
-   A `-` line in the first diff, or a changed value, is a change made on one side only: find out which is right before you go on. The last command prints `ok`; a refusal names the key and the rule.
+   Any other `-` line in the first diff, or another changed value, is a change made on one side only: find out which is right before you go on. The last command prints `ok`; a refusal names the key and the rule.
 3. **The role's policy,** by the account owner (ADMIN §5; the adminserver README, "The instance role's policies"). Render it twice, from the server's release, into new directories: from the server's file of step 2, which is what the policies in force were rendered from, and from your edited one. Compare the two. Nothing here reads `~/zab-admin/policies`, which a second machine (§15) doesn't have and either machine may hold an older render in:
 
    ```sh
@@ -1064,7 +1064,8 @@ organizers = []                              # its own organizers' user IDs (§7
 mention_after_s = 120                        # a turn this long or longer mentions its owner (ADMIN §2.1)
 alerts_channel = <WS_ALERTS_CHANNEL_ID>      # #<WS>-fleet-alerts
 channel = <WS_PARTICIPANTS_CHANNEL_ID>       # its participants' channel (§5.4); optional: or delete
-# "Start here"'s first step, about gift plans, in its own words (ADMIN §2.1); optional: or delete
+# "Start here"'s first step, about gift plans, in its own words (ADMIN §2.1); optional: or delete,
+# and set it later with !set-workshop (ADMIN §2.10)
 gifts_step = "Accept any gift subscriptions: Claude Max (from Anthropic) and ChatGPT Pro (from OpenAI)."
 spare_idle_stop = 10                         # a spare's idle stop, in minutes (ORGANIZERS §3.7)
 [workshop.bot]                               # `Workshop admin · <WS>`
@@ -1528,7 +1529,7 @@ Once the server runs a release with it (its `deploy.sh` has `--in-band`), a depl
 Either way the server installs only tags signed by a key of its own `allowed_signers`: the form decides how the tags travel, never which are trusted. No user, token, port or other host is taken, and a refusal never shows the value. The HTTPS form needs a running release whose loader takes it: an older one refuses it at step 3's checks (`release_repo: expected …`), so keep the SSH form until the server runs one that does.
 
 **Which repository:**
-- **The public zab repository,** by its HTTPS address, `https://github.com/<OWNER>/<REPO>.git` of the address `README.md`'s install line gives, or, for its owner's server, by its SSH address with a deploy key: the server fetches the published releases there, one commit each, whose tags are signed with the key SECURITY.md publishes, a key of that server's `allowed_signers`. Nothing is pushed for the server: a release's tag is there once it is published, signed and pushed by the maintainer's publication of the release, never by `upgrade.py` (the adminserver README), which pushes only to your clone's origin. The running release's tag there must name the commit the server's `deploys.jsonl` records for it, which holds for a release deployed from the public repository's commit. A server that runs one deployed from another repository's commit, such as the clone the release was first tagged in, first takes one hand deploy of a published release (*Onto the public repository's commits*, below).
+- **The public zab repository,** by its HTTPS address, `https://github.com/<OWNER>/<REPO>.git` of the address `README.md`'s install line gives, or, for its owner's server, by its SSH address with a deploy key: the server fetches the published releases there, one commit each, whose tags are signed with the key SECURITY.md publishes, a key of that server's `allowed_signers`. Nothing is pushed for the server: a release's tag is there once it is published, signed and pushed by the maintainer's publication of the release, the maintainer's `upgrade.py --publish` (the adminserver README). A deployer's `upgrade.py`, without `--publish`, pushes only to their clone's origin. The running release's tag there must name the commit the server's `deploys.jsonl` records for it, which holds for a release deployed from the public repository's commit. A server that runs one deployed from another repository's commit, such as the clone the release was first tagged in, first takes one hand deploy of a published release (*Onto the public repository's commits*, below).
   With the maintainer's signature (SECURITY.md's line in your `allowed_signers`, §2.2), this is the repository for any server, by its HTTPS address.
 - **A repository whose releases you tag yourself** (§9), which you own: that repository, by its HTTPS address if it is public.
 - **Otherwise,** the public repository's releases, signed by you (§9): your tags aren't in the public repository, so a **repository of your own** holds them, private (the SSH form) or public (the HTTPS form). Make it once, with `gh` signed in as its owner (`--public` for a public one). It prints `https://github.com/<OWNER>/<REPO>`:
@@ -1565,7 +1566,7 @@ RUNNING=<release>               # vX.Y.Z, the release the server runs
    ```
 
    Or the repository's *Settings → Deploy keys → Add deploy key*, with *Allow write access* unchecked.
-3. **`admin.toml`: the server's, plus `release_repo`.** Start from the server's file, not your copy: `!new-workshop` adds its entries on the server alone, and a copy installed without them would remove those workshops. It prints `same`, or a diff whose changed lines are all `+`, the `[[workshop]]` entries `!new-workshop` added since your copy was made:
+3. **`admin.toml`: the server's, plus `release_repo`.** Start from the server's file, not your copy: `!new-workshop` adds its entries on the server alone, and `!set-workshop` changes its lines there alone, so a copy installed without them would remove those workshops or undo those changes. It prints `same`, or a diff of `+` lines, the `[[workshop]]` entries `!new-workshop` added since your copy was made, and of `-`/`+` pairs, each an `ami` or `gifts_step` line that `!set-workshop` changed (ADMIN §2.10): the server's is right. Any other `-` line, or another changed value, is a change made on one side only: find out which is right before you go on:
 
    ```sh
    scp "$HOST:/etc/zab-admin/admin.toml" ~/zab-admin/etc/admin.toml.server
@@ -1679,6 +1680,8 @@ git -C ~/zab show "$C:pyproject.toml" | grep '^version'   # version = "X.Y.Z", $
 
 Then go on to step 3.
 
+**The public repository's maintainer** runs it with `--publish` (#991). That run also exports the release from the private repository the public one is exported from, commits and signs its public tag, and pushes both tags: first the public `main` and the tag together (`git push --atomic`), then the private tag. It refuses before any push when something is wrong: the export, a tag that doesn't verify, a public `main` that moved, the identity, `gh`'s `workflow` scope, or a public clone that is the private repository or reaches its origin over SSH. It ends with the line of step 4, `!upgrade-server vX.Y.Z sha256=<SHA-256>`: steps 1 and 2 are done, and the published tag is there. A release whose running release has no `--publish` is signed by hand after the review, then published by its own driver, from `~/zab-"$V"`, with `--since "$RUNNING"`.
+
 1. **Review it with the running release's `deploy.sh`,** since the running release. The server's plan reviews it so, and compares the SHA-256:
 
    ```sh
@@ -1737,7 +1740,7 @@ Then go on to step 3.
 
      Then run `rm ~/zab-admin/etc/admin.toml.server`, and go on to step 4.
 4. **In `#zab-admins`:** `!upgrade-server vX.Y.Z sha256=<the review's SHA-256>`.
-   - Read the plan: both tags, by object, commit, signer and key; the SHA-256, the same as yours; the privileged diff. Approve it.
+   - Read the plan: both tags, by object, commit, signer and key; the SHA-256, the same as yours; the privileged diff. Approve it. No `!plans` round first (ADMIN §2.4 step 6, #989): the plan's notes name the plans in flight on every bot when it was made, and while any plan applies or is approved, a month-end run included, the approval is answered `busy: P-<n> is applying on <its bot>. …` and not recorded; send it again once that plan's result is posted, before this plan expires. A plan **Pending now** stays pending, but is stale once the bots run the new release: its organizers request it again.
    - The result says `the apply helper: vX.Y.Z is installed and current, with its fleet wheel (SHA-256 <hex>), and its units restarted, but the bots', which restart themselves into it`.
    - The bots then restart into it, and `!version` answers `zab vX.Y.Z+<commit> · …`.
 5. **To compare the server's fleet wheel with your own build** (optional, over SSH): type the version when asked. It ends `zulip_agent_bridge-X.Y.Z-py3-none-any.whl is already there: SHA-256 <hex>.`, the result's SHA-256, or stops with `… is there with other content`:
@@ -1756,6 +1759,13 @@ Then go on to step 3.
 - **A signer removed from `allowed_signers`** (§17): the running release's tag, the review's base, no longer verifies. Deploy the next release from your machine with §17's step 9; in-band works again from there. If you take that step's public-repository alternative instead, signing the running release's tag again, `release_repo` still holds the old tag object. Push the new one with `git -C ~/zab push --force "$RR" "refs/tags/$RUNNING"` (with `RR` in the HTTPS form, after the setup's step 4 `gh auth setup-git`, or to the repository's SSH address instead); the server takes it, since its commit is the same.
 - **GitHub's SSH host key rotated** (the SSH form): the pinned keys (`workshop/adminserver/github-known-hosts`) come from the running release, so the fetch is refused until a release with the new keys is deployed with `deploy.sh`.
 - **A tag moved in `release_repo` to another commit:** a released tag never moves, so the server keeps the copy it took and refuses the moved one, every time. Ask its signer why. Once that is understood, either release under another version, or remove the server's copy: `ssh -t "$HOST" sudo git -C /var/lib/zab-admin-upgrade/repo.git tag -d vX.Y.Z`, which prints `Deleted tag 'vX.Y.Z' (was <hex>)`.
+
+**The plans in flight, at a `deploy.sh` upgrade or downgrade** (ADMIN §2.4 step 6, #989). No `!plans` round first, but for a release without the check (the last bullet): the deploy checks itself, once the release is built and before anything is installed. Its output lists them under `The plans in flight on the bots:`, one line each, such as `P-41, applying on zab-test's bot (!rollout) for 3 min`, or says `No plan is in flight on the bots.`
+- **A plan applying or approved,** a month-end run included: the deploy waits for it, up to 15 minutes (`--plan-wait MINUTES`, from 0 to 120), printing `Waiting for P-<n>, …` once a minute, and goes on once none is left. If one still is, it ends `deploy.sh: a plan is applying or approved, or state.db can't be read (above): nothing was deployed. …`: the server runs what it ran; run the same command again once that plan's result is posted.
+- **A plan pending or being planned:** named, and the deploy goes on. The restart interrupts a plan being planned; a pending plan stays pending, but its approval afterwards finds it stale. Each is requested again.
+- **A plan that is stuck** (its result never comes, and its workshop's approvals keep being answered `busy:`): add `--interrupt-plans "<why>"` before `"$V"`, letters, digits, spaces and `._,:;()#+=/@-` only. The deploy names the plans and goes on, and its record in `/opt/zab-admin/deploys.jsonl`, copied into the audit log, keeps the reason and the plans it cut: `unknown` when the check couldn't read them (`The plans check failed (above): going on, …`).
+- **A Ctrl-C during the wait** takes effect only when the wait ends, at most `--plan-wait`'s minutes: the deploy then stops there, with nothing installed.
+- **A release without the check, a downgrade's target among them** (0.2.20 and older): it runs its own server half, which has none, so the `!plans` round of before still comes first. Send `!plans` to each workshop's bot and the server's, and wait for the result of any apply under way (a progress message with no result yet). What `deploy.sh` says depends on whose it is. This release's, or a later one's, says so before its prompt, `Note: vX.Y.Z has no check of the plans in flight (#989): …`, and refuses `--plan-wait` and `--interrupt-plans` for it. The target's own, as the rollback in *After an applied upgrade* and the downgrade in *When `deploy.sh` is still the way* run it, says nothing, and refuses the two options as `unknown option`.
 
 **After an applied upgrade:**
 - **The bots don't come back:** `!version` has no answer minutes after the result. The release is current, but its bot doesn't run:
@@ -1791,13 +1801,13 @@ Then go on to step 3.
    PUBLIC=<the public zab repository's clone URL>   # README.md's install line gives it
    git clone -q "$PUBLIC" ~/zab-deploy-"$V"
    git -C ~/zab-deploy-"$V" remote remove origin
-   git -C ~/zab-deploy-"$V" fetch -q --no-tags ~/zab "+refs/tags/$RUNNING:refs/tags/$RUNNING" "+$C:refs/private/C"
+   git -C ~/zab-deploy-"$V" -c maintenance.auto=false fetch -q --no-tags ~/zab "+refs/tags/$RUNNING:refs/tags/$RUNNING" "+$C:refs/private/C"
    S="$HOME/zab-admin/etc/allowed_signers"
    git -C ~/zab-deploy-"$V" -c gpg.ssh.allowedSignersFile="$S" tag -v "$V" 2>&1 | grep 'Good "git" signature for '
    git -C ~/zab-deploy-"$V" -c gpg.ssh.allowedSignersFile="$S" tag -v "$RUNNING" 2>&1 | grep 'Good "git" signature for '
    ```
 
-   The clone has no remote, so nothing can be pushed from it, and `~/zab`'s history reaches only it: the bundle `deploy.sh` sends the server holds the published tag and the public history alone.
+   The clone has no remote, so nothing can be pushed from it, and `~/zab`'s history reaches only it: the bundle `deploy.sh` sends the server holds the published tag and the public history alone. The fetch starts no git maintenance (`-c maintenance.auto=false`, as `deploy.sh`'s own fetch on the server): from git 2.54 on, that maintenance would go on writing in the clone in the background while you check it and deploy from it: a commit-graph of the history it fetched, and a repack when neither of the two packs holds twice as many objects as the other.
 3. **The published `V` is `C`, less files the server never uses.** The review's SHA-256 covers the release paths alone. The fleet wheel `--with-wheel` builds also takes the rest of `src/zab`, `README.md`, `LICENSE` and `.gitignore`, which no review shows. So check, before the deploy, that the published commit names `C` as its source, and that its tree is `C`'s with files removed and nothing added or changed, none of them a file the server installs or builds from:
 
    ```sh
@@ -1900,7 +1910,7 @@ For your second machine (a laptop beside a desktop), or one that replaces a lost
    rm -rf ~/zab-admin/etc.old && { [ ! -d ~/zab-admin/etc ] || mv ~/zab-admin/etc ~/zab-admin/etc.old; } && mv "$T" ~/zab-admin/etc
    ```
 
-   On a machine whose copy is stale, the `diff` shows what changed on the server, such as `+` entries from `!new-workshop`. A `-` line is something only your copy had: find out why before you drop it. Run this block on either machine before you edit `admin.toml` (§6.5) or deploy: `deploy.sh` shows the server's differences from your copy at every upgrade (`The server's admin.toml differs from …`), and installs nothing of them.
+   On a machine whose copy is stale, the `diff` shows what changed on the server, such as `+` entries from `!new-workshop`, or an `ami` or `gifts_step` line `!set-workshop` changed. A `-` line is something only your copy had: find out why before you drop it. Run this block on either machine before you edit `admin.toml` (§6.5) or deploy: `deploy.sh` shows the server's differences from your copy at every upgrade (`The server's admin.toml differs from …`), and installs nothing of them.
 7. **Signing.** §2.3's three `git config` lines, now that `allowed_signers` is here, then a release's tag:
 
    ```sh

@@ -312,6 +312,7 @@ NAME_A_RETIRED_ROW = {
     "roster restore": "the roster only: its mark",
     "roster rename": "the roster only: refused for a row with anything provisioned",
     "new-workshop": "the server's: a new workshop has no row",
+    "set-workshop": "the server's: a workshop's entry names no row (#1043)",
     "upgrade-server": "the server's: an upgrade of the server names no row (#569)",
     # #570: a kept VM's end, and the schedule of the rows in service
     "keep-until": "the roster only: a date is refused by its own check, `none` clears it",

@@ -57,6 +57,23 @@ def this_runs_power_offs(log: str, since: float, until: float) -> list[str]:
     return found
 
 
+#: What the polls below take for idle stop's stop: `pending` too, a start since (#1017).
+STOPPED = ("stopping", "stopped", "pending")
+
+
+def idle_stopped(ec2, instance_id: str) -> None:
+    """After a poll read the VM `stopping`, `stopped` or `pending`: until it reads `stopped`. A
+    VM started again after its idle stop fails the part at once, not after a timeout (#1017):
+    ten idle minutes leave the test waker no owner message to wake it for, so that start is
+    the waker's to explain (its journal's `Wake start:` line), and the DM's wake can't be
+    tested."""
+    state = ec2.wait_stopped(instance_id, timeout=300, stopping=True)
+    assert state == "stopped", (
+        f"the VM was started again after its idle stop (EC2 {state}), before the DM: see the "
+        "test waker's `Wake start:` line"
+    )
+
+
 @pytest.mark.scenario(11)
 async def test_idle_stop(chat: Chat, rig, ec2, instance_id, vm, scenario):
     """`push_config --idle-stop 10`, then nobody touches the VM: it stops within 10 to 12
@@ -66,13 +83,13 @@ async def test_idle_stop(chat: Chat, rig, ec2, instance_id, vm, scenario):
         vm.script(WAIT_FOR_LOGIN, timeout=240)  # the clock starts at a login it recorded
         installed, installed_at = time.monotonic(), time.time()
         state = ec2.state(instance_id)
-        while state not in ("stopping", "stopped") and time.monotonic() - installed < 20 * 60:
+        while state not in STOPPED and time.monotonic() - installed < 20 * 60:
             await asyncio.sleep(20)  # AWS only: no SSH, no Zulip, nothing that counts as use
             state = ec2.state(instance_id)
         took, stopped_at = time.monotonic() - installed, time.time()
-        assert state in ("stopping", "stopped"), f"still {state} after {took:.0f} s"
+        assert state in STOPPED, f"still {state} after {took:.0f} s"
         scenario.timing("stop after the install", took, low=LOW_S, high=HIGH_S)
-        ec2.wait_state(instance_id, "stopped", timeout=300)
+        idle_stopped(ec2, instance_id)
         await asyncio.sleep(35)  # the waker's state refresh
         turn = await chat.dm("claude", "!status")
         _, took = await chat.reply(turn, DM_STATUS_RE, within=600)
@@ -149,11 +166,11 @@ async def test_a_background_job_holds_the_vm_up(
         assert res.ok, f"zab job start exited {res.returncode}: {(res.stderr or res.stdout)[-300:]}"
         vm.script(WAIT_FOR_LOGIN, timeout=240)  # as part 1
         state = ec2.state(instance_id)
-        while state not in ("stopping", "stopped") and time.monotonic() - began < JOB_S + 20 * 60:
+        while state not in STOPPED and time.monotonic() - began < JOB_S + 20 * 60:
             await asyncio.sleep(20)  # AWS only, as part 1
             state = ec2.state(instance_id)
         took, stopped_at = time.monotonic() - began, time.time()
-        assert state in ("stopping", "stopped"), f"still {state} after {took:.0f} s"
+        assert state in STOPPED, f"still {state} after {took:.0f} s"
         # a timeout after the job's end: from the last tick that saw it, at most a tick (60 s
         # and its run, `AccuracySec=5s`) before the end, to the first tick a timeout later, a
         # tick at most after that, then the 20 s poll: about 9 to 12 minutes after the end. The
@@ -164,7 +181,7 @@ async def test_a_background_job_holds_the_vm_up(
             low=JOB_S + (MINUTES - 1) * 60 - 30,
             high=JOB_S + (MINUTES + 4) * 60,
         )
-        ec2.wait_state(instance_id, "stopped", timeout=300)
+        idle_stopped(ec2, instance_id)
         await asyncio.sleep(35)  # the waker's state refresh
         turn = await chat.dm("claude", "!status")
         await chat.reply(turn, DM_STATUS_RE, within=600)

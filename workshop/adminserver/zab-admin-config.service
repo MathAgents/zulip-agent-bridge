@@ -1,7 +1,9 @@
-# docs/ADMIN.md §1.2, §2.9: the root helper of !new-workshop (zab.admin.confighelper). Started
-# by zab-admin-config.path, it reads and deletes the bot's request, validates the new entry and
-# the whole new admin.toml with the strict loader, then writes the new bot's key (root:zab-admin
-# 0640, never over a file) and admin.toml (atomically, keeping admin.toml.bak). Its outcome, and
+# docs/ADMIN.md §1.2, §2.9, §2.10: the root helper of !new-workshop and !set-workshop
+# (zab.admin.confighelper). Started by zab-admin-config.path, it reads and deletes the bot's
+# request, validates the new entry, or the change of an existing entry's ami or gifts_step (#1043,
+# which writes no key), and the whole new admin.toml with the strict loader, then writes the new
+# bot's key (root:zab-admin 0640, never over a file) and admin.toml (atomically, keeping
+# admin.toml.bak). Its outcome, and
 # a record of each change the bot can't alter, stay in its own state directory. It restarts
 # nothing: the bot that asked restarts itself once its apply has posted its result.
 # Root, with two capabilities: CAP_DAC_OVERRIDE to read and delete the request in zab-admin's
@@ -30,7 +32,7 @@
 # hand, such as a rollback copy of admin.toml: nothing the helper can't do through admin.toml.
 # /var/lib/zab-admin (the fleet key, the bot's state, the participants' keys) is hidden.
 [Unit]
-Description=zab admin config helper: add a !new-workshop entry to admin.toml
+Description=zab admin config helper: a !new-workshop or !set-workshop entry into admin.toml
 
 [Service]
 Type=oneshot

@@ -7,8 +7,13 @@ What the collector sees of each VM, sampled every minute, is all it prices:
   #553: every volume attached to the VM, read every `collector.VOLUME_EVERY`), from the VM's
   creation, its volume's attachment, to the last time the collector saw it. A size read is
   priced from its first read on, and the first one from the VM's creation (`Seen.volumes`);
-  until one is read, and where the role can't read it, 200 GB, `launch.py`'s root volume;
-- **its public IPv4 address,** an Elastic IP, held running or stopped, over the same time.
+  until one is read, and where the role can't read it, 80 GB, `launch.py`'s root volume;
+- **its public IPv4 address,** an Elastic IP, held running or stopped, over the same time;
+- **its volumes' initialization** at a provisioned rate (#1007; `launch.py --init-rate`): once
+  per volume, in the month of its creation, at `init_price` of the rate EC2 shows on it, per GB
+  of its size when first read. EBS charges per GB of the snapshot's data, which the collector
+  can't read (the role has no `DescribeSnapshots`, §5): an image's snapshot holds less than its
+  root, so this is an upper bound, and reads high.
 
 Priced from `PRICES`, on-demand list prices (those compared with workshop fleets' bill matched
 it: VERIFY V13, at `REGIONS` below); the exact figure is AWS's (§11.2). §11.2 puts the table in
@@ -42,6 +47,7 @@ import calendar
 import itertools
 import math
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -66,9 +72,18 @@ _PRICE = {
     "t3.medium": 0.0416,
 }
 PRICES = {(region, kind): price for region in REGIONS for kind, price in _PRICE.items()}
-VOLUME_GB = 200  # launch.py's gp3 root volume: a VM's until a size is read
+VOLUME_GB = 80  # launch.py's gp3 root volume (`aws_common.ROOT_GB`): a VM's until a size is read
 GP3_GB_MONTH = 0.08
 IPV4_HOUR = 0.005  # an Elastic IP, attached or not
+#: EBS's provisioned rate for volume initialization (#1007), USD per GB of snapshot data, once
+#: per volume, by the top rate of each tier in MiB/s: AWS's public list prices (us-east-1,
+#: Nov 2026), taken for every region of `REGIONS`; not yet compared with a bill.
+INIT_GB = ((200, 0.0024), (300, 0.0036))
+
+
+def init_price(rate: int | None) -> float:
+    """USD per GB of a volume created at `rate` MiB/s; 0 at EBS's default rate (None or 0)."""
+    return next((price for top, price in INIT_GB if rate and 0 < rate <= top), 0.0)
 
 
 def fixed_hour(gb: float) -> float:
@@ -132,15 +147,26 @@ class Seen:
     #: [since, GB], in order: its volumes' size from each time on; `VOLUME_GB` before the first
     #: (module doc)
     volumes: list[list[Any]] = field(default_factory=list)
+    #: [volume, created, GB, rate]: each volume EC2 showed created at a provisioned
+    #: initialization rate (#1007), at its size when first read (module doc)
+    inits: list[list[Any]] = field(default_factory=list)
 
     def observe(
-        self, state: str, launched: float | None, now: float, volume_gb: int | None = None
+        self,
+        state: str,
+        launched: float | None,
+        now: float,
+        volume_gb: int | None = None,
+        inits: Sequence[Sequence[Any]] = (),
     ) -> None:
         """One sighting: in `state`, last started at `launched`; with its volumes' size, when
-        EC2 showed it. The first size counts from the VM's creation, a change from `now`."""
+        EC2 showed it. The first size counts from the VM's creation, a change from `now`. Each
+        of `inits` not seen before is kept as it is first seen."""
         self.last = max(self.last, now)
         if volume_gb is not None and (not self.volumes or self.volumes[-1][1] != volume_gb):
             self.volumes.append([min(self.created, now) if not self.volumes else now, volume_gb])
+        known = {init[0] for init in self.inits}
+        self.inits += [list(init) for init in inits if init[0] not in known]
         if state != "running" or launched is None or launched > now:
             return
         if self.runs and self.runs[-1][0] == launched:
@@ -165,6 +191,7 @@ class Seen:
         if unpriced:
             return Cost(None, None, round(today, 2), round(hours, 2), tuple(sorted(unpriced)))
         month = ran + self._fixed(max(self.created, lo), min(self.last, now))
+        month += sum(gb * init_price(rate) for _, at, gb, rate in self.inits if lo <= at <= now)
         projected = month
         if present and price is not None:
             since = max(self.created, now - RECENT)
@@ -197,6 +224,7 @@ class Seen:
             "last": self.last,
             "runs": self.runs,
             "volumes": self.volumes,
+            "inits": self.inits,
         }
 
     @classmethod
@@ -223,7 +251,11 @@ class Seen:
         ) or [v[0] for v in volumes] != sorted(v[0] for v in volumes):  # fmt: skip
             return None
         sizes = [[float(since), gb] for since, gb in volumes]
-        return cls(*text, *times, kept, sizes)  # type: ignore[arg-type]
+        inits = data.get("inits", [])  # none in a history before #1007
+        if not isinstance(inits, list) or not all(map(_init, inits)):
+            return None
+        kept_inits = [[v, float(at), gb, rate] for v, at, gb, rate in inits]
+        return cls(*text, *times, kept, sizes, kept_inits)  # type: ignore[arg-type]
 
 
 def _number(value: Any) -> bool:
@@ -233,6 +265,16 @@ def _number(value: Any) -> bool:
 def _gb(value: Any) -> bool:
     """A volume size as EC2 gives it: a whole number of GB, 1 to 64 TiB."""
     return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 65536
+
+
+def _init(value: Any) -> bool:
+    """A volume's initialization as `Seen.inits` keeps it: [volume, created, GB, rate], the rate
+    EBS's (100 to 300 MiB/s)."""
+    if not isinstance(value, list | tuple) or len(value) != 4:
+        return False
+    volume, at, gb, rate = value
+    ok_rate = isinstance(rate, int) and not isinstance(rate, bool) and 100 <= rate <= 300
+    return isinstance(volume, str) and bool(volume) and _number(at) and _gb(gb) and ok_rate
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,7 +314,8 @@ class History:
             entry = self.seen[instance] = Seen(workshop, slug, vm["type"], start, now)
         entry.slug, entry.type = slug, vm["type"]  # retagged (`!adopt-spare`), or resized
         size = vm.get("volume_gb")
-        entry.observe(vm["state"], vm.get("launched"), now, size if _gb(size) else None)
+        inits = [init for init in vm.get("inits") or () if _init(init)]
+        entry.observe(vm["state"], vm.get("launched"), now, size if _gb(size) else None, inits)
 
     def prune(self, now: float) -> None:
         """Forget an instance not seen for `KEEP`, and runs that no estimate needs any more."""

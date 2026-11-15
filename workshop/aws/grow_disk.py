@@ -46,20 +46,33 @@ next boot).
    new size, then `growpart` grows the root partition and `resize2fs` (ext4) or `xfs_growfs` (xfs)
    its file system, online; it prints `df -PkT /` before and after. **Stopped:** nothing more.
    Its file system grows at its next boot: the workshop image is Ubuntu's cloud image, whose
-   cloud-init runs `growpart` and `resizefs` at every boot, which is how the image's 100 GB
-   root fills `launch.py`'s 200 GB volume. The apply doesn't start it: a start costs, and the
+   cloud-init runs `growpart` and `resizefs` at every boot, which is how an image's root fills
+   a larger volume at the first boot. The apply doesn't start it: a start costs, and the
    waker or `!start` boots it when it is needed;
 4. reports the root file system's new size, or why it didn't grow. The volume has grown by
    then: a failed SSH step is exit 1, and the file system grows at the next boot (`!stop`, then
    `!start`), or now with the same size again, the file system alone (`finish`).
 
 SSH is `admin_common`'s: the host key pinned in `--known-hosts`, no forwarding.
+
+**Automatic growth** (#998; `zab.admin.autogrow` runs it, docs/ADMIN.md §3.4):
+`--auto-cap GB` in place of `--size`. The size is then the volume's and half again, rounded up
+to whole GB, at most GB; within EBS's 6 hours of the volume's last modification, the volume's
+own size: the file system alone, which finishes a growth whose SSH step failed. Every check
+above holds, and a VM that isn't running is never grown. Its last line is `AUTO` and the
+outcome as JSON (`auto_line`), which the bot's alert reads: `grown` (exit 0); `failed` (exit
+1); or, exit `NOTHING`, with nothing changed, `stopped`, `capped` (the volume is at the cap
+already), `wait` (within EBS's 6 hours, the file system filling the volume already), or
+`replaced`: with `--expect-instance ID`, the VM whose disk was read, the row's VM is another
+instance now (a spare handed over), whose disk nobody read (Codex round 3 on #1003).
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
+import math
 import pathlib
 import shlex
 import subprocess
@@ -112,6 +125,10 @@ LIVE = ("pending", "running", "stopping", "stopped")
 EC2_CONFIG = {"connect_timeout": 10, "read_timeout": 20, "retries": {"total_max_attempts": 2}}
 #: The root file system's use, in KiB (`df -P`), with its type.
 DF = "LC_ALL=C df -PkT /"
+#: `--auto-cap`'s last line starts so (module doc). A line from the VM always starts with the
+#: slug and `: `, and a slug has no blank.
+AUTO = "auto result: "
+NOTHING = 3  # `--auto-cap`: nothing grows now, and nothing failed
 #: Run on the VM as `ubuntu` (sudo), with the new size in GB as `$1`. A fixed literal: nothing
 #: else of the roster, the command or EC2 reaches it. The root partition and its disk are found
 #: from the root file system's device numbers in sysfs, so that `/dev/root` works too. (`sys`
@@ -205,6 +222,14 @@ class GrowError(Exception):
     """A check failed: nothing was changed."""
 
 
+class Nothing(GrowError):
+    """`--auto-cap`: nothing grows now, and nothing failed; `outcome` says why (module doc)."""
+
+    def __init__(self, outcome: str, text: str, instance: str, size: int | None = None) -> None:
+        super().__init__(text)
+        self.outcome, self.instance, self.size = outcome, instance, size
+
+
 @dataclass(frozen=True, slots=True)
 class Target:
     """What the checks found: the row's VM and its root volume."""
@@ -217,6 +242,7 @@ class Target:
     kind: str  # the volume's type: gp3
     size: int  # GB, now
     new: int  # GB, asked for
+    again: dt.datetime | None = None  # when EBS allows the volume's next modification
 
     @property
     def monthly(self) -> float:
@@ -237,8 +263,12 @@ def find(
     size: int,
     scope: Scope,
     now: dt.datetime,
+    cap: int | None = None,
+    expect: str | None = None,
 ) -> Target:
-    """Every check of the module doc, in order (raises GrowError); the row's VM and volume."""
+    """Every check of the module doc, in order (raises GrowError); the row's VM and volume.
+    With `cap` (`--auto-cap`), `size` is the volume's and half again, at most `cap`; with
+    `expect`, the row's VM must be that instance."""
     tags = scope_tags(scope)
     if is_spare_name(slug):
         raise GrowError(f"{slug} is a spare: only a participant's row grows")
@@ -248,8 +278,8 @@ def find(
     ip = (row.get("ip") or "").strip()
     if not ip:
         raise GrowError(f"{slug} has no ip in the roster: it has no VM")
-    if not 1 <= size <= MAX_GB:
-        raise GrowError(f"{size} GB is outside 1 to {MAX_GB} GB")
+    if not 1 <= (size if cap is None else cap) <= MAX_GB:
+        raise GrowError(f"{size if cap is None else cap} GB is outside 1 to {MAX_GB} GB")
     found = [
         i for i in ec2.find_instances({**tags, "participant": slug}, LIVE) if has_participant(i)
     ]
@@ -260,6 +290,11 @@ def find(
         )
     inst = found[0]
     iid, state = inst["InstanceId"], (inst.get("State") or {}).get("Name") or "?"
+    if expect is not None and iid != expect:  # another VM's reading grows nothing here
+        said = f"{slug}'s VM is {iid} now, not {expect}, whose disk was read"
+        raise Nothing("replaced", said, expect)
+    if cap is not None and state != "running":  # never grown, nor started, for it (#998)
+        raise Nothing("stopped", f"{slug}'s VM {iid} is {state}: it grows only while it runs", iid)
     if state not in ("running", "stopped"):
         raise GrowError(
             f"{slug}'s VM {iid} is {state}: request again once it is running or stopped"
@@ -287,6 +322,17 @@ def find(
             "volume in its scope (docs/ADMIN.md §5); the account owner tags it"
         )
     current = int(vol.get("Size") or 0)
+    last = again = None
+    if cap is not None:  # the size from the volume's own, and its last modification (#998)
+        last = latest(ec2.volume_modifications(vid))
+        again = when_again(last, vid)
+        if again is not None and now < again:
+            size = current  # its file system alone, if it didn't grow
+        elif current >= cap:
+            said = f"{slug}'s volume {vid} is {current} GB, the cap of {cap} GB"
+            raise Nothing("capped", said, iid, current)
+        else:
+            size = min(cap, math.ceil(current * 3 / 2))
     same = size == current  # the file system alone, on a running VM (#563)
     fs_only = same and state == "running"
     if size <= current and not fs_only:
@@ -294,12 +340,12 @@ def find(
         raise GrowError(
             f"{slug}'s volume {vid} is {current} GB already: ask for more (EBS only grows){boot}"
         )
-    last = latest(ec2.volume_modifications(vid))
+    if cap is None:
+        last = latest(ec2.volume_modifications(vid))
+        again = when_again(last, vid)
     if last is not None:
-        started, mstate = last.get("StartTime"), last.get("ModificationState") or "?"
-        if not isinstance(started, dt.datetime):
-            raise GrowError(f"{vid}'s last modification has no start time")
-        again = started + dt.timedelta(seconds=MODIFY_EVERY_S)
+        started, mstate = last["StartTime"], last.get("ModificationState") or "?"
+        assert again is not None  # `when_again`'s
         if now < again and not fs_only:
             raise GrowError(
                 f"{vid} was modified at {utc(started)} ({mstate}), and EBS allows one "
@@ -310,7 +356,19 @@ def find(
                 f"{vid}'s modification of {utc(started)} is still modifying: request again "
                 "once it is optimizing"
             )
-    return Target(slug, ip, iid, state, vid, str(vol.get("VolumeType") or "?"), current, size)
+    kind = str(vol.get("VolumeType") or "?")
+    return Target(slug, ip, iid, state, vid, kind, current, size, again)
+
+
+def when_again(last: Mapping[str, Any] | None, vid: str) -> dt.datetime | None:
+    """When EBS allows the next modification after `last` (raises GrowError for one without a
+    start time); None after none."""
+    if last is None:
+        return None
+    started = last.get("StartTime")
+    if not isinstance(started, dt.datetime):
+        raise GrowError(f"{vid}'s last modification has no start time")
+    return started + dt.timedelta(seconds=MODIFY_EVERY_S)
 
 
 def latest(modifications: list[Mapping[str, Any]]) -> Mapping[str, Any] | None:
@@ -406,24 +464,62 @@ def wait_modified(
         sleep(POLL_S)
 
 
-def grow_fs(t: Target, runner: Runner, known_hosts: str, log: Callable[[str], None]) -> bool:
-    """`GROW` on the VM; True when its root file system grew to fill the volume."""
+@dataclass(frozen=True, slots=True)
+class Grew:
+    """What `GROW` did: `ok`; whether it resized the file system; its use after, in percent; and
+    why it failed, in a few words."""
+
+    ok: bool
+    resized: bool = False
+    used: int | None = None
+    why: str = ""
+
+
+def grow_fs(t: Target, runner: Runner, known_hosts: str, log: Callable[[str], None]) -> Grew:
+    """`GROW` on the VM; `ok` when its root file system grew to fill the volume."""
     remote = shlex.join(["bash", "-c", GROW, "bash", str(t.new)])
     res = runner(ssh_argv(t.ip, remote, known_hosts=known_hosts), timeout_s=GROW_S)
+    resized, used = False, None
     for line in res.stdout.splitlines():
         label, _, rest = line.partition(": ")
         if label in ("before", "after"):
             when = "now" if label == "after" else label
             log(f"{t.slug}: root file system {when}: {df_line(rest)}")
+            used = df_percent(rest) if label == "after" else used
         elif label == "grow":
             log(f"{t.slug}: {rest}")
-    if not res.ok:
-        why = (res.stderr.strip().splitlines() or [f"exit {res.exit_code}"])[-1][:200]
-        if res.exit_code == -1:  # a timeout: it may have grown, the lines above say how far
-            log(f"{t.slug}: FAILED: the grow over SSH didn't finish ({why})")
-        else:
-            log(f"{t.slug}: FAILED: its file system was not grown ({why})")
-    return res.ok
+            resized = resized or rest.endswith(" resized")
+    if res.ok:
+        return Grew(True, resized, used)
+    why = (res.stderr.strip().splitlines() or [f"exit {res.exit_code}"])[-1][:200]
+    if res.exit_code == -1:  # a timeout: it may have grown, the lines above say how far
+        why = f"the grow over SSH didn't finish ({why})"
+    else:
+        why = f"its file system was not grown ({why})"
+    log(f"{t.slug}: FAILED: {why}")
+    return Grew(False, resized, used, why)
+
+
+def df_percent(line: str) -> int | None:
+    """`df -PkT /`'s percentage used, from its data line: `79%` is 79; None if unreadable."""
+    parts = line.split()
+    share = parts[5] if len(parts) >= 7 else ""
+    if share.endswith("%") and share[:-1].isdigit() and int(share[:-1]) <= 100:
+        return int(share[:-1])
+    return None
+
+
+def auto_line(outcome: str, t: Target | None = None, **fields: Any) -> str:
+    """`--auto-cap`'s last line (module doc): `AUTO` and the outcome, with the VM, the volume's
+    size before and after, in GB, its file system's (`fs`), its use after in percent (`used`),
+    when EBS allows its next modification (`again`, epoch seconds) and a failure's `reason`."""
+    again = fields.pop("again", None) or (t.again if t else None)
+    data: dict[str, Any] = {"outcome": outcome, "instance": None, "from": None, "to": None}
+    if t is not None:
+        data |= {"instance": t.instance, "from": t.size, "to": t.new}
+    data |= {"fs": "", "used": None, "reason": ""} | fields
+    data["again"] = again.timestamp() if isinstance(again, dt.datetime) else None
+    return AUTO + json.dumps(data, sort_keys=True)
 
 
 def run(
@@ -440,17 +536,32 @@ def run(
     sleep: Callable[[float], None] | None = None,  # time.sleep, looked up at the call
     clock: Callable[[], float] | None = None,  # time.monotonic, likewise
     now: Callable[[], dt.datetime] | None = None,
+    cap: int | None = None,
+    expect: str | None = None,
 ) -> int:
+    """`cap`: `--auto-cap` (module doc), whose last line is `auto_line`'s; `expect`:
+    `--expect-instance`."""
     sleep, clock = sleep or time.sleep, clock or time.monotonic
-    when = (now or (lambda: dt.datetime.now(dt.UTC)))()
+    now = now or (lambda: dt.datetime.now(dt.UTC))
+    when = now()
+
+    def done(code: int, outcome: str, t: Target | None = None, **fields: Any) -> int:
+        if cap is not None:
+            log(auto_line(outcome, t, **fields))
+        return code
+
     try:
-        t = find(rows, ec2, slug=slug, size=size, scope=scope, now=when)
+        t = find(rows, ec2, slug=slug, size=size, scope=scope, now=when, cap=cap, expect=expect)
+    except Nothing as exc:
+        log(f"nothing grows now: {exc}")
+        sizes = {"from": exc.size, "to": exc.size}
+        return done(NOTHING, exc.outcome, instance=exc.instance, reason=str(exc), **sizes)
     except GrowError as exc:
         log(f"refusing: {exc}")
-        return 1
+        return done(1, "failed", reason=str(exc))
     except Exception as exc:  # botocore: an expired credential, UnauthorizedOperation
         log(f"refusing: the EC2 lookup failed: {error_line(exc)}")
-        return 1
+        return done(1, "failed", reason=f"the EC2 lookup failed: {error_line(exc)}")
     log(volume_line(t))
     if t.state == "running":
         log(f"{t.slug}: root file system now: {read_df(t, runner, known_hosts)}")
@@ -467,18 +578,21 @@ def run(
         log("(dry run: nothing changed)")
         return 0
     if t.fs_only:  # the VM was running at `find`: no ModifyVolume, no wait (#563)
-        if grow_fs(t, runner, known_hosts, log):
-            return 0
+        grew = grow_fs(t, runner, known_hosts, log)
+        if grew.ok and cap is not None and not grew.resized:  # within EBS's 6 hours (#998)
+            return done(NOTHING, "wait", t, fs="unchanged", used=grew.used)
+        if grew.ok:
+            return done(0, "grown", t, fs="grown", used=grew.used)
         log(f"{t.slug}: the volume is {t.new} GB; {finish(t)}")
-        return 1
+        return done(1, "failed", t, fs="not grown", reason=grew.why)
     try:
         ec2.modify_volume(t.volume, t.new)
     except Exception as exc:
         code = error_code(exc)
-        log(
-            f"{t.slug}: FAILED: ModifyVolume of {t.volume} ({code or 'no code'}): {error_line(exc)}"
-        )
-        return 1
+        why = f"ModifyVolume of {t.volume} ({code or 'no code'}): {error_line(exc)}"
+        log(f"{t.slug}: FAILED: {why}")
+        return done(1, "failed", t, reason=why, to=t.size)
+    again = now() + dt.timedelta(seconds=MODIFY_EVERY_S)  # from after EC2 took the request
     log(f"{t.slug}: ModifyVolume {t.volume} {t.size} GB → {t.new} GB: requested")
     try:
         wait_modified(ec2, t, log=log, sleep=sleep, clock=clock)
@@ -486,23 +600,26 @@ def run(
                  if i.get("InstanceId") == t.instance]  # fmt: skip
     except GrowError as exc:
         log(f"{t.slug}: FAILED: {exc}")
-        return 1
+        return done(1, "failed", t, again=again, fs="not grown", reason=str(exc))
     except Exception as exc:  # the modification was requested: the volume may have grown
-        log(f"{t.slug}: FAILED: reading EC2 after ModifyVolume: {error_line(exc)}")
+        why = f"reading EC2 after ModifyVolume: {error_line(exc)}"
+        log(f"{t.slug}: FAILED: {why}")
         log(f"{t.slug}: the volume is {t.new} GB, or will be; {finish(t)}")
-        return 1
+        return done(1, "failed", t, again=again, fs="not grown", reason=why)
     state = (found[0].get("State") or {}).get("Name") if found else "gone"
     if state == "stopped":
         log(f"{t.slug}: the VM is stopped: its file system grows to {t.new} GB at its next boot")
-        return 0
+        return done(0, "grown", t, again=again, fs="next boot")
     if state != "running":
         log(f"{t.slug}: FAILED: the VM is {state} now: its file system grows at its next boot "
             f"(!stop {t.slug}, then !start {t.slug})")  # fmt: skip
-        return 1
-    if grow_fs(t, runner, known_hosts, log):
-        return 0
+        why = f"the VM is {state} now: its file system grows at its next boot"
+        return done(1, "failed", t, again=again, fs="not grown", reason=why)
+    grew = grow_fs(t, runner, known_hosts, log)
+    if grew.ok:
+        return done(0, "grown", t, again=again, fs="grown", used=grew.used)
     log(f"{t.slug}: the volume is {t.new} GB; {finish(t)}")
-    return 1
+    return done(1, "failed", t, again=again, fs="not grown", reason=grew.why)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -511,14 +628,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--roster", required=True)
     parser.add_argument("--slug", required=True, help="the participant's row")
+    size = parser.add_mutually_exclusive_group(required=True)
+    size.add_argument("--size", type=int, help=f"the new size in GB, at most {MAX_GB}")
+    size.add_argument(
+        "--auto-cap", type=int, metavar="GB", help="automatic growth (#998): by half, to at most GB"
+    )
     parser.add_argument(
-        "--size", required=True, type=int, help=f"the new size in GB, at most {MAX_GB}"
+        "--expect-instance", metavar="ID", help="--auto-cap: the VM whose disk was read (#998)"
     )
     parser.add_argument("--region", required=True, help="the workshop's region")
     parser.add_argument("--known-hosts", default=str(DEFAULT_KNOWN_HOSTS))
     add_tag_argument(parser)
     parser.add_argument("--dry-run", action="store_true")
     opts = parser.parse_args(argv)
+    if opts.expect_instance is not None and opts.auto_cap is None:
+        parser.error("--expect-instance goes with --auto-cap")
     try:
         scope = parse_tags(opts.tag)
         rows = read_roster(opts.roster)
@@ -529,11 +653,13 @@ def main(argv: list[str] | None = None) -> int:
         rows,
         Ec2(opts.region, config=EC2_CONFIG),
         slug=opts.slug,
-        size=opts.size,
+        size=opts.size or 0,
         scope=scope,
         dry_run=opts.dry_run,
         runner=run_keeping,  # looked up here, so that a test can replace it
         known_hosts=opts.known_hosts,
+        cap=opts.auto_cap,
+        expect=opts.expect_instance,
     )
 
 

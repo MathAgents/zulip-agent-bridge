@@ -700,6 +700,7 @@ GLOBAL = Context(902, "Workshop admin", re.compile(config.RELEASE_PATTERNS["fina
 FILLED = (
     (re.compile(r"\bvX\.Y\.Z\b"), "v1.2.3"),
     (re.compile(r"sha256=<[^>]*>"), "sha256=" + "0" * 64),
+    (re.compile(r"<ws>"), "harvard-2026"),  # a workshop's name (#1043's `!set-workshop <ws>`)
 )
 
 

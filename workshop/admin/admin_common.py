@@ -15,16 +15,19 @@ import configparser
 import datetime
 import hashlib
 import ipaddress
+import json
 import os
 import pathlib
 import re
 import shlex
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Protocol, TypeVar
+from dataclasses import dataclass, replace
+from typing import Any, Protocol, TypeVar
 
 AWS_DIR = pathlib.Path(__file__).resolve().parents[1] / "aws"
 if str(AWS_DIR) not in sys.path:
@@ -49,15 +52,21 @@ from aws_common import (  # noqa: E402  - path set up above
 
 __all__ = [
     "ALLOWLIST_PENDING",
+    "CONNECT_RETRY_WAITS_S",
     "DEFAULT_KNOWN_HOSTS",
+    "IN_USE_CMD",
     "KEEP_UNTIL_HOUR",
+    "READY_CMD",
     "REFSERVE_URL",
     "ROSTER_COLUMNS",
+    "ConnectRetry",
     "RunResult",
     "Runner",
+    "add_start_stopped",
     "allowlist_pending",
     "check_duplicates",
     "column_snapshot",
+    "connect_failure",
     "first_line",
     "format_table",
     "git_identity",
@@ -65,10 +74,12 @@ __all__ = [
     "host_of",
     "keep_until_value",
     "keys_dir",
+    "lets_in",
     "load_roster",
     "load_zuliprc",
     "merge_roster_changes",
     "move_legacy_keys",
+    "noting",
     "owner_record",
     "pending_label",
     "read_roster",
@@ -84,9 +95,14 @@ __all__ = [
     "sign_in_pending",
     "slug_of",
     "ssh_argv",
+    "ssh_host",
     "ssh_options",
+    "start_stop",
+    "start_stopped_line",
+    "stderr_line",
     "subprocess_runner",
     "validate_row",
+    "vm_in_use",
     "work_repo",
     "write_roster",
 ]
@@ -103,6 +119,7 @@ class RunResult:
     exit_code: int  # -1 when the command timed out or could not be started
     stdout: str
     stderr: str
+    note: str = ""  # `ConnectRetry`'s, when the connect took more than one try (#1009)
 
     @property
     def ok(self) -> bool:
@@ -291,6 +308,157 @@ def scp_argv(
     return ["scp", *ssh_options(known_hosts), "--", local, f"{user}@{host}:{remote_path}"]
 
 
+# ---------------------------------------------------------------- SSH connect retries (#1009)
+
+#: The pauses before an SSH connect's second and third tries (#1009). With `ConnectTimeout=15`
+#: (`ssh_options`), the third try begins about 50 s after the first: a VM that answered a moment
+#: ago, and then sent no SYN-ACK for 7 to 15 s some 30 to 40 s after its boot (seen twice, cause
+#: unknown), answers one of them.
+CONNECT_RETRY_WAITS_S: tuple[float, ...] = (5.0, 15.0)
+#: ssh's exit status for its own errors, a failed connect among them (scp's too, OpenSSH 9).
+SSH_EXIT = 255
+#: The line ssh prints when its TCP connect fails, and nothing else (`ssh_connect_direct`,
+#: OpenSSH's sshconnect.c): strerror of ETIMEDOUT (macOS: "Operation timed out"), ECONNREFUSED
+#: or EHOSTUNREACH.
+_CONNECT_FAILED = re.compile(
+    r"ssh: connect to host (?P<host>\S+) port [0-9]+: "
+    r"(?P<why>Connection timed out|Operation timed out|Connection refused|No route to host)"
+)
+#: The line scp prints after its ssh's failed connect (OpenSSH 9's SFTP mode).
+_SCP_CLOSED = "scp: Connection closed"
+
+
+def ssh_host(argv: list[str]) -> str:
+    """The host of an `ssh_argv` or `scp_argv` command line; "" for any other command."""
+    if argv[:1] == ["ssh"] and "--" in argv and argv.index("--") == len(argv) - 2:
+        dest = argv[-3]  # `ssh <options> user@host -- <remote>`
+    elif argv[:1] == ["scp"] and len(argv) >= 4 and argv[-3] == "--":
+        dest = argv[-1].partition(":")[0]  # `scp <options> -- <local> user@host:<path>`
+    else:
+        return ""
+    user, at, host = dest.rpartition("@")
+    return host if user and at and host else ""
+
+
+def connect_failure(argv: list[str], res: RunResult) -> str:
+    """Why `argv`'s ssh or scp failed to connect, from `res`; "" if that isn't what it did.
+
+    Strict, since a command retried must never have run (#1009): ssh's own exit status, nothing
+    on stdout, and a stderr that is ssh's connect line for this very host and nothing else,
+    scp's line after it aside. Once the connection is up, the remote command's stderr comes back
+    on ssh's, and its exit status can be 255 too, ssh's for a connection cut mid-command or the
+    command's own: neither is taken for a connect failure, unless the command itself prints
+    that very line, for this host, as all its stderr, exits 255 and prints nothing on stdout.
+    None of these scripts' commands runs ssh on the VM, so none does.
+    """
+    host = ssh_host(argv)
+    if not host or res.exit_code != SSH_EXIT or res.stdout:
+        return ""
+    lines = [line for line in res.stderr.splitlines() if line.strip()]
+    if argv[0] == "scp" and lines[1:] == [_SCP_CLOSED]:
+        lines = lines[:1]
+    match = _CONNECT_FAILED.fullmatch(lines[0]) if len(lines) == 1 else None
+    return match["why"] if match and match["host"] == host else ""
+
+
+class ConnectRetry:
+    """A `Runner` that tries ssh and scp again after a failed connect, to a VM that answered
+    earlier in this run (#1009; README.md, "Either way").
+
+    A connect that fails (`connect_failure`) is tried again after each of `waits`, but only
+    for a host this runner has seen answer: an ssh whose remote command ran there, whatever its
+    exit status but 255, or an scp that worked. A VM that is stopped, or an address that is
+    wrong, fails at its first try as before, with no wait, and so does a VM whose tries have all
+    failed, until it answers again. Nothing else is ever retried. A success after a retry has a
+    `note` (`ssh: connected on try 2 (…)`); a failed connect's line says when its first try
+    began, UTC, to match with the VM's journal.
+
+    One per script run, made in `main()` and shared by its parallel per-VM threads, so what
+    answered is the run's alone. `waits` defaults to `CONNECT_RETRY_WAITS_S`, `sleep` to
+    `time.sleep`.
+    """
+
+    def __init__(
+        self,
+        runner: Runner,
+        *,
+        waits: Iterable[float] | None = None,
+        sleep: Callable[[float], None] | None = None,
+        now: Callable[[], datetime.datetime] | None = None,
+        log: Callable[[str], None] | None = None,
+    ) -> None:
+        self.runner = runner
+        self.waits = tuple(CONNECT_RETRY_WAITS_S if waits is None else waits)
+        self.sleep = sleep or time.sleep
+        self.now = now or (lambda: datetime.datetime.now(datetime.UTC))
+        self.log = log  # each note, as `<host>: <note>`, for a script without a notes column
+        self._answered: set[str] = set()
+        self._lock = threading.Lock()
+
+    def answered(self, host: str) -> bool:
+        with self._lock:
+            return host in self._answered
+
+    def __call__(self, argv: list[str], **kwargs: Any) -> RunResult:
+        host = ssh_host(argv)
+        failed: list[tuple[str, str]] = []  # (began, why) of each try that didn't connect
+        waits = iter(self.waits)
+        while True:
+            began = self.now().strftime("%H:%M:%SZ")
+            res = self.runner(argv, **kwargs)
+            why = connect_failure(argv, res) if host else ""
+            if not why:
+                break
+            failed.append((began, why))
+            wait = next(waits, None) if self.answered(host) else None
+            if wait is None:
+                with self._lock:  # gone for longer than the waits cover: fail fast from now on
+                    self._answered.discard(host)
+                return _stamped(res, failed)
+            self.sleep(wait)
+        if host and (res.ok or (argv[0] == "ssh" and 0 < res.exit_code < SSH_EXIT)):
+            with self._lock:
+                self._answered.add(host)
+        if not failed:
+            return res
+        whys = " / ".join(dict.fromkeys(why for _, why in failed))
+        note = f"{argv[0]}: connected on try {len(failed) + 1} ({_began(failed)}: {whys})"
+        if self.log is not None:
+            self.log(f"{host}: {note}")
+        return replace(res, note=note)
+
+
+def _began(failed: list[tuple[str, str]]) -> str:
+    times = ", ".join(began for began, _ in failed)
+    return f"try 1 began {times}" if len(failed) == 1 else f"tries 1-{len(failed)} began {times}"
+
+
+def _stamped(res: RunResult, failed: list[tuple[str, str]]) -> RunResult:
+    """`res` with when its first try began, after ssh's connect line (#1009). Only the first:
+    the waits between the tries are fixed, and the line fits the scripts' 100-character cells."""
+    line = next(line for line in res.stderr.splitlines() if line.strip())
+    first = failed[0][0]
+    said = f"began {first}" if len(failed) == 1 else f"{len(failed)} tries from {first}"
+    return replace(res, stderr=res.stderr.replace(line, f"{line} ({said})", 1))
+
+
+def stderr_line(line: str) -> None:
+    """`line` on stderr at once: `ConnectRetry`'s `log` where a VM's row has no notes."""
+    print(line, file=sys.stderr, flush=True)
+
+
+def noting(runner: Runner, notes: list[str]) -> Runner:
+    """`runner`, appending each result's `note` to `notes`: a step's result says so (#1009)."""
+
+    def run(argv: list[str], **kwargs: Any) -> RunResult:
+        res = runner(argv, **kwargs)
+        if res.note:
+            notes.append(res.note)
+        return res
+
+    return run
+
+
 def host_key_fingerprint(key_line: str) -> str:
     """`SHA256:…` of a `known_hosts` or `ssh-keyscan` line, as `ssh-keygen -l` prints it."""
     parts = key_line.split()
@@ -374,6 +542,104 @@ def remote_chain(*argvs: Iterable[str]) -> str:
 #: Fixed literals; harmless on a VM without idle stop.
 IDLE_HOLD_ON_CMD = "echo $(( $(date +%s) + 3600 )) | sudo tee /run/zab-idle-stop.hold >/dev/null"
 IDLE_HOLD_OFF_CMD = "sudo rm -f /run/zab-idle-stop.hold"
+
+
+# ------------------------------------------------------------- a stopped VM for its row (#995)
+
+#: `idle_stop.py --in-use`, sent on stdin and run as root: what says whether anyone used the VM
+#: since its boot (`idle_stop.use_facts`). A fixed literal.
+IN_USE_CMD = "cd / && sudo /usr/bin/python3 -I - --in-use"
+IDLE_STOP_SCRIPT = pathlib.Path(__file__).resolve().parent / "idle_stop.py"
+#: A VM just started lets a login in (`lets_in`). A fixed literal.
+READY_CMD = "true"
+#: push_config.py's and trust_fix.py's exits when their own `--start-stopped` halted its starts
+#: (`power.StartStop.tripped`, #1031): every row done all the same, or not. The admin bot's plan
+#: of every workshop then gives its later workshops' runs `--halted-in`, so that they start no
+#: VM either; with the first, it still reads the targets' status, and the ledger records the
+#: rollout's release, as for an exit 0 (`zab.admin.actions`'s `STARTS_HALTED` and
+#: `STARTS_HALTED_FAILED`, which a test holds equal).
+HALTED_EXIT, HALTED_FAILED_EXIT = 3, 4
+#: `--halted-in`'s workshop, as admin.toml names one (`zab.admin.config`), printed in the rows.
+HALTED_IN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?", re.ASCII)
+
+
+def add_start_stopped(parser: Any) -> None:
+    """`--start-stopped N`, with `--region` and `--scope-tag` (#995): `power.StartStop`."""
+    parser.add_argument(
+        "--start-stopped", type=int, metavar="N", help="start each row's stopped VM for its "
+        "row, at most N at a time, and stop it again once its row is done, unless someone used "
+        "it since its start (#995); needs --region and --scope-tag",
+    )  # fmt: skip
+    parser.add_argument("--region", help="with --start-stopped: the workshop's region")
+    parser.add_argument(
+        "--scope-tag", action="append", default=[], metavar="KEY=VALUE",
+        help="with --start-stopped, repeatable: the fleet's scope, as the aws/ scripts' --tag",
+    )  # fmt: skip
+    parser.add_argument(
+        "--halted-in", metavar="WORKSHOP", help="with --start-stopped: start no VM, since the "
+        "run of the same plan in WORKSHOP halted its starts (#1031; the admin bot passes it)",
+    )  # fmt: skip
+
+
+def start_stopped_line(n: int) -> str:
+    """The line that a run with `--start-stopped N` prints first, in its dry run too."""
+    return (
+        f"stopped VMs: each started for its row, at most {n} at a time, and stopped again once "
+        "its row is done, unless someone used it since its start (--start-stopped)"
+    )
+
+
+def lets_in(runner: Runner, host: str, known_hosts: str) -> bool:
+    """Whether the VM at `host` lets an SSH login in (`READY_CMD`): port 22 answers before a
+    boot allows logins (Ubuntu 24.04's socket-activated sshd, `/run/nologin`), so a VM just
+    started is tried until it does (`power.StartStop`, review of #1026)."""
+    return runner(ssh_argv(host, READY_CMD, known_hosts=known_hosts), timeout_s=30).ok
+
+
+def vm_in_use(runner: Runner, host: str, known_hosts: str) -> list[str]:
+    """Why the VM at `host` was used since its boot (`idle_stop.in_use`): its answer to
+    `IN_USE_CMD`, read here. A read that fails is a reason too (`power.UNREAD_PREFIX`)."""
+    from idle_stop import USE_UNREAD, in_use  # the module that runs on the VM
+
+    res = runner(ssh_argv(host, IN_USE_CMD, known_hosts=known_hosts), timeout_s=120,
+                 stdin=IDLE_STOP_SCRIPT.read_text(encoding="utf-8"))  # fmt: skip
+    if not res.ok:
+        why = first_line(res.stderr or res.stdout, 80) or f"exit {res.exit_code}"
+        return [f"{USE_UNREAD}: {why}"]
+    lines = res.stdout.strip().splitlines()
+    try:
+        facts = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        facts = None
+    return in_use(facts)
+
+
+def start_stop(
+    opts: Any, rows: list[dict[str, str]], runner: Runner, *, log: Callable[[str], None]
+) -> Any:
+    """The `power.StartStop` of a run with `--start-stopped` (`opts`, `add_start_stopped`), or
+    None without; ValueError, for the script to print, when it can't be made."""
+    if opts.start_stopped is None:
+        return None
+    if opts.start_stopped < 1 or not opts.region or not opts.scope_tag:
+        raise ValueError("--start-stopped takes N ≥ 1, with --region and --scope-tag")
+    where = getattr(opts, "halted_in", None) or ""
+    if where and not HALTED_IN.fullmatch(where):
+        raise ValueError("--halted-in takes a workshop's name")
+    from aws_common import Ec2, parse_tags  # boto3 only with the flag
+    from idle_stop import UNREAD
+    from power import EC2_CONFIG, StartStop
+
+    scope = parse_tags(opts.scope_tag)
+    try:
+        ec2 = Ec2(opts.region, config=EC2_CONFIG)
+    except ImportError:
+        raise ValueError("--start-stopped needs boto3 (uv run --with boto3 python …)") from None
+    kh = str(opts.known_hosts)
+    return StartStop(ec2, scope, rows, at_once=opts.start_stopped, log=log,
+                     in_use=lambda row: vm_in_use(runner, host_of(row), kh),
+                     unread_reasons=UNREAD, halted_in=where,
+                     ready=lambda row: lets_in(runner, host_of(row), kh))  # fmt: skip
 
 
 # -------------------------------------------------------------------------------------- hygiene

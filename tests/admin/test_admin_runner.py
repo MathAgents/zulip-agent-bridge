@@ -109,9 +109,33 @@ def fake(site, name, body):
 
 
 def calls(site, name=None, dry=None):
+    """The fakes' calls so far. A test may poll while a fake writes its line, and a read can see
+    half of it (a CI flake on #998, `JSONDecodeError` on `{"script": "aws/tea`): only the lines
+    that end in their newline are read (#988)."""
     path = site.tmp / "calls.jsonl"
-    rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    text = path.read_text() if path.exists() else ""
+    rows = [json.loads(line) for line in text.split("\n")[:-1]]
     return [r for r in rows if name in (None, r["script"]) and dry in (None, r["dry"])]
+
+
+def test_calls_reads_a_line_only_once_it_is_whole(tmp_path):
+    site = SimpleNamespace(tmp=tmp_path)
+    assert calls(site) == []
+    line = json.dumps({"script": "aws/teardown.py", "argv": [], "dry": False})
+    (tmp_path / "calls.jsonl").write_text(f"{line}\n{line[:19]}")  # the second, half written
+    assert calls(site) == [json.loads(line)]
+
+
+def test_calls_leave_out_a_line_still_being_written(tmp_path):
+    """A read while a fake script writes its line, or after a kill mid-write, sees only part of
+    it: the whole lines count, the partial one doesn't (a CI flake on #1001)."""
+    site = SimpleNamespace(tmp=tmp_path)
+    assert calls(site) == []
+    one = json.dumps({"script": "aws/power.py", "argv": ["--stop"], "dry": False})
+    (tmp_path / "calls.jsonl").write_text(one + "\n" + '{"script": "aws/tea')
+    assert calls(site) == [json.loads(one)]
+    (tmp_path / "calls.jsonl").write_text('{"script": "aws/power.py", "ar')
+    assert calls(site) == []
 
 
 def vms(fleet, names):

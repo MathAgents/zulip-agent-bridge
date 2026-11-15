@@ -76,16 +76,54 @@ jobs:
       # run while the runner can still upload its log, which the job's would lose (#473).
       # By Nov 5 the run took 9 to 11 minutes on a pull request and 8 to 12 on main (the slow
       # tests are few, but long), at the old 12-minute limit; so 20 and 25 (#845), inside the
-      # job's 30.
+      # job's 30. By Nov 9 a pull request's took 10 to 18 minutes, half of it the tests marked
+      # `deploy_rig`, which a pull request runs in the `rigs` job instead (#988).
       # The tests marked `timing` run in the job below.
       - if: github.event_name == 'pull_request'
         timeout-minutes: 20
-        run: uv run pytest -n auto -m "not slow and not timing" -rs --durations=20
+        run: uv run pytest -n auto -m "not slow and not timing and not deploy_rig" -rs --durations=20
       - if: github.event_name != 'pull_request'
         timeout-minutes: 25
         run: uv run pytest -n auto -m "not timing" -rs --durations=20
       - run: uv run ruff check
       - run: uv run ruff format --check
+  # On a pull request, the tests marked `deploy_rig` run here, once, under Python 3.12: tests of
+  # what runs on the admin server (deploy.sh's server half and the upgrade helper, in their rig,
+  # tests/workshop), under its /usr/bin/python3 of Ubuntu 24.04. The `test` jobs above leave
+  # them out: they were half of each one's time, three times over (#988). What runs on the
+  # deployer's machine, under any Python, stays in the `test` jobs: deploy.sh's laptop-half
+  # programs (tests/workshop/test_deploy_sh_python.py), upgrade.py and the admin harness. A push
+  # to main runs every test in every `test` job, as before, so this job is for pull requests
+  # alone. Its tests need neither age nor nft.
+  rigs:
+    name: rigs (3.12)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04  # what zab runs on: the VMs, the image, the admin server
+    timeout-minutes: 30
+    env:
+      UV_PYTHON: '3.12'
+    steps:
+      # The network steps are bounded and retried as in the `test` job (#900).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        timeout-minutes: 5
+        with:
+          python-version: '3.12'
+      - name: Install uv and the locked environment
+        timeout-minutes: 5
+        run: |
+          for attempt in 1 2; do
+            timeout -k 10 60 python -m pip install uv &&
+              timeout -k 10 60 uv sync --locked &&
+              exit 0 || status=$?
+            echo "::warning::installing uv and the environment, attempt $attempt: exit status $status"
+          done
+          exit "$status"
+      - timeout-minutes: 20
+        run: uv run pytest -n auto -m "deploy_rig and not slow and not timing" -rs --durations=20
   # The tests marked `timing` bound CPU against a reference timed in the same run. A runner's
   # two vCPUs are one core's two threads, and another xdist worker on the second thread swings
   # a process's CPU by up to 1.7 times, more than these bounds allow; so they run here, one at

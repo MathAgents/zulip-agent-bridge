@@ -821,6 +821,7 @@ def test_reserved_slugs_are_the_grammars():
     assert ri.RESERVED_SLUGS == {
         "all", "spares", "hold", "protect", "lean-shared", "restart-codex", "invites-only",
         "no-invite", "unsynced", "steer", "idle-stop", "multi-party", "raw-log", "export",
+        "every-workshop",  # #995
     }  # fmt: skip
     for slug in ri.RESERVED_SLUGS:  # each passes the slug pattern: only this check stops it
         ri.validate_row({"slug": slug})

@@ -55,6 +55,7 @@ workshop/admin/push_waker.py
 workshop/admin/roster_import.py
 workshop/admin/roster_sync.py
 workshop/admin/scan_hosts.py
+workshop/admin/set_workshop.py
 workshop/admin/stage_server.py
 workshop/admin/status.py
 workshop/admin/trust_fix.py

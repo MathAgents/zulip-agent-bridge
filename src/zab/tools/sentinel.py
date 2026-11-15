@@ -58,8 +58,6 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from zab import __version__
 from zab import jobs as zjobs
 from zab.commands.service import SENTINEL as SENTINEL_UNIT
@@ -75,7 +73,7 @@ from zab.core.jobcontrol import (
     unended,
 )
 from zab.tools import vmstat
-from zab.zulip.client import ZulipClient, ZulipError
+from zab.zulip.client import ZulipClient, ZulipError, transient
 
 log = logging.getLogger("zab.sentinel")
 
@@ -158,15 +156,6 @@ def command_text(
         words[1] = words[1].casefold()
     text = " ".join(words)
     return text if text in COMMANDS else None
-
-
-def transient(exc: BaseException) -> bool:
-    """Zulip didn't answer, or asked for a retry: a transport error, a rate limit, a server error
-    or a response that isn't JSON (`zab.core.bridge.zulip_unreachable`'s rule)."""
-    return isinstance(exc, httpx.TransportError) or (
-        isinstance(exc, ZulipError)
-        and (exc.status == 429 or exc.status >= 500 or exc.code == "INVALID_RESPONSE")
-    )
 
 
 def held(now: float, path: str = HOLD) -> bool:

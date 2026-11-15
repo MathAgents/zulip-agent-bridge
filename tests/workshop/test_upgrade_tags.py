@@ -379,3 +379,55 @@ def test_something_else_at_the_copys_path_stops_the_run(machine):
         done.stderr
     )
     assert tag_of(machine, machine.origin) == tag_of(machine, machine.clone) != ""
+
+
+def own_copy(machine: Machine, at: str = "") -> Path:
+    """vN signed by hand on C (or `at`), and its copy, as BOOTSTRAP §9 makes it."""
+    machine.git("fetch", "-q", "origin", "--tags", where=machine.clone)
+    machine.sign(V, at or machine.c, machine.key, where=machine.clone)
+    copy = machine.home / f"zab-{V}"
+    machine.git("worktree", "add", "-q", "--detach", copy, V, where=machine.clone)
+    return copy
+
+
+def test_vns_own_copy_finishes_the_run_once_its_tag_verifies_with_since(machine):
+    """#991: the copy of vN, once its tag verifies, with --since vP: vP's copy reviews, its
+    SHA-256 compared again and the review not paged; nothing to type, and the tag is pushed.
+    So a newer driver than the running release's can finish a release it signed by hand."""
+    copy = own_copy(machine)
+    argv = [V, "--commit", machine.c, "--review-sha256", machine.sha]
+    alone = machine.run(*argv, copy=copy)
+    assert alone.returncode == 1, said(alone)
+    assert f"stopped: {copy} is {V}'s own copy: name the release the server runs with --since" in (
+        alone.stderr
+    )
+    done = machine.run(*argv, "--since", "v0.3.0", copy=copy)
+    assert done.returncode == 0, said(done)
+    assert f"this copy: {V}, signed, at {copy}; v0.3.0's, at {machine.copy_v0}\n" in done.stdout
+    assert f"[1/2] the review of {machine.c[:12]}, v0.3.0's deploy.sh\n" in done.stdout
+    assert f"{machine.sha}: compared again, its review not paged, since {V}'s tag" in done.stdout
+    assert "Type " not in done.stdout and "zab admin release review" not in done.stdout
+    assert tag_of(machine, machine.origin) == tag_of(machine, machine.clone) != ""
+    wrong = machine.run(*argv, "--since", "v0.2.9", copy=machine.copy_v0)  # vP's copy: it agrees
+    assert wrong.returncode == 1, said(wrong)
+    assert f"stopped: {machine.copy_v0}: it is v0.3.0's copy, not v0.2.9's (--since).\n" in (
+        wrong.stderr
+    )
+    assert wrong.stderr.endswith(f'--review-sha256 {machine.sha} --since "$V"\n')  # the fix line
+
+
+@pytest.mark.parametrize("case", ["another commit", "no copy of vP"])
+def test_vns_own_copy_stops_off_c_or_without_vps_copy(machine, case):
+    if case == "another commit":
+        other = machine.release(V, parent="main")  # off main, and it says 0.3.1 too
+        machine.git("tag", "side", other)  # so that the clone's fetch brings the commit
+        copy = own_copy(machine, at=other)
+        why = f"stopped: {V} verifies on {other}, not on {machine.c}: check the release message\n"
+    else:
+        copy = own_copy(machine)
+        machine.git("worktree", "remove", machine.copy_v0, where=machine.clone)
+        why = f"stopped: {machine.copy_v0}, the copy of v0.3.0 (--since) that reviews {V}: no such"
+    argv = [V, "--commit", machine.c, "--review-sha256", machine.sha, "--since", "v0.3.0"]
+    done = machine.run(*argv, copy=copy)
+    assert done.returncode == 1 and why in done.stderr, said(done)
+    assert tag_of(machine, machine.origin) == ""

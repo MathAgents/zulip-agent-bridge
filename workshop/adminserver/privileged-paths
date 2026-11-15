@@ -9,7 +9,8 @@
 # drop-in, the Caddyfile); render_policy.py, whose output bounds the role; this list and
 # release-paths. A file added there is privileged at once.
 workshop/adminserver
-# D32 (Drew, Oct 18): the root helper of !new-workshop (zab-admin-config.service, as root): its
+# D32 (Drew, Oct 18): the root helper of !new-workshop, and of !set-workshop since #1043
+# (zab-admin-config.service, as root): its
 # own code, and the two modules whose functions it runs as root, the strict loader of what it
 # writes into admin.toml and the key checks.
 src/zab/admin/confighelper.py

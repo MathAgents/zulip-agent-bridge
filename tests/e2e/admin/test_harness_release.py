@@ -38,11 +38,18 @@ def git(repo, *args, check=True):
 
 @pytest.fixture
 def made(tmp_path):
+    return _made(tmp_path)
+
+
+def _made(tmp_path):
+    """A checkout on `main`, as zab's own is, and the rig's release repository cloned from it:
+    the clone's HEAD names `main` too, so no test may fetch into that branch (#1042). It needs
+    no fetch: the clone shares the checkout's objects (`--shared`), a later commit's too."""
     checkout = tmp_path / "checkout"
     (checkout / "src" / "zab").mkdir(parents=True)
     (checkout / "pyproject.toml").write_text('[project]\nname = "zab"\nversion = "0.2.3"\n')
     (checkout / "src" / "zab" / "__init__.py").write_text('"""zab."""\n\n__version__ = "0.2.3"\n')
-    subprocess.run(["git", "init", "-q", str(checkout)], check=True)  # noqa: S603, S607
+    git(checkout, "init", "-q", "-b", "main")
     git(checkout, "add", "-A")
     git(checkout, "commit", "-q", "-m", "base")
     rig = rigs.load({"HOME": str(tmp_path)})
@@ -86,7 +93,6 @@ def test_a_release_carries_files_of_any_bytes_as_they_are(made):
     (rel.checkout / "CHANGELOG.md").write_text("# Changelog\n\n## 0.2.3\n")
     git(rel.checkout, "add", "-A")
     git(rel.checkout, "commit", "-q", "-m", "a changelog")
-    rel.git("fetch", "-q", str(rel.checkout), "HEAD:refs/heads/main")
     base = rel.commit_of("HEAD")
     added = b"cr\r\nesc \x1b[0m\n\xff\xe2\x80\n"
     files = {"workshop/adminserver/a.md": added, "CHANGELOG.md": b"x"}
@@ -133,7 +139,6 @@ def test_a_public_release_is_the_export_of_the_private_one(made):
     git(checkout, "add", "-A")
     git(checkout, "commit", "-q", "-m", "with private files")
     rel.ensure_repo()
-    rel.git("fetch", "-q", str(checkout), "HEAD:refs/heads/main")
     base = rel.commit_of("HEAD")
     first = rel.release(base, "v0.2.4rc1")
     p1 = rel.export("v0.2.4rc1", first)
@@ -170,7 +175,6 @@ def _commit(rel, files: dict[str, str], message: str) -> str:
         (rel.checkout / name).write_text(text)
     git(rel.checkout, "add", "-A")
     git(rel.checkout, "commit", "-q", "-m", message)
-    rel.git("fetch", "-q", str(rel.checkout), "HEAD:refs/heads/main")
     return rel.commit_of("HEAD")
 
 
@@ -258,6 +262,27 @@ def test_an_unsigned_tag_stays_unsigned_whatever_the_users_git_config(made, monk
     assert "BEGIN" not in rel.git("cat-file", "tag", "v0.2.4rc1")
     rel.export("v0.2.4rc1", commit, signer=None)
     assert "BEGIN" not in rel.public_git("cat-file", "tag", "v0.2.4rc1")
+
+
+@pytest.mark.parametrize("default", ["", "main", "master"], ids=["unset", "main", "master"])
+def test_the_users_default_branch_changes_nothing(tmp_path, monkeypatch, default):
+    """#1042: with `init.defaultBranch = main` in the user's global git config, the fixture's
+    checkout and so the rig's clone of it were on `main`, the tests' fetch into that branch was
+    refused, and seven tests failed, the export's suite with them. Unset, `main` or `master`,
+    the setting changes nothing now: the checkout, the clone and the public repository are on
+    `main`, and a commit made after the clone is released, exported and deployed, unfetched."""
+    config = tmp_path / "gitconfig"
+    config.write_text(f"[init]\n\tdefaultBranch = {default}\n" if default else "")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    rel, _, _ = _made(tmp_path)
+    for repo in (rel.checkout, rel.rig.repo):
+        assert git(repo, "symbolic-ref", "HEAD").stdout == "refs/heads/main\n"
+    base = _commit(rel, {"later.txt": "made after the clone\n"}, "later")
+    public = rel.export("v0.2.4rc1", rel.release(base, "v0.2.4rc1"), fresh=True)
+    assert rel.public_git("symbolic-ref", "HEAD") == "refs/heads/main"
+    clone = rel.deploy_clone("v0.2.4rc1", tmp_path / "clone")
+    assert git(clone, "rev-parse", "HEAD").stdout.strip() == public
 
 
 def test_the_drop_list_is_read_without_running_the_tool():

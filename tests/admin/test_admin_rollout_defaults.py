@@ -9,6 +9,7 @@ import pytest
 
 from zab.admin.actions import (
     IDLE_STOP_DEFAULT,
+    STARTS_STOPPED,
     Live,
     build,
     digests,
@@ -17,7 +18,7 @@ from zab.admin.actions import (
 )
 from zab.admin.fleet import ApplyEnd, Ledger
 
-from .test_admin_actions import FLEET, OUT, ROLL, WHL, command
+from .test_admin_actions import FLEET, OUT, ROLL, START, WHL, command
 
 #: Instance IDs, as EC2 writes them: alice's VM, bob's, carol's, dave's, and a broken one
 A, B, C, D, X = (f"i-0{c * 16}" for c in "abcde")
@@ -93,7 +94,12 @@ def make(message, layout, fleet=FLEET):
     return build(command(message, fleet), fleet, layout=layout)
 
 
-def push(layout, middle: str) -> tuple[str, ...]:
+def push(layout, middle: str, *, start: bool = True) -> tuple[str, ...]:
+    """push_config.py's list: `middle`, and a rollout's `--start-stopped` (#995) before its
+    `--only`; `!adopt-spare`'s steps, whose spare its first step started, have none."""
+    if start:
+        words, only = middle.partition("--only")[::2]
+        middle = f"{words} {START} --only{only}"
     return tuple((ROLL.format(release=WHL.format(W=layout.wheels)) + f" {middle}").split())
 
 
@@ -144,6 +150,7 @@ def test_a_rollout_without_the_words_applies_both_defaults(layout):
         "then this rollout again, or `!idle-stop 60 bob carol`, which turns it on even where "
         "it was off on purpose.",
         "The dry run shows every step the defaults may take, as on a new VM.",
+        STARTS_STOPPED,  # #995
     )
 
 
@@ -164,7 +171,7 @@ def test_explicit_words_keep_their_meaning(layout, words, middle, notes):
     waker(layout)
     action = make(f"!rollout v0.2.2 bob dave {words}", layout)
     assert action.steps[0].argv == push(layout, f"{middle} --only bob --only dave")
-    assert len(action.notes) == notes
+    assert len(action.notes) == notes + 1  # and the stopped VMs' (#995)
 
 
 def test_without_any_waker_the_note_names_the_rows(layout):
@@ -229,15 +236,16 @@ def test_a_late_joiner_gets_the_defaults_after_the_waker(layout):
     scripts = [next(w for w in s.argv if w.endswith(".py")).rsplit("/", 1)[1] for s in action.steps]
     assert scripts.index("push_waker.py") < scripts.index("push_config.py")
     tail = f"{DEFAULTS} --has-waker carol"
-    assert action.steps[4].argv == push(layout, f"{tail} --adopt-spare carol --only carol")
-    assert action.steps[6].argv == push(layout, f"{tail} --only carol")
+    assert action.steps[4].argv == push(layout, f"{tail} --adopt-spare carol --only carol",
+                                        start=False)  # fmt: skip
+    assert action.steps[6].argv == push(layout, f"{tail} --only carol", start=False)
     assert len(action.notes) == 2 and "Not on" not in " ".join(action.notes)
 
 
 def test_a_late_joiner_without_the_fleets_waker_gets_no_idle_stop(layout):
     action = adopt(layout, dataclasses.replace(FLEET, waker=False, settings=("steer=off",)))
     assert action.steps[3].argv == push(
-        layout, f"--no-claude-steer {DEFAULTS} --adopt-spare carol --only carol"
+        layout, f"--no-claude-steer {DEFAULTS} --adopt-spare carol --only carol", start=False
     )
     # no rollout to send again in this plan (review round 3)
     assert action.notes[-1] == (
@@ -249,7 +257,9 @@ def test_a_late_joiner_without_the_fleets_waker_gets_no_idle_stop(layout):
 def test_a_late_joiner_gets_the_fleets_own_words_where_they_were_given(layout):
     fleet = dataclasses.replace(FLEET, waker=True, settings=("idle-stop=0", "lean-shared"))
     action = adopt(layout, fleet)
-    assert action.steps[6].argv == push(layout, "--idle-stop 0 --lean-shared --only carol")
+    assert action.steps[6].argv == push(
+        layout, "--idle-stop 0 --lean-shared --only carol", start=False
+    )
     assert action.notes == ()
 
 

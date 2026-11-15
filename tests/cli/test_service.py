@@ -2,6 +2,8 @@ import asyncio
 import itertools
 import os
 import subprocess
+import sys
+import time
 import uuid
 from pathlib import Path
 from shutil import which as real_which
@@ -434,12 +436,16 @@ def test_a_daemon_whose_unit_changed_otherwise_too_is_restarted(setup, monkeypat
     assert not any(a.startswith("--pid=") for argv in seen for a in argv)
 
 
-def test_limit_only_reads_the_limit_line_alone():
+def test_reload_only_reads_the_limit_and_oom_policy_lines_alone():
     old = "[Service]\nExecStart=x\nRestart=on-failure\n"
-    new = "[Service]\nExecStart=x\nLimitNOFILE=65536\nRestart=on-failure\n"
-    assert service.limit_only(old, new) and service.limit_only(new, new.replace("65536", "4096"))
-    assert not service.limit_only(new, new)  # unchanged: nothing to do
-    assert not service.limit_only(old, new.replace("ExecStart=x", "ExecStart=y"))
+    new = "[Service]\nExecStart=x\nOOMPolicy=continue\nLimitNOFILE=65536\nRestart=on-failure\n"
+    assert service.reload_only(old, new) and service.reload_only(new, new.replace("65536", "4096"))
+    assert service.reload_only(new, new.replace("OOMPolicy=continue\n", ""))
+    assert not service.reload_only(new, new)  # unchanged: nothing to do
+    assert not service.reload_only(old, new.replace("ExecStart=x", "ExecStart=y"))
+    assert service.limit_changed(old, new)
+    assert service.limit_changed(new, new.replace("65536", "4096"))
+    assert not service.limit_changed(new, new.replace("OOMPolicy=continue\n", ""))
 
 
 @pytest.mark.parametrize(
@@ -479,6 +485,66 @@ def test_an_inactive_daemon_starts_from_the_new_unit(setup, monkeypatch, capsys)
     assert restarts == [("try-restart", "--no-block", "zab-sentinel.service")]
     enabled = [call.args for call in control.call_args_list if call.args[0] == "enable"]
     assert enabled and "codex-app-server.service" in enabled[0]
+    assert "open-file limit" not in capsys.readouterr().out
+
+
+# ------------------------------------------------------------- a job killed for memory (#997)
+
+
+def test_the_agents_units_outlive_a_job_killed_for_memory(tmp_path, monkeypatch):
+    """#997: an agent's commands run in its backend's unit, a Claude turn's under the bridge's
+    and a Codex turn's under the daemon's. Both units keep running when the kernel's OOM killer
+    kills one of their processes (`OOMPolicy=continue`), instead of systemd's default, which
+    stops the unit. The sentinel runs no agent and keeps the default."""
+    monkeypatch.setattr(service, "binary", lambda name: "/usr/bin/" + name)
+    config = Config(
+        tmp_path / "config.toml",
+        BridgeConfig(),
+        [],
+        {"codex": BackendConfig(kind="codex", socket=str(tmp_path / "decoy.sock"))},
+        [],
+        RenderConfig(),
+    )
+    rendered = service.units(config)
+    for name in ("zab.service", "codex-app-server.service"):
+        body = rendered[name]
+        assert body.count("OOMPolicy=") == 1 and "\nOOMPolicy=continue\n" in body, name
+        assert body.index("[Service]") < body.index("OOMPolicy=") < body.index("[Install]")
+    assert "OOMPolicy" not in rendered[service.SENTINEL]
+
+
+@pytest.mark.parametrize("limit_too", [False, True], ids=["policy alone", "limit too"])
+def test_a_running_daemon_gets_its_oom_policy_without_a_restart(
+    setup, monkeypatch, capsys, limit_too
+):
+    """#997: a rollout over a release whose units had no `OOMPolicy=` restarts no running Codex
+    daemon, which would end its Codex turns: the manager's reload hands it the policy, and
+    `prlimit` runs only where the limit is new too (#664). The bridge's unit changed, so it is
+    restarted, as every rollout restarts it anyway."""
+    config, control, _ = setup
+    monkeypatch.setattr(service, "nofile_limit", lambda: 65536)
+    config.backends["codex"] = BackendConfig(kind="codex", codex_home="/isolated")
+    assert service.main(["install"]) == 0
+    directory = service.unit_directory()
+    for name in ("codex-app-server.service", "zab.service"):  # as v0.2.20 wrote them
+        unit = directory / name
+        unit.write_text(unit.read_text().replace(service.OOM_POLICY, ""))
+    if limit_too:  # as v0.2.10 wrote the daemon's
+        unit = directory / "codex-app-server.service"
+        unit.write_text(unit.read_text().replace("LimitNOFILE=65536\n", ""))
+    run, seen = _systemd()
+    monkeypatch.setattr(service, "run", run)
+    control.reset_mock()
+    capsys.readouterr()
+    assert service.main(["install"]) == 0
+    for name in ("codex-app-server.service", "zab.service"):
+        assert service.OOM_POLICY in (directory / name).read_text(), name
+    calls = [call.args for call in control.call_args_list]
+    restarts = [args for args in calls if args[0] == "try-restart"]
+    assert restarts == [("try-restart", "--no-block", "zab.service", "zab-sentinel.service")]
+    assert calls.index(("daemon-reload",)) < calls.index(restarts[0])
+    prlimit = ["/usr/bin/true", "--pid=937", "--nofile=65536:65536"]
+    assert (prlimit in seen) is limit_too
     assert "open-file limit" not in capsys.readouterr().out
 
 
@@ -590,3 +656,60 @@ async def test_a_bridge_failing_at_start_backs_off_and_recovers_on_its_own(tmp_p
         await systemctl("reset-failed", name)
         (units / name).unlink(missing_ok=True)
         await systemctl("daemon-reload")
+
+
+# Under a second. Without a user manager, the units' text and the install's restarts (above) are
+# checked without systemd.
+@pytest.mark.skipif(not _user_manager(), reason="no user systemd manager")
+def test_a_unit_outlives_its_child_killed_for_memory(tmp_path):
+    """#997 on a real user manager: two units, each a shell whose child outgrows the unit's
+    64 MB `MemoryMax`, as an agent's job can outgrow the VM, and is OOM-killed. systemd's default
+    stops the first, `oom-kill`. The second gets the units' `OOMPolicy=` in its file while it
+    runs, then a reload, as a Codex daemon does from the install that adds the line: its shell
+    runs on, the same process."""
+    tool = real_which("systemctl")
+    units = Path(os.environ["XDG_RUNTIME_DIR"]) / "systemd" / "user"
+    units.mkdir(parents=True, exist_ok=True)
+    go = tmp_path / "go"
+    tag = uuid.uuid4().hex[:12]
+    names = [f"zab-test-{tag}-oom-{policy}.service" for policy in ("default", "continue")]
+
+    def systemctl(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([tool, "--user", *args], capture_output=True, text=True, timeout=30)  # noqa: S603
+
+    def show(name: str) -> dict[str, str]:
+        out = systemctl("show", "-p", "ActiveState", "-p", "Result", "-p", "MainPID", name).stdout
+        return dict(line.split("=", 1) for line in out.splitlines())
+
+    for name in names:
+        job = tmp_path / f"{name}.sh"
+        job.write_text(
+            f"while [ ! -e '{go}' ]; do sleep 0.1; done\n"
+            f"'{sys.executable}' -c 'x = b\"x\" * (300 * 2**20)'\n"
+            f"echo ran >> '{tmp_path / name}'\nexec sleep 300\n"
+        )
+        start = " ".join(service.quote(arg, command=True) for arg in ["/bin/sh", str(job)])
+        (units / name).write_text(f"[Service]\nExecStart={start}\nMemoryMax=64M\nMemorySwapMax=0\n")
+    try:
+        assert systemctl("daemon-reload").returncode == 0
+        assert systemctl("start", *names).returncode == 0
+        before = show(names[1])["MainPID"]
+        (units / names[1]).write_text((units / names[1]).read_text() + service.OOM_POLICY)
+        assert systemctl("daemon-reload").returncode == 0
+        go.touch()
+        for _ in range(200):
+            if show(names[0])["ActiveState"] != "active" and (tmp_path / names[1]).exists():
+                break
+            time.sleep(0.1)
+        first, second = show(names[0]), show(names[1])
+        if first["ActiveState"] == "active" and (tmp_path / names[0]).exists():
+            pytest.skip("the child outgrew MemoryMax unkilled: no memory controller here")
+        assert first["Result"] == "oom-kill", first
+        assert second == {"ActiveState": "active", "Result": "success", "MainPID": before}
+        assert (tmp_path / names[1]).read_text() == "ran\n"
+    finally:
+        systemctl("stop", *names)
+        systemctl("reset-failed", *names)
+        for name in names:
+            (units / name).unlink(missing_ok=True)
+        systemctl("daemon-reload")

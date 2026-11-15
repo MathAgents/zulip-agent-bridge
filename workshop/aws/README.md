@@ -71,12 +71,34 @@ another credential.
   7.3 GB, mostly shared pages. Each agent runs up to 10 turns at once (`max_concurrent_turns`,
   #919), and a turn that uses Lean starts a Lean server of its own, about 1.3 GB idle with one
   small file open: with every turn in Lean at once, those and the agents' other processes fill
-  the VM's usable memory and run into the 8 GiB swap (SPEC §7.10). The common case, turns that
-  wait on the model, needs much less; Sage, Magma and comparator runs come on top. Where the
-  region's vCPU quota is short,
+  the VM's usable memory and run into the swap (SPEC §7.10; 5 GiB, 8 GiB on VMs launched
+  before #997). The common case, turns that wait on the model, needs much less; Sage, Magma
+  and comparator runs come on top. Where the region's vCPU quota is short,
   `--instance-type r7a.xlarge` keeps the 32 GiB on 4 vCPUs: the image is the same (x86-64), and
   `build_ami.py --smoke-only <ami> --smoke-instance-type r7a.xlarge` checks it on that type.
-- **Root volume:** gp3, 200 GiB (#205), deleted on termination.
+- **Root volume:** gp3, 80 GiB (`aws_common.ROOT_GB`, #998), deleted on termination. It was
+  200 GiB (#205) while each topic built its own Mathlib; the shared one is the default now,
+  and a filling disk grows by itself (docs/ADMIN.md §3.4). An image's root is a launch's
+  least, since EC2 launches no volume smaller than its snapshot: `build_ami.py` builds on
+  80 GiB, and an image built before #998, whose root is 100 GiB, launches with 100 GiB. A new
+  VM's first day should use about 40 GB of it, the image and the first boot's 5 GiB swap file, which
+  `df` counts (44 GB before #997: ["The image's footprint"](../ami/README.md#the-images-footprint)),
+  so about 20 GB more before its first growth, at 85% (`df`'s percentage).
+- **Volume initialization:** 200 MiB/s (`--init-rate`, `aws_common.INIT_RATE`, #1007). A
+  volume made from a snapshot fetches each block from S3 on its first read, at about 5 MiB/s
+  by EBS's default: a fresh VM's first `import Mathlib` took about half an hour (#999), unless
+  the first boot's warm-up had read its files. At a provisioned rate, EBS fetches every block
+  from the launch on, so the disk is whole within minutes. It is charged once per volume, per
+  GB of the snapshot's data: $0.0024 at 100 to 200 MiB/s, $0.0036 at 201 to 300 (AWS's list
+  prices, us-east-1, Nov 2026). `--init-rate 0` keeps EBS's default rate; any other value
+  must be 100 to 300. `aws_common.init_rate_params` gives the parameter, the same in
+  RunInstances' block device mapping and in CreateVolume. EBS's quota is 5,000 MiB/s per
+  Region, summed over the volumes being created at once (AWS's *Initialize Amazon EBS
+  volumes*, "Quotas"): 25 at 200 MiB/s, where `launch.py` launches one VM at a time. A launch
+  refused for that quota, or for EBS's capacity at the rate, fails its row (a `FAILED` line in
+  the summary), and the same `!launch` again, or `launch.py` again, retries that row: a refused
+  launch leaves it no VM that counts (an instance EC2 ended is `terminated`, not one of
+  `LIVE_STATES`) and no `host`, and the VMs that exist are left alone.
 - **Metadata:** IMDSv2 required. **No instance profile or IAM role,** so the agents on a VM can't
   reach AWS.
 - **Network:** the default VPC; a security group that admits TCP 22 alone (below), outbound
@@ -136,14 +158,17 @@ uv run --with boto3 python workshop/aws/launch.py --roster test-roster.csv \
 - Idempotent: a row whose `participant` tag already has a live instance **in this workshop** is
   not launched again; its Elastic IP is reconciled instead (allocated or attached if a previous
   run died in between). Resources of another event, even with the same login, are ignored.
-- Launches from the AMI with the settings of "The VMs": `m7a.2xlarge` (8 vCPUs, 32 GiB; D23), 200 GiB
-  gp3 root (issue #205) deleted on termination, IMDSv2 required, no IAM role, tags `Name=ws-<slug>`,
+- Launches from the AMI with the settings of "The VMs": `m7a.2xlarge` (8 vCPUs, 32 GiB; D23), an 80
+  GiB gp3 root (`aws_common.ROOT_GB`, #998), or the image's own where it is larger, deleted on
+  termination, initialized at `--init-rate` (200 MiB/s by default, #1007; each launch's line
+  and the summary name it), IMDSv2 required, no IAM role, tags `Name=ws-<slug>`,
   `participant=<slug>` and the scope tags, and the first-boot script
   (`workshop/ami/README.md`, "First boot"): host name,
   git identity (the roster names and e-mail; a row without an e-mail fails), `~/work`,
-  `/etc/zab-participant.json` (slug and checkout), then the post-AMI decisions (an 8 GiB
-  swap file, Claude Code's auto-updater off through `/etc/claude-code/managed-settings.json`,
-  Codex's `check_for_update_on_startup = false`, the LMFDB MCP server for both CLIs; all
+  `/etc/zab-participant.json` (slug and checkout), then the post-AMI decisions (a 5 GiB
+  swap file, #997, Claude Code's auto-updater off through
+  `/etc/claude-code/managed-settings.json`, Codex's `check_for_update_on_startup = false`, the
+  LMFDB MCP server for both CLIs; all
   idempotent, mirrored in `workshop/ami/build.sh`). No key import and no cron job:
   participants get no SSH, organizers keep `ubuntu` with their own keys. A participant who
   asks for SSH gets it by hand, as `ubuntu`: `sudo -u agent ssh-import-id gh:<login>`. Check the
@@ -446,6 +471,14 @@ Behind `!grow-disk` (ORGANIZERS §4.1). It grows one row's root volume to `--siz
   VM's grows at its next boot, through cloud-init's `growpart`; the script never starts it.
 - **The file system alone:** the volume's own size, on a running VM, finishes a grow whose SSH
   step failed, at no cost and without the 6 hours' wait.
+- **`--auto-cap GB`** in place of `--size` (#998), for the admin bots' automatic growth of a
+  filling disk: half the volume's size again, rounded up to whole GB, at most GB; within the 6
+  hours of the volume's last modification, its file system alone. A VM that isn't running is
+  never grown. Every check above holds. Its last line, `auto result: ` and JSON, says what it
+  did: `grown` (exit 0), `failed` (exit 1), or, exit 3 and nothing changed, `stopped`, `capped`
+  (at GB already) or `wait` (within the 6 hours, the file system filling the volume already).
+  With `--expect-instance ID`, the instance whose disk was read, a row's VM that is another
+  instance now gives `replaced` (exit 3), before any change.
 
 SSH goes through the host key pinned in `--known-hosts`, with no forwarding. It needs
 `ec2:DescribeInstances`, `ec2:DescribeVolumes`, `ec2:DescribeVolumesModifications` and

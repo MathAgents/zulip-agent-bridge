@@ -91,6 +91,32 @@ def test_a_deploy_that_never_reached_the_vm_is_recognized(monkeypatch, step, std
         assert admin.connect_failed(Result(0, printed.stdout, ""), "zab-test", HOST) == ""
 
 
+@pytest.mark.parametrize("answered", [False, True])
+def test_a_connect_failure_the_runner_dated_is_still_recognized(monkeypatch, answered):
+    """#1009: the admin scripts' runner (`admin_common.ConnectRetry`) adds when the connect
+    began, after one try or three; push_config may still simply run again (#690)."""
+    monkeypatch.syspath_prepend(str(config.CHECKOUT / "workshop" / "admin"))
+    pc = importlib.import_module("push_config")
+    answers = [pc.RunResult(0, "", "")] if answered else []
+    calls = []
+
+    def ssh(argv, **kw):
+        calls.append(argv)
+        return answers.pop(0) if answers else pc.RunResult(255, "", TIMED_OUT)
+
+    run = importlib.import_module("admin_common").ConnectRetry(ssh, sleep=lambda s: None)
+    if answered:
+        run(pc.ssh_argv(HOST, "true", known_hosts="kh"))
+    res = run(pc.ssh_argv(HOST, pc.MKTEMP_CMD, known_hosts="kh"))
+    assert res.stderr != TIMED_OUT and len(calls) == (4 if answered else 1)
+    row = pc.VmResult("zab-test", HOST)
+    pc._fail(row, "ssh", res)
+    printed = Result(1, pc.render([row]) + "\n", "\n1 VM(s) failed\n")
+    assert admin.connect_failed(printed, "zab-test", HOST) == row.failures[0]
+    row.failures = [row.failures[0].replace("Z)", " UTC)")]  # not ssh's line, nor the runner's
+    assert admin.connect_failed(Result(1, pc.render([row]) + "\n", ""), "zab-test", HOST) == ""
+
+
 def test_a_failed_push_config_says_why_from_its_row(tmp_path, monkeypatch):
     """#517: the error was stderr's last line, `1 VM(s) failed`; now it is the row's failures,
     or the last line of the output when there is no row (a crash, a timeout)."""

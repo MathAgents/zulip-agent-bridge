@@ -112,6 +112,22 @@ through its commands (ORGANIZERS §3):
   (`ForwardAgent=no`, `ForwardX11=no`), whatever `~/.ssh/config` says.
 - The VMs' host keys recorded once with `scan_hosts.py` (§0): every later connection pins them
   (`StrictHostKeyChecking=yes` against that `known_hosts` alone).
+- **A failed connect is tried again, to a VM that answered earlier in the run** (#1009).
+  `push_config.py`, `final_sync.py`, `trust_fix.py` and `provision_repos.py` try an `ssh` or
+  `scp` whose TCP connect failed (exit 255 with ssh's `ssh: connect to host … port 22:
+  Connection timed out`, `Connection refused` or `No route to host` alone, nothing on stdout)
+  twice more, 5 s and then 15 s later. ssh gives up on a connect after 15 s
+  (`ConnectTimeout=15`), so the third try begins about 50 s after the first, and a call to a
+  VM that stays dark fails after up to about 65 s (three tries of up to 15 s, and the two
+  waits), not 15 s; later calls to it fail at once. An exit 255 once the connection is up, a
+  connection cut mid-command among them, fails at once: it is not sent again, unless the
+  command itself printed ssh's connect line as all its stderr, which none of these scripts'
+  commands do. A VM that hasn't answered in the run (stopped, or a wrong address) fails at its
+  first try with no wait, as before, and so does one whose three tries failed, until it
+  answers again. A retry that connects is noted in the VM's row
+  (`note: ssh: connected on try 2 (try 1 began 09:31:05Z: Connection timed out)`), or on stderr
+  where the table has no notes; a failed connect says when it began, UTC (`(began 09:31:05Z)`,
+  or `(3 tries from 09:30:12Z)`), to match with the VM's journal. `status.py` doesn't retry.
 
 ## 0. `scan_hosts.py`, once, right after the launch
 
@@ -583,6 +599,31 @@ and its limits; `--uninstall` removes it.
 
   Otherwise name the rows whose waker is on: `--has-waker alice --has-waker bob`. The dry run
   shows each VM as a new one, with every step the defaults may take.
+- `--start-stopped N --region R --scope-tag KEY=VALUE…` (#995; the bot's `!rollout` passes it,
+  `--scope-tag` once per scope tag, as the `aws/` scripts' `--tag`): a row whose VM EC2 shows
+  stopped is started for its row, waited for until it lets an SSH login in, rolled out, then
+  stopped again at once, unless it was used since its start, as `idle_stop.py --in-use` reads
+  it on the VM: a turn or a message taken in since then (zab's activity), or a turn, a
+  background job or a login still open when it reads. A VM it can't read is left running too,
+  and after 3 of them in a row the run starts no more, and exits 3, or 4 if a row wasn't done
+  either; `--halted-in WORKSHOP`, which the admin bot gives the later workshops' runs of a plan
+  of every workshop after such an exit (#1031), starts none from the first row. A VM left running stays up for its idle
+  stop where that is on, and otherwise until someone stops it. At most N VMs that the run
+  started are being started, rolled out or checked at once; one left running gives its slot
+  back. A VM running, or started meanwhile by the waker, is left running; one stopping is
+  waited for, 5 minutes at most. A start that fails fails its row alone, and is never taken for
+  this run's: a VM EC2 then shows up (someone else's start, or this one's whose answer was lost)
+  is left running, its cell `start failed (…), VM up: left running`; one still stopped reads
+  `not started: …`, with `a start may still reach it: look at it` unless EC2 answered the error:
+  a server error (HTTP 5xx, such as `InternalError`) is no such answer, unless it says that the
+  VM had no capacity (`Insufficient…Capacity`) or the request was throttled
+  (`RequestLimitExceeded`, `EC2ThrottledException`; #1031).
+  A VM that lets no login in within 5 minutes of its start is stopped again. A line says each start and stop as
+  it happens; the table gets a `power` column, and a line under it counts the VMs started. Its
+  dry run reads no EC2 and prints one fixed line. It needs boto3 and the role's (or a
+  profile's) EC2 permissions, as `power.py`. **A run killed** (the admin bot's deadline, say)
+  leaves the VMs it started and hadn't stopped yet running, under the rollout's one-hour
+  idle-stop hold: read `status.py` (`!status all`), and stop those that shouldn't run.
 - `--uninstall` (§6).
 
 ## 3. `status.py`
@@ -630,6 +671,9 @@ FAIL`. Unreachable hosts are rows. Run it every 30 minutes during the workshop.
 zab version, idle stop (timer enabled and active, its minutes, the last verdict in
 `/var/log/zab-idle-stop.log`) and the last activity. The
 table is unchanged. `--tag KEY=VALUE` (repeatable) scopes the EC2 lookup, as in `workshop/aws/`.
+`--read-user-only` (#998) reads as `zab-monitor` alone, never as `ubuntu`, so that no read is a
+login idle stop counts, and leaves out a VM that user can't read: the admin server's collector
+sweeps the VMs whose idle stop may be on so (docs/ADMIN.md §4.1).
 
 ## 4. The roster: `roster.csv`
 
@@ -1046,16 +1090,26 @@ picks it up, so restart one.
 no shell on the server: `!trust-fix all`, or slugs. Its plan's dry run is this script's run
 without `--apply`, its approval the `--apply`, each as the bot's user with the fleet key, as
 below, and with `--admin-bot`: the dry run then exits 0 once its table is printed, so that a row
-`not reached` is shown in the plan rather than refusing it, and the apply fails on that row; the
-reruns it prints are `!trust-fix <slugs>`, and the other commands it prints, a deployer's,
+`not reached` is shown in the plan rather than refusing it; the bot also passes
+`--start-stopped 6 --region R --scope-tag K=V…` (#995; §2.4, as `push_config.py`'s), so the
+apply starts a stopped VM for its fix, six at a time, and stops it again once it is done, unless
+it was used since its start, its use can't be read, or its fix may still be running there (cut
+short, or apt-get killed mid-install; `FixResult.held`): then it is left running, its row says
+why, for its idle stop where that is on (a VM never rolled out has none) and otherwise until it
+is stopped; a `power` column and a line under the table say what became of each. A VM whose
+other commands under the table look into it over SSH (conda's transactions, the managed
+settings) is stopped again all the same, and those commands then begin with `!start <slug>`
+(#1031), so that a conda-forge outage, say, leaves no VM up. The reruns it prints are
+`!trust-fix <slugs>`, and the other commands it prints, a deployer's,
 start `sudo -u zab-admin`, for a shell on the server. With `--apply`, it prints a line per VM as
 it ends, `done: <slug> (<address>): <check> (<cells>)`, before the table: the bot's progress
-message shows the latest, and its deadline (60 minutes, or 2 minutes a row above 30) keeps the VMs done. The bot refuses it beside a `!rollout` or
+message shows the latest, and its deadline (60 minutes, or 2.5 minutes a row above 24) keeps the VMs done. The bot refuses it beside a `!rollout` or
 `!final-sync` of the same workshop, and those beside it (ADMIN §2.4 step 5). It doesn't take
 `--upgrade-left-pips`: that stays a hand run. The rest of this section reads the same for it.
 
-**First, start the VMs:** a stopped one is `not reached`. During a workshop, `!start all` through
-the bot (ORGANIZERS §2.4), or start only the rows you name; idle stop stops them again later.
+**By hand, first start the VMs:** a stopped one is `not reached`, unless the run has
+`--start-stopped` (above). During a workshop, `!start all` through the bot (ORGANIZERS §2.4), or
+start only the rows you name; idle stop stops them again later.
 Each `--apply` holds off the VM's idle stop while it works there (below). A spare is no roster
 row: it gets the fix after its `!adopt-spare`, with `--only <its slug>`. Until then its uv is the
 old one, and the adoption's own rollout went through it.

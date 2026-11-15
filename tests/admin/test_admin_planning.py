@@ -620,10 +620,10 @@ async def test_a_status_read_spanning_an_apply_never_voids_it(site, server, runn
     c.idle_changed["harvard-2026/alice"] = start + 60  # the apply, during the read
     ws = server.config.workshops[0]
     c.vms[ws.name] = [{"slug": "alice", "kind": "participant", "state": "running",
-                       "launched": start - 3600}]  # fmt: skip
-    assert c.due(ws, later) == []
+                       "launched": start - 3600, "instance": "i-1"}]  # fmt: skip
+    assert c.due(ws, later) == ([], ["alice"])  # as the read user alone (#998)
     c.idle_changed.clear()  # without the apply, the same read makes alice sweepable
-    assert c.due(ws, later) == ["alice"]
+    assert c.due(ws, later) == (["alice"], [])
 
 
 async def test_status_feeds_the_collector_and_quotes_its_cost(site, server, runner):

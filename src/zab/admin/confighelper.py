@@ -50,10 +50,22 @@ waits for this outcome, posts its result, then restarts itself to load the new e
 the starter restarts itself whenever admin.toml changes (§1.2). A restart from here would cut
 the bot's apply short.
 
+**A change of an existing entry** (`!set-workshop`, ADMIN §2.10, #1043) comes the same way:
+
+    {"version": 1, "plan": "P-43", "workshop": "mit-2027",
+     "set": {"ami": "ami-…", "gifts_step": "…" or null}, "was": {the same keys, as planned}}
+
+It sets `SETTABLE`'s keys alone, of one workshop, each to a new value (null removes
+`gifts_step`), and only while the entry holds what the plan read. The lines of those keys alone
+are rewritten in place (`_rewrite`: a `gifts_step` added goes after the workshop's own last
+key, before `[workshop.bot]`), every other line kept, comments included. Then the strict
+loader, and the new file's TOML must equal the old one's but for those values. No key is
+written; the record, the renames and the outcome are as above.
+
 **What it can't check.** The approvals live in the bot's `state.db`. A compromised `zab-admin`
-can therefore add a workshop with organizers it picks (§2.9, "The helper's residual risk"): the
-root-owned record of each change, and deploy.sh's diff of admin.toml against the deployer's copy,
-are what show it.
+can therefore add a workshop with organizers it picks, or change a workshop's image or gift step
+(§2.9, "The helper's residual risk"): the root-owned record of each change, and deploy.sh's diff
+of admin.toml against the deployer's copy, are what show it.
 """
 
 from __future__ import annotations
@@ -101,6 +113,19 @@ SUBTABLES = {
     "bot": ("zuliprc", "user_id", "email", "channels"),
     "aws": ("region", "ami", "security_group", "instance_types", "key_name", "admin_keys"),
 }
+#: The keys a change of an existing entry may set (#1043), each with its table in the entry, ""
+#: for the workshop's own: nothing else is ever changed. `gifts_step` alone may be removed.
+SETTABLE = {"ami": "aws", "gifts_step": ""}
+_CHANGE = frozenset({"version", "plan", "workshop", "set", "was"})
+#: A table's header line (`[[workshop]]`, `[workshop.aws]`), with blanks and a comment.
+_HEADER = re.compile(
+    r"[ \t]*(\[\[?)[ \t]*([A-Za-z0-9_-]+(?:[ \t]*\.[ \t]*[A-Za-z0-9_-]+)*+)[ \t]*\]\]?"
+    r"[ \t]*(?:#.*)?",
+    re.ASCII,
+)
+#: The one form of a line `_rewrite` replaces: after its key, a basic string, then at most a
+#: comment. Possessive repeats of groups, as tests/test_regex_memory.py requires.
+_STRING = r'([ \t]*=[ \t]*)"(?:[^"\\]|\\.)*+"([ \t]*(?:#.*)?)'
 
 
 class Refused(Exception):
@@ -131,6 +156,17 @@ class Request:
     @property
     def name(self) -> str:
         return self.entry["name"]
+
+
+@dataclass(frozen=True, slots=True)
+class Change:
+    """A change of one existing entry (#1043): `values`, the new ones, None for a `gifts_step`
+    removed; `was`, what its plan read, of the same keys."""
+
+    plan: str
+    name: str
+    values: dict[str, str | None]
+    was: dict[str, str | None]
 
 
 def take(paths: Any, owner: int, name: str = REQUEST) -> bytes | None:
@@ -193,20 +229,17 @@ def _remove(name: str, folder: int) -> None:
         pass
 
 
-def parse(data: bytes) -> Request:
+def parse(data: bytes) -> Request | Change:
     """The request, checked for shape; its key in canonical form."""
     try:
         found = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError):  # deep nesting too (#421's review)
         raise Refused("the request is not JSON") from None
+    if isinstance(found, dict) and set(found) == _CHANGE:
+        return _change(found)
     if not isinstance(found, dict) or set(found) != {"version", "plan", "entry", "zuliprc"}:
         raise Refused("the request has other keys than version, plan, entry and zuliprc")
-    if type(found["version"]) is not int or found["version"] != 1:  # not `true`, not 1.0
-        raise Refused("the request is not version 1, or names no plan")
-    if not isinstance(found["plan"], str):
-        raise Refused("the request is not version 1, or names no plan")
-    if not _PLAN.fullmatch(found["plan"]):
-        raise Refused("the request's plan is not P-<n>")
+    _plan(found)
     entry, key = found["entry"], found["zuliprc"]
     if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
         raise Refused("the request's entry is not a table with a name")
@@ -215,6 +248,34 @@ def parse(data: bytes) -> Request:
     if not isinstance(key, str):
         raise Refused("the request's zuliprc is not text")
     return Request(found["plan"], entry, canonical_zuliprc(key))
+
+
+def _plan(found: dict[str, Any]) -> str:
+    if type(found["version"]) is not int or found["version"] != 1:  # not `true`, not 1.0
+        raise Refused("the request is not version 1, or names no plan")
+    if not isinstance(found["plan"], str):
+        raise Refused("the request is not version 1, or names no plan")
+    if not _PLAN.fullmatch(found["plan"]):
+        raise Refused("the request's plan is not P-<n>")
+    return found["plan"]
+
+
+def _change(found: dict[str, Any]) -> Change:
+    """A change's request (module doc), checked for shape; the loader checks its values."""
+    plan, name, values, was = _plan(found), found["workshop"], found["set"], found["was"]
+    if not isinstance(name, str) or not _NAME.fullmatch(name):
+        raise Refused("the change's workshop is not a workshop name")
+    if not isinstance(values, dict) or not values or not isinstance(was, dict):
+        raise Refused("the change sets nothing")
+    if set(values) - set(SETTABLE) or set(was) != set(values):
+        raise Refused(f"a change sets {' or '.join(SETTABLE)} alone, and says what each was")
+    for key, value in values.items():
+        removable = key == "gifts_step"
+        if not all(isinstance(v, str) or (v is None and removable) for v in (value, was[key])):
+            raise Refused(f"the change's {key} is not text")
+        if value == was[key]:
+            raise Refused(f"the change's {key} is unchanged")
+    return Change(plan, name, dict(values), dict(was))
 
 
 def canonical_zuliprc(text: str) -> str:
@@ -303,6 +364,71 @@ def new_text(old: str, request: Request, paths: Paths) -> str:
     return text
 
 
+def changed_text(old: str, change: Change, paths: Paths) -> str:
+    """admin.toml with the change made (module doc), once every check passes: the workshop is
+    one of admin.toml's, its keys hold what the plan read, and the new file is the old one but
+    for those values."""
+    try:
+        before = parse_admin_config(old, paths.config, roots=paths.roots)
+    except AdminConfigError as exc:
+        raise Refused(f"the current admin.toml is refused: {exc}") from None
+    ws = before.workshop(change.name)
+    if ws is None:
+        raise Refused(f"{change.name} is no workshop of admin.toml: only an entry there changes")
+    now = {"ami": ws.aws.ami, "gifts_step": ws.gifts_step}
+    if any(now[key] != value for key, value in change.was.items()):
+        raise Refused(f"{change.name}'s entry changed since the plan: request it again")
+    index = before.workshops.index(ws)
+    text = _rewrite(old, index, change.values)
+    try:
+        parse_admin_config(text, paths.config, roots=paths.roots)
+    except AdminConfigError as exc:
+        raise Refused(f"the new admin.toml is refused: {exc}") from None
+    want = tomllib.loads(old)
+    entry = want["workshop"][index]
+    for key, value in change.values.items():
+        table = entry[SETTABLE[key]] if SETTABLE[key] else entry
+        if value is None:
+            del table[key]
+        else:
+            table[key] = value
+    if tomllib.loads(text) != want:
+        raise Refused("the new admin.toml would change more than these keys")
+    return text
+
+
+def _rewrite(old: str, index: int, values: dict[str, str | None]) -> str:
+    """`old` with the lines of `values`' keys in its `index`-th `[[workshop]]` rewritten, each a
+    one-line basic string in its table (`SETTABLE`), its comment kept; a `gifts_step` removed,
+    or added after the workshop's own last key, before its next table. Any other form is
+    refused, for a deployer to edit by hand; `changed_text` checks the result."""
+    lines, spans, count = old.split("\n"), dict[tuple[int, str], range](), -1
+    heads = [(i, m) for i, line in enumerate(lines) if (m := _HEADER.fullmatch(line))]
+    for n, (i, header) in enumerate(heads):  # each table of an entry: its lines
+        name = re.sub(r"[ \t]", "", header[2])
+        if header[1] == "[[" and name == "workshop":
+            count += 1
+        end = heads[n + 1][0] if n + 1 < len(heads) else len(lines)
+        if name == "workshop" or name.startswith("workshop."):
+            spans.setdefault((count, name.removeprefix("workshop").lstrip(".")), range(i + 1, end))
+    gone: set[int] = set()
+    for key, value in values.items():
+        span = spans.get((index, SETTABLE[key]), range(0))
+        at = [i for i in span if re.match(rf"[ \t]*{key}[ \t]*=", lines[i])]
+        line = re.fullmatch(rf"([ \t]*{key}){_STRING}", lines[at[0]]) if len(at) == 1 else None
+        new = json.dumps(value, ensure_ascii=False)  # a JSON string is a TOML basic string
+        if line is not None and value is None:
+            gone.add(at[0])
+        elif line is not None:
+            lines[at[0]] = f"{line[1]}{line[2]}{new}{line[3]}"
+        else:  # neither blank nor a comment: the last is the table's last key, or its end
+            keys = [i for i in span if lines[i].strip() and not lines[i].lstrip().startswith("#")]
+            if at or value is None or key != "gifts_step" or not keys:
+                raise Refused(f'{key} is not a line `{key} = "…"` of the entry: edit it by hand')
+            lines[keys[-1]] += f"\n{key} = {new}"
+    return "\n".join(line for i, line in enumerate(lines) if i not in gone)
+
+
 def request_keys(config: AdminConfig, name: str) -> tuple[str, ...]:
     """The break-glass key files the workshop `name` names."""
     found = config.workshop(name)
@@ -350,32 +476,53 @@ def _replace(path: str, data: bytes, mode: int) -> None:
 
 
 def apply(
-    request: Request, paths: Paths, key_group: int, now: float | None = None
+    request: Request | Change, paths: Paths, key_group: int, now: float | None = None
 ) -> tuple[str, str]:
-    """Add the entry (module doc): the new admin.toml's SHA-256, and a warning ("" for none)
-    when something failed after the change was made."""
+    """Add the entry, or make the change (module doc): the new admin.toml's SHA-256, and a
+    warning ("" for none) when something failed after the change was made."""
     with open(paths.config, encoding="utf-8") as f:  # root's own file: the loader reads it so
         old = f.read()
+    if isinstance(request, Change):  # #1043: no key; old → new, a `gifts_step` in full
+        changes = {k: {"old": request.was[k], "new": v} for k, v in request.values.items()}
+        fields = {"event": "set-workshop", "plan": request.plan, "workshop": request.name,
+                  "changes": changes}  # fmt: skip
+        return _install(paths, old, changed_text(old, request, paths), fields, now)
     text = new_text(old, request, paths)
     name = request.name
     key = f"{name}.zuliprc"
     if os.path.lexists(f"{paths.keys}/{key}"):
         raise Refused(f"{paths.keys}/{key} exists: a deployer removes it first")
-    config_dir, config_name = os.path.split(paths.config)
     try:
         _write_new(paths.keys, key, request.zuliprc.encode("ascii"), 0o640, key_group)
     except OSError as exc:
         raise Refused(f"the key was not written: {exc.strerror}") from None
+    fields = {
+        "event": "new-workshop",
+        "plan": request.plan,
+        "workshop": request.name,
+        "organizers": request.entry.get("organizers", []),
+        "bot": request.entry["bot"].get("user_id"),
+    }
+    return _install(paths, old, text, fields, now, f"{paths.keys}/{key}")
+
+
+def _install(
+    paths: Paths, old: str, text: str, fields: dict[str, Any], now: float | None, key: str = ""
+) -> tuple[str, str]:
+    """`text` as admin.toml, the old file kept as admin.toml.bak, and the record (module doc);
+    `key`, the new bot's key written already, goes too if it fails."""
+    config_dir, config_name = os.path.split(paths.config)
     new, bak = paths.config + ".new", paths.config + ".bak.new"
+    staged = (key, new, bak) if key else (new, bak)
     try:  # everything that can fail, before the record and the two renames
         for leftover in (new, bak):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(leftover)
         _write_new(config_dir, config_name + ".new", text.encode("utf-8"), 0o644)
         os.link(paths.config, bak)  # the old file, kept as admin.toml.bak
-        _record(paths, request, old, text, now)
+        _record(paths, fields, old, text, now)
     except OSError as exc:
-        for leftover in (f"{paths.keys}/{key}", new, bak):
+        for leftover in staged:
             with contextlib.suppress(OSError):
                 os.unlink(leftover)
         raise Refused(f"admin.toml was not written: {exc.strerror}") from None
@@ -385,31 +532,27 @@ def apply(
         os.replace(bak, paths.config + ".bak")
         os.replace(new, paths.config)
     except OSError as exc:  # admin.toml is as it was; the record says otherwise: said
-        for leftover in (f"{paths.keys}/{key}", new, bak):
+        for leftover in staged:
             with contextlib.suppress(OSError):
                 os.unlink(leftover)
         why = f"admin.toml was not written: {exc.strerror} (changes.jsonl has a line for it)"
         raise Refused(why) from None
     try:  # the change is made: what fails from here is said, never a refusal (review of #421)
-        for directory in (config_dir, paths.keys):
+        for directory in (config_dir, paths.keys) if key else (config_dir,):
             _sync(directory)
     except OSError as exc:
         return _sha256(text), f"the directories' fsync failed: {exc.strerror}"
     return _sha256(text), ""
 
 
-def _record(paths: Paths, request: Request, old: str, text: str, now: float | None) -> None:
+def _record(paths: Paths, fields: dict[str, Any], old: str, text: str, now: float | None) -> None:
     """A line of `changes.jsonl`, root's (module doc): the change, by its digests. Whole or not
     at all (Codex round 2 on #421): a short write is continued, and a failure cuts the file back
     to its length before, so no torn line is left for the next one to follow. One helper runs at
     a time (a oneshot), so that length is the file's."""
     record = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
-        "event": "new-workshop",
-        "plan": request.plan,
-        "workshop": request.name,
-        "organizers": request.entry.get("organizers", []),
-        "bot": request.entry["bot"].get("user_id"),
+        **fields,
         "before_sha256": _sha256(old),
         "after_sha256": _sha256(text),
     }
@@ -453,6 +596,8 @@ def run(paths: Paths, owner: int, key_group: int) -> int:
         plan, name = request.plan, request.name
         digest, warning = apply(request, paths, key_group)
         said = f"{name} added to admin.toml; admin.toml.bak kept"
+        if isinstance(request, Change):  # #1043
+            said = f"{name}'s entry changed in admin.toml; admin.toml.bak kept"
         outcome = {"ok": True, "message": said + (f"; but {warning}" if warning else "")}
         outcome["admin_toml_sha256"] = digest
     except Refused as exc:

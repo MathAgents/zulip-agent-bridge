@@ -15,6 +15,12 @@
 # and places it after the deploy, under the same confirmation; a run that ends before the wheel
 # is placed says whether the release was deployed, and prints the --wheel command to paste.
 #
+# An upgrade restarts the bots, which interrupts the plans in flight (docs/ADMIN.md §2.4 step 6,
+# #989). So the server half, once the release is built and before anything is installed, waits
+# for any plan applying or approved, up to --plan-wait MINUTES (default 15; 0 refuses at once),
+# then refuses, and names the plans pending or being planned. --interrupt-plans REASON skips
+# the wait, for a plan that is stuck: the deploy record keeps REASON and the plans it cut.
+#
 # After a deployer key is replaced (docs/BOOTSTRAP.md §17), --base-signers FILE holds the retired
 # keys' allowed_signers lines, which the base may be signed by, never the release deployed (#587).
 # The base must then be the release the server runs, at the commit its own deploy record names,
@@ -56,6 +62,9 @@ FILE_RE='^[A-Za-z0-9_.][A-Za-z0-9._@+-]*(/[A-Za-z0-9_.][A-Za-z0-9._@+-]*)*$' # e
 HEX_RE='^[0-9a-f]{40}([0-9a-f]{24})?$'
 SHA_RE='^[0-9a-f]{64}$'
 HOST_RE='^[A-Za-z0-9_][A-Za-z0-9._@-]*$'
+WAIT_RE='^(0|[1-9][0-9]?|1[01][0-9]|120)$'                     # --plan-wait's minutes (#989)
+REASON_RE='^[A-Za-z0-9][A-Za-z0-9 ._,:;()#+=/@-]{0,199}$'       # --interrupt-plans': JSON as is
+CUT_RE='^(unknown|(P-[1-9][0-9]{0,8}( P-[1-9][0-9]{0,8})*)?)$' # the plans it cut, for the record
 # uv on the server, the version VERIFY V9 was checked with: its release tarballs' SHA-256. Its
 # built-in roots lack emSign ECC Root CA - G3, which 0.13.3 and earlier hold (#816).
 UV_VERSION=0.13.7
@@ -667,14 +676,14 @@ build_wheel() {
 
 laptop_main() {
   local review='' since='' etc='' secrets='' bootstrap=0 downgrade=0 wheel=0 running base=''
-  local base_commit='' f expect='' with_wheel=0 what base_signers='' signers
+  local base_commit='' f expect='' with_wheel=0 what base_signers='' signers plan_wait='' interrupt=''
   OUT=. HOST='' REPO='' V='' TMP='' REMOTE_TMP='' PAGE=1 WHEEL_SHA='' WHEEL_DUE=0 DEPLOYED=0 WHEEL_CMD=''
   SSH=${ZAB_DEPLOY_SSH:-ssh}
   RP=${ZAB_DEPLOY_PREFIX:-} # tests only: the server's paths under a temporary root
   while [ $# -gt 0 ]; do
     case $1 in
       # an empty value is none: never an option silently left as its default (#772)
-      --review | --since | --etc | --secrets | --host | --repo | --out | --expect-diff-sha256 | --base-signers) if [ $# -lt 2 ] || [ -z "$2" ]; then die "$1 needs a value"; fi ;;
+      --review | --since | --etc | --secrets | --host | --repo | --out | --expect-diff-sha256 | --base-signers | --plan-wait | --interrupt-plans) if [ $# -lt 2 ] || [ -z "$2" ]; then die "$1 needs a value"; fi ;;
     esac
     case $1 in
       --review) review=$2 && shift ;;
@@ -693,6 +702,14 @@ laptop_main() {
         ;;
       --with-wheel) with_wheel=1 ;;
       --base-signers) base_signers=$2 && shift ;;
+      --plan-wait)
+        [[ $2 =~ $WAIT_RE ]] || die "--plan-wait: minutes, from 0 to 120: $2"
+        plan_wait=$2 && shift
+        ;;
+      --interrupt-plans)
+        [[ $2 =~ $REASON_RE ]] || die "--interrupt-plans: a reason of letters, digits, spaces and ._,:;()#+=/@- (200 at most)"
+        interrupt=$2 && shift
+        ;;
       -*) die "unknown option $1" ;;
       *) [ -z "$V" ] || die "one release at a time" && V=$1 ;;
     esac
@@ -719,8 +736,8 @@ laptop_main() {
   if [ -n "$review" ]; then
     # A host only with --base-signers, whose base the review checks against what HOST runs
     [[ -z $V && (-z $HOST || -n $base_signers) ]] || die "--review takes a commit, not a release or a host"
-    [[ -z $expect && $with_wheel == 0 ]] ||
-      die "--expect-diff-sha256 and --with-wheel go with a deploy, not --review"
+    [[ -z $expect$plan_wait$interrupt && $with_wheel == 0 ]] ||
+      die "--expect-diff-sha256, --with-wheel, --plan-wait and --interrupt-plans go with a deploy, not --review"
     base_commit=
     [ -z "$base_signers" ] || [ -n "$since" ] || die "--base-signers: a review's base is --since's"
     if [ -n "$base_signers" ]; then
@@ -772,7 +789,7 @@ laptop_main() {
   g show "$commit:workshop/adminserver/deploy.sh" >"$TMP/payload/deploy.sh"
   g bundle create -q "$TMP/payload/release.bundle" "refs/tags/$V"
   if [ "$wheel" = 1 ]; then
-    [[ $bootstrap$downgrade$with_wheel == 000 && -z $since$expect$base_signers ]] || die "--wheel goes alone"
+    [[ $bootstrap$downgrade$with_wheel == 000 && -z $since$expect$base_signers$plan_wait$interrupt ]] || die "--wheel goes alone"
     build_wheel "$TMP/payload"
     MANIFEST=$(tree_of | sha256)
     confirm "place it on $HOST for !rollout"
@@ -786,6 +803,7 @@ laptop_main() {
     running=
     [ "$bootstrap" = 1 ] || die "$HOST runs no release: --bootstrap first"
     [ -z "$base_signers" ] || die "--base-signers: a bootstrap has no base"
+    [ -z "$plan_wait$interrupt" ] || die "--plan-wait, --interrupt-plans: a bootstrap has no plan"
     [[ -n $secrets && -d $secrets ]] || die "--bootstrap needs --secrets DIR"
     [ -f "$etc/backup_recipients" ] || die "$etc/backup_recipients: the deployers' backup keys (§1.7)"
   else
@@ -795,6 +813,12 @@ laptop_main() {
     [[ $running =~ $VERSION_RE ]] || die "$HOST runs $running, not a release"
     [ "$V" != "$running" ] || die "$HOST already runs $V"
     ! older "$V" "$running" || [ "$downgrade" = 1 ] || die "$V is older than $running, which $HOST runs: --downgrade"
+    # A release from before the check (#989), a downgrade's say, runs its own server half, which
+    # has none: it would refuse --plan-wait, and never see --interrupt-plans.
+    if ! g cat-file -e "$commit:src/zab/admin/inflight.py" 2>/dev/null; then
+      [ -z "$plan_wait$interrupt" ] || die "$V has no check of the plans in flight (#989): it takes neither --plan-wait nor --interrupt-plans"
+      note "Note: $V has no check of the plans in flight (#989): its deploy restarts the bots whatever they apply. Send !plans to every bot first, and wait for the result of any apply under way (BOOTSTRAP §13.4)."
+    fi
   fi
   base=${since:-$running}
   if [ -n "$base" ]; then
@@ -839,6 +863,8 @@ laptop_main() {
   local -a flags=()
   [ "$bootstrap" = 0 ] || flags+=(--bootstrap)
   [ "$downgrade" = 0 ] || flags+=(--downgrade)
+  [ -z "$plan_wait" ] || flags+=(--plan-wait "$plan_wait") # only when given: an older server half has none
+  [ -z "$interrupt" ] || printf '%s\n' "$interrupt" >"$TMP/payload/interrupt-plans" # never on a command line
   if [ "$with_wheel" = 1 ]; then # from here until it is placed, any exit says what to run for it
     printf -v WHEEL_CMD '%q ' "$(cd "$(dirname "$0")" && pwd)/${0##*/}" --repo "$REPO" --host "$HOST" \
       --etc "$etc" --wheel "$V"
@@ -1298,7 +1324,7 @@ record() {
 
 server_main() {
   local commit='' manifest='' base=- diff=- bootstrap=0 downgrade=0 wheel='' wheel_sha='' running=''
-  local build_wheel=0
+  local build_wheel=0 plan_wait='' interrupt='' cut=''
   local kind f
   V='' PAYLOAD='' BUILDING='' WORK='' CONSOLE_HOST='' REL='' IN_BAND='' WHEEL_BUILD=''
   while [ $# -gt 0 ]; do
@@ -1318,6 +1344,7 @@ server_main() {
       --wheel) wheel=$2 ;;
       --wheel-sha256) wheel_sha=$2 ;;
       --in-band) IN_BAND=$2 ;; # !upgrade-server's plan, from its apply helper (#569)
+      --plan-wait) plan_wait=$2 ;; # minutes (#989)
       *) die "unknown option $1" ;;
     esac
     shift 2
@@ -1328,6 +1355,8 @@ server_main() {
   [[ -z $IN_BAND || ($bootstrap == 0 && -z $wheel) ]] || die "--in-band is an upgrade's alone"
   [[ $build_wheel == 0 || ($bootstrap$downgrade == 00 && -z $wheel$IN_BAND && $base$diff == --) ]] ||
     die "--build-wheel goes alone"
+  [[ -z $plan_wait || ($plan_wait =~ $WAIT_RE && $bootstrap$build_wheel == 00 && -z $IN_BAND$wheel) ]] ||
+    die "bad arguments"
   [[ -d $PAYLOAD && -f $PAYLOAD/release.bundle ]] || die "no payload"
   PAYLOAD=$(cd "$PAYLOAD" && pwd) # absolute: the server half works from "/"
   PREFIX=${ZAB_DEPLOY_PREFIX:-}
@@ -1357,6 +1386,10 @@ server_main() {
   mkdir "$WORK/home"
   export HOME=$WORK/home XDG_CONFIG_HOME=$WORK/home # no root dotfile reaches git or anything else
   take_payload
+  if [ -e "$PAYLOAD/interrupt-plans" ]; then # --interrupt-plans' reason (#989), never in a command line
+    interrupt=$(<"$PAYLOAD/interrupt-plans")
+    [[ $interrupt =~ $REASON_RE && $bootstrap$build_wheel == 00 && -z $IN_BAND$wheel ]] || die "bad arguments"
+  fi
   if [ "$bootstrap" = 1 ]; then
     if [ -e "$OPT/current" ] || [ -L "$OPT/current" ]; then die "already bootstrapped"; fi
     priv env DEBIAN_FRONTEND=noninteractive apt-get -q update
@@ -1420,6 +1453,24 @@ server_main() {
   imds_active
   REL=$OPT/releases/$V
   build "$REL"
+  # The plans in flight, which the bots' restart below would interrupt (ADMIN §2.4 step 6, #989),
+  # from this release's zab.admin.inflight as zab-admin, which reads state.db read-only and takes
+  # the bot's lock only as a probe, shared, for an instant: it waits for a plan applying or
+  # approved, then refuses (a Ctrl-C takes effect only when the wait ends, and stops it). Before
+  # anything is installed, so that a refusal leaves the server as it was. In-band, the bot holds
+  # every workshop's lock for the upgrade's own plan, which applies now; a bootstrap has no bot.
+  if [ "$bootstrap" = 0 ] && [ -z "$IN_BAND" ]; then
+    local -a how=(--wait "$((${plan_wait:-15} * 60))")
+    [ -z "$interrupt" ] || how=(--report)
+    if cut=$(as_user zab-admin "$REL/.venv/bin/python" -I -B -m zab.admin.inflight --state-dir "$VAR" "${how[@]}"); then
+      [[ $cut =~ $CUT_RE ]] || die "the plans check printed something other than plan IDs"
+    elif [ -n "$interrupt" ]; then
+      cut=unknown
+      note "The plans check failed (above): going on, as --interrupt-plans says."
+    else
+      die "a plan is applying or approved, or state.db can't be read (above): nothing was deployed. Deploy again once its result is posted, or, for a plan that is stuck, with --interrupt-plans REASON, which the deploy record keeps"
+    fi
+  fi
   # Every step before `current` moves: a failure removes REL and leaves `current` as it was (none,
   # for a bootstrap), and the running release's units as they were, so the same command can run
   # again. Each step is idempotent. The new release's units are installed and loaded only after
@@ -1434,7 +1485,7 @@ server_main() {
   # The record goes with the switch, before the restart: it always names the release `current`
   # points to. A unit that then fails to start is an operational fault, retried by hand (#338).
   record "$([ "$bootstrap" = 1 ] && echo bootstrap || echo upgrade)" \
-    ",\"from\":\"${running:--}\",\"base\":\"$base\",\"diff_sha256\":\"$diff\",\"downgrade\":$([ "$downgrade" = 1 ] && echo true || echo false)${IN_BAND:+,\"plan\":\"$IN_BAND\"}"
+    ",\"from\":\"${running:--}\",\"base\":\"$base\",\"diff_sha256\":\"$diff\",\"downgrade\":$([ "$downgrade" = 1 ] && echo true || echo false)${IN_BAND:+,\"plan\":\"$IN_BAND\"}${interrupt:+,\"interrupt_plans\":\"$interrupt\",\"interrupted\":\"$cut\"}"
   install_units "$REL/workshop/adminserver" || units_failed "$REL/workshop/adminserver"
   restart
 }

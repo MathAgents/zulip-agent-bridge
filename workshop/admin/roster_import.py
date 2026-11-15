@@ -107,6 +107,7 @@ RESERVED_SLUGS = frozenset(
     {"all", "spares", "hold", "protect", "lean-shared", "restart-codex"}
     | {"invites-only", "no-invite", "unsynced", "steer", "idle-stop", "multi-party", "raw-log"}
     | {"export"}  # !retire's (#559)
+    | {"every-workshop"}  # the server's bot's selection of every workshop (#995)
 )
 _WORKSHOP_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 MAX_UPLOAD_BYTES = 1 << 20  # the bot downloads at most 1 MB (§3.1)

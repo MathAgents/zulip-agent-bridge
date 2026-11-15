@@ -117,11 +117,17 @@ def connect_failure(result: Result, host: str) -> str:
     return causes[0]
 
 
+#: What the admin scripts' runner adds to that line: when its first try began (#1009,
+#: `admin_common.ConnectRetry`).
+_BEGAN = r"(?: \((?:began|[0-9]+ tries from) [0-9]{2}:[0-9]{2}:[0-9]{2}Z\))?"
+
+
 def connect_line(line: str, host: str) -> bool:
     """Whether `line` is ssh's own line for a TCP connect to `host` that failed (`ssh: connect to
     host <host> port 22: Connection timed out`, …): the command never ran. For a line another
-    program kept of ssh's stderr, such as a failure in push_config's table (#690)."""
-    return bool(_failure_forms(host)[0].fullmatch(line.strip()))
+    program kept of ssh's stderr, such as a failure in push_config's table (#690), which also
+    says when the connect began (`_BEGAN`)."""
+    return bool(re.fullmatch(_failure_forms(host)[0].pattern + _BEGAN, line.strip()))
 
 
 def say(line: str) -> None:

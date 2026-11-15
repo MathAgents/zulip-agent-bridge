@@ -27,7 +27,7 @@ import subprocess
 import tarfile
 import time
 import tomllib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 from urllib.parse import quote
 
@@ -286,6 +286,16 @@ async def test_a4_launch_and_protect(scenario, tester, rigged, server, aws, nonc
             lambda value: value == "stop", what=f"{slug}'s shutdown behavior, stop",
         )  # fmt: skip
     assert re.search(r"\b2 matched the console\b", text), "scan_hosts did not verify both keys"
+    # #1007: each root volume was created at launch.py's initialization rate, 200 MiB/s
+    roots = [
+        m["Ebs"]["VolumeId"]
+        for inst in vm_states(aws).values()
+        for m in inst.get("BlockDeviceMappings") or []
+        if (m.get("Ebs") or {}).get("VolumeId")
+    ]
+    volumes = aws.aws.ec2("describe_volumes", VolumeIds=roots)["Volumes"]
+    rates = sorted(v.get("VolumeInitializationRate") or 0 for v in volumes)
+    assert rates == [200, 200], f"the root volumes' initialization rates: {rates}"
     pinned = server.read(f"/var/lib/zab-admin/ws/{E2E.name}/out/known_hosts").splitlines()
     assert len({line.split()[0] for line in pinned if line.strip()}) == 2, "known_hosts"
     DONE["participants"] = [inst["InstanceId"] for inst in vms.values()]
@@ -816,6 +826,25 @@ FULL_DISK = re.compile(
 )
 
 
+#: The collector's unit on the server, which writes the snapshot that the bots' automatic growth
+#: of a filling disk reads (#998, ADMIN §3.4).
+COLLECTOR = "zab-admin-collector.service"
+
+
+@contextlib.contextmanager
+def collector_held(server: Any) -> Iterator[None]:
+    """The collector stopped, then started again, whatever happens (#998). A `!status` answered
+    meanwhile goes to its reads file, where only a VM's newest read counts at its next pass:
+    so a disk that a `!status` reads at 85% or more, then read again below it before the end,
+    never reaches the snapshot, and the bots never grow it. A6's fill stays A6's, and A21 still
+    finds `zab-test-a`'s volume unmodified (A26's module doc)."""
+    server.run(["sudo", "systemctl", "stop", COLLECTOR])
+    try:
+        yield
+    finally:
+        server.run(["sudo", "systemctl", "start", COLLECTOR])
+
+
 def on_vm(server: Any, ip: str, *remote: str) -> Any:
     """`remote` on the fleet VM at `ip`, from the server (`ON_VM`): its `Result`."""
     return server.as_admin("/usr/bin/python3", "-I", "-c", ON_VM, E2E.name, ip, *remote,
@@ -854,30 +883,36 @@ async def test_a6_a_full_disk_names_its_free_space(scenario, tester, rigged, ser
     its root file system to about 93%; `!status zab-test-a` names the disk under strain with
     its free space, `df`'s Available in binary GB. The file is removed whatever happens, and
     checked gone; a `!status` after that shows the disk under no strain. Needs no provisioning
-    (Q9): the disk is status.py's read, as `zab-monitor` or `ubuntu`."""
+    (Q9): the disk is status.py's read, as `zab-monitor` or `ubuntu`. The collector is held
+    from before the fill to after that last `!status` (`collector_held`, #998): the bots'
+    automatic growth reads its snapshot, and would otherwise grow the volume of a disk past
+    85% within minutes, which A21 then couldn't grow for 6 hours (A26)."""
     t = talk(tester, rigged, E2E.name, f"e2e-A6-disk-{nonce}")
     ip = ip_of(server, A)
     _, used, available, _ = df_of(server, ip)
-    try:
-        made = on_vm(server, ip, "fallocate", "-l", f"{fill_kib(used, available)}KiB", FILL)
-        assert made.ok, f"fallocate: exit {made.returncode}: {made.stderr.strip()[-300:]}"
-        before = df_of(server, ip)
-        assert before[3] >= 90, f"{A}'s disk at {before[3]}% after the fill"
+    with collector_held(server):
+        try:
+            made = on_vm(server, ip, "fallocate", "-l", f"{fill_kib(used, available)}KiB", FILL)
+            assert made.ok, f"fallocate: exit {made.returncode}: {made.stderr.strip()[-300:]}"
+            before = df_of(server, ip)
+            assert before[3] >= 90, f"{A}'s disk at {before[3]}% after the fill"
+            asked = await t.ask(f"!status {A}", STATUS_ANSWER, within=PLAN_S)
+            answer = await whole(tester, asked)
+            after = df_of(server, ip)
+            found = FULL_DISK.search(answer)
+            assert found, f"no disk under strain with its free space: {answer[:800]}"
+            free = {pages.disk_gb(df[2] * 1024) for df in (before, after)}  # df's, around it
+            assert int(found[1]) >= 90 and found[2] in free, (found[0], before, after)
+            scenario.notes.append(f"{A}'s disk filled to {before[3]}%: `{found[0][2:]}` (#552)")
+        finally:
+            removed = on_vm(server, ip, "rm", "-f", "--", FILL)
+            gone = on_vm(server, ip, "test", "-e", FILL)
+            assert removed.ok and gone.returncode == 1, (
+                f"{FILL} may remain on {A} ({ip}): rm exit {removed.returncode}, test -e exit "
+                f"{gone.returncode}; remove it by hand"
+            )
+        # below 85% now: the collector's next pass takes this read, the newest, not the fill's
         answer = await whole(tester, await t.ask(f"!status {A}", STATUS_ANSWER, within=PLAN_S))
-        after = df_of(server, ip)
-        found = FULL_DISK.search(answer)
-        assert found, f"no disk under strain with its free space: {answer[:800]}"
-        free = {pages.disk_gb(df[2] * 1024) for df in (before, after)}  # df's, around the read
-        assert int(found[1]) >= 90 and found[2] in free, (found[0], before, after)
-        scenario.notes.append(f"{A}'s disk filled to {before[3]}%: `{found[0][2:]}` (#552)")
-    finally:
-        removed = on_vm(server, ip, "rm", "-f", "--", FILL)
-        gone = on_vm(server, ip, "test", "-e", FILL)
-        assert removed.ok and gone.returncode == 1, (
-            f"{FILL} may remain on {A} ({ip}): rm exit {removed.returncode}, test -e exit "
-            f"{gone.returncode}; remove it by hand"
-        )
-    answer = await whole(tester, await t.ask(f"!status {A}", STATUS_ANSWER, within=PLAN_S))
     assert "GB free" not in answer, f"the disk still under strain: {answer[:800]}"
 
 

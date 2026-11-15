@@ -460,6 +460,35 @@ def die_by(sig: int) -> int:
     return 128 + sig
 
 
+def pending(pid: int) -> list[int]:
+    """The signals of `IGNORED` waiting, blocked, in process `pid`: its `SigPnd` and `ShdPnd`
+    in `/proc/PID/status`, hexadecimal masks whose bit n-1 is signal n; none if unreadable."""
+    mask = 0
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key in ("SigPnd", "ShdPnd"):
+                mask |= int(value, 16)
+    except (OSError, ValueError):
+        return []
+    return [sig for sig in IGNORED if mask >> (sig - 1) & 1]
+
+
+def gate() -> None:
+    """The job's process between its fork and its exec (`preexec_fn`), while the wrapper waits
+    in `Popen` with the signals of `IGNORED` blocked (#1020). They go back to their defaults
+    and are unblocked here, so that one sent to this process, at the fork or since, ends it now,
+    before the job runs, and one sent later reaches the job. One sent before the fork reached
+    the wrapper alone and waits there: this process takes it on, and the job never runs. So a
+    stop reaches the job exactly once, or ends it before it runs, however soon it comes."""
+    with contextlib.suppress(Exception):  # an exception here would fail the job's start
+        for sig in IGNORED:
+            signal.signal(sig, signal.SIG_DFL)
+        for sig in pending(os.getppid()):
+            os.kill(os.getpid(), sig)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, IGNORED)
+
+
 def run_job(directory: Path, *, cap: int = LOG_CAP) -> int:
     """`zab job _exec`, the unit's main process: the job's argument list run with no shell, with
     stdin `/dev/null`, in its directory, with its own environment; its stdout and stderr copied
@@ -469,18 +498,25 @@ def run_job(directory: Path, *, cap: int = LOG_CAP) -> int:
     Signals: a stop (`zab job stop`, `!stop`) and the cap (`RuntimeMaxSec`) send TERM to every
     process of the unit (`KillMode=control-group`), so the job gets it directly, exactly once,
     and a TERM handler that saves its work runs once. The wrapper takes no action on TERM, INT
-    or HUP (a handler of its own that does nothing, which the job's exec resets to the
+    or HUP (a handler of its own that does nothing, which the job's process resets to the
     default) and waits for the job; after `TimeoutStopSec` systemd kills what is left. A
     signal sent to the wrapper alone (`kill <MainPID>`, `systemctl --user kill
     --kill-whom=main`) therefore does nothing: stop a job with `zab job stop`. (Passing
     signals on, as Codex rounds 3 and 4 on #928 had it, delivered a second TERM into every stop
-    and cap: a bash trap ran twice, and a Python save handler re-entered; review round 2.)"""
+    and cap: a bash trap ran twice, and a Python save handler re-entered; review round 2.)
+
+    Until the job's process is forked, the wrapper keeps them blocked, and that process, before
+    its exec, takes on any that waits in the wrapper (`gate`): a stop that comes as the job
+    starts, before the job's process exists, ends it before it runs. Taken by the handler, it
+    would have stopped nothing, and the job would have run on until systemd's SIGKILL (#1020).
+    There, a signal sent to the wrapper alone can't be told from a stop, and ends the job too."""
     job = Job.load(directory)
     if job is None:
         print(f"zab job _exec: no job in {directory}", file=sys.stderr)
         return 2
+    signal.pthread_sigmask(signal.SIG_BLOCK, IGNORED)  # until the fork: `gate`
     for sig in IGNORED:
-        signal.signal(sig, lambda *_: None)  # a handler, reset in the job at its exec
+        signal.signal(sig, lambda *_: None)  # a handler, reset to the default in `gate`
     fd = os.open(job.log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     # unbuffered: a failed write fails at once, in `copy`, and nothing is left for the close to
     # flush and fail on, which would replace the job's status (Codex round 5 on #928)
@@ -489,12 +525,14 @@ def run_job(directory: Path, *, cap: int = LOG_CAP) -> int:
         try:
             child = subprocess.Popen(  # noqa: S603 - the job's own argument list, no shell
                 job.argv, cwd=job.cwd, env=job.env, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, preexec_fn=gate,
             )  # fmt: skip
         except OSError as exc:
             with contextlib.suppress(OSError):
                 out.write(f"zab: can't run {job.argv[0]!r} in {job.cwd}: {exc.strerror}\n".encode())
             return 127
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, IGNORED)  # the job's process was forked
         assert child.stdout is not None
         copy(child, child.stdout.fileno(), out, cap)
         code = child.wait()

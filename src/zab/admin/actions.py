@@ -341,6 +341,9 @@ class Action:
     #: The apply's deadline in seconds when it isn't the verb's (`runner.TIMEOUTS`): `!retire`'s
     #: grows with its rows (#559).
     timeout: float | None = None
+    #: A plan of every workshop (#995, `zab.admin.fleetwide`): each workshop's own action, which
+    #: its apply runs in turn; its `steps` are theirs, one after the other.
+    parts: tuple[Action, ...] = ()
 
     @property
     def dry_runs(self) -> tuple[Argv, ...]:
@@ -607,38 +610,104 @@ def _build_protect(j: _Job) -> tuple[Step, ...]:
 
 #: `!trust-fix`'s apply deadline (#992): an hour, or this much a row, whichever is more. A VM
 #: takes 12 minutes at worst short of a hang: apt's lock waited out twice (300 s each, after a
-#: `!start all`, which then blocks the later steps), or apt, then conda's two installs, a few
-#: minutes each; trust_fix.py runs six at a time (`--parallel`), so 2 minutes a row.
-TRUST_FIX_FLOOR_S, TRUST_FIX_ROW_S = 3600, 120
+#: start, which then blocks the later steps), or apt, then conda's two installs, a few minutes
+#: each. A stopped one is started first and stopped after (#995): a minute or two as a rule, and
+#: up to about 12 more at worst (`power.START_WAIT_S` for a VM stopping and again for its start,
+#: then the use check's 2). trust_fix.py runs six at a time (`--parallel`), so 2.5 minutes a row
+#: gives each VM 15 minutes: the fix's 12-minute worst case with a usual start and stop, not
+#: every row's worst.
+TRUST_FIX_FLOOR_S, TRUST_FIX_ROW_S = 3600, 150
+#: The stopped VMs a trust fix has started at once (#995): its own six SSH workers.
+TRUST_FIX_AT_ONCE = 6
 
 
 def _build_trust_fix(j: _Job) -> tuple[Step, ...]:
     """trust_fix.py (#992; workshop/admin/README.md §10): its run without `--apply` is the plan's
     dry run. `--admin-bot`: that dry run shows a row not reached, a stopped VM most often, rather
-    than failing the plan, as `!rollout`'s plan shows one; the apply fails on it, and prints each
-    VM's outcome as it ends. Its deadline grows with its rows (`TRUST_FIX_ROW_S`)."""
-    argv = j.run("admin/trust_fix.py", j.roster, j.kh, "--admin-bot", _only(j.slugs))
+    than failing the plan; the apply starts it for its fix and stops it again (#995,
+    `--start-stopped`, as `!rollout`'s), and prints each VM's outcome as it ends. Its deadline
+    grows with its rows (`TRUST_FIX_ROW_S`)."""
+    power = _starts_stopped(j, TRUST_FIX_AT_ONCE)
+    argv = j.run("admin/trust_fix.py", j.roster, j.kh, "--admin-bot", power, _only(j.slugs))
     j.timeout = float(max(TRUST_FIX_FLOOR_S, len(j.slugs) * TRUST_FIX_ROW_S))
     j.notes.append(
         "**The trust fix** (workshop/admin/README.md §10) gives each VM the current image's "
-        "trust stores; a VM takes a minute or a few, six at a time. A row `not reached` (a VM "
-        "stopped, as the status shows) is left as it is, and fails the apply: `!start` it, then "
-        "`!trust-fix` it again."
+        "trust stores; a VM takes a minute or a few, six at a time. A VM stopped now (`start, "
+        "then stop` under `power`) is `not reached` in the dry run: the apply starts it for its "
+        "fix, at most six at a time, and stops it again once it is done, unless it was used "
+        "since its start (a turn or a message taken in since then, or a background job or a "
+        "login still open), its use can't be read, or its fix may still be running there (cut "
+        "short, or apt killed mid-install): then it is left running, for its idle stop where "
+        "that is on (a VM never rolled out has none), and otherwise until `!stop`. The "
+        "commands under the result's table for a VM stopped again begin with `!start`."
     )
     return (Step(_cat(argv, "--apply"), argv),)
+
+
+#: A stopped VM started for its row and stopped again after it (#995): at most this many at once,
+#: push_config.py's own SSH workers (`--parallel`'s default), each workshop's rollout in turn.
+START_AT_ONCE = 8
+#: `!rollout`'s apply deadline (#995): 30 minutes, or a minute a row, whichever is more. A row
+#: takes about 2 minutes, 8 at a time; a stopped one adds its start and stop, a minute or two as a
+#: rule, and up to about 12 at worst (`power.START_WAIT_S` for a VM stopping and again for its
+#: start, then the use check's 2): the deadline covers the usual case, not every row's worst.
+ROLLOUT_FLOOR_S, ROLLOUT_ROW_S = 1800, 60
+STARTS_STOPPED = (
+    "**Stopped VMs** (`power` in the status table): each is started for its row at the apply, "
+    f"at most {START_AT_ONCE} at a time, then stopped again as soon as its row is done, unless "
+    "it was used since its start (a turn or a message taken in since then, or a background job "
+    "or a login still open) or its use can't be read: then it is left running, for its idle "
+    "stop where that is on, and otherwise until `!stop`. A VM running stays running. Decided at "
+    "the apply, VM by VM, from EC2's state then; the result's `power` column says what became "
+    "of each."
+)
+
+
+def _starts_stopped(j: _Job, at_once: int) -> Argv:
+    """push_config.py's and trust_fix.py's `--start-stopped` (#995), with the workshop's region
+    and every scope tag: `power.StartStop`."""
+    scope = _cat(*(("--scope-tag", _value(f"{k}={v}")) for k, v in j.fleet.workshop.tags))
+    return ("--start-stopped", str(at_once), *j.region, *scope)
+
+
+#: push_config.py's and trust_fix.py's exits when their `--start-stopped` halted its starts: the
+#: use of `power.UNREAD_LIMIT` VMs in a row that it started couldn't be read (#1031). The first
+#: with every row done all the same: the apply's later steps still run, and the ledger takes it
+#: as an exit 0 (`fleet.ApplyEnd.halted`); the second with a row not done, as an exit 1.
+#: (`admin_common.HALTED_EXIT` and `HALTED_FAILED_EXIT`, which a test holds equal.)
+STARTS_HALTED, STARTS_HALTED_FAILED = 3, 4
+#: The scripts that exit so, as `runner.script` names them.
+HALTING = ("admin/push_config.py", "admin/trust_fix.py")
+
+
+def halt_starts(part: Action, where: str) -> Action:
+    """A part of a plan of every workshop (#995, `zab.admin.fleetwide`) as its apply runs it once
+    the part of workshop `where` has halted its starts (`STARTS_HALTED…`, #1031): each step that
+    starts stopped VMs gets `--halted-in WHERE`, and starts none, so that a use check broken on
+    every VM leaves up the VMs of one workshop, not of each. Its rows of a stopped VM are refused
+    `not started: …`, and the others run as approved. Never hashed: it only starts fewer VMs."""
+    steps = tuple(
+        dataclasses.replace(step, argv=_cat(step.argv, "--halted-in", _value(where)))
+        if "--start-stopped" in step.argv else step
+        for step in part.steps
+    )  # fmt: skip
+    return dataclasses.replace(part, steps=steps)
 
 
 def _build_rollout(j: _Job) -> tuple[Step, ...]:
     """push_config.py with the release and the command's words, then the targets' status. Each
     of `lean-shared` and `idle-stop=` left out is its default (#704), which the plan's notes say;
     the rows whose waker is on are read from its config (`waker_rows`) and named, so that one
-    opted in or out between plan and apply makes the plan STALE."""
+    opted in or out between plan and apply makes the plan STALE. A stopped VM is started for
+    its row and stopped again (#995, `STARTS_STOPPED`), so the deadline grows with the rows."""
     c = j.command
     lean, idle = "lean-shared" not in c.keywords, c.idle_stop is None
     woken = waker_rows(f"{j.layout.waker}/config.toml", j.fleet.workshop.name) if idle else None
     defaults = _defaults(j, lean=lean, idle=idle, woken=woken or {})
-    push = _push(j, j.wheel(c.version), j.flags(), defaults, _only(j.slugs))
-    j.notes += _default_notes(j, lean=lean, idle=idle, woken=woken)
+    power = _starts_stopped(j, START_AT_ONCE)
+    push = _push(j, j.wheel(c.version), j.flags(), defaults, power, _only(j.slugs))
+    j.notes += [*_default_notes(j, lean=lean, idle=idle, woken=woken), STARTS_STOPPED]
+    j.timeout = float(max(ROLLOUT_FLOOR_S, len(j.slugs) * ROLLOUT_ROW_S))
     return (_dry(push, "--parallel", "1"), Step(_status(j, j.slugs)))
 
 
@@ -811,6 +880,16 @@ def _build_grow_disk(j: _Job) -> tuple[Step, ...]:
     size = ("--size", _gigabytes(j.command.size))
     slug = ("--slug", _value(j.command.slug))
     return (_dry(j.run("aws/grow_disk.py", j.roster, j.kh, j.tags, j.region, slug, size)),)
+
+
+def auto_grow(fleet: Fleet, slug: str, cap: int, instance: str, *, layout: Layout = LAYOUT) -> Argv:
+    """The automatic growth's argument list (#998, `autogrow`): `!grow-disk`'s apply for one row,
+    built and checked as its plan's is, with `--auto-cap` in place of `--size`, and the VM
+    whose disk was read, `--expect-instance` (Codex round 3 on #1003)."""
+    command = Command("grow-disk", slug=slug, size=cap)
+    argv = build(command, fleet, layout=layout).steps[0].argv
+    at = argv.index("--size")
+    return (*argv[:at], "--auto-cap", *argv[at + 1 :], "--expect-instance", _value(instance))
 
 
 #: How far ahead `!keep-until` may set a kept VM's end (ADMIN §11.5): a month, extended a few
@@ -1273,6 +1352,9 @@ VERBS: dict[str, Verb] = {
     # the server's (§2.9): `zab.admin.newworkshop` builds it, from admin.toml, with no fleet;
     # hashed on its dry run, which names the entry, the people and the region's setup
     "new-workshop": Verb(_server_verb, DRY_RUN, normalize=normalize_dry_run),
+    # #1043: `zab.admin.setworkshop` builds it, from admin.toml; hashed on its dry run whole,
+    # each line old and new and the image's checks, so a newer image makes it STALE
+    "set-workshop": Verb(_server_verb, DRY_RUN, normalize=normalize_exact),
     # #569, §1.6: `zab.admin.upgradeserver` builds it; hashed on its dry run whole, the plan
     # helper's text (both tags, the reviewed SHA-256, the privileged diff), which names no time
     "upgrade-server": Verb(_server_verb, DRY_RUN, normalize=normalize_exact),
@@ -1283,6 +1365,7 @@ KEEP_EXCLUDED = frozenset({"status", "roster remove", "roster restore", "roster 
 BOT_VERBS = frozenset(
     {"help", "version", "plans", "plan", "audit", "console", "roster show", "approve", "reject"}
     | {"month-end show", "month-end cancel"}  # the schedule's reading and its veto (#570)
+    | {"show-workshop"}  # a workshop's entry, as the bots loaded it (#1043)
 )
 #: Bare keywords → their fixed flags (§2.3).
 KEYWORD_FLAGS: dict[str, dict[str, Argv]] = {

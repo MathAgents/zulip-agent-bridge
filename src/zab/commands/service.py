@@ -56,6 +56,15 @@ RESTART_BACKOFF = (5, 120)  # RestartSteps, RestartMaxDelaySec
 #: available". `nofile_limit` keeps it within the user manager's hard limit.
 CODEX_NOFILE = 65536
 _NOFILE_LINE = re.compile(r"^LimitNOFILE=.*\n", re.MULTILINE)
+#: The agents' commands run in their backend's unit: a Claude turn's under `zab.service`, whose
+#: process starts each `claude`, and a Codex turn's under the daemon's. systemd's default,
+#: `OOMPolicy=stop`, stops a whole unit when the kernel's OOM killer kills any one of its
+#: processes: an agent's Magma or Sage job killed for memory took the bridge and every Claude
+#: turn with it, or the daemon and every Codex turn. With `continue` the job alone ends, and its
+#: turn sees it killed (#997; SPEC §13.3). The manager reads it from the unit at its reload, so a
+#: running daemon needs no restart for it (systemd 255, DECISIONS, 2026-11-08).
+OOM_POLICY = "OOMPolicy=continue\n"
+_RELOADED_LINE = re.compile(r"^(?:LimitNOFILE|OOMPolicy)=.*\n", re.MULTILINE)
 SCRUB = (
     "OPENAI_API_KEY",
     "CODEX_ACCESS_TOKEN",
@@ -119,9 +128,15 @@ def nofile_limit() -> int:
     return min(caps)
 
 
-def limit_only(old: str, new: str) -> bool:
-    """Whether a unit's text changed in its `LimitNOFILE=` line alone (#664)."""
-    return old != new and _NOFILE_LINE.sub("", old) == _NOFILE_LINE.sub("", new)
+def reload_only(old: str, new: str) -> bool:
+    """Whether a unit's text changed only in lines that a running daemon gets without a restart:
+    its `LimitNOFILE=` (`raise_limit`, #664) and its `OOMPolicy=` (the reload, #997)."""
+    return old != new and _RELOADED_LINE.sub("", old) == _RELOADED_LINE.sub("", new)
+
+
+def limit_changed(old: str, new: str) -> bool:
+    """Whether a unit's `LimitNOFILE=` line changed (#664)."""
+    return _NOFILE_LINE.findall(old) != _NOFILE_LINE.findall(new)
 
 
 def limit_note(name: str, nofile: int) -> str:
@@ -178,6 +193,7 @@ def units(config: Config, *, nofile: int = CODEX_NOFILE) -> dict[str, str]:
             + "\n"
             + environment
             + f"Environment={quote('CODEX_HOME=' + home)}\n"
+            + OOM_POLICY
             + f"LimitNOFILE={nofile}\n"
             + "Restart=on-failure\nRestartSec=5\n[Install]\nWantedBy=default.target\n"
         )
@@ -201,6 +217,7 @@ def units(config: Config, *, nofile: int = CODEX_NOFILE) -> dict[str, str]:
         )
         + "\n"
         + bridge_environment
+        + OOM_POLICY
         + "Restart=on-failure\nRestartSec=5\n"
         + "RestartSteps={}\nRestartMaxDelaySec={}\n".format(*RESTART_BACKOFF)
         + "KillMode=mixed\nTimeoutStopSec=30\n"
@@ -304,12 +321,13 @@ def main(argv: list[str]) -> int:
                     )
                     if state.returncode != 0:
                         continue
-                    # a Codex daemon whose unit gained only its open-file limit is not restarted,
-                    # which would end its running turns: `prlimit` gives it the limit (#664)
-                    if name.startswith("codex-app-server") and limit_only(
-                        path.read_text(), rendered[name]
-                    ):
-                        limited.append(name)
+                    # a Codex daemon whose unit changed only in its open-file limit or its OOM
+                    # policy is not restarted, which would end its running turns: `prlimit`
+                    # gives it the limit (#664), the reload below the policy (#997)
+                    old = path.read_text()
+                    if name.startswith("codex-app-server") and reload_only(old, rendered[name]):
+                        if limit_changed(old, rendered[name]):
+                            limited.append(name)
                     else:
                         changed_active.append(name)
             directory.mkdir(parents=True, exist_ok=True)

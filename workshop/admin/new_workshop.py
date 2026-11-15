@@ -164,6 +164,21 @@ def region_setup(
         setup.problems.append(
             f"{count} named {GROUP} and tagged {text} in {region}: exactly one is needed"
         )
+    setup.image = newest_image(ec2, region, scope, setup)
+    if setup.image and setup.group:
+        what = f"the role may launch {instance_type} from them in {region}"
+        may_launch(ec2, setup, setup.image["ImageId"], setup.group["GroupId"], instance_type,
+                   tags, what)  # fmt: skip
+    return setup
+
+
+def newest_image(
+    ec2: Any, region: str, scope: dict[str, str], setup: Setup
+) -> dict[str, Any] | None:
+    """The region's newest available image carrying the fleet's `scope`, as a line of `setup`,
+    or None, with the problem: the one place it is picked, for `!new-workshop` and for
+    `!set-workshop ami=newest` (#1043). Two made at the same time are refused, both named."""
+    text = scope_text(scope)
     images = sorted(ec2.find_images(scope), key=lambda image: image.get("CreationDate") or "")
     newest = [i for i in images if i.get("CreationDate") == images[-1].get("CreationDate")]
     if len(newest) > 1:  # never a silent pick between two (review of #423): a person decides
@@ -172,24 +187,33 @@ def region_setup(
             f"{len(newest)} images tagged {text} in {region} are the newest, made "
             f"{images[-1].get('CreationDate') or '?'}: {named}: untag all but one"
         )
-    elif images:
-        setup.image = images[-1]
-        more = f", the newest of {len(images)}" if len(images) > 1 else ""
-        setup.found.append(
-            f"image {setup.image['ImageId']} ({setup.image.get('Name') or 'unnamed'}, made "
-            f"{setup.image.get('CreationDate') or '?'}){more}, tagged {text}"
-        )
-    else:
+        return None
+    if not images:
         setup.problems.append(f"no available image tagged {text} in {region}")
-    if setup.image and setup.group:
-        specs = [{"ResourceType": kind, "Tags": tag_list(tags)} for kind in ("instance", "volume")]
-        code = ec2.dry_run(
-            "run_instances", ImageId=setup.image["ImageId"], InstanceType=instance_type,
-            SecurityGroupIds=[setup.group["GroupId"]], TagSpecifications=specs, MinCount=1,
-            MaxCount=1,
-        )  # fmt: skip
-        _dry(setup, code, f"the role may launch {instance_type} from them in {region}")
-    return setup
+        return None
+    more = f", the newest of {len(images)}" if len(images) > 1 else ""
+    setup.found.append(f"image {image_line(images[-1])}{more}, tagged {text}")
+    return images[-1]
+
+
+def image_line(image: dict[str, Any]) -> str:
+    """`ami-… (its name, made its date)`."""
+    name, made = image.get("Name") or "unnamed", image.get("CreationDate") or "?"
+    return f"{image['ImageId']} ({name}, made {made})"
+
+
+def may_launch(
+    ec2: Any, setup: Setup, image: str, group: str, instance_type: str, tags: dict[str, str],
+    what: str,
+) -> None:  # fmt: skip
+    """A DryRun launch of `instance_type` from `image` in `group`, tagged `tags` (V12), said in
+    `setup` as `what`."""
+    specs = [{"ResourceType": kind, "Tags": tag_list(tags)} for kind in ("instance", "volume")]
+    code = ec2.dry_run(
+        "run_instances", ImageId=image, InstanceType=instance_type, SecurityGroupIds=[group],
+        TagSpecifications=specs, MinCount=1, MaxCount=1,
+    )  # fmt: skip
+    _dry(setup, code, what)
 
 
 def key_pair_setup(ec2: Any, setup: Setup, name: str, key: str, tags: dict[str, str]) -> None:
@@ -586,15 +610,34 @@ def make_zulip(ws: Workshop, admin: ZulipAdmin, s: Survey) -> tuple[dict[str, An
     return bot, ids
 
 
+@dataclass(frozen=True)
+class Words:
+    """How the waits word what a request does: `!new-workshop`'s adds an entry, with the new
+    bot's key; `!set-workshop`'s changes one (`set_workshop.CHANGES`, #1043)."""
+
+    may: str = "the entry may be added"
+    none: str = "nothing was added"
+    held: str = " with the new bot's key,"
+
+
+ADDS = Words()
+
+
 def send_request(ws: Workshop, entry: dict, zuliprc: str, folder: str, result: str) -> int:
     """The helper's request (module doc, step 4), then its outcome for this plan: 0 when it
     added the entry."""
-    target = pathlib.Path(folder) / "request.json"
     body = {"version": 1, "plan": ws.plan, "entry": entry, "zuliprc": zuliprc}
+    return submit(ws.plan, body, folder, result)
+
+
+def submit(plan: str, body: dict, folder: str, result: str, words: Words = ADDS) -> int:
+    """`body` to the helper as `request.json` in `folder`, then its outcome for `plan`: 0 when it
+    applied the request. `!set-workshop`'s change goes this way too (#1043)."""
+    target = pathlib.Path(folder) / "request.json"
     earlier = _stamp(result)  # the helper replaces the file: an outcome must be a new one
     tmp = pathlib.Path(folder) / f"request.{os.getpid()}.new"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:  # it holds the bot's key: never left behind half-written (review of #423)
+    try:  # a new bot's key: never left behind half-written (review of #423)
         with os.fdopen(fd, "w", encoding="ascii") as f:
             json.dump(body, f, ensure_ascii=True)
         # in one step, never over another request, with one link always (#898's Codex round 1)
@@ -608,15 +651,15 @@ def send_request(ws: Workshop, entry: dict, zuliprc: str, folder: str, result: s
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
-    outcome = _outcome(ws, target, result, earlier, WAIT)
+    outcome = _outcome(plan, target, result, earlier, WAIT)
     if outcome is None:
-        return withdraw(ws, target, result, earlier)
+        return withdraw(plan, target, result, earlier, words)
     print(f"the config helper: {outcome.get('message')}")
     return 0 if outcome.get("ok") is True else 1
 
 
 def _outcome(
-    ws: Workshop, target: pathlib.Path, result: str, earlier: Any, seconds: float
+    plan: str, target: pathlib.Path, result: str, earlier: Any, seconds: float
 ) -> dict | None:
     """The helper's outcome of this request within `seconds`: a `result.json` written after it
     (Codex on #423: never an earlier one, of this plan or not), naming this plan, or none, which
@@ -632,38 +675,40 @@ def _outcome(
             outcome = json.loads(pathlib.Path(result).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(outcome, dict) or outcome.get("plan") not in (ws.plan, None):
+        if not isinstance(outcome, dict) or outcome.get("plan") not in (plan, None):
             continue
-        if outcome.get("plan") == ws.plan:
+        if outcome.get("plan") == plan:
             return outcome
         if not os.path.lexists(target):
             return {**outcome, "ok": False}
     return None
 
 
-def withdraw(ws: Workshop, target: pathlib.Path, result: str, earlier: Any) -> int:
-    """No outcome in time: the request, which holds the bot's key, is taken back, so that a late
-    helper never applies a plan reported failed (review of #423). By a rename, as the helper
+def withdraw(
+    plan: str, target: pathlib.Path, result: str, earlier: Any, words: Words = ADDS
+) -> int:
+    """No outcome in time: the request, which may hold the bot's key, is taken back, so that a
+    late helper never applies a plan reported failed (review of #423). By a rename, as the helper
     claims one (`zab.admin.confighelper.take`): of the two renames exactly one finds it."""
     withdrawn = target.with_name(f"request.{os.getpid()}.withdrawn")
     try:
         os.rename(target, withdrawn)
     except FileNotFoundError:  # the helper has it: its outcome may still come
-        outcome = _outcome(ws, target, result, earlier, LATE)
+        outcome = _outcome(plan, target, result, earlier, LATE)
         if outcome is not None:
             print(f"the config helper, late: {outcome.get('message')}")
             return 0 if outcome.get("ok") is True else 1
         waited = f"{WAIT + LATE:.0f} s"
-        print(f"the config helper took the request but said nothing within {waited}: the entry "
-              f"may be added: read {result} and journalctl -u zab-admin-config")  # fmt: skip
+        print(f"the config helper took the request but said nothing within {waited}: "
+              f"{words.may}: read {result} and journalctl -u zab-admin-config")  # fmt: skip
         return 1
     except OSError as exc:
-        print(f"the request could not be withdrawn ({exc.strerror}): it is still pending, with "
-              f"the new bot's key, at {target}: a deployer removes it, or the helper applies it "
+        print(f"the request could not be withdrawn ({exc.strerror}): it is still pending,"
+              f"{words.held} at {target}: a deployer removes it, or the helper applies it "
               "when it next runs (journalctl -u zab-admin-config)")  # fmt: skip
         return 1
     try:
-        ours = json.loads(withdrawn.read_text(encoding="ascii")).get("plan") == ws.plan
+        ours = json.loads(withdrawn.read_text(encoding="ascii")).get("plan") == plan
     except (OSError, ValueError, AttributeError):
         ours = False
     if not ours:  # never: the bot sends one request at a time; put back, never over another
@@ -681,7 +726,7 @@ def withdraw(ws: Workshop, target: pathlib.Path, result: str, earlier: Any) -> i
     with contextlib.suppress(OSError):
         os.unlink(withdrawn)
     print(f"the config helper said nothing within {WAIT:.0f} s: the request is withdrawn, and "
-          "nothing was added: journalctl -u zab-admin-config")  # fmt: skip
+          f"{words.none}: journalctl -u zab-admin-config")  # fmt: skip
     return 1
 
 

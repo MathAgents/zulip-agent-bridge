@@ -9,7 +9,6 @@ rig's repository over git's `file` transport (`Paths.fetch_url`, the tests' seam
 """
 
 import contextlib
-import copy
 import dataclasses
 import hashlib
 import json
@@ -22,7 +21,6 @@ import ssl
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 
 import pytest
@@ -39,13 +37,17 @@ from workshop.test_adminserver_deploy import (
     call,
     reviewed_sha256,
     run_in_unit,
+    served,
     systemctl_log,
 )
 from workshop.test_adminserver_deploy import bootstrapped as bootstrapped  # the fixtures
 from workshop.test_adminserver_deploy import index as index
 from zab.admin import upgradehelper as uh
 
-pytestmark = pytest.mark.skipif(bool(_tools_missing()), reason=_tools_missing() or "ok")
+pytestmark = [
+    pytest.mark.skipif(bool(_tools_missing()), reason=_tools_missing() or "ok"),
+    pytest.mark.deploy_rig,  # a pull request runs it in CI's rigs (3.12) job (#988)
+]
 SERVER = DEPLOY.parent
 REPO = "git@github.com:Example/zab.git"
 NONCE = "0123456789abcdef0123456789abcdef"
@@ -782,13 +784,7 @@ def test_the_plan_helper_plans_under_its_units_filters(server, tmp_path):
 def installed(bootstrapped, request):
     """A server bootstrapped with v0.3.0 by deploy.sh in its test rig (`ZAB_DEPLOY_PREFIX`): a
     copy of `bootstrapped`'s, its own, as `test_adminserver_deploy.server` makes it."""
-    rig, template = bootstrapped
-    name = re.sub(r"\W", "_", request.node.name)[:40]
-    if rig.tmp.exists():  # a copy that failed part way, before its test
-        rig.tmp.rename(tempfile.mkdtemp(prefix=f"{name}-before-", dir=rig.tmp.parent))
-    shutil.copytree(template, rig.tmp, symlinks=True)
-    yield copy.deepcopy(rig)
-    rig.tmp.rename(tempfile.mkdtemp(prefix=f"{name}-", dir=rig.tmp.parent))
+    yield from served(bootstrapped, request)
 
 
 #: What deploy.sh's server half needs from the rig's environment, unprivileged.
@@ -1010,8 +1006,10 @@ def test_an_apply_request_names_its_commit(server):
     ],
 )
 def test_a_request_is_read_by_its_patterns_alone(server, change, why):
+    """Refused before the review: so `sha256` need not be the review's, which would take a run of
+    deploy.sh --review per case (#988)."""
     server.rig.release("v0.3.1")
-    refused(server.plan(**change), why)
+    refused(server.plan(**{"sha256": "0" * 64, **change}), why)
 
 
 @pytest.mark.parametrize(

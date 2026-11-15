@@ -397,6 +397,17 @@ async def test_a_resumed_session_with_a_stopped_background_task_delivers_its_ans
     await backend.close()
 
 
+@pytest.fixture
+def short_eof_grace(monkeypatch):
+    """A turn's grace for its pipes after the CLI exits, `eof_grace_s`: 1 s, not 5 s. The tests
+    of a lingering holder wait it out, and what they check is that the turn ends at it, well
+    before the holder's 60 s (#988)."""
+    for method in (cb.ClaudeTurn.objects, cb.ClaudeTurn.wait):
+        assert method.__kwdefaults__["eof_grace_s"] == 5.0
+        monkeypatch.setitem(method.__kwdefaults__, "eof_grace_s", 1.0)
+
+
+@pytest.mark.usefixtures("short_eof_grace")
 async def test_lingering_grandchild_does_not_hold_the_turn(home, tmp_path):
     """issue #36: after the CLI exits, waiting for stdout EOF is bounded (§9.6)."""
     script = tmp_path / "linger"
@@ -427,6 +438,7 @@ async def test_lingering_grandchild_does_not_hold_the_turn(home, tmp_path):
     assert done.final_text == "ok"
 
 
+@pytest.mark.usefixtures("short_eof_grace")
 async def test_lingering_grandchild_on_stderr_does_not_hold_the_turn(home, tmp_path):
     """codex round 1 on PR #49: a holder of stderr only is killed after the grace too."""
     script = tmp_path / "linger_err"

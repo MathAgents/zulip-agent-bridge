@@ -38,7 +38,7 @@ GENESIS = "0" * 64
 EVENTS = frozenset(
     "request plan refused unchanged foreign approval reject expired stale apply_start apply_end"
     " interrupted upgrade backup read console_login wake_check config waker month_end"
-    " retire_step".split()
+    " retire_step plan_end disk_grow".split()
 )  # §2.8
 _RESERVED = frozenset({"seq", "ts", "event", "prev"})
 # `SEQ:HEX`, or a head pasted as posted: `audit #SEQ · chain HEX`.

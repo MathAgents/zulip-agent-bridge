@@ -2,8 +2,9 @@
 the bots of `botkit` with the real `Runner`, as in `test_admin_runner.py`, running the real
 `workshop/admin/trust_fix.py` (its `main`) with its SSH answered by fake VMs, as
 `test_admin_runner.ADOPT` runs `adopt_spare.py`. The plan is its dry run, a row per VM; the
-approval applies it, and the result names each row's outcome; a stopped VM is shown, never
-started, and fails the apply; `!reject` drops it. The trust fix and a rollout or a final sync
+approval applies it, and the result names each row's outcome; a stopped VM is shown `not
+reached`, then started for its fix and stopped again (#995), through `power.StartStop` with a
+fake EC2; `!reject` drops it. The trust fix and a rollout or a final sync
 of one workshop never run beside each other. The script's own flag is tested in
 `tests/workshop/test_trust_fix.py`."""
 
@@ -44,20 +45,67 @@ assert site and server  # fixtures, used by name
 ADMIN = str(Path(__file__).resolve().parents[2] / "workshop" / "admin")
 #: trust_fix.py itself, run by its `main`, its SSH to the VMs answered here: each VM reports as
 #: one of the Oct 19 image would, its uv and Claude Code's store older at a dry run, fixed at
-#: an apply. A VM whose address `STATE` lists `down` isn't reached, as a stopped one isn't;
-#: with `STATE`'s `gate`, an apply waits there until `go`.
+#: an apply. A VM whose address `STATE` lists `down` is stopped, and isn't reached until the
+#: fake EC2 starts it (#995), which logs each start and stop to `STATE`'s `ec2`; nobody used
+#: it since (`idle_stop.py --in-use`'s answer). With `STATE`'s `gate`, an apply waits there
+#: until `go`.
 REAL = """
 sys.path.insert(0, ADMIN)
+import admin_common
+import idle_stop
+import power
 import trust_fix
 from admin_common import RunResult
 
 STATE = json.loads(pathlib.Path(STATE_FILE).read_text())
+SLUGS = {"198.51.100.1": "alice", "198.51.100.2": "bob", "203.0.113.5": "erin"}
+UP = {ip for ip in SLUGS if ip not in STATE["down"]}
+UNUSED = {"now": 1e9, "uptime": 60.0, "turns": 0, "activity": None, "jobs": 0, "logins": []}
+
+
+class Ec2:
+    def __init__(self, scope):
+        self.scope = scope
+
+    def find_instances(self, tags, states):
+        return [{"InstanceId": f"i-{ip[-1]}", "PublicIpAddress": ip,
+                 "State": {"Name": "running" if ip in UP else "stopped"},
+                 "Tags": [{"Key": k, "Value": v}
+                          for k, v in {**self.scope, "participant": slug}.items()]}
+                for ip, slug in SLUGS.items()]
+
+    def _log(self, verb, ids):
+        with open(STATE["ec2"], "a") as f:
+            f.write(verb + " " + " ".join(ids) + chr(10))
+
+    def start(self, ids):  # EC2's answer: each one's state before (review of #1026, N1)
+        self._log("start", ids)
+        before = [{"InstanceId": i, "PreviousState": {"Name": "running" if ip in UP else
+                   "stopped"}} for ip in SLUGS if (i := f"i-{ip[-1]}") in ids]
+        UP.update(ip for ip in SLUGS if f"i-{ip[-1]}" in ids)
+        return before
+
+    def stop(self, ids):
+        self._log("stop", ids)
+        UP.difference_update(ip for ip in SLUGS if f"i-{ip[-1]}" in ids)
+
+
+def start_stop(opts, rows, runner, *, log):
+    scope = dict(tag.split("=", 1) for tag in opts.scope_tag)
+    kh = opts.known_hosts
+    return power.StartStop(
+        Ec2(scope), scope, rows, at_once=opts.start_stopped, log=log, answers=lambda ip: True,
+        sleep=lambda s: None, unread_reasons=idle_stop.UNREAD, halted_in=opts.halted_in or "",
+        in_use=lambda row: admin_common.vm_in_use(runner, admin_common.host_of(row), kh),
+    )
 
 
 def ssh(argv, *, timeout_s=120.0, env=None, stdin=None):
     host, remote = argv[argv.index("--") - 1].removeprefix("ubuntu@"), argv[-1]
-    if host in STATE["down"]:
+    if host not in UP:
         return RunResult(255, "", f"ssh: connect to host {host} port 22: Connection timed out")
+    if remote == admin_common.IN_USE_CMD:
+        return RunResult(0, json.dumps(UNUSED) + chr(10), "")
     if not remote.startswith(trust_fix.REMOTE_CMD):  # an apply's probe
         return RunResult(0, "", "")
     apply = "--apply" in remote.split()
@@ -82,6 +130,7 @@ def ssh(argv, *, timeout_s=120.0, env=None, stdin=None):
 
 
 trust_fix.subprocess_runner = ssh
+trust_fix.start_stop = start_stop
 sys.exit(trust_fix.main(sys.argv[1:]))
 """
 #: status.py's answer (schema 1): alice running, bob as `BOB` gives.
@@ -94,12 +143,16 @@ print(json.dumps({{"schema": 1, "vms": vms, "summary": {{}}, "ec2_error": None}}
 """
 BOB_IP = "198.51.100.2"
 NOT_REACHED = f"not reached: ssh: connect to host {BOB_IP} port 22: Connection timed out"
+#: ... and the time its one try began, UTC (#1009): bob never answered, so no retry.
+NOT_REACHED_AT = re.compile(re.escape(NOT_REACHED) + r" \(began \d\d:\d\d:\d\dZ\)$")
 
 
 def trust_fix(site, *, down=(), gate=None, hang=()) -> None:
     state = site.tmp / "trust-fix-state.json"
-    gated = str(gate) if gate else ""
-    state.write_text(json.dumps({"down": list(down), "gate": gated, "hang": list(hang)}))
+    gated, ec2 = str(gate) if gate else "", str(site.tmp / "ec2.log")
+    state.write_text(
+        json.dumps({"down": list(down), "gate": gated, "hang": list(hang), "ec2": ec2})
+    )
     fake(site, "admin/trust_fix.py", f"ADMIN, STATE_FILE = {ADMIN!r}, {str(state)!r}\n{REAL}")
 
 
@@ -149,7 +202,9 @@ async def test_the_plan_is_the_dry_run_of_each_row_with_a_vm(site, server):
     assert (plan.requirement, plan.targets) == (Requirement(CHANGE), ("alice", "bob"))
     text = posts(site)[-2]
     dry = text.split("**Dry run**", 1)[1].split("**Status**", 1)[0]
-    assert "── admin/trust_fix.py\nparticipant  host " in dry
+    assert "── admin/trust_fix.py\nstopped VMs: each started for its row, at most 6" in dry
+    assert "\nparticipant  host " in dry  # the dry run's table, with no power column (#995)
+    assert "power" not in dry.split("\nparticipant  host ", 1)[1].split("\n", 1)[0]
     for slug in ("alice", "bob"):  # carol has no VM: `all` is the rows with one
         found = row(dry, slug)
         assert "0.13.2: would install 0.13.7" in found and found.endswith("FAILED"), found
@@ -157,7 +212,10 @@ async def test_the_plan_is_the_dry_run_of_each_row_with_a_vm(site, server):
     assert "**The trust fix** (workshop/admin/README.md §10)" in text
     (argv,) = runs(site)  # the plan's run: no --apply, and as the bot runs it
     assert "--apply" not in argv and "--admin-bot" in argv
-    assert " ".join(argv).endswith("--admin-bot --only alice --only bob")
+    scope = "--scope-tag workshop=harvard-2026 --scope-tag zab-scope=mathagents"
+    assert " ".join(argv).endswith(
+        f"--admin-bot --start-stopped 6 --region us-west-2 {scope} --only alice --only bob"
+    )
     assert [c["script"] for c in calls(site)] == ["admin/trust_fix.py", "admin/status.py"]
 
 
@@ -172,7 +230,7 @@ async def test_approved_it_applies_and_its_result_names_each_rows_outcome(site, 
     for slug in ("alice", "bob"):
         found = row(result, slug)
         assert "0.13.2 -> 0.13.7" in found and "unset -> system" in found, found
-        assert found.endswith("  ok"), found
+        assert re.search(r"  ok +running$", found), found  # both running: left so (#995)
     assert "\n2 VM(s) fixed and checked\n── admin/trust_fix.py exited 0" in result
     # a reconciler: the apply runs no dry run again, only the apply itself
     assert ["--apply" in argv for argv in runs(site)] == [False, True]
@@ -180,27 +238,32 @@ async def test_approved_it_applies_and_its_result_names_each_rows_outcome(site, 
     assert (end["verb"], end["targets"], end["exit"]) == ("trust-fix", ["alice", "bob"], 0)
 
 
-async def test_a_stopped_row_is_shown_then_fails_the_apply_and_is_never_started(site, server):
-    """As `!rollout` treats a stopped VM: the plan is offered, its status table says `stopped`
-    and the dry run's row `not reached`; the apply goes on with the others and fails on it,
-    naming the bot's command to send once it is started. Nothing starts it."""
+async def test_a_stopped_row_is_started_fixed_and_stopped_again(site, server):
+    """#995, as `!rollout` treats a stopped VM: the plan is offered, its status table says
+    `stopped` and `start, then stop`, and the dry run's row `not reached` (a dry run starts
+    nothing); the apply starts the VM for its fix, fixes it, and stops it again, nobody having
+    used it; alice, running, is fixed and left running."""
     trust_fix(site, down=[BOB_IP])
     fake(site, "admin/status.py", STATUS.format(bob="stopped"))
     plan = await request(server, "!trust-fix all")
     assert plan.state == PENDING, plan.note
     text = posts(site)[-2]
-    assert row(text, "bob").endswith(NOT_REACHED)
+    assert NOT_REACHED_AT.search(row(text, "bob")), row(text, "bob")
     assert "; not done: bob\n── admin/trust_fix.py exited 0" in text
-    assert re.search(r"^bob +stopped ", text.split("**Status**", 1)[1], re.M), text
+    status = text.split("**Status**", 1)[1]
+    assert re.search(r"^bob +stopped .* start, then stop$", status, re.M), status
+    assert re.search(r"^alice +active .* left running$", status, re.M), status
+    assert not (site.tmp / "ec2.log").exists()  # the plan started nothing
     await approve(server, plan)
     await settle(server)
-    assert server.store.get(plan.id).state == FAILED
+    assert server.store.get(plan.id).state == DONE
     result = posts(site)[-1]
-    assert result.startswith(
-        f"❌ **{plan.name}** · `!trust-fix all`: failed at step 1 of 1: admin/trust_fix.py exited 1"
-    ), result
-    assert row(result, "alice").endswith("  ok") and row(result, "bob").endswith(NOT_REACHED)
-    assert "Then rerun them:\n  !trust-fix bob\n" in result
+    assert result.startswith(f"✅ **{plan.name}** · `!trust-fix all`: done in "), result
+    assert re.search(r"  ok +running$", row(result, "alice")), row(result, "alice")
+    assert re.search(r"  ok +started, stopped again$", row(result, "bob")), row(result, "bob")
+    assert (site.tmp / "ec2.log").read_text() == "start i-2\nstop i-2\n"
+    assert "\npower: bob i-2: started for its row\n" in result
+    assert "\nstopped VMs: 1 started, 1 stopped again\n" in result
     assert calls(site, "aws/power.py") == []
 
 
@@ -234,12 +297,13 @@ async def test_each_vm_is_said_as_it_ends_and_a_timeout_keeps_those_done(site, s
 
 
 def test_the_deadline_grows_with_the_rows():
-    """An hour, or 2 minutes a row above 30: six VMs at a time, 12 minutes each at worst."""
+    """An hour, or 2.5 minutes a row above 24: six VMs at a time, 12 minutes each at worst and a
+    stopped one's start and stop (#995)."""
     every = Command("trust-fix", selection=Selection(all=True))
     assert build(every, FLEET).timeout == actions.TRUST_FIX_FLOOR_S == 3600
     rows = tuple(Row(f"p{n}", f"198.51.100.{n + 1}", "us-west-2") for n in range(41))
     many = build(every, dataclasses.replace(FLEET, rows=rows))
-    assert len(many.targets) == 41 and many.timeout == 41 * actions.TRUST_FIX_ROW_S == 4920
+    assert len(many.targets) == 41 and many.timeout == 41 * actions.TRUST_FIX_ROW_S == 6150
 
 
 # ---------------------------------------------------------------- never beside each other

@@ -2,6 +2,7 @@
 by hand."""
 
 import calendar
+import json
 
 import pytest
 
@@ -19,10 +20,10 @@ PRICE = costs.PRICES[RG, M]
 
 
 def test_the_fixed_cost_is_the_volume_and_the_address():
-    # 200 GB of gp3 at $0.08 a GB-month over 730 hours, and $0.005 an hour for the address:
-    # about $20 a month (§11.2)
-    assert FIXED_HOUR == pytest.approx(0.0269178, abs=1e-7)
-    assert 730 * FIXED_HOUR == pytest.approx(19.65)
+    # 80 GB of gp3 at $0.08 a GB-month over 730 hours, and $0.005 an hour for the address:
+    # about $10 a month (§11.2)
+    assert FIXED_HOUR == pytest.approx(0.0137671, abs=1e-7)
+    assert 730 * FIXED_HOUR == pytest.approx(10.05)
 
 
 def test_the_month_and_the_day_are_utc():
@@ -58,15 +59,15 @@ def test_a_recorded_history_matches_a_hand_computation():
     cost = seen.cost(NOW, present=True, region=RG)
     assert cost is not None
     # This month: 8 running hours at $0.46368 = $3.70944; the volume and the address from
-    # Oct 10 00:00 to now, 252 hours at $0.02691781 = $6.78329. Together $10.49.
-    assert cost.month == 10.49
+    # Oct 10 00:00 to now, 252 hours at $0.01376712 = $3.46931. Together $7.18.
+    assert cost.month == 7.18
     # Projected: 276 hours are left (to Nov 1 00:00). The last 7 days (since Oct 13 12:00, 168
-    # hours) it ran 8: a share of 0.047619. So 276 * (0.02691781 + 0.047619 * 0.46368)
-    # = 276 * 0.04899781 = $13.52339 more: $24.02.
-    assert cost.projected == 24.02
+    # hours) it ran 8: a share of 0.047619. So 276 * (0.01376712 + 0.047619 * 0.46368)
+    # = 276 * 0.03584712 = $9.89381 more: $17.07.
+    assert cost.projected == 17.07
     assert (cost.hours_today, cost.hours_month) == (4.0, 8.0)
     totals = history.workshop("harvard", {"i-1"}, NOW, RG)
-    assert totals == {"month": 10.49, "projected": 24.02, "hours_today": 4.0, "unpriced": [],
+    assert totals == {"month": 7.18, "projected": 17.07, "hours_today": 4.0, "unpriced": [],
                       "unpriced_region": None}  # fmt: skip
 
 
@@ -79,7 +80,7 @@ def test_the_three_regions_have_the_same_prices(region):
         "r7a.xlarge": 0.3043, "r7a.2xlarge": 0.6086, "t3.medium": 0.0416,
     }  # fmt: skip
     cost = history_of_one_vm().seen["i-1"].cost(NOW, True, region)
-    assert (cost.month, cost.projected) == (10.49, 24.02)
+    assert (cost.month, cost.projected) == (7.18, 17.07)
 
 
 def test_a_workshop_in_another_region_is_unpriced_not_priced_as_us():
@@ -101,7 +102,7 @@ def test_a_vm_no_longer_seen_projects_nothing_more():
     history = history_of_one_vm()
     cost = history.seen["i-1"].cost(NOW + 3600, present=False, region=RG)
     # nothing after its last sighting: the same as at NOW, an hour's running cost aside
-    assert cost is not None and cost.month == 10.49 and cost.projected == cost.month
+    assert cost is not None and cost.month == 7.18 and cost.projected == cost.month
 
 
 def test_only_this_months_part_counts():
@@ -110,7 +111,7 @@ def test_only_this_months_part_counts():
     cost = seen.cost(NOW, present=True, region=RG)
     assert cost is not None and cost.hours_month == 2.0
     # 2 running hours, and the fixed cost from Oct 1, 468 hours
-    assert cost.month == round(2 * PRICE + 468 * FIXED_HOUR, 2) == 13.52
+    assert cost.month == round(2 * PRICE + 468 * FIXED_HOUR, 2) == 7.37
 
 
 def test_a_young_vm_projects_at_its_current_state():
@@ -220,8 +221,8 @@ def test_a_resize_reprices_only_what_follows_it():
     history.observe("i-1", "harvard", "alice", vm, t(14, 5))
     after = history.seen["i-1"].cost(t(14, 5), present=True, region=RG)
     assert before is not None and after is not None
-    # 100 hours at $0.46368, and 101 hours of the volume and the address: $49.09
-    assert after.month == before.month == round(100 * PRICE + 101 * FIXED_HOUR, 2) == 49.09
+    # 100 hours at $0.46368, and 101 hours of the volume and the address: $47.76
+    assert after.month == before.month == round(100 * PRICE + 101 * FIXED_HOUR, 2) == 47.76
     assert after.projected > before.projected  # what is left, at the larger type's price
     vm |= {"state": "running", "launched": t(14, 6)}
     history.observe("i-1", "harvard", "alice", vm, t(14, 7))
@@ -237,12 +238,12 @@ def stopped_since(created: float) -> dict:
 
 def test_a_volume_is_priced_at_the_size_read_from_its_creation():
     """#553: the first size EC2 shows counts from the VM's creation; until one is read, and
-    without one, 200 GB."""
+    without one, 80 GB, `launch.py`'s (#998)."""
     history = History()
     history.observe("i-1", "harvard", "alice", stopped_since(t(10)) | {"volume_gb": 300}, NOW)
     history.observe("i-2", "harvard", "bob", stopped_since(t(10)), NOW)
     big, plain = history.seen["i-1"], history.seen["i-2"]
-    assert big.volumes == [[t(10), 300]] and plain.volumes == [] and plain.volume_gb == 200
+    assert big.volumes == [[t(10), 300]] and plain.volumes == [] and plain.volume_gb == 80
     hours = 10 * 24 + 12  # Oct 10 00:00 to Oct 20 12:00
     assert big.cost(NOW, True, RG).month == round(hours * costs.fixed_hour(300), 2)
     assert plain.cost(NOW, True, RG).month == round(hours * FIXED_HOUR, 2)
@@ -251,7 +252,7 @@ def test_a_volume_is_priced_at_the_size_read_from_its_creation():
     assert projected == pytest.approx(
         round(hours * costs.fixed_hour(300), 2) + left * costs.fixed_hour(300), abs=0.01
     )
-    assert costs.fixed_hour(200) == FIXED_HOUR
+    assert costs.fixed_hour(80) == FIXED_HOUR
 
 
 def test_a_grown_volume_reprices_only_what_follows_its_read():
@@ -283,3 +284,44 @@ def test_volume_sizes_read_back_and_are_pruned():
         assert Seen.of(old | {"volumes": bad}) is None
     history.prune(NOW)  # the 300 GB of Aug 20 is still in force at the month's start
     assert history.seen["i-1"].volumes == [[t(20, month=8), 300], [t(5), 400]]
+
+
+def test_the_initialization_rates_prices_are_awss_tiers():
+    """#1007: AWS's list prices per GB of snapshot data, by tier; nothing at EBS's default."""
+    assert [costs.init_price(r) for r in (None, 0, 100, 200)] == [0.0, 0.0, 0.0024, 0.0024]
+    assert [costs.init_price(r) for r in (201, 300)] == [0.0036, 0.0036]
+
+
+def test_a_volumes_initialization_is_priced_once_in_its_month():
+    """#1007: once per volume EC2 showed created at a provisioned rate, at its size when first
+    read (an upper bound on the snapshot's data), in the month of its creation only; each
+    sighting after the first adds nothing, and the projection none more."""
+    history = History()
+    vm = stopped_since(t(10)) | {"volume_gb": 80, "inits": [["vol-1", t(10), 80, 200]]}
+    for now in (t(15), t(18), NOW):
+        history.observe("i-1", "harvard", "alice", vm, now)
+    history.observe("i-1", "harvard", "alice", vm | {"inits": [["vol-1", t(10), 160, 200]]}, NOW)
+    seen = history.seen["i-1"]
+    assert seen.inits == [["vol-1", t(10), 80, 200]]
+    hours = 10 * 24 + 12
+    fixed = hours * FIXED_HOUR
+    cost = seen.cost(NOW, True, RG)
+    assert cost.month == round(fixed + 80 * 0.0024, 2)
+    left = (month_end(NOW) - NOW) / 3600
+    assert cost.projected == pytest.approx(cost.month + left * FIXED_HOUR, abs=0.01)
+    # a restore's new volume (#999), at 300: priced too; last month's volume isn't, this month
+    history.observe("i-1", "harvard", "alice", vm | {"inits": [["vol-2", t(19), 80, 300]]}, NOW)
+    assert seen.cost(NOW, True, RG).month == round(fixed + 80 * (0.0024 + 0.0036), 2)
+    old = stopped_since(t(10)) | {"volume_gb": 80, "inits": [["vol-9", t(28, month=9), 80, 200]]}
+    history.observe("i-9", "harvard", "bob", old, NOW)
+    assert history.seen["i-9"].cost(NOW, True, RG).month == round(fixed, 2)
+    for bad in (["vol-3", t(19), 80, 50], ["vol-3", t(19), 80], ["", t(19), 80, 200], "x"):
+        history.observe("i-1", "harvard", "alice", vm | {"inits": [bad]}, NOW)
+    assert [init[0] for init in seen.inits] == ["vol-1", "vol-2"]
+    data = history.to_json()
+    assert History.of(data).to_json() == data
+    # kept in collector/state.json, as JSON, and read back after a restart
+    assert data["i-1"]["inits"] == [["vol-1", t(10), 80, 200], ["vol-2", t(19), 80, 300]]
+    assert History.of(json.loads(json.dumps(data))).seen["i-1"].inits == data["i-1"]["inits"]
+    assert Seen.of({k: v for k, v in data["i-1"].items() if k != "inits"}).inits == []  # pre-#1007
+    assert Seen.of(data["i-1"] | {"inits": [["vol-1", t(10), 80, 400]]}) is None

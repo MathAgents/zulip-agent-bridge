@@ -8,7 +8,7 @@ import logging
 import math
 import time
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -16,7 +16,7 @@ from zab.config import BotConfig, allowed_users
 from zab.core.addressing import KINDS, typed_kinds, visible_text
 from zab.core.store import Store
 from zab.waker import queues
-from zab.zulip.client import ZulipClient, error_kind
+from zab.zulip.client import ZulipClient, ZulipError, error_kind, transient
 
 LOG = logging.getLogger("zab.waker")
 #: The fleet's `workshop` tag value; the config's `workshop` key overrides it (the test waker's
@@ -42,6 +42,13 @@ UP = ("pending", "running")
 #: Seconds of Zulip's clock (whole seconds) against this host's, as the wake monitor allows
 #: (`wakes.SKEW`): for the catch-up's start without a mark, and the stale-message rule.
 SKEW = 30.0
+#: Seconds a wake's owner check is tried again for, from its first failure while Zulip is
+#: unavailable (`transient`: a 5xx, a 429, a timeout or a connection error; #1022): first after
+#: `BACKOFF` seconds, the wait doubled up to a minute, and cut to leave the try after it `ROOM`
+#: seconds before the bound; when it can't, the wake is given up instead.
+OUTAGE = 300.0
+BACKOFF = 5.0
+ROOM = 5.0
 
 
 @dataclass
@@ -55,16 +62,40 @@ class Target:
 class Waiting:
     """A message that may wait for its VM's wake (SPEC §13.4): its IDs and type, never its
     text, and which of the VM's bots saw it, each with whether it names that bot (`named`).
-    Both bots of a VM see a channel message: the copies merge here."""
+    Both bots of a VM see a channel message: the copies merge here. For the wake's log line
+    (`Waker.fields`, #1017): when Zulip says it was sent (`sent`), whether it came by a
+    catch-up (`caught`), and the VM's state in the waker's cache when its first copy came
+    (`seen`)."""
 
     id: int
     sender_id: int
     type: str
     bots: dict[str, tuple[Target, bool]] = field(default_factory=dict)
+    sent: float | None = None
+    caught: bool = False
+    seen: str = "unknown"
 
     @classmethod
-    def of(cls, message: dict) -> Waiting:
-        return cls(message["id"], message["sender_id"], message["type"])
+    def of(cls, message: dict, seen: str | None = None) -> Waiting:
+        sent = message.get("timestamp")
+        return cls(
+            message["id"],
+            message["sender_id"],
+            message["type"],
+            sent=float(sent) if type(sent) in (int, float) and math.isfinite(sent) else None,
+            caught=isinstance(message.get("typed"), list),  # `queues.kept`'s: no text
+            seen=seen or "unknown",
+        )
+
+
+def why(entry: Waiting) -> str:
+    """What `entry` is to its VM's bots, for the wake log (#1017): `dm`; `mention`, a channel
+    message that names one of them, completed or typed (`named`); or `channel`, one that names
+    none of them, which the bridge gives each (SPEC §4.5 rule 6.2). By the copies merged so
+    far: a mention reads `channel` until the copy of a bot it names has come."""
+    if entry.type == "private":
+        return "dm"
+    return "mention" if any(named for _, named in entry.bots.values()) else "channel"
 
 
 def kind_of(name: str) -> str | None:
@@ -87,6 +118,13 @@ def named(target: Target, message: dict, flags: Iterable[str]) -> bool:
         return kind in typed
     text = message.get("content")
     return bool(kind and isinstance(text, str) and kind in typed_kinds(visible_text(text)))
+
+
+def unavailable(exc: BaseException) -> str:
+    """How a transient Zulip error reads in the wake log (#1022): its kind (`error_kind`), and
+    a Zulip error's HTTP status, never its message."""
+    status = f" HTTP {exc.status}" if isinstance(exc, ZulipError) else ""
+    return error_kind(exc) + status
 
 
 def error_code(exc: Exception) -> str:
@@ -274,7 +312,7 @@ class Waker:
         entry = waiting.get(mid)
         first = entry is None
         if entry is None:
-            entry = waiting[mid] = Waiting.of(message)
+            entry = waiting[mid] = Waiting.of(message, self.states.get(instance))
             if len(waiting) > HOLD:
                 # Drop the oldest message of the sender with the most, so that another
                 # sender's flood never pushes out the owner's.
@@ -299,7 +337,10 @@ class Waker:
     ) -> bool:
         """Start the VM's wake for `entry` if a bot that saw it allows its sender, the bots
         that answer for it first; False when none does, or not yet. `denied` remembers failed
-        owner checks across calls. A copy that merges during a check is checked too."""
+        owner checks across calls. A copy that merges during a check is checked too. The
+        cooldown comes first, without a Zulip call, and unlogged, as an owner refusal is: the
+        failed start that began it has its line, and a cooldown that begins during the owner
+        check is logged by `wake`, after its own (#1017)."""
         if self.cooling(instance):
             return False
         denied = set() if denied is None else denied
@@ -316,6 +357,22 @@ class Waker:
         if instance not in self.tasks:
             self.tasks[instance] = asyncio.create_task(self.wake(target, entry))
         return True
+
+    def fields(self, instance: str, bot: str, entry: Waiting) -> str:
+        """The wake log's fields (#1017), IDs only, never the message's text: the workshop, the
+        VM, the bot whose owner check let the message count, the message and its sender; `why`
+        it counts (`why`), by the copies the waker had when the line is written: a start
+        doesn't wait for the other bot's copy, so a mention of the bot whose copy hadn't come
+        reads `channel`; the VM's state in the waker's cache when its first copy came (`seen`:
+        `stopped` or `stopping`, the VM was down then; another, the message was kept for a poll
+        that showed the VM stopping or stopped, SPEC §13.4.1); `via`, `live` or `catch-up`
+        (§13.4.3); and its `age`, by Zulip's send time and this host's clock."""
+        age = "?" if entry.sent is None else f"{max(0.0, time.time() - entry.sent):.0f}s"
+        return (
+            f"workshop={self.tag['Value']} vm={instance} bot={bot} message={entry.id} "
+            f"sender={entry.sender_id} why={why(entry)} seen={entry.seen} "
+            f"via={'catch-up' if entry.caught else 'live'} age={age}"
+        )
 
     def ranked(self, entry: Waiting) -> list[str]:
         """The bots that saw `entry`, in the configuration's order."""
@@ -349,28 +406,90 @@ class Waker:
         finally:
             await poster.close()
 
+    async def ready(self, target: Target, trigger: Waiting, line: Callable[[], str]) -> bool:
+        """Whether `target`'s VM may be started for `trigger` now: stopped at a fresh refresh,
+        after up to five minutes of `stopping`, and the owner check passed. Else False, the
+        reason logged, `Wake not started:`. While Zulip is unavailable (`transient`), the check
+        is tried again, from the refresh, until the bound, `OUTAGE` seconds after its first
+        failure (#1022). Each wait leaves the try after it at least `ROOM` seconds before the
+        bound, and a try's owner check is cut off at the bound. The wake is given up when no
+        wait can, when the bot's request budget would hold a try past the bound (a 429's
+        `Retry-After`), or at the bound. The messages keep waiting meanwhile, and those that
+        come join them, as `self.tasks` holds the wake. A refusal, a 4xx included, still ends
+        it at once (SPEC §13.4.1)."""
+        until: float | None = None  # the outage's end: its first failure, plus `OUTAGE`
+        cause = ""  # its latest error, as the log says it (`unavailable`)
+
+        def gave_up() -> bool:
+            LOG.warning("Wake not started: %s (Zulip unavailable: %s)", line(), cause)
+            return False
+
+        tries = 0
+        while True:
+            if until is not None:
+                left = until - time.monotonic()
+                if left <= 0 or target.client.budget.delay() >= left:
+                    return gave_up()
+            await self.refresh(force=True)
+            # Keep the triggering message while an idle shutdown finishes.
+            deadline = time.monotonic() + 300
+            while self.states.get(target.instance) == "stopping":
+                if time.monotonic() >= deadline:
+                    reason = "VM still stopping after five minutes"
+                    LOG.warning("Wake not started: %s (%s)", line(), reason)
+                    return False
+                await asyncio.sleep(10)
+                await self.refresh(force=True)
+            if (state := self.states.get(target.instance)) != "stopped":
+                LOG.info("Wake not started: %s (VM %s)", line(), state or "missing")
+                return False
+            bound = asyncio.timeout(None if until is None else until - time.monotonic())
+            try:
+                async with bound:
+                    allowed = await self.owner(target, trigger.sender_id)
+            except TimeoutError:
+                if not bound.expired():
+                    raise  # not the outage's bound
+                return gave_up()
+            except Exception as exc:
+                if not transient(exc):
+                    raise
+                now, cause = time.monotonic(), unavailable(exc)
+                until = now + OUTAGE if until is None else until
+                wait = min(60.0, BACKOFF * 2**tries, until - ROOM - now)
+                if wait <= 0:  # no room for a try after it
+                    return gave_up()
+                if not tries:
+                    LOG.info("Wake delayed: %s (Zulip unavailable: %s)", line(), cause)
+                await asyncio.sleep(wait)
+                tries += 1
+                continue
+            if allowed:
+                return True
+            LOG.info("Wake not started: %s (owner check refused)", line())
+            return False
+
     async def wake(self, target: Target, trigger: Waiting) -> None:
+        """Start `target`'s VM for `trigger`, which `target`'s owner check let count. Each
+        start request is logged after it, `Wake start:` with its result (`ok`, or the error
+        code of a refusal or a failure), and so is a wake given up before one, `Wake not
+        started:` with the reason (#1017); a wait for Zulip (`ready`, #1022), `Wake delayed:`,
+        at its first failure."""
         issued = False
+
+        def line() -> str:
+            return self.fields(target.instance, target.bot.name, trigger)
+
         try:
             async with self.locks[target.instance]:
                 for attempt in range(3):
                     if attempt:
                         await asyncio.sleep(60 * 2 ** (attempt - 1))
-                    await self.refresh(force=True)
-                    # Keep the triggering message while an idle shutdown finishes.
-                    deadline = time.monotonic() + 300
-                    while self.states.get(target.instance) == "stopping":
-                        if time.monotonic() >= deadline:
-                            LOG.warning("VM still stopping after five minutes: %s", target.instance)
-                            return
-                        await asyncio.sleep(10)
-                        await self.refresh(force=True)
-                    if self.states.get(target.instance) != "stopped":
-                        return
-                    if not await self.owner(target, trigger.sender_id):
+                    if not await self.ready(target, trigger, line):
                         return
                     key = f"wake:{target.instance}"
                     if self.cooling(target.instance):
+                        LOG.info("Wake not started: %s (a start under a minute ago)", line())
                         return
                     # Save before the AWS call, including failures, across restarts.
                     self.store.set(key, time.time())
@@ -380,6 +499,7 @@ class Waker:
                             InstanceIds=[target.instance],
                         )
                     except Exception as exc:
+                        LOG.info("Wake start: %s result=%s", line(), error_code(exc))
                         if error_code(exc) != "InsufficientInstanceCapacity":
                             raise
                         if attempt < 2:
@@ -405,6 +525,7 @@ class Waker:
                             ),
                         )
                         return
+                    LOG.info("Wake start: %s result=ok", line())
                     self.states[target.instance] = "pending"
                     self.up[target.instance] = time.time()
                     # No awaits from here to `acking`: a message first seen after this point
@@ -419,8 +540,8 @@ class Waker:
                     self.acking[target.instance] = batch
                     await self.acknowledge(target, trigger, batch)
                     return
-        except Exception as exc:
-            LOG.warning("Wake failed (%s)", type(exc).__name__)  # Never log Zulip contents.
+        except Exception as exc:  # never Zulip contents: the exception's class and the IDs
+            LOG.warning("Wake failed (%s): %s", type(exc).__name__, line())
         finally:
             self.tasks.pop(target.instance, None)
             self.acking.pop(target.instance, None)

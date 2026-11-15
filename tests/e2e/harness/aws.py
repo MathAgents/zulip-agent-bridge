@@ -118,6 +118,27 @@ class TestEc2:
                 raise TimeoutError(f"{instance_id} still {state} after {timeout:.0f} s")
             self.sleep(every)
 
+    def wait_stopped(
+        self, instance_id: str, *, timeout: float = 600, every: float = 2, stopping: bool = False
+    ) -> str:
+        """After a stop of the running instance: `stopped` once it reads so, for the caller to
+        start; or the state in which it reads started again since (#1017): `pending`, which
+        only a start makes, or `running` after a read of `stopping`, this call's or the
+        caller's (`stopping=True`). The test waker starts a stopped VM again for an owner
+        message it saw just before the stop, and the polls can miss `stopped` in between (in
+        #1017's run, its start came 18 s after the test's stop). A `running` before any
+        `stopping` is a stop that EC2 doesn't show yet. TimeoutError after `timeout`. The
+        polls are frequent: a start seen at its `pending` is timed within `every` seconds."""
+        start = self.clock()
+        while True:
+            state = self.state(instance_id)
+            if state == "stopped" or state == "pending" or (state == "running" and stopping):
+                return state
+            stopping = stopping or state == "stopping"
+            if self.clock() - start >= timeout:
+                raise TimeoutError(f"{instance_id} still {state} after {timeout:.0f} s")
+            self.sleep(every)
+
     def wait_while(
         self, instance_id: str, state: str, *, timeout: float = 600, every: float = 10
     ) -> str:

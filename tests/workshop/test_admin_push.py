@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -416,6 +417,87 @@ def test_adopting_a_spare_needs_the_rows_e_mail(out_dir):
     result = pc.rollout_vm(row, opts, runner)
     assert result.failures == ["adopt spare: alice: no e-mail for git's user.email"]
     assert runner.remotes(ALICE) == [pc.OWNER_CMD]
+
+
+class Flaky(FakeRunner):
+    """`FakeRunner`, except that the first `drop[remote]` tries of an SSH of `remote` time out at
+    the TCP connect, as `MKTEMP_CMD`'s did in A20 (#1009): nothing reaches the VM."""
+
+    def __init__(self, *, drop: dict[str, int], **kw):
+        super().__init__(**kw)
+        self.drop = dict(drop)
+
+    def __call__(self, argv, **kw):
+        if argv[0] == "ssh" and self.drop.get(argv[-1], 0) > 0:
+            self.drop[argv[-1]] -= 1
+            self.calls.append(list(argv))
+            self.stdins.append(kw.get("stdin"))
+            host = argv[-3].partition("@")[2]
+            return ac.RunResult(255, "", f"ssh: connect to host {host} port 22: {TIMED_OUT}\r\n")
+        return super().__call__(argv, **kw)
+
+
+TIMED_OUT = "Connection timed out"
+#: The note a step's result gets when its connect took a second try (#1009).
+RETRIED = re.compile(rf"ssh: connected on try 2 \(try 1 began \d\d:\d\d:\d\dZ: {TIMED_OUT}\)")
+
+
+def test_a_connect_timeout_mid_adoption_is_retried_and_the_adoption_goes_on(out_dir):
+    """#1009, A20: the owner check, the git identity and the owner record reached the spare,
+    then `MKTEMP_CMD`'s connect timed out. It is tried again 5 s later, connects, and the
+    adoption goes on to the end. Nothing that reached the VM is sent twice."""
+    spare = {ALICE: owner_stdout("", spare="zab-spare-1")}
+    opts = pc.Options(out_dir=out_dir, adopt_spares=frozenset({"alice"}))
+    row = {"slug": "alice", "repo": "thesis", "email": "alice@example.org", "ip": ALICE}
+    plain = FakeRunner(owners=spare)
+    assert pc.rollout_vm(row, opts, plain).ok
+    sent = plain.remotes(ALICE)  # the owner check, the identity, the record, then MKTEMP_CMD
+    assert sent[0] == pc.OWNER_CMD and sent[2].startswith(pc.ADOPT_CMD)
+    assert sent[3] == pc.MKTEMP_CMD and sent[-1].startswith("rm -rf")
+    runner, slept = Flaky(drop={pc.MKTEMP_CMD: 1}, owners=spare), []
+    result = pc.rollout_vm(row, opts, ac.ConnectRetry(runner, sleep=slept.append))
+    assert result.ok and result.adopted == "zab-spare-1", result.failures
+    assert slept == [5.0]
+    assert runner.remotes(ALICE) == sent[:4] + sent[3:]  # MKTEMP_CMD's two tries, all else once
+    assert [n for n in result.notes if n.startswith("ssh: ")] == [result.notes[0]]
+    assert RETRIED.fullmatch(result.notes[0]), result.notes
+    assert f"note: {result.notes[0]}" in pc.render([result])
+
+
+def test_a_vm_that_never_answered_fails_at_its_first_connect_as_before(out_dir):
+    """#1009, criterion 3: a stopped VM, or a wrong address, is tried once, with no wait; its
+    failure says when the connect began. So does a VM's last try, after two retries."""
+    runner = Flaky(drop={pc.OWNER_CMD: 1})
+    slept: list[float] = []
+    row = {"github": "alice", "repo": "alice/thesis", "zulip_user_id": "101", "ip": ALICE}
+    opts = pc.Options(out_dir=out_dir)
+    result = pc.rollout_vm(row, opts, ac.ConnectRetry(runner, sleep=slept.append))
+    assert (len(runner.calls), slept, result.notes) == (1, [], [])
+    began = r" \(began \d\d:\d\d:\d\dZ\)"
+    assert re.fullmatch(
+        rf"ssh: ssh: connect to host {ALICE} port 22: Connection timed out{began}",
+        result.failures[0],
+    ), result.failures
+    runner = Flaky(drop={pc.MKTEMP_CMD: 3})
+    result = pc.rollout_vm(row, opts, ac.ConnectRetry(runner, sleep=slept.append))
+    assert slept == [5.0, 15.0] and runner.remotes(ALICE).count(pc.MKTEMP_CMD) == 3
+    assert re.fullmatch(
+        rf"ssh: ssh: connect to host {ALICE} port 22: Connection timed out \(3 tries from \S+\)",
+        result.failures[0],
+    ), result.failures
+
+
+def test_main_retries_a_connect_to_a_vm_that_answered(roster, out_dir, monkeypatch, capsys):
+    """#1009: the runner of `main` retries, and the row's notes say so."""
+    runner = Flaky(drop={pc.MKTEMP_CMD: 1})
+    monkeypatch.setattr(pc, "subprocess_runner", runner)
+    monkeypatch.setattr(ac, "CONNECT_RETRY_WAITS_S", (0.0, 0.0))  # never 5 s in a test
+    args = ["--roster", str(roster), "--out-dir", str(out_dir), "--tag", "v0.1.0rc4"]
+    assert pc.main([*args, "--only", "alice", "--known-hosts", KH]) == 0
+    out = capsys.readouterr().out
+    line = next(line for line in out.splitlines() if line.startswith("alice"))
+    assert RETRIED.search(line), out
+    assert runner.remotes(ALICE).count(pc.MKTEMP_CMD) == 2
 
 
 def test_parse_owner():

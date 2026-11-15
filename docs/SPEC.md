@@ -1,6 +1,6 @@
 # zab — Zulip Agent Bridge: specification
 
-Status: describes v0.2.20.
+Status: describes v0.2.21.
 
 This document is the source of truth for the bridge. Section numbers are stable: cite them in commits and pull requests ("SPEC §7.4"). `#NNN` is an issue or pull request of the private repository where zab is developed (CONTRIBUTING.md; D37). The words *must*, *should* and *may* are used in the RFC 2119 sense. *Phase 1* is the bridge as first built, for a workshop in October 2026, with the amendments since folded in; §18 lists what is deferred, and §16 the history.
 
@@ -1276,7 +1276,8 @@ not block commands. Hidden models remain valid when named explicitly.
 - An extra turn is held with ⏳, and its status message reads "waiting for a free slot".
 - A per-session lock ensures a session never runs two turns at once.
 - **The workshop VMs allow 10 per backend** (#919; 4 from Oct 9, 2 before), so 20 turns on an
-  m7a.2xlarge: 8 vCPUs and 32 GiB (D23), with an 8 GiB swap file (`workshop/ami/README.md`).
+  m7a.2xlarge: 8 vCPUs and 32 GiB (D23), with a 5 GiB swap file (8 GiB on VMs launched before
+  #997; `workshop/ami/README.md`, "The image's footprint").
   At 4, an agent's fifth turn waited, and participants were held by ⏳. The other defaults stay:
   3 in the schema, for a personal machine that does other work, and 2 from `zab init --profile
   workshop`, which doesn't know the machine's size (§5.3). Why 10 fits the fleet's VMs:
@@ -1304,6 +1305,27 @@ not block commands. Hidden models remain valid when named explicitly.
     processes, so such a peak runs into the swap. It needs every turn in Lean at once; 10 was
     chosen for the common case, turns that wait on the model (#919). `!status` shows the
     memory, and a VM under strain (ORGANIZERS §3.6).
+  - **The swap is sized for that peak** (#997; DECISIONS, 2026-11-08). A VM had 5,290 MiB
+    (5.5 GB) in use (`free -m`) after a boot and one Codex turn, that turn's Lean tree stopped
+    (same measurement), likely with the 3.6 GB of Codex's `lean-lsp-mcp` children, which it
+    recorded right after boot. On top of that, 20 Lean servers add 26 GB; the 10 Claude turns'
+    own `lean-lsp-mcp` about 0.5 GB (54 MB each, as Codex's; Claude's MCP servers end with the
+    turn); and 10 `claude` processes 3 to 5 GB if each holds 0.3 to 0.5 GB, a guess until one is
+    measured. That rough sum, of `free -m`'s "used" and the processes' anonymous memory, is 35
+    to 37 GB against 32.9 GB of RAM: 2.2 to 4.2 GB over, before any page cache for the `.olean`
+    files the servers map. The 5 GiB (5.37 GB) swap file holds that, mostly idle memory (the
+    `lean-lsp-mcp` children wait between calls), with about 1.2 GB to spare at the high end,
+    where 4 GiB left about 0.1 GB. The margin still rests on two things: the `claude` guess (at
+    more than about 0.62 GB each the peak outgrows the swap), and how the recorded Lean figures
+    were converted from `/proc`'s kB, which the record doesn't say: read as GiB, 20 servers hold
+    about 27.5 GB, and the high end outgrows the swap by about 0.3 GB. The next check build owes
+    a reading of `RssAnon`, in kB, of a `claude` process and of a Lean tree. Of Codex's idle
+    Lean servers kept beyond its running turns (up to 30 minutes, §7.12), 1.3 GB each, two at
+    most fit beside the peak, none at the high end, where 8 GiB held about two more: past that
+    the kernel's OOM killer is weighted to take a background job first, if one runs (§7.14,
+    §13.3), then the largest process, a Lean server or a `claude`, whose turn sees it killed,
+    while the bridge's units go on (§13.3). The swap's size doesn't change the bill, which is
+    the volume's provisioned size; it takes headroom on the volume.
 
 ### 7.11 Forking a session (`!fork`, issue #202)
 
@@ -1534,7 +1556,10 @@ expansion), so `start` refuses a `<dir>` of other characters than letters, digit
   its environment, runs its argument list with no shell, copies stdout and stderr to the log, up
   to 1 GiB (then one line saying that the rest was dropped), and exits with the job's status. The
   agent's arguments, working directory and environment never reach systemd, which can expand
-  `$VAR` in a command line.
+  `$VAR` in a command line. A stop's SIGTERM, which systemd sends to every process of the unit,
+  reaches the job once: `_exec` takes no action on it and waits for the job. One that comes
+  while `_exec` starts the job, before the job's own program runs, ends the job there, and it
+  never runs (#1020).
 - **`zab job _ended <dir>`** runs as `ExecStopPost`, however the job ended, and writes
   `<dir>/ended.json`: systemd's `$SERVICE_RESULT`, `$EXIT_CODE` and `$EXIT_STATUS`, the boot id, the
   user manager's state (`systemctl --user is-system-running`, an argument list), and a copy of
@@ -1555,9 +1580,9 @@ expansion), so `start` refuses a `<dir>` of other characters than letters, digit
     stopped, and saw the manager `stopping`, the job ending `killed`/TERM/`success` (#655 V3).
 - **The slice** `zab-jobs.slice` holds every job (§13.3). All of them together get at most
   `[jobs] max_memory_percent` of the memory and no swap (`MemorySwapMax=0`), `CPUWeight=50` and
-  4096 tasks. With `OOMScoreAdjust=500` the kernel kills a job before the bridge, an agent or a
-  Lean server; with `Nice=10` and the weight, the bridge and the agents stay responsive while
-  jobs keep every CPU busy.
+  4096 tasks. With `OOMScoreAdjust=500` the kernel is weighted to kill a job before the bridge,
+  an agent or a Lean server (§13.3); with `Nice=10` and the weight, the bridge and the agents
+  stay responsive while jobs keep every CPU busy.
 - **As the bridge's user**, with no new privilege: only the user manager is involved, with no
   sudo, no system unit and `NoNewPrivileges=yes`. On the workshop VMs `agent` already has
   passwordless sudo (D22), and zab adds nothing to it. Lingering, which `zab service install`
@@ -2618,6 +2643,7 @@ Description=Codex app-server daemon (for zab)
 [Service]
 ExecStart=%h/.local/bin/codex app-server --listen unix://
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+OOMPolicy=continue
 LimitNOFILE=65536
 Restart=on-failure
 RestartSec=5
@@ -2640,6 +2666,7 @@ WatchdogSec=300
 ExecStart=%h/.local/bin/zab run
 # zab service install writes the real PATH list (§13.1)
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+OOMPolicy=continue
 Restart=on-failure
 RestartSec=5
 RestartSteps=5
@@ -2653,7 +2680,8 @@ WantedBy=default.target
 - Adjust the `codex` path to wherever the install put it. `zab service install` detects it with `shutil.which`.
 - The Codex unit is written only if a Codex backend in daemon mode is configured.
 - **The Codex daemon's open files** (issue #664). Each Codex thread the daemon has loaded keeps a `lean-lsp-mcp` child and its pipes (#632), so the default soft limit of 1024 is reached: on the test VM, 109 children held 967 files a minute after boot. Its unit sets `LimitNOFILE=65536`, or the user manager's `DefaultLimitNOFILE` where that is lower (1048576 on the AMI). systemd would clamp a higher value to the manager's hard limit itself; the cap is for the reinstall below: a daemon started from a unit without the line has that hard limit, and an unprivileged `prlimit` can't raise a hard limit. The installing process's own limit binds neither, and is not read. The bridge's and the sentinel's units keep the default: the bridge held 15 to 20 files on the test VM, and Claude's processes, its children, end with their turn.
-- **A reinstall applies it without a restart.** When an active Codex daemon's unit changed in its `LimitNOFILE=` line alone, as on the first install of this unit over one without it, `zab service install` doesn't restart the daemon, which would end its running Codex turns: it runs `prlimit --pid=<MainPID> --nofile=<n>:<n>` on it, and the daemon's next start reads the limit from the unit. If `prlimit` fails, it prints that the limit applies at the next start (a boot, or `!restart codex`), and `push_config.py` puts that line in the VM's row as a note. Any other change to the unit restarts the daemon, as before.
+- **A reinstall applies it without a restart.** When an active Codex daemon's unit changed in its `LimitNOFILE=` line alone, as on the first install of this unit over one without it, `zab service install` doesn't restart the daemon, which would end its running Codex turns: it runs `prlimit --pid=<MainPID> --nofile=<n>:<n>` on it, and the daemon's next start reads the limit from the unit. If `prlimit` fails, it prints that the limit applies at the next start (a boot, or `!restart codex`), and `push_config.py` puts that line in the VM's row as a note. Nor does a change to its `OOMPolicy=` line (below), with the limit's or alone: the manager's reload hands the running daemon the policy (systemd 255; DECISIONS, 2026-11-08). Any other change to the unit restarts the daemon, as before.
+- **A job killed for memory ends alone** (#997). The agents' commands run in their backend's unit: a Claude turn's in `zab.service`, whose process starts each `claude`, and a Codex turn's in the daemon's. systemd's default, `OOMPolicy=stop`, stops a whole unit when the kernel's OOM killer kills any one of its processes, so an agent's Magma or Sage job killed for memory took the bridge and every Claude turn with it, or the daemon and every Codex turn, until `Restart=` brought it back. Both units set `OOMPolicy=continue`: the job alone ends, and its turn sees it killed. The kernel's OOM killer picks the largest process, which is usually such a job. A background job (§7.14) runs outside both units, in `zab-jobs.slice`, and the kernel is weighted to take it first: `OOMScoreAdjust=500`, 300 above the agents' commands (user services get 200), adds 0.3 × (memory + swap) to its score, about 11 GiB on a workshop VM (32 GiB and 5 GiB), so only a process that much larger than the job goes before it. `OOMScoreAdjust=` can't protect the bridge instead: in a user unit it can't go below the user manager's own value (`user@.service`'s 100; user services get 200), and the agents' commands, its children, would inherit it. The sentinel's unit runs no agent and keeps the default.
 - Each listener touches `<state_dir>/heartbeat-<bot>` after advancing its event cursor
   (sentinel progress). Separately, in-memory liveness advances on every listen-loop
   pass and before each handler, including errors. Known poster-queue and rate-limit
@@ -2780,6 +2808,29 @@ or a short owner DM: on each waiting owner message in a channel, a ⏰ from each
 completed or typed, else from each of the VM's bots (§4.5 rule 6.2, #713), and one DM per wake
 for the owner's DMs (§13.4.2). No incoming message text is persisted or logged.
 
+The waker logs each start request at INFO, one line after it, `Wake start:` with its result,
+`result=ok` or the error code of a refusal or a failure (one line per capacity retry); and each
+wake given up before its request, `Wake not started:` with the reason (the VM no longer stopped
+at the wake's own refresh, the owner check refused there, a cooldown begun since the message's
+owner check, a VM still stopping after five minutes, or Zulip still unavailable after five
+minutes of retries, §13.4.1); a wake that waits for Zulip has a `Wake delayed:` line at its
+first failure. Two kinds of message get no line, as
+no wake begins for them: one whose sender no bot of the VM allows, and one the cooldown holds
+back before any owner check, which is checked first, without a Zulip call (the start that
+began the cooldown has its line). The line has the
+workshop, the VM, the bot whose owner check let the message count, the message's ID and its
+sender's, and why it counts: `why` (`dm`; `mention`, a channel message that names one of the
+VM's bots, completed or typed; or `channel`, one that names none), by the copies the waker had
+when it wrote the line (a start doesn't wait for the other bot's copy, so a mention of the bot
+whose copy hadn't come yet reads `channel`); `seen` (the VM's state in the waker's cache when
+the message's first copy came: `stopped` or `stopping`, the VM was down then; another, the
+message was kept for a poll that showed the VM stopping or stopped, §13.4.1); `via` (`live`, or
+`catch-up`, §13.4.3); and `age` (seconds since Zulip's send time) (#1017):
+
+```
+Wake start: workshop=zab-test vm=i-0123456789abcdef0 bot=claude-zab-test message=4321 sender=20 why=mention seen=running via=live age=48s result=ok
+```
+
 #### 13.4.1 Wakes
 
 The waker checks its 30-second state cache before owner resolution. A wake waits
@@ -2792,14 +2843,36 @@ type, and which of the VM's bots saw it, each with whether the message names tha
 queue's `mentioned` flag (a completed mention), or a typed mention of the bot's kind
 (§4.5, #713), which Zulip doesn't flag. The waker reads that as the message arrives,
 outside code and quotes as the bridge does, and takes a bot's kind from its name's
-prefix, `claude-…` or `codex-…`, as `push_waker` names the bots. Never its
-text. At most 100 are kept per VM; past that, the oldest message of the sender
+prefix, `claude-…` or `codex-…`, as `push_waker` names the bots. For the log
+(§13.4), also its send time, whether a catch-up fetched it, and the VM's cached
+state when its first copy came. Never its text. At most 100 are kept per VM; past that, the oldest message of the sender
 with the most is dropped, so another sender cannot push out the owner's. Both
 bots' queues see a channel message; their copies merge into one entry, so a
 message counts once. If the VM then shows stopped/stopping, the waker rechecks
 owner authorization and wakes it without requiring a second message. A poll acts
 only on the messages seen before it; one that arrives during its pass waits for
 the next poll.
+
+**While Zulip is unavailable (#1022).** A wake checks its owner once more, with
+`GET users/me` and `GET users`, just before its start request. When Zulip doesn't answer
+that check, or asks for a retry (a 5xx, a 429, a response that isn't JSON, a timeout or a
+connection error), the wake tries again from its EC2 refresh, so that a VM started or
+stopping meanwhile is seen. It waits 5 s, then twice as long each time up to a minute, within
+five minutes from the first failure: the last wait is cut so that its try begins at least 5 s
+before they end (when every try fails at once, the tries come 5, 15, 35, 75, 135, 195, 255
+and 295 s after the first failure). An owner check Zulip hasn't answered when the five
+minutes end is cut off, and none begins that the bot's request budget would hold past their
+end, as a 429's `Retry-After` can. Meanwhile the wake stays in flight:
+its messages keep waiting, those that arrive join it, and other VMs' wakes go on. Its first
+failure is logged, `Wake delayed:` with the reason `Zulip unavailable: <kind>`: the
+latest error's class, and for an answer from Zulip, its HTTP status (`ZulipError HTTP 502`).
+If Zulip is still unavailable after the five minutes, the wake is given up with `Wake not
+started:` and the same reason, and its messages are dropped. A message the owner sends once Zulip is
+back wakes the VM. A refusal still ends the wake at once, with no start and no retry: a
+`users/me` that isn't a bot, a sender the bot doesn't allow, or another 4xx, such as a
+deactivated bot's `UNAUTHORIZED` (`Wake failed`). A check that fails before any wake begins,
+as the message arrives or at a poll, keeps the message for the next poll, whatever the
+error.
 
 #### 13.4.2 Acknowledgments
 
@@ -2836,7 +2909,8 @@ channel message, so the order in which the queues deliver does not pick the bots
 All the owner DMs of one wake share one "⏳ Starting your VM" notice, from the bot
 that received the first. A message first seen after the start request gets no ⏰; the
 bridge's 👀 answers it. If no start request is made (the VM is up, the cooldown,
-the owner check, a capacity failure), the waiting messages are dropped. The last
+the owner check, Zulip unavailable for five minutes, §13.4.1), or the start fails (a
+capacity failure), the waiting messages are dropped. The last
 1,024 acknowledged messages are remembered, so a copy that arrives after its ⏰s
 adds none, from either bot: no bot adds a second ⏰ to a message. The waker logs
 `httpx` and `httpcore` at WARNING only.

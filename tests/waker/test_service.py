@@ -1,9 +1,11 @@
 import asyncio
 import logging
+import re
 import threading
 from types import SimpleNamespace
 from typing import ClassVar
 
+import httpx
 import pytest
 
 from zab.config import BotConfig
@@ -11,7 +13,7 @@ from zab.core.store import Store
 from zab.testing.fake_zulip import FakeZulip
 from zab.waker import queues, service
 from zab.waker.service import TAG, Target, Waker
-from zab.zulip.client import ZulipClient
+from zab.zulip.client import ZulipClient, ZulipError
 
 pytestmark = pytest.mark.integration
 INSTANCE = "i-0123456789abcdef0"
@@ -900,3 +902,373 @@ def test_the_waker_logs_httpx_warnings_only(http_loggers, monkeypatch):
     assert calls == [{"level": logging.INFO}]
     assert [logger.level for logger in http_loggers] == [logging.WARNING] * 2
     assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+
+
+# ---------------------------------------------------------------------- the wake log (#1017)
+
+#: A wake's log line (`Waker.fields`): every field, the age a whole number of seconds.
+WAKE_LINE = (
+    r"Wake (?P<what>start|delayed|not started|failed \(\w+\)): workshop=nt-agents-2026 "
+    rf"vm={INSTANCE} bot=(?P<bot>[\w-]+) message=(?P<message>\d+) sender=(?P<sender>\d+) "
+    r"why=(?P<why>dm|mention|channel) seen=(?P<seen>\w+) via=(?P<via>live|catch-up) "
+    r"age=\d+s(?P<rest>.*)"
+)
+
+
+def wake_lines(caplog) -> list[dict[str, str]]:
+    """The waker's wake lines, each parsed by `WAKE_LINE` (any other fails the test)."""
+    found = []
+    for record in caplog.records:
+        text = record.getMessage()
+        if record.name == "zab.waker" and text.startswith(
+            ("Wake start", "Wake delayed", "Wake not", "Wake fail")
+        ):
+            match = re.fullmatch(WAKE_LINE, text)
+            assert match, text
+            found.append(match.groupdict() | {"level": record.levelname})
+    return found
+
+
+@pytest.mark.parametrize("dm", [False, True])
+async def test_a_start_is_logged_with_its_message_and_why(setup, caplog, dm):
+    """One INFO line per start request, after it: the workshop, the VM, the bot, the message's
+    and the sender's IDs, why the message counts, and the result; never the message's text."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, target, fake, ec2 = setup
+    mid = await send(waker, target, fake, dm=dm)
+    assert len(ec2.starts) == 1
+    assert wake_lines(caplog) == [{
+        "what": "start", "bot": "bot", "message": str(mid), "sender": "20",
+        "why": "dm" if dm else "channel", "seen": "stopped", "via": "live", "rest": " result=ok",
+        "level": "INFO",
+    }]  # fmt: skip
+    assert "unmentioned follow-up" not in caplog.text
+
+
+async def test_a_message_held_for_the_poll_is_logged_as_seen_running(pair, caplog):
+    """#1017's case: a mention seen while the VM was up, then a poll that shows it stopped (a
+    stop just after the message): `seen=running` says that it waited for that poll."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, codex, claude, fake, ec2, _ = pair
+    waker.states[INSTANCE] = "running"
+    message = fake.post_as(20, "@**Claude** DECOY", "wake")
+    await deliver(waker, message, (codex, False), (claude, True))
+    assert not ec2.starts and not wake_lines(caplog)  # nothing logged while it waits
+    await waker.refresh(force=True)
+    await waker.reconsider()
+    await asyncio.gather(*waker.tasks.values())
+    (line,) = wake_lines(caplog)
+    assert (line["bot"], line["message"], line["why"], line["seen"], line["via"]) == (
+        "claude", str(message["id"]), "mention", "running", "live"
+    )  # fmt: skip
+    assert "DECOY" not in caplog.text
+
+
+async def test_a_caught_up_message_is_logged_as_such(pair, caplog):
+    """A message that the catch-up fetched (#403): `via=catch-up`, its typed mention read
+    before its text went."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, codex, claude, fake, _, _ = pair
+    mark = fake.post_as(20, "handled before the restart", "earlier")["id"]
+    message = fake.post_as(20, "@codex DECOY", "caught up")
+    fake.messages[message["id"]]["flags"] = []  # typed: Zulip flags no mention
+    for target in (codex, claude):
+        await queues.catch_up(target, waker.message, (mark, None), set(), message["id"])
+    await asyncio.gather(*waker.tasks.values())
+    (line,) = wake_lines(caplog)
+    assert (line["bot"], line["why"], line["via"], line["rest"]) == (
+        "codex", "mention", "catch-up", " result=ok"
+    )  # fmt: skip
+    assert "DECOY" not in caplog.text
+
+
+class Refused(Exception):
+    response: ClassVar = {"Error": {"Code": "UnauthorizedOperation"}}
+
+
+async def test_a_refused_start_is_logged_with_its_code(setup, monkeypatch, caplog):
+    """EC2 (or the starter) refuses the start: its line has the error code, then the wake's
+    failure, with the same fields."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, target, fake, ec2 = setup
+
+    def start_instances(**kwargs):
+        raise Refused()
+
+    monkeypatch.setattr(ec2, "start_instances", start_instances)
+    mid = await send(waker, target, fake)
+    start, failed = wake_lines(caplog)
+    assert (start["what"], start["message"], start["rest"], start["level"]) == (
+        "start", str(mid), " result=UnauthorizedOperation", "INFO"
+    )  # fmt: skip
+    assert (failed["what"], failed["message"], failed["rest"]) == ("failed (Refused)", str(mid), "")
+
+
+async def test_each_capacity_failure_is_logged(setup, monkeypatch, caplog):
+    """InsufficientInstanceCapacity, then a start: one line for each request."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, target, fake, ec2 = setup
+    ec2.failures = 2
+    clock = [1000]
+    monkeypatch.setattr(
+        service, "time", SimpleNamespace(time=lambda: clock[0], monotonic=lambda: clock[0])
+    )
+
+    async def sleep(delay):
+        clock[0] += delay
+
+    monkeypatch.setattr(service.asyncio, "sleep", sleep)
+    await send(waker, target, fake, dm=True)
+    assert [line["rest"] for line in wake_lines(caplog)] == [
+        " result=InsufficientInstanceCapacity", " result=InsufficientInstanceCapacity", " result=ok"
+    ]  # fmt: skip
+
+
+@pytest.mark.parametrize("why", ["up", "owner", "cooldown"])
+async def test_a_wake_given_up_before_its_start_is_logged(setup, monkeypatch, caplog, why):
+    """No start request: the VM up at the wake's own refresh, the owner check refused at the
+    wake's own check, or a start asked for since the message's owner check (another wake's).
+    Each line says why, at INFO, once."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, target, fake, ec2 = setup
+    if why == "up":
+        ec2.state = "running"  # the cache still says stopped
+    elif why == "owner":
+        answers = iter([True, False])
+        monkeypatch.setattr(waker, "owner", lambda target, uid: asyncio.sleep(0, next(answers)))
+    else:
+
+        async def owner(target, uid):  # a start asked for meanwhile
+            waker.store.set(f"wake:{INSTANCE}", service.time.time())
+            return True
+
+        monkeypatch.setattr(waker, "owner", owner)
+    mid = await send(waker, target, fake)
+    assert not ec2.starts
+    (line,) = wake_lines(caplog)
+    assert (line["what"], line["message"], line["sender"]) == ("not started", str(mid), "20")
+    reason = {"up": " (VM running)", "owner": " (owner check refused)",
+              "cooldown": " (a start under a minute ago)"}[why]  # fmt: skip
+    assert (line["bot"], line["rest"], line["level"]) == ("bot", reason, "INFO")
+
+
+async def test_a_message_the_cooldown_holds_back_gets_no_line(pair, caplog):
+    """The cooldown is checked first, without an owner check: each bot's copy of a message
+    then is dropped unlogged, as one whose sender no bot allows (the start that began the
+    cooldown has its line)."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, codex, claude, fake, ec2, _ = pair
+    waker.store.set(f"wake:{INSTANCE}", service.time.time())
+    waker.calls.clear()
+    message = fake.post_as(20, "@**Claude** DECOY", "wake")
+    await deliver(waker, message, (codex, False), (claude, True))
+    await asyncio.gather(*waker.tasks.values())
+    assert not ec2.starts and not wake_lines(caplog)
+    assert not [endpoint for _, endpoint, _ in waker.calls if endpoint.startswith("users")]
+
+
+# ------------------------------------------------- Zulip unavailable in the wake's check (#1022)
+
+
+@pytest.fixture
+def paused(monkeypatch):
+    """The waker's clock (`clock`, which a client's request budget may take too), which only
+    its sleeps move, at once: each sleep's delay (`delays`), then each of `during` (coroutine
+    functions) runs, as in that pause."""
+    now = [1000.0]
+    state = SimpleNamespace(delays=[], during=[])
+
+    async def sleep(delay):
+        state.delays.append(delay)
+        now[0] += delay
+        for during in state.during:
+            await during()
+
+    state.clock = SimpleNamespace(time=lambda: now[0], monotonic=lambda: now[0], sleep=sleep)
+    monkeypatch.setattr(service, "time", state.clock)
+    monkeypatch.setattr(service.asyncio, "sleep", sleep)
+    return state
+
+
+def users_fail(monkeypatch, target, failure):
+    """`GET users` raises `failure(n)` at its n-th call, unless None: the first is the
+    message's owner check (`Waker.trigger`), the wake's own follow."""
+    original, calls = target.client.request, []
+
+    async def request(method, endpoint, **params):
+        if endpoint == "users":
+            calls.append(endpoint)
+            if (exc := failure(len(calls))) is not None:
+                raise exc
+        return await original(method, endpoint, **params)
+
+    monkeypatch.setattr(target.client, "request", request)
+
+
+#: Each transient error, and how the wake log names it.
+TRANSIENT = {
+    "502": (ZulipError("INVALID_RESPONSE", 502), "ZulipError HTTP 502"),  # a proxy's page, Nov 9
+    "429": (ZulipError("RATE_LIMIT_HIT", 429), "ZulipError HTTP 429"),
+    "refused": (httpx.ConnectError("refused"), "ConnectError"),
+    "timeout": (httpx.ReadTimeout("slow"), "ReadTimeout"),
+}
+
+
+@pytest.mark.parametrize(("error", "kind"), TRANSIENT.values(), ids=TRANSIENT.keys())
+async def test_a_zulip_error_in_the_wakes_check_is_tried_again(
+    setup, monkeypatch, caplog, paused, error, kind
+):
+    """Zulip passes the message's owner check, then fails the wake's: one line says the wake
+    waits, the check is tried again 5 s later from a fresh refresh, and the VM starts once. A
+    message that came meanwhile joined the wake: its ⏰ too."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, target, fake, ec2 = setup
+    users_fail(monkeypatch, target, lambda n: error if n == 2 else None)
+    later = []
+
+    async def message():
+        later.append(fake.post_as(20, "DECOY meanwhile", "wake"))
+        await waker.message(target, later[-1])
+
+    paused.during.append(message)
+    mid = await send(waker, target, fake)
+    assert len(ec2.starts) == 1 and paused.delays == [5.0] and ec2.describes == 2
+    for m in (mid, later[0]["id"]):
+        assert [r["emoji_code"] for r in fake.messages[m]["reactions"]] == ["23f0"]
+    assert [(line["what"], line["rest"], line["level"]) for line in wake_lines(caplog)] == [
+        ("delayed", f" (Zulip unavailable: {kind})", "INFO"), ("start", " result=ok", "INFO")
+    ]  # fmt: skip
+    assert "DECOY" not in caplog.text and not waker.waiting and not waker.tasks
+
+
+async def test_a_zulip_outage_past_the_bound_drops_the_wake_with_a_line(
+    setup, monkeypatch, caplog, paused
+):
+    """Every try fails: the waits double from 5 s up to a minute, the last cut to leave its try
+    `ROOM` (5 s) before the bound, five minutes after the first failure; each wait has its try
+    (review round 1). Then `Wake not started:` with the error's kind and status, and the
+    messages are dropped, as before (#1022)."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, target, fake, ec2 = setup
+    down, checks = ZulipError("INVALID_RESPONSE", 502), []
+    users_fail(monkeypatch, target, lambda n: checks.append(n) or (down if n > 1 else None))
+    mid = await send(waker, target, fake)
+    assert not ec2.starts
+    assert paused.delays == [5, 10, 20, 40, 60, 60, 60, 40]
+    assert sum(paused.delays) == service.OUTAGE - service.ROOM
+    assert len(checks) == 1 + 9  # the message's own check, then the wake's tries
+    reason = " (Zulip unavailable: ZulipError HTTP 502)"
+    assert [(line["what"], line["message"], line["rest"], line["level"])
+            for line in wake_lines(caplog)] == [
+        ("delayed", str(mid), reason, "INFO"), ("not started", str(mid), reason, "WARNING")
+    ]  # fmt: skip
+    assert not waker.waiting and not waker.tasks
+
+
+async def test_zulip_back_before_the_bound_gets_its_last_try(setup, monkeypatch, caplog, paused):
+    """Review round 1: Zulip back 260 s after the first failure, just after the try at 255 s.
+    The last wait, cut to 40 s, still leads to a try, at 295 s, which starts the VM."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, target, fake, ec2 = setup
+    down, first = ZulipError("INVALID_RESPONSE", 502), paused.clock.monotonic()
+    back = first + 260
+    users_fail(
+        monkeypatch, target, lambda n: down if n > 1 and paused.clock.time() < back else None
+    )
+    await send(waker, target, fake)
+    assert len(ec2.starts) == 1 and paused.delays == [5, 10, 20, 40, 60, 60, 60, 40]
+    assert [line["what"] + line["rest"] for line in wake_lines(caplog)] == [
+        "delayed (Zulip unavailable: ZulipError HTTP 502)", "start result=ok"
+    ]  # fmt: skip
+
+
+async def test_a_refusal_in_the_wakes_check_ends_it_at_once(setup, monkeypatch, caplog, paused):
+    """A 401 (a deactivated bot's key) is Zulip refusing: no retry and no start, the wake failed
+    as before #1022."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, target, fake, ec2 = setup
+    refused = ZulipError("UNAUTHORIZED", 401)
+    users_fail(monkeypatch, target, lambda n: refused if n > 1 else None)
+    await send(waker, target, fake)
+    assert not ec2.starts and not paused.delays
+    (line,) = wake_lines(caplog)
+    assert (line["what"], line["level"]) == ("failed (ZulipError)", "WARNING")
+    assert not waker.waiting and not waker.tasks
+
+
+async def test_a_vm_up_after_the_outage_is_left_alone(setup, monkeypatch, caplog, paused):
+    """The retry begins at the refresh: a VM started meanwhile is no longer stopped, so no
+    start request, and the messages go to its bridge."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, target, fake, ec2 = setup
+    down = ZulipError("INVALID_RESPONSE", 503)
+    users_fail(monkeypatch, target, lambda n: down if n == 2 else None)
+
+    async def started():
+        ec2.state = "running"
+
+    paused.during.append(started)
+    await send(waker, target, fake)
+    assert not ec2.starts and paused.delays == [5.0]
+    assert [line["what"] + line["rest"] for line in wake_lines(caplog)] == [
+        "delayed (Zulip unavailable: ZulipError HTTP 503)", "not started (VM running)"
+    ]  # fmt: skip
+
+
+async def test_a_rate_limit_past_the_bound_ends_the_wake_without_waiting(
+    setup, monkeypatch, caplog, paused
+):
+    """Codex round 1 on #1023: a 429 whose `Retry-After`, an hour, outlasts the bound, through
+    the client. Its request budget would hold the next try for the hour, and the VM would start
+    then; the wake gives up after its first wait instead, the 429 its reason."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    waker, target, fake, ec2 = setup
+    target.client.budget.clock = paused.clock
+    original, calls = target.client.request, []
+
+    async def request(method, endpoint, **params):
+        if endpoint == "users/me":
+            calls.append(endpoint)
+            if len(calls) == 2:  # the wake's own check: Zulip answers it with the 429
+                fake.failures.append((429, {"code": "RATE_LIMIT_HIT", "retry-after": 3600}))
+        return await original(method, endpoint, **params)
+
+    monkeypatch.setattr(target.client, "request", request)
+    mid = await send(waker, target, fake)
+    assert not ec2.starts and paused.delays == [5.0] and len(calls) == 2
+    reason = " (Zulip unavailable: ZulipError HTTP 429)"
+    assert [(line["what"], line["message"], line["rest"], line["level"])
+            for line in wake_lines(caplog)] == [
+        ("delayed", str(mid), reason, "INFO"), ("not started", str(mid), reason, "WARNING")
+    ]  # fmt: skip
+    assert not waker.waiting and not waker.tasks
+
+
+async def test_a_try_zulip_never_answers_ends_at_the_bound(setup, monkeypatch, caplog):
+    """Codex round 1 on #1023: a try begun before the bound, which Zulip never answers, is cut
+    off there, and nothing starts. On the real clock, the bound, the first wait and the room
+    for a try shortened."""
+    caplog.set_level(logging.INFO, "zab.waker")
+    monkeypatch.setattr(service, "OUTAGE", 0.3)
+    monkeypatch.setattr(service, "BACKOFF", 0.01)
+    monkeypatch.setattr(service, "ROOM", 0.05)
+    waker, target, fake, ec2 = setup
+    original, calls = target.client.request, []
+
+    async def request(method, endpoint, **params):
+        if endpoint == "users":
+            calls.append(endpoint)
+            if len(calls) == 2:
+                raise ZulipError("INVALID_RESPONSE", 502)
+            if len(calls) > 2:
+                await asyncio.Event().wait()  # no answer
+        return await original(method, endpoint, **params)
+
+    monkeypatch.setattr(target.client, "request", request)
+    await asyncio.wait_for(send(waker, target, fake), 5)
+    assert not ec2.starts and len(calls) == 3
+    assert [line["what"] + line["rest"] for line in wake_lines(caplog)] == [
+        "delayed (Zulip unavailable: ZulipError HTTP 502)",
+        "not started (Zulip unavailable: ZulipError HTTP 502)",
+    ]
+    assert not waker.waiting and not waker.tasks

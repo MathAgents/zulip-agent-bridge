@@ -38,6 +38,51 @@ from typing import Any
 #: releases (#593). `ZAB_REPO` overrides it in push_config.py, build_ami.py and build.sh; it
 #: must be a URL uv installs from (https:// or ssh://), not scp-style `git@host:path`.
 ZAB_REPO_URL = "https://github.com/MathAgents/zulip-agent-bridge"
+#: A fleet VM's root volume, in GB (gp3; README.md, "The VMs"), and the image's: EC2 refuses a
+#: volume smaller than its image's snapshot, so `build_ami.py` builds on this size and
+#: `launch.py` takes an older, larger image's own (#998). 80 GB, with the shared Mathlib the
+#: default and the admin bots' automatic growth of a filling disk (docs/ADMIN.md §3.4): no
+#: Harvard VM passed 70 GB, its 8 GiB swap file included. A new VM's first day should take about
+#: 40 GB of it, the image and a 5 GiB swap file (#997; 44 GB before: workshop/ami/README.md,
+#: "The image's footprint"). It was 200 (#205), when each topic built its own Mathlib.
+ROOT_GB = 80
+
+
+def root_gb_of(images: list[dict[str, Any]]) -> int | None:
+    """The size in GB of the root volume of DescribeImages' image, as its snapshot has it; None
+    when EC2 doesn't say. `launch.py` and `build_ami.py` launch no smaller volume (`ROOT_GB`)."""
+    for image in images:
+        for mapping in image.get("BlockDeviceMappings") or []:
+            size = (mapping.get("Ebs") or {}).get("VolumeSize")
+            if mapping.get("DeviceName") == image.get("RootDeviceName") and type(size) is int:
+                return size
+    return None
+
+
+#: EBS's provisioned rate for volume initialization, in MiB/s (#1007): a volume created from a
+#: snapshot, an image's at a launch or an archive's at a restore (#999), fetches every block
+#: from S3 at this rate from its creation on, so that it is whole within minutes. At EBS's
+#: default rate each block comes on its first read, at about 5 MiB/s: a fresh VM's first
+#: `import Mathlib` took about half an hour (#999). 200 is the top of the cheaper of its two
+#: price tiers (100-200, 201-300; docs/ADMIN.md §11.2); 0 keeps EBS's default rate.
+INIT_RATE = 200
+INIT_RATES = "0, or 100 to 300 MiB/s"
+
+
+def init_rate_params(rate: int) -> dict[str, int]:
+    """EBS's parameter for `rate` (`INIT_RATE`), the same in RunInstances' `Ebs` of a block
+    device mapping and in CreateVolume's arguments: `VolumeInitializationRate`, or none for 0,
+    EBS's default rate. Raises ValueError outside `INIT_RATES`."""
+    if type(rate) is not int or not (rate == 0 or 100 <= rate <= 300):
+        raise ValueError(f"volume initialization rate: {INIT_RATES}, got {rate!r}")
+    return {"VolumeInitializationRate": rate} if rate else {}
+
+
+def init_rate_text(rate: int) -> str:
+    """How the launch's output names `rate`."""
+    return f"{rate} MiB/s" if rate else "EBS's default (each block on its first read)"
+
+
 #: Tags set per participant (`launch.participant_tags`), never part of a scope.
 RESERVED_TAG_KEYS = frozenset({"Name", "participant"})
 #: The admin server's fleet-wide scope tag (docs/ADMIN.md §5): one value for every workshop of
@@ -354,8 +399,15 @@ def is_spare_name(name: str) -> bool:
 #: Decisions taken after the AMI was specified (issue #36; ../ami/README.md, "First boot"), applied
 #: at every first boot so that they hold whether or not the image already carries them. Every step
 #: is idempotent and runs as root (cloud-init). Mirrored in `workshop/ami/build.sh`.
-#: - An 8 GiB swap file: Ubuntu AMIs have no swap, and a participant's big Magma or Sage job
-#:   would otherwise get an agent, or the bridge, OOM-killed. Its `/etc/fstab` line is added
+#: - A 5 GiB swap file (#997; 8 GiB before, which `df` counted as used on every first day):
+#:   Ubuntu AMIs have no swap, and 5 GiB holds what SPEC §7.10's peak, every turn in Lean,
+#:   needs beyond the VM's memory, mostly idle processes' memory: at its recorded sizes and a
+#:   guess at the `claude` processes', not measured yet, with about 1.2 GB to spare at the high
+#:   end. It no longer stands between a big job and the bridge: the bridge's units keep running
+#:   when the kernel's OOM killer kills one of their processes (`OOMPolicy=continue`, from `zab
+#:   service install`; DECISIONS, 2026-11-08, has the arithmetic). A VM that has a swap file on
+#:   already, as every VM launched before keeps its 8 GiB one, is left alone.
+#:   Not mirrored in `build.sh`: the image carries no swap file. Its `/etc/fstab` line is added
 #:   only when no `/swapfile` line is there, separated by a space or a tab: an image may carry
 #:   one, written by hand perhaps, and the file needs only one (#799).
 #: - Claude Code's auto-updater off through the managed settings file, which the participant's
@@ -373,7 +425,7 @@ def is_spare_name(name: str) -> bool:
 #:   `~/.claude.json`, so the participant's first login still runs onboarding (verified 2.1.285).
 COMMON_FIRST_BOOT = """\
 if ! swapon --show=NAME --noheadings | grep -qx /swapfile; then
-  fallocate -l 8G /swapfile && chmod 0600 /swapfile && mkswap /swapfile >/dev/null \\
+  fallocate -l 5G /swapfile && chmod 0600 /swapfile && mkswap /swapfile >/dev/null \\
     && swapon /swapfile
 fi
 grep -q '^/swapfile[[:space:]]' /etc/fstab || echo '/swapfile none swap sw,nofail 0 0' >> /etc/fstab
@@ -418,7 +470,6 @@ WARM_PATHS = (
     # follow the link
     "/opt/lean",
     "/home/agent/lean",
-    "/home/agent/.cache/mathlib",
     "/usr/share/texlive",
     "/usr/share/texmf",
     "/home/agent/miniforge",
@@ -824,6 +875,10 @@ class Ec2:
         found = self._ec2.describe_security_groups(Filters=filters)["SecurityGroups"]
         return [g for g in found if has_tags(g, tags) and name in (None, g.get("GroupName"))]
 
+    def image_root_gb(self, image_id: str) -> int | None:
+        """The size in GB of the image's root volume (`root_gb_of`)."""
+        return root_gb_of(self._ec2.describe_images(ImageIds=[image_id])["Images"])
+
     def find_images(self, tags: dict[str, str]) -> list[dict[str, Any]]:
         """This account's available images that carry every one of `tags`."""
         if not tags:
@@ -872,8 +927,11 @@ class Ec2:
     def wait_running(self, instance_id: str) -> None:
         self._ec2.get_waiter("instance_running").wait(InstanceIds=[instance_id])
 
-    def start(self, instance_ids: list[str]) -> None:
-        self._ec2.start_instances(InstanceIds=instance_ids)
+    def start(self, instance_ids: list[str]) -> list[dict[str, Any]]:
+        """EC2's `StartingInstances`: each one's `PreviousState`, which says whether this call
+        started it (`power.StartStop`, #995)."""
+        answer = self._ec2.start_instances(InstanceIds=instance_ids)
+        return list((answer or {}).get("StartingInstances") or [])
 
     def stop(self, instance_ids: list[str]) -> None:
         self._ec2.stop_instances(InstanceIds=instance_ids)

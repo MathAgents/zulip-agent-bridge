@@ -346,8 +346,15 @@ async def stop(ec2, instance_id: str) -> None:
 
 
 async def until_stopped(ec2, instance_id: str) -> None:
-    """Wait until the VM is stopped and the waker has seen it so."""
-    ec2.wait_state(instance_id, "stopped", timeout=600)
+    """Wait until the VM is stopped and the waker has seen it so. A VM started again after the
+    stop, before the scenario's messages, fails the part at once, not after `wait_state`'s ten
+    minutes (#1017): `stop` waited for the poll that drops what the waker held, so a start
+    then is the waker's to explain (its journal's `Wake start:` line names the message)."""
+    state = ec2.wait_stopped(instance_id, timeout=600)
+    assert state == "stopped", (
+        f"the VM was started again after the stop (EC2 {state}), before the scenario's "
+        "messages: see the test waker's `Wake start:` line"
+    )
     await asyncio.sleep(WAKER_POLL_S)
     assert ec2.state(instance_id) == "stopped", "the VM woke before the scenario's messages"
 

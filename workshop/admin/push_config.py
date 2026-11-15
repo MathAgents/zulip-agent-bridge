@@ -77,12 +77,16 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from admin_common import (
     DEFAULT_KNOWN_HOSTS,
     GITHUB_OWNER,
+    HALTED_EXIT,
+    HALTED_FAILED_EXIT,
     IDLE_HOLD_OFF_CMD,
     IDLE_HOLD_ON_CMD,
     REFSERVE_OWNER,
     REFSERVE_URL,
+    ConnectRetry,
     Runner,
     RunResult,
+    add_start_stopped,
     allowlist_pending,
     first_line,
     format_table,
@@ -90,6 +94,7 @@ from admin_common import (
     host_of,
     keys_dir,
     load_roster,
+    noting,
     owner_record,
     pending_label,
     remote_chain,
@@ -99,6 +104,8 @@ from admin_common import (
     sign_in_pending,
     slug_of,
     ssh_argv,
+    start_stop,
+    start_stopped_line,
     subprocess_runner,
     work_repo,
 )
@@ -1087,6 +1094,7 @@ def rollout_vm(row: Mapping[str, str], opts: Options, runner: Runner) -> VmResul
     """README.md §2, steps 1 to 4, on one VM; stops at the first failed step, always cleans up
     staging."""
     result = VmResult(slug=slug_of(dict(row)), host="")
+    runner = noting(runner, result.notes)  # a connect that took a retry (#1009)
     try:
         result.host = host_of(row)
     except ValueError as exc:
@@ -1725,6 +1733,7 @@ def steps_vm(row: Mapping[str, str], opts: Options, runner: Runner) -> VmResult:
     """`--lean-shared` and/or `--idle-stop` without a release: the owner check, then only
     those steps (the shared Mathlib first, the idle-stop timer last)."""
     result = VmResult(slug=slug_of(dict(row)), host="")
+    runner = noting(runner, result.notes)  # a connect that took a retry (#1009)
     try:
         result.host = host_of(row)
     except ValueError as exc:
@@ -1779,7 +1788,12 @@ def steps_vm(row: Mapping[str, str], opts: Options, runner: Runner) -> VmResult:
 # ------------------------------------------------------------------------------------ CLI
 
 
-def render(results: list[VmResult], *, uninstall: bool = False, steps_only: bool = False) -> str:
+def render(
+    results: list[VmResult], *, uninstall: bool = False, steps_only: bool = False,
+    power: Mapping[str, str] | None = None,
+) -> str:  # fmt: skip
+    """The table; with `power` (`--start-stopped`, #995), a column of what became of each VM:
+    left running, or started and stopped again (`power.StartStop`)."""
     whole = uninstall or steps_only  # ok or FAIL, no doctor
     rows = [
         [
@@ -1787,6 +1801,7 @@ def render(results: list[VmResult], *, uninstall: bool = False, steps_only: bool
             r.host or "-",
             ("ok" if r.installed else "FAIL") if not whole else ("ok" if r.ok else "FAIL"),
             "-" if whole else _doctor_cell(r),
+            *([power.get(r.slug, "-")] if power is not None else []),
             "; ".join(
                 ([f"was {r.adopted}"] if r.adopted else [])
                 + r.failures
@@ -1796,7 +1811,8 @@ def render(results: list[VmResult], *, uninstall: bool = False, steps_only: bool
         for r in results
     ]
     head = "uninstall" if uninstall else "steps" if steps_only else "install"
-    return format_table(["participant", "host", head, "doctor", "failures"], rows)
+    columns = ["participant", "host", head, "doctor", *(["power"] if power is not None else [])]
+    return format_table([*columns, "failures"], rows)
 
 
 def _doctor_cell(r: VmResult) -> str:
@@ -1957,6 +1973,11 @@ class DryRunner:
         return out
 
 
+def flushed(line: str) -> None:
+    """A line as it comes, for the admin bot's progress message (`power.StartStop`'s, #995)."""
+    print(line, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="push_config.py", description="Roll the bridge out to the workshop VMs (README.md §2)."
@@ -2099,6 +2120,7 @@ def main(argv: list[str] | None = None) -> int:
         "--idle-stop-default turns idle stop on there alone; with =INSTANCE, the waker's "
         "instance ID for the row, only on the VM that is that instance",
     )
+    add_start_stopped(parser)
     args = parser.parse_args(argv)
     if args.restart_codex and (args.uninstall or not (args.tag or args.wheel)):
         parser.error("--restart-codex needs a release (--tag or --wheel)")
@@ -2232,10 +2254,34 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run
         else None
     )
-    runner: Runner = dry or subprocess_runner
+    # one per run: a connect that fails is retried only to a VM that answered in it (#1009)
+    runner: Runner = dry or ConnectRetry(subprocess_runner)
+    window = None
+    if args.start_stopped is not None:  # #995: power.StartStop, never in a dry run
+        try:
+            window = None if args.dry_run else start_stop(args, rows, runner, log=flushed)
+        except ValueError as exc:
+            print(f"refusing: {exc}", file=sys.stderr)
+            return 2
+        print(start_stopped_line(args.start_stopped), flush=True)
+        if window is not None and window.off:
+            print(f"start/stop off: {window.off}; stopped VMs are not started", flush=True)
+        elif window is not None and window.halted:  # #1031: an earlier workshop's run halted
+            print(f"start/stop halted: {window.halted}; stopped VMs are not started", flush=True)
+
+    def vm(row: dict[str, str]) -> VmResult:
+        def work() -> VmResult:
+            return (steps_vm if steps_only else rollout_vm)(row, opts, runner)
+
+        if window is None:
+            return work()
+        refused = lambda why: VmResult(slug=slug_of(row), host=row.get("host", ""),  # noqa: E731
+                                       failures=[why])  # fmt: skip
+        return window.around(row, work, refused)
+
     results = run_parallel(
         rows,
-        lambda row: (steps_vm if steps_only else rollout_vm)(row, opts, runner),
+        vm,
         parallel=1 if args.dry_run else args.parallel,
         on_error=lambda row, exc: VmResult(
             slug=slug_of(row),
@@ -2245,7 +2291,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     for line in dry.lines() if dry else []:
         print(line)
-    print(render(results, uninstall=args.uninstall, steps_only=steps_only))
+    power = dict(window.cells) if window is not None and not window.off else None
+    print(render(results, uninstall=args.uninstall, steps_only=steps_only, power=power))
+    if window is not None and window.summary():
+        print("\n" + window.summary())
     bad = [r for r in results if not r.ok]
     pending = [
         f"{len(vms)} VM(s) ok, {what} pending: expected until {until}"
@@ -2260,6 +2309,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\n" + "\n".join(pending))
     if bad:
         print(f"\n{len(bad)} VM(s) failed", file=sys.stderr)
+    if window is not None and window.tripped:  # #1031: a plan's later workshops start none
+        return HALTED_FAILED_EXIT if bad else HALTED_EXIT
     return 1 if bad else 0
 
 

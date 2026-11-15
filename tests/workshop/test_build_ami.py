@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import aws_common as ac
 import build_ami as ba
 import m2_debs
 import pytest
@@ -39,6 +40,10 @@ class FakeEc2:
         self.instances: list[str] = []
         self.sg_busy = 0  # delete_security_group fails this many times first
         self.deny_ingress = False
+        self.image_gb: dict[str, int] = {}  # an image's root, where DescribeImages says it
+
+    def image_root_gb(self, image):
+        return self.image_gb.get(image)
 
     def identity(self):
         self.calls.append(("identity",))
@@ -686,11 +691,16 @@ def test_main_builds_then_smokes_and_reports_the_ami(monkeypatch, pubkey, capsys
     out = capsys.readouterr().out
     assert rc == 0 and "AMI ami-new" in out and "smoke test passed" in out
     assert ec2.instances == ["i-0001", "i-0002"]  # the builder, then the smoke instance
+    sizes = [c[1]["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"] for c in ec2.calls
+             if c[0] == "run_instance"]  # fmt: skip
+    assert sizes == [ac.ROOT_GB, ac.ROOT_GB] == [80, 80]  # #998: the fleet's root
     terminated = [c[1] for c in ec2.calls if c[0] == "terminate"]
     assert terminated == [["i-0001"], ["i-0002"]]  # the builder before the smoke instance launches
     assert [c[0] for c in ec2.calls][-2:] == ["delete_key_pair", "delete_security_group"]
-    # --smoke-only: no build, one instance, the image is not created
+    # --smoke-only: no build, one instance, the image is not created; an image built before
+    # #998, whose root is 100 GB, on 100 GB, since EC2 refuses less (Codex round 1 on #1004)
     ec2, ssh = FakeEc2(), FakeSsh()
+    ec2.image_gb["ami-x"] = 100
     monkeypatch.setattr(ba, "Ec2", lambda region, profile: ec2)
     monkeypatch.setattr(ba, "Ssh", lambda key, known_hosts, log: ssh)
     rc = with_build(
@@ -710,7 +720,12 @@ def test_main_builds_then_smokes_and_reports_the_ami(monkeypatch, pubkey, capsys
         ],
     )
     assert rc == 0 and "create_image" not in [c[0] for c in ec2.calls]
-    assert ec2.calls[[c[0] for c in ec2.calls].index("run_instance")][1]["ImageId"] == "ami-x"
+    params = ec2.calls[[c[0] for c in ec2.calls].index("run_instance")][1]
+    assert params["ImageId"] == "ami-x"
+    assert params["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"] == 100
+    assert "zab-ami-smoke: ami-x's root is 100 GB, so the instance's is too, not 80 GB" in (
+        capsys.readouterr().out
+    )
     scripts = [c[2] for c in ssh.calls if c[0] == "run" and "ZAB_EOF" in c[2]]
     assert scripts and all("MAGMA=1" in s for s in scripts)
 

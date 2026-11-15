@@ -353,9 +353,10 @@ def test_the_runbooks_commands_parse_on_the_global_bot():
 
     text = (Path(__file__).resolve().parents[2] / "docs" / "NEW-WORKSHOP.md").read_text()
     ctx = Context(GLOBAL, "Workshop admin", re.compile(r"^v\d+\.\d+\.\d+$"), None)
-    shown = re.findall(r"^(![a-z-]+ .*)$", text, re.M) + re.findall(r"`(![a-z-]+[^`]*)`", text)
-    named = ("!new-workshop", "!approve", "!help")
+    shown = re.findall(r"^ *(![a-z-]+ .*)$", text, re.M) + re.findall(r"`(![a-z-]+[^`]*)`", text)
+    named = ("!new-workshop", "!approve", "!help", "!set-workshop", "!show-workshop")  # #1043
     commands = [c for c in shown if c.split()[0] in named and len(c.split()) > 1]
     assert len(commands) >= 3
+    assert {c.split()[0] for c in commands} >= {"!set-workshop", "!show-workshop"}  # §6
     for line in commands:
         assert isinstance(parse(line, ctx), Command), line

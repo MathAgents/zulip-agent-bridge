@@ -202,8 +202,9 @@ def disk_gb(n: int) -> str:
     """Bytes as binary "GB" (2**30 bytes), rounded up as `df -h` rounds them: to a tenth below
     10 GB, whole from there; `0` for none. The disk's unit (#552) is memory's and `!vm`'s (#204;
     SPEC §13.5: "GB means binary gigabytes"), and `df -h`'s; `!vm` rounds
-    its size to the nearest GB, so the two can differ by one (the fleet's 200 GiB root, 193.6
-    GiB, reads 194 in both). status.py has the same (`disk_gb`; a test keeps the two equal)."""
+    its size to the nearest GB, so the two can differ by one (a 200 GiB root, the fleet's
+    before #998, 193.6 GiB, reads 194 in both). status.py has the same (`disk_gb`; a test
+    keeps the two equal)."""
     if n <= 0:
         return "0"
     tenths = -(-n * 10 // 2**30)

@@ -128,7 +128,7 @@ from zab.admin.actions import (
 )
 from zab.admin.fleet import ApplyEnd, FleetError, RowEnd, read_roster, roster_rows
 from zab.admin.grammar import Command, Selection
-from zab.admin.planning import NOTE_CHARS, Job, Prepared
+from zab.admin.planning import NOTE_CHARS, PART, Job, Prepared
 from zab.admin.plans import APPLYING, APPROVED, DONE, EXPIRED, FAILED, STALE, Plan, fingerprint
 from zab.admin.reads import footer, short
 from zab.admin.scrub import (
@@ -309,6 +309,18 @@ class Ran:
         out (Codex on #354)."""
         return self.code == 0 and not self.ended
 
+    @property
+    def halted(self) -> bool:
+        """push_config.py or trust_fix.py, ended on its own, halted its starts (#1031): the use
+        of the VMs it started couldn't be read (`actions.STARTS_HALTED…`)."""
+        halts = (actions_mod.STARTS_HALTED, actions_mod.STARTS_HALTED_FAILED)
+        return not self.ended and self.script in actions_mod.HALTING and self.code in halts
+
+    @property
+    def halted_done(self) -> bool:
+        """`halted`, with every row done all the same (`actions.STARTS_HALTED`)."""
+        return self.halted and self.code == actions_mod.STARTS_HALTED
+
     def __str__(self) -> str:
         how, name = (", then SIGKILL" if self.killed else ""), self.label
         if self.code is None:
@@ -474,6 +486,14 @@ def _fields(plan: Plan) -> dict[str, Any]:
     return {"plan": plan.name, "workshop": plan.workshop, "bot": plan.bot}
 
 
+def _shown(job: Job) -> str:
+    """The command a result or a progress line names: the plan's, or, for a part of a plan of
+    every workshop (#995), its workshop and that workshop's own command."""
+    if not job.part:
+        return f"`{short(job.plan.command)}`"
+    return f"{job.part} · `{short(' '.join(('!' + job.action.verb, *job.action.args)))}`"
+
+
 def _step_record(ran: Ran) -> dict[str, Any]:
     """A step as `apply_end` records it, with its row when it has one (review of #564)."""
     out: dict[str, Any] = {"script": ran.script, "exit": ran.code, "ended": ran.ended}
@@ -481,6 +501,11 @@ def _step_record(ran: Ran) -> dict[str, Any]:
     return out | ({"row": ran.row} if ran.row else {})
 
 
+#: Why a step that halted its starts with every row done fails the apply (#1031; `Ran.halted`).
+HALTED_DONE = (
+    "it halted its starts, as the use of 3 VMs in a row that it started couldn't be read, and did "
+    "every row all the same: tell a deployer"
+)
 #: The cell of a month-end run's row cancelled during the run, before its step (#570).
 CANCELLED_CELL = "cancelled"
 #: The cell of a `!retire`'s step that ran but whose `retire_step` record couldn't be written,
@@ -885,6 +910,9 @@ class Runner:
         self.rosters = asyncio.Lock()  # the server's roster lock (module doc, #646)
         self.queued: list[Plan] = []  # the plans that hold it or wait for it, in order
         self._hashed: dict[int, dict[str, str]] = {}  # an apply's input digests, as rechecked
+        #: (plan, workshop) → (outcome, chain head, whether it halted its starts) of each part
+        #: of a plan of every workshop
+        self._parted: dict[tuple[int, str], tuple[str, Any, bool]] = {}
         self.unread: dict[str, int] = {}  # a workshop's month-end runs whose reads failed
 
     # -------------------------------------------------------------------------- processes
@@ -1120,7 +1148,8 @@ class Runner:
         if (listing and self.vms is None) or (action.hashed == RETIRE and self.tagged is None):
             raise RunnerError("this server can't list its VMs yet: nothing runs")
         tmp = self._fresh(plan.name)
-        deadline = time.monotonic() + timeout(action.verb)
+        # a plan of every workshop: the verb's deadline once a workshop (#995, review of #1030)
+        deadline = time.monotonic() + timeout(action.verb) * max(1, len(action.parts))
         hashed = Capture(KEEP // 2)  # with the plan's own lines, one scrubber call holds it all
         try:
             for step in action.steps:
@@ -1138,6 +1167,12 @@ class Runner:
                 out = read if read is not None else shown
                 env = self.environment(tmp)
                 await self._step(action.status, env, tmp, deadline, out, framed=read is None)
+            for part in action.parts if planning else ():  # every workshop's (#995)
+                out = read if read is not None else shown
+                if part.status is not None:
+                    out.feed(f"{PART}{part.workshop}\n")
+                    env = self.environment(tmp)
+                    await self._step(part.status, env, tmp, deadline, out, framed=read is None)
             vms: Mapping[str, str] = {}
             tagged: Mapping[str, str] = {}
             if action.hashed in (TARGETS, RETIRE) and self.vms is not None:
@@ -1272,6 +1307,9 @@ class Runner:
             text = f"❌ {plan.name} is {plan.state} ({plan.note}{since}): nothing was done."
             await self._say(job, f"{text} Request again.", head)
             return
+        if action.parts:  # every workshop's (#995): each part under its own records
+            await self._parts(job, plan)
+            return
         try:
             await server.audit(
                 "apply_start",
@@ -1294,6 +1332,70 @@ class Runner:
             await self._steps(job, plan, Rows(action, live.vms), live)
         finally:
             self._hashed.pop(plan.id, None)
+
+    async def _parts(self, job: Job, plan: Plan) -> None:
+        """A plan of every workshop (#995, `fleetwide`): each workshop's part in turn, as that
+        workshop's own `!rollout … all` applies, under its records (`apply_start` and
+        `apply_end` with its workshop, its command's words and its rows, which the ledger reads
+        as that workshop's), with its own deadline and result; one that fails doesn't stop the
+        next. Their records say `part`, so that the console shows the plan applying until its
+        `plan_end`, which follows the last. An error past a part's own handling ends the loop:
+        the plan is finished all the same, so its locks are released (review of #1030, N5); only
+        the bot's stop leaves it APPLYING, for the next start to mark INTERRUPTED. Once a part
+        has halted its starts (`actions.STARTS_HALTED`: a use check broken on its VMs), each
+        later part runs with `--halted-in` (`actions.halt_starts`) and starts no VM (#1031). The
+        plan is DONE when every part is; then one line for them all, which names such a halt."""
+        server, started, ended = self.server, time.monotonic(), list[tuple[str, str]]()
+        assert server.store is not None and server.approvals is not None
+        head, halted, held = None, "", list[str]()  # the part that halted its starts, and after
+        for part in job.action.parts:
+            record = {**_fields(plan), "workshop": part.workshop, "part": True}
+            try:
+                await server.audit(
+                    "apply_start", **record, hash=plan.hash, verb=part.verb, args=list(part.args),
+                    approvers=list(server.approvals.approved_by(plan.id)), server=server.release,
+                    **ApplyEnd.start_fields(part.targets),
+                )  # fmt: skip
+            except Exception as exc:  # nothing more runs without its record
+                LOG.warning("%s: apply_start not recorded (%s)", plan.name, type(exc).__name__)
+                ended.append((part.workshop, "not begun: the audit log can't be written"))
+                break
+            try:
+                run = actions_mod.halt_starts(part, halted) if halted else part
+                held += [part.workshop] * bool(halted)
+                await self._steps(dataclasses.replace(job, action=run, part=part.workshop),
+                                  plan, Rows(run, {}))  # fmt: skip
+            except Exception as exc:  # past the part's own handling: no further part runs
+                LOG.warning("%s: %s's part failed (%s)", plan.name, part.workshop,
+                            type(exc).__name__, exc_info=exc)  # fmt: skip
+                self._parted.pop((plan.id, part.workshop), None)
+                ended.append((part.workshop, f"error ({type(exc).__name__})"))
+                break
+            outcome, head, halt = self._parted.pop((plan.id, part.workshop), ("error", head, False))
+            ended.append((part.workshop, outcome))
+            halted = halted or part.workshop * halt
+        done = [ws for ws, outcome in ended if outcome == "done"]
+        ok = len(done) == len(job.action.parts)
+        server.store.finish(plan.id, ok)
+        try:  # the whole plan's end, after its parts' (the console's, N2)
+            head = await server.audit(
+                "plan_end", **_fields(plan), verb=job.action.verb, exit=0 if ok else 1,
+                outcome="done" if ok else "failed", parts=dict(ended),
+            )  # fmt: skip
+        except Exception as exc:  # the parts' own records stand; the footer is the last's
+            LOG.warning("%s: plan_end not recorded (%s)", plan.name, type(exc).__name__)
+        others = "; ".join(f"{ws}: {outcome}" for ws, outcome in ended if outcome != "done")
+        never = [p.workshop for p in job.action.parts][len(ended) :]
+        others += f"; not begun: {', '.join(never)}" * bool(never)
+        if halted:  # #1031: the use of the VMs it started couldn't be read
+            then = f": {', '.join(held)} started no VM" if held else ""
+            others += f"; starts halted in {halted}{then}"
+        title = (
+            f"{'✅' if ok else '❌'} **{plan.name}** · `{short(plan.command)}`: "
+            f"{len(done)} of {len(job.action.parts)} workshops done in "
+            f"{took(time.monotonic() - started)}" + (f"; {others.lstrip('; ')}" if others else "")
+        )
+        await self._say(job, title, head)
 
     async def month_end(
         self, plan: Plan, bot: AdminBot, where: tuple[int, str], fleet: Fleet, schedule: Plan,
@@ -1491,7 +1593,9 @@ class Runner:
         hooks: RunHooks | None = None,
     ) -> bool:  # fmt: skip
         """The steps in order, up to the first that fails, or each row's up to its own first
-        failure (`Rows`); `apply_end` however it ends, and whether it was recorded (`_end`).
+        failure (`Rows`); past one that halted its starts with every row done, which fails the
+        apply but runs the steps after it, the status read (#1031, `Ran.halted_done`);
+        `apply_end` however it ends, and whether it was recorded (`_end`).
         `!month-end schedule` has no step: its apply stores the schedule (`_schedule`), from
         the recheck's `live`. A month-end run's `hooks` (#570) may wait before a row's step or
         stop its row, and record each one that ends. A `!retire`'s row's step, a month-end
@@ -1534,7 +1638,8 @@ class Runner:
                     hooks.after(step, ran)  # never claims a step the log doesn't have
                 if ran.ended or not (ran.ok or step.tolerated or step.row):
                     failed = True
-                    break
+                    if not ran.halted_done:  # every row done: the status read runs (#1031)
+                        break
             timed_out = any(ran.ended for ran in steps)
             failed = failed or bool(rows.stopped)
             outcome = "timed out" if timed_out else "failed" if failed else "done"
@@ -1591,10 +1696,14 @@ class Runner:
         head = None
         await asyncio.to_thread(server.reload_secrets)  # what a cut-short step wrote, too
         scrubbed = await asyncio.to_thread(server.scrub, shown.kept()) + shown.note()
-        saved, digest = await asyncio.to_thread(self._write, plan, "apply.txt", scrubbed)
+        name = f"apply-{job.part}.txt" if job.part else "apply.txt"  # a part's own (#995)
+        saved, digest = await asyncio.to_thread(self._write, plan, name, scrubbed)
         ends = rows.ends() if rows.cells else None
-        end = ApplyEnd(plan.workshop, plan.name, action.verb, action.args, code, action.targets,
-                       ends)  # fmt: skip
+        # #1031: the steps all exited 0 but one that halted its starts with every row done,
+        # which the ledger takes as an exit 0
+        halted = any(r.halted_done for r in steps) and all(r.ok or r.halted_done for r in steps)
+        end = ApplyEnd(job.part or plan.workshop, plan.name, action.verb, action.args, code,
+                       action.targets, ends, halted=halted and outcome == "failed")  # fmt: skip
         recorded = False
         try:
             head = await server.audit(
@@ -1609,13 +1718,17 @@ class Runner:
                 output=saved,
                 output_sha256=digest,
                 server=server.release,
+                **({"part": True} if job.part else {}),  # a part's: the plan goes on (#995)
             )
             recorded = True
         except Exception as exc:  # the result says so (review of #354)
             LOG.warning("%s: apply_end not recorded (%s)", plan.name, type(exc).__name__)
         if outcome == "interrupted":
             return recorded  # still APPLYING: the next start marks it INTERRUPTED and says so
-        server.store.finish(plan.id, code == 0)
+        if job.part:  # a part of a plan of every workshop (#995): `_parts` finishes it
+            self._parted[(plan.id, job.part)] = (outcome, head, any(r.halted for r in steps))
+        else:
+            server.store.finish(plan.id, code == 0)
         await self._result(job, plan, outcome, steps, scrubbed, started, head, rows)
         await server.backups.after(job, before)
         return recorded
@@ -1626,9 +1739,14 @@ class Runner:
     ) -> None:  # fmt: skip
         n, total = len(steps), len(job.action.applied)
         where = f"step {n} of {total}: {steps[-1]}" if steps else ""
+        failed = f"failed at {where}. Nothing after it ran"
+        halt = next((i for i, r in enumerate(steps) if r.halted_done), None)
+        if halt is not None:  # #1031: the steps after it ran
+            later = ". The steps after it ran" if halt + 1 < n else ""
+            failed = f"failed at step {halt + 1} of {total}: {steps[halt]}: {HALTED_DONE}{later}"
         what = {
             "done": ("✅", f"done in {took(time.monotonic() - started)}, every step exited 0"),
-            "failed": ("❌", f"failed at {where}. Nothing after it ran"),
+            "failed": ("❌", failed),
             "timed out": ("⏱", f"timed out after {took(limit(job.action))}, at {where}"),
         }.get(outcome, ("❌", f"the runner failed, {n} of {total} steps begun. Nothing more ran"))
         if job.action.verb == MONTH_END and outcome == "done":  # its apply has no step (#570)
@@ -1640,7 +1758,7 @@ class Runner:
             what, table = self._rows(rows, outcome, started, what), [fence(rows.table())]
             table += self._after(job, rows)
         inline, cut = _tail(scrubbed)
-        title = f"{what[0]} **{plan.name}** · `{short(plan.command)}`: {what[1]}"
+        title = f"{what[0]} **{plan.name}** · {_shown(job)}: {what[1]}"
         most = job.bot.client.limits.get("max_message_length", 10000) if job.bot else 10000
         if table and len("\n".join([title, *table, inline])) > most - RESULT_ROOM:
             # cut to fit, as a plan is (review of #564): the whole of it attached
@@ -1653,6 +1771,9 @@ class Runner:
             link = await self._attach(job.bot, f"{plan.name}-apply.txt", scrubbed)
             whole = f"the whole output: {link}" if link else "the whole output's attachment failed"
             lines.append(f"*The last lines; {whole}.*")
+        if job.part:  # its output's `!` commands are its workshop's (review of #1030, N4)
+            lines.append(f"*A command this output names, such as a rerun, goes to {job.part}'s "
+                         "own bot, in its organizers channel, not to this one.*")  # fmt: skip
         lines.append(
             footer(head)
             if head is not None
@@ -1748,7 +1869,7 @@ class Runner:
         where += f" for {steps[-1].row}" if steps and steps[-1].row else ""
         line = next((x for x in reversed(scrubbed.split("\n")) if x.strip()), "")
         said = f"\nlast line: {span(line[-200:])}" if line else ""
-        return f"⏳ **{job.plan.name}** · `{short(job.plan.command)}`: applying, {where}{said}"
+        return f"⏳ **{job.plan.name}** · {_shown(job)}: applying, {where}{said}"
 
     async def _ticker(
         self, job: Job, message: int, steps: list[Ran], shown: Capture, posted: str

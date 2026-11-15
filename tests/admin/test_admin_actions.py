@@ -154,6 +154,10 @@ WAKER = (
 )
 NO_APPLY = "(the list without --apply)"  # push_waker.py's dry run is its run without --apply
 DEFAULTS = "--lean-shared-default --idle-stop-default 60"  # a rollout's, without the words (#704)
+#: A rollout's: a stopped VM started for its row and stopped again (#995), 8 at a time
+START = "--start-stopped 8 --region us-west-2 --scope-tag workshop=harvard-2026 --scope-tag "
+START += "zab-scope=mathagents"
+TRUST_START = START.replace("--start-stopped 8", "--start-stopped 6")  # #995: the trust fix's 6
 
 #: (message, [(apply, dry run or None, env)]). Each string is split on spaces.
 EXACT = [
@@ -224,7 +228,7 @@ EXACT = [
         [
             (
                 ROLL.format(release=WHL) + " --lean-shared --restart-codex --no-claude-steer "
-                f"--idle-stop 15 --no-multi-party --claude-raw-log meta {EVERYONE}",
+                f"--idle-stop 15 --no-multi-party --claude-raw-log meta {START} {EVERYONE}",
                 PARALLEL_DRY,
                 (),
             ),
@@ -236,7 +240,7 @@ EXACT = [
     (
         "!rollout v0.2.2 bob",
         [
-            (ROLL.format(release=WHL) + f" {DEFAULTS} --only bob", PARALLEL_DRY, ()),
+            (ROLL.format(release=WHL) + f" {DEFAULTS} {START} --only bob", PARALLEL_DRY, ()),
             (f"{STATUS} --only bob", None, ()),
         ],
     ),
@@ -245,7 +249,8 @@ EXACT = [
         [
             (
                 ROLL.format(release=WHL)
-                + f" --claude-steer --multi-party --claude-raw-log off {DEFAULTS} --only bob",
+                + f" --claude-steer --multi-party --claude-raw-log off {DEFAULTS} {START} "
+                "--only bob",
                 PARALLEL_DRY,
                 (),
             ),
@@ -373,13 +378,20 @@ EXACT = [
     # #992: its run without --apply is the plan's dry run; `all` is the rows with a VM
     (
         "!trust-fix all",
-        [(f"{PY}/admin/trust_fix.py {R} {KH} --admin-bot {LAUNCHED} --apply", NO_APPLY, ())],
+        [
+            (
+                f"{PY}/admin/trust_fix.py {R} {KH} --admin-bot {TRUST_START} {LAUNCHED} --apply",
+                NO_APPLY,
+                (),
+            )
+        ],
     ),
     (
         "!trust-fix dave bob",
         [
             (
-                f"{PY}/admin/trust_fix.py {R} {KH} --admin-bot --only bob --only dave --apply",
+                f"{PY}/admin/trust_fix.py {R} {KH} --admin-bot {TRUST_START} --only bob "
+                "--only dave --apply",
                 NO_APPLY,
                 (),
             )
@@ -477,12 +489,12 @@ def test_every_verb_maps_to_exact_argument_lists(message, steps, layout):
 
 def test_the_table_covers_every_mapped_verb():
     covered = {command(message).verb for message, _ in EXACT}
-    # !new-workshop and !upgrade-server are the [global] bot's, built by zab.admin.newworkshop
-    # and zab.admin.upgradeserver (#569); !retire's steps
+    # !new-workshop, !set-workshop and !upgrade-server are the [global] bot's, built by
+    # zab.admin.newworkshop, setworkshop (#1043) and upgradeserver (#569); !retire's steps
     # carry their rows (#559); !roster sync and restore need another fleet (#627), and
     # !month-end schedule rows with an end (#570): each has its own tests
     left = {"new-workshop", "upgrade-server", "retire", "roster sync", "roster restore"}
-    left.add("month-end schedule")
+    left |= {"month-end schedule", "set-workshop"}
     assert covered == set(VERBS) - left
 
 
@@ -493,7 +505,7 @@ def test_every_verb_is_mapped_or_answered_by_the_bot():
 
 
 def test_every_keyword_and_setting_has_a_fixed_flag():
-    for verb in set(VERBS) - {"new-workshop", "upgrade-server"}:  # their modules' own flags
+    for verb in set(VERBS) - {"new-workshop", "set-workshop", "upgrade-server"}:  # their own
         spec = SPECS[verb]
         assert set(spec.keywords) == set(KEYWORD_FLAGS.get(verb, {})), verb
         assert set(spec.settings) <= set(SETTING_FLAGS), verb
@@ -562,7 +574,8 @@ SELECTING = sorted(verb for verb in VERBS if SPECS[verb].selection)
 def raw_selection(**fields) -> Selection:
     """A Selection past the grammar's own checks (#323): actions.py refuses it on its own."""
     selection = object.__new__(Selection)
-    values = {"all": False, "spares": False, "slugs": (), "spare_names": (), **fields}
+    values = {"all": False, "spares": False, "slugs": (), "spare_names": (),
+              "every_workshop": False, **fields}  # fmt: skip
     for name, value in values.items():
         object.__setattr__(selection, name, value)
     return selection
@@ -1205,7 +1218,7 @@ def test_a_selection_of_the_wrong_types_is_refused(layout):
     """A truthy "false" read back from a stored plan must never mean `all` (the review of
     #333): the grammar refuses it, and so does actions.py on its own."""
     for fields in ({"all": "false"}, {"spares": "no"}, {"slugs": ["alice"]}, {"slugs": (1,)}):
-        with pytest.raises(ValueError, match="two bools"):
+        with pytest.raises(ValueError, match="three bools"):
             Selection(**{"slugs": ("alice",), **fields})
     for verb in ("status", "provision zulip", "stop"):
         for fields in ({"all": "false"}, {"spares": "no"}, {"slugs": ["alice"]}):

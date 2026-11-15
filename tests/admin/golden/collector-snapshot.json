@@ -9,8 +9,8 @@
    ],
    "cost": {
     "hours_today": 2.17,
-    "month": 8.76,
-    "projected": 57.4,
+    "month": 4.96,
+    "projected": 32.58,
     "running": 2,
     "spares": 1,
     "spares_running": 1,
@@ -45,8 +45,8 @@
      "cost": {
       "hours_month": 1.0,
       "hours_today": 1.0,
-      "month": 2.4,
-      "projected": 15.74,
+      "month": 1.45,
+      "projected": 9.54,
       "unpriced": []
      },
      "instance": "i-a",
@@ -77,6 +77,7 @@
        "last_verdict": "busy: 1 session",
        "minutes": 60
       },
+      "instance": null,
       "last_activity": "2027-01-15T07:30:00Z",
       "last_error": "token [redacted secret]",
       "load": {
@@ -107,8 +108,8 @@
      "cost": {
       "hours_month": 0.0,
       "hours_today": 0.0,
-      "month": 1.94,
-      "projected": 12.71,
+      "month": 0.99,
+      "projected": 6.5,
       "unpriced": []
      },
      "instance": "i-b",
@@ -127,8 +128,8 @@
      "cost": {
       "hours_month": 0.17,
       "hours_today": 0.17,
-      "month": 2.02,
-      "projected": 13.21,
+      "month": 1.07,
+      "projected": 7.0,
       "unpriced": []
      },
      "instance": "i-s",
@@ -147,8 +148,8 @@
      "cost": {
       "hours_month": 1.0,
       "hours_today": 1.0,
-      "month": 2.4,
-      "projected": 15.74,
+      "month": 1.45,
+      "projected": 9.54,
       "unpriced": []
      },
      "instance": "i-z",
@@ -189,6 +190,7 @@
        "last_verdict": "busy: 1 session",
        "minutes": 60
       },
+      "instance": null,
       "last_activity": "2027-01-15T07:30:00Z",
       "last_error": null,
       "load": {
@@ -217,8 +219,8 @@
    ],
    "cost": {
     "hours_today": 1.0,
-    "month": 2.4,
-    "projected": 15.74,
+    "month": 1.45,
+    "projected": 9.54,
     "running": 1,
     "spares": 0,
     "spares_running": 0,
@@ -238,8 +240,8 @@
      "cost": {
       "hours_month": 1.0,
       "hours_today": 1.0,
-      "month": 2.4,
-      "projected": 15.74,
+      "month": 1.45,
+      "projected": 9.54,
       "unpriced": []
      },
      "instance": "i-e",

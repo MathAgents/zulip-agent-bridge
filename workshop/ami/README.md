@@ -126,6 +126,57 @@ The image's disk, network, metadata and tags are the launch's ([`workshop/aws/RE
 VMs"](../aws/README.md#the-vms)). The first boot (below) applies the swap file, the update pins and the MCP setup again, so
 that they hold on images built before them.
 
+## The image's footprint
+
+A VM's disk held about 44 GB on its first day before #997: 36 GB of image (measured on the
+check build of Nov 8, by directory, on issue #997) and the 8 GiB swap file of its first boot,
+which `df` counts as used. The image now leaves out what nobody runs, each saving in the build's
+log (`freed … MiB`, from `build.sh` steps 12b and 12c):
+
+- **Package documentation** (about 0.45 GB of the 0.7 GB in `/usr/share/doc`, most of it TeX
+  Live's package manuals, so `texdoc biblatex` and the like find nothing; CTAN has them):
+  `/etc/dpkg/dpkg.cfg.d/zab-no-doc`, written before the first package is installed, leaves
+  `/usr/share/doc` out of every package but its copyright file, and keeps Macaulay2's tree
+  whole, since the macaulay2 package builds `help`'s databases from the dumps there (the build
+  checks they exist). Man pages and info files stay.
+  The file stays on the image, so a package an agent installs on a VM gets no documentation
+  either; `sudo rm /etc/dpkg/dpkg.cfg.d/zab-no-doc` and `sudo apt-get install --reinstall
+  PACKAGE` bring a package's back.
+- **conda's package cache** (`conda clean -afy`, up to 1.44 GB): the Sage environment is
+  unchanged, since it holds hard links or copies of the cache's files, not symlinks (the build
+  stops if the clean leaves one dangling).
+- **apt's package cache.**
+- **Mathlib's downloaded archives**, `~/.cache/mathlib` (0.47 GB), its own step (12c): a
+  project on the shared Mathlib builds from the unpacked files, and the smoke test runs a new
+  project's first `lake build` with no network at all. `lake exe cache get`, which the agents'
+  instructions forbid in such a project, would download them again.
+
+With these and the first boot's 5 GiB swap file (below), a new VM's first day should take about
+40 GB: half of the 80 GiB root that `launch.py` gives since #998, from which a filling disk grows
+by itself at 85% (docs/ADMIN.md §3.4). The next check build measures the image's part, its smoke
+test's `disk used`; the swap file is a launched VM's, made by its first boot, which the smoke
+instance doesn't run (it gets no user data).
+
+**The swap file is 5 GiB** (8 GiB before #997), made by the first boot where no `/swapfile` is
+on already. Its job was to keep a big Magma or Sage job from getting an agent or the bridge
+OOM-killed. Swap only delays an out-of-memory kill, and the kernel's OOM killer picks the
+largest process, usually the job. What took the bridge down with the job was systemd's default
+policy: when any process of a unit is OOM-killed, it stops the whole unit. The agents' commands
+run in the bridge's unit (Claude's) and in the Codex daemon's, so both units now carry
+`OOMPolicy=continue` (`zab service install`,
+[SPEC §13.3](../../docs/SPEC.md#133-systemd-user-units-linux)): the job alone ends, and its turn
+sees it killed. The size is SPEC §7.10's peak, every turn in Lean at once, at its recorded sizes
+and a guess at the `claude` processes', which nobody has measured yet: 2.2 to 4.2 GB beyond the
+VM's 32.9 GB, which the kernel moves out of memory, idle processes' first, such as the Codex
+threads' `lean-lsp-mcp` children (about 54 MB each). 5 GiB (5.37 GB) holds the high end with
+about 1.2 GB to spare, where 4 GiB left 0.1 GB; the margin rests on that guess, and on how the
+recorded Lean figures were converted from kB, both owed a measurement by the next check build.
+8 GiB also held about two of Codex's idle Lean servers more; at such a peak the OOM killer now
+takes a background job first, if one runs (SPEC §7.14), then a Lean server or a `claude`, and
+its turn sees it killed. A job that outgrows the VM's memory is killed after 5 GiB of swap
+instead of 8, and alone. The swap's size doesn't change the bill, only the volume's headroom.
+The arithmetic, and why not `OOMScoreAdjust=`: DECISIONS, 2026-11-08.
+
 ## First boot
 
 `launch.py` gives every VM a cloud-init script, rendered per roster row from `aws_common.py`'s
@@ -141,9 +192,11 @@ templates, every value shell-quoted. It runs once, as root, at the instance's fi
    checkout), which `push_config.py` and `provision_repos.py` check before they change anything;
 5. then, idempotently, the decisions taken after the image was specified, mirrored in
    `build.sh`:
-   - an 8 GiB swap file, `/swapfile` (`fallocate -l 8G /swapfile`, then `mkswap` and `swapon`,
-     and an `/etc/fstab` line with `nofail`): Ubuntu's images have none, and a big Magma or Sage
-     job would otherwise get an agent or the bridge OOM-killed;
+   - a 5 GiB swap file, `/swapfile` (`fallocate -l 5G /swapfile`, then `mkswap` and `swapon`,
+     and an `/etc/fstab` line with `nofail`), where no `/swapfile` is on already: Ubuntu's
+     images have none, and it holds what a VM's busiest moment needs beyond its memory. VMs
+     launched before #997 keep their 8 GiB file
+     (["The image's footprint"](#the-images-footprint) says why 5 GiB);
    - Claude Code's auto-updater off (`DISABLE_AUTOUPDATER` in the managed settings),
      claude.ai connectors off, and its own CA list on the system store
      (`CLAUDE_CODE_CERT_STORE=system`, #882), merged into the file with every other key kept.
@@ -168,14 +221,17 @@ get no SSH, and the roster's GitHub columns play no part in the first boot.
 
 **Which image a workshop launches from.** The admin server launches a workshop's VMs from the
 `ami` of its entry in `admin.toml` (`_build_launch` in `src/zab/admin/actions.py` passes it to
-`launch.py --ami`). An entry keeps its `ami`; a new one gets its region's newest scoped image:
+`launch.py --ami`). An entry keeps its `ami` until a global admin's `!set-workshop <ws>
+ami=newest` moves it to the region's newest, picked by the same `newest_image` ([ADMIN
+§2.10](../../docs/ADMIN.md#210-changing-a-workshops-entry-set-workshop-show-workshop-1043)); a new one
+gets its region's newest scoped image:
 
 - **Each region set up for the fleet** holds dated copies of the workshop image,
   `zab-fleet-YYYYMMDD`, made by the account owner, the image and its snapshots tagged with the
   fleet's scope (`zab-scope=<[global] scope>`; [BOOTSTRAP §6.1](../../docs/BOOTSTRAP.md#61-the-fleets-security-group-and-image-per-region)). A new region gets a copy of the
   newest scoped image of a region set up already ([BOOTSTRAP §6.5](../../docs/BOOTSTRAP.md#65-a-new-region-end-to-end)).
-- **`!new-workshop` takes the region's newest** for the new entry ([ADMIN §2.9](../../docs/ADMIN.md#29-adding-a-workshop-new-workshop)): `region_setup`
-  (`workshop/admin/new_workshop.py`) asks `find_images` (`workshop/aws/aws_common.py`) for this
+- **`!new-workshop` takes the region's newest** for the new entry ([ADMIN §2.9](../../docs/ADMIN.md#29-adding-a-workshop-new-workshop)), as `!set-workshop ami=newest` does for an existing one: `newest_image`
+  (`workshop/admin/new_workshop.py`, which `region_setup` calls) asks `find_images` (`workshop/aws/aws_common.py`) for this
   account's `available` images in the region that carry every fleet-wide scope tag, the scope and
   `[global]`'s extra `tags`, and takes the one with the latest `CreationDate`. When two share the
   latest `CreationDate`, both are named and the plan is refused.
@@ -256,8 +312,10 @@ does not match `--zab-tag`.
 - The account's credential is the owner's profile, `$P`, through IAM Identity Center where the
   account uses it, so that no long-lived key sits on the laptop ([BOOTSTRAP §1](../../docs/BOOTSTRAP.md#1-prerequisites-on-the-laptop), step 4). Never put
   an AWS key in a repository, a log or Zulip.
-- The builder is an `m7a.xlarge` from the latest Canonical Ubuntu 24.04 amd64 image, 100 GiB
-  gp3, IMDSv2 required, no IAM role, in a temporary security group that admits SSH from the
+- The builder is an `m7a.xlarge` from the latest Canonical Ubuntu 24.04 amd64 image, 80 GiB
+  gp3, the fleet's root (`aws_common.ROOT_GB`, #998: EC2 launches no volume smaller than the
+  image's snapshot; it was 100 GiB, and an image built so launches, and is smoke-tested with
+  `--smoke-only`, on 100 GiB), IMDSv2 required, no IAM role, in a temporary security group that admits SSH from the
   building machine's egress address only, with a temporary key pair imported from `--ssh-public-key`.
   Its default, `~/.ssh/id_ed25519.pub`, is usually a personal key: pass the dedicated key's,
   `~/.ssh/zab-deployer.pub`, whose agent in [BOOTSTRAP §2.1](../../docs/BOOTSTRAP.md#21-the-key)'s terminal serves the build's ssh. The host key is checked against the fingerprints cloud-init
@@ -441,6 +499,10 @@ image, before and after a reboot:
   builds the smoke file (amsart, tikz-cd, xy, biblatex, cleveref); `lake env lean` runs the
   Mathlib smoke file from `~/lean/workspace`; `comparator-run` accepts the smoke challenge; and
   `python3`, `lean`, `lake`, `latexmk` and `comparator-run` resolve on the services' `PATH`;
+- a new project's first `lake build` (`lean-project`'s template, which imports `Mathlib.Tactic`)
+  succeeds with no network at all, in a network namespace of its own (`unshare --net`), and
+  leaves `~/.cache/mathlib` as it was: nothing is fetched, and Mathlib's cache isn't run (#997;
+  `build.sh` wants the directory gone, `--smoke` lets an older image keep its own; timed);
 - with Magma, `magma -b` prints 4 (above); with Sage, `sage -c 'print(EllipticCurve("11a1").rank())'`
   prints 0;
 - every tool of `files/tools.toml`, each with its small computation (59 tools with Magma and

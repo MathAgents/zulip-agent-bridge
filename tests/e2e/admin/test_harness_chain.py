@@ -15,11 +15,15 @@ from e2e.admin import conftest
 from e2e.admin import test_scenarios_1_server as server
 from e2e.admin import test_scenarios_1_upgrade as in_band
 from e2e.admin import test_scenarios_2_bot as bot
+from e2e.admin import test_scenarios_2_deploy_plans as deploy_plans
 from e2e.admin import test_scenarios_3_defaults as defaults
 from e2e.admin import test_scenarios_3_late_joiner as joiner
 from e2e.admin import test_scenarios_4_grow_disk as grow
+from e2e.admin import test_scenarios_4_grow_disk_auto as grow_auto
 from e2e.admin import test_scenarios_4_trust_fix as trust
+from e2e.admin import test_scenarios_4_waking_rollout as waking
 from e2e.admin import test_scenarios_8_later as later
+from e2e.admin import test_scenarios_8_set_workshop as set_workshop
 from e2e.admin import test_scenarios_8_the_end as end
 from e2e.admin import test_scenarios_8_the_end_of_month as month
 from e2e.admin import test_scenarios_8_the_kept_fleet as kept
@@ -32,10 +36,13 @@ PARTS = [
         server,
         in_band,
         bot,
+        deploy_plans,
         defaults,
         joiner,
         grow,
+        grow_auto,
         trust,
+        waking,
         later,
         end,
         month,
@@ -58,11 +65,13 @@ Q9_GATED = (
 def test_the_parts_run_in_their_files_order():
     """Pytest runs the files in name order (conftest): A10b after A10, on the release it
     deployed; A23 after the bot scenarios (A8's waker among them) and before A20, whose idle
-    stop it must not find on its VM; A20 before A9, which finds the fleet as A20 leaves it; A9
-    after A16; A17 after A9,
+    stop it must not find on its VM; A20 before A9, which finds the fleet as A20 leaves it; A26
+    after A21, so that A21 never meets a volume it grew (#998); A27 after A16 and before A9
+    (#1043), on e2e2's entry alone; A9 after A16; A17 after A9,
     which ends the first workshop's VMs, and before A18, so that each runs at most three
     instances; then the checks that sweep what they did (A12, A13)."""
-    modules = (server, in_band, bot, defaults, joiner, grow, trust, later, end, month, kept, checks)
+    modules = (server, in_band, bot, deploy_plans, defaults, joiner, grow, grow_auto, trust, later,
+               set_workshop, end, month, kept, checks)  # fmt: skip
     assert sorted(m.__name__ for m in modules) == [m.__name__ for m in modules]
 
 
@@ -119,6 +128,8 @@ WHILE_Q9_IS_OPEN = {
     "test_a8_a_start_with_no_message_alerts": False,  # the bots' keys and zulip_user_id: A5
     "test_a8_the_waker": False,
     "test_a8_the_waker_comes_up_after_a_busy_topic": False,  # #717: the same, and A5's bots
+    # A10's part with a plan applying (#989): A4's VMs alone, for a `!protect on` it holds
+    "test_a10_a_deploy_refuses_while_a_plan_applies": True,
     # A23 (#704): A5's bots, for the waker and the rollout
     "test_a23_a_rollout_without_the_words_applies_the_defaults": False,
     # A20: A5's bots and A6's rollout first; its last part undoes what the others did, if any
@@ -130,8 +141,12 @@ WHILE_Q9_IS_OPEN = {
     "test_a21_a_size_that_doesnt_grow_is_refused": True,
     "test_a21_a_running_vm_grows_online": True,
     "test_a21_a_stopped_vm_grows_at_its_next_boot": True,
+    # A26 (#998): after A21, on zab-test-b rolled out by A6, with A5's bots (its DM)
+    "test_a26_a_filling_disk_grows_by_itself_online": False,
     # A24 (#992): A4's VMs alone, as A21; it leaves them as A21 does
     "test_a24_the_trust_fix_as_a_plan": True,
+    # A25 (#995): A4's VMs as A24 leaves them, and A5's bots for the rollout; it leaves them so
+    "test_a25_a_rollout_starts_a_stopped_vm_and_stops_it_again": False,
     "test_a16_new_workshop": False,  # the provisioner's key makes its bot and channels
     # A9: the provisioner's key makes the throwaway row's bots, which !deactivate-bots ends; the
     # final sync runs its --strict refusal of a row without a repository, then skips (Q9)

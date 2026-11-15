@@ -49,6 +49,8 @@ and backs the admin bot's `!start` and `!stop`.
   or `unchanged`.
 - `--dry-run` reads EC2 and prints one line per target, the same as a real run but with "would";
   it changes nothing. A failed EC2 lookup is one `FAILED` line and exit 1, not a traceback.
+- `StartStop` (#995) is not this script's: `push_config.py --start-stopped` and `trust_fix.py`'s
+  start each row's stopped VM for that row's work, and stop it again as soon as it is done.
 """
 
 from __future__ import annotations
@@ -57,11 +59,12 @@ import argparse
 import json
 import pathlib
 import sys
+import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 
 from aws_common import (
     Ec2,
@@ -401,6 +404,365 @@ def power(
     if dry_run:
         log("dry run: nothing changed")
     return 1 if failed else 0
+
+
+# ------------------------------------------------------------ a stopped VM for its row (#995)
+
+#: `StartStop`'s waits, as `adopt_spare.py`'s: from a start request until the VM runs, its port 22
+#: answers and it lets a login in, and for a VM `stopping` (idle stop powering it off) until it
+#: is stopped. After a start whose answer was lost, how long EC2 is read for a start to show.
+START_WAIT_S, LOST_START_S = 300.0, 30.0
+#: A row's cell in the script's table: a VM left as it was, and one started and stopped again.
+RUNNING, STOPPED_AGAIN = "running", "started, stopped again"
+#: The start of the cell of a VM this run started whose stop failed: `!stop <slug>` follows.
+NOT_STOPPED_AGAIN = "started, NOT stopped again"
+#: The start of the cell of a VM up after a start that failed, never this run's (`_unclaimed`).
+START_FAILED = "start failed"
+#: The start of a reason why a VM's use couldn't be read, `vm_in_use`'s and `_after`'s, beside
+#: `in_use`'s own (`idle_stop.UNREAD`, which `StartStop` is given): never a word matched anywhere,
+#: which a login's name could hold (review round 2 of #1026, N1).
+UNREAD_PREFIX = "its use can't be read: "
+#: After this many VMs in a row that the run started and whose use it couldn't read, it starts
+#: no more: a check broken on every VM would otherwise start the whole fleet and leave it up.
+UNREAD_LIMIT = 3
+#: Errors that EC2 may answer with a server status (HTTP 5xx) though the request did nothing: no
+#: capacity for the VM, or the request throttled (`answered`).
+REFUSALS = ("RequestLimitExceeded", "EC2ThrottledException")  # botocore's two for EC2, at 503
+R = TypeVar("R")
+
+
+class StartStop:
+    """A stopped VM started for its row's work, and stopped again as soon as that is done (#995;
+    docs/ADMIN.md §3, action 4): `push_config.py --start-stopped N`, and `trust_fix.py`'s.
+
+    - **Which VMs.** One lookup when it is made maps each row's `ip` to its VM, as `power` does:
+      every scope tag, a participant tag, the row's own (`owner_problem`). A row without one runs
+      its work as before, with no start or stop; so does every row when that lookup fails
+      (`off`, which the script prints).
+    - **At its row** (`around`), EC2's state is read again: `running` or `pending`, the work runs
+      and the VM is left running. `stopping` is waited for (`START_WAIT_S`). `stopped` takes one
+      of `at_once` slots and is started. EC2's `PreviousState` says whose start it was: anything
+      but `stopped`, or none, is someone else's (the waker's), and the VM is left running.
+      **A start that raises is never this run's** (`_unclaimed`): someone else's may have come
+      first. A VM EC2 then shows up is left running, and said so; one still stopped is refused,
+      and, unless EC2 answered the error (so this start didn't act), said to be one that a start
+      may still reach (`LOST_START_S` of reads first). This run's start is waited for until
+      the VM runs, its port 22 answers and, with `ready`, it lets a login in (sshd answers
+      before a boot allows logins), EC2's lookups retried until `START_WAIT_S`. Then the work
+      runs, and then, however the work ended, `in_use(row)` gives the reasons it was used since
+      its start, read on the VM (`idle_stop.py --in-use`): with none it is stopped at once
+      (`StopInstances`), with any it is left running.
+    - **The bound.** The slot is held from the start to that decision: at most `at_once` VMs
+      that this run started are being started, worked on or checked at once. A VM left running
+      gives its slot back and stays up; one stopped is still stopping for a while.
+    - **A check that can't be read** (`unread_reasons`, `idle_stop.UNREAD`, or `UNREAD_PREFIX`)
+      leaves its VM running, as unknown use does in idle stop. After `UNREAD_LIMIT` such VMs in
+      a row the run starts no more (`halted`, and `tripped`): their rows are refused, and the
+      line under the table says why. `halted_in`, the workshop whose run of the same plan
+      halted before this one (#1031): this run starts no VM from the first.
+    - **Failures.** A VM that can't be started, or is still stopping, isn't worked on: its row
+      gets `refused(why)`. One started that doesn't come up in time is stopped again, and
+      refused. A stop that fails is said in the row's cell, with the command that stops it.
+    - A line as each VM is started and stopped (`log`), each row's outcome as its cell of the
+      script's table (`cells`), and `summary`, under the table. Thread-safe: the script's
+      workers call `around` at once."""
+
+    def __init__(
+        self,
+        ec2: Any,
+        scope: Scope,
+        rows: Sequence[dict[str, str]],
+        *,
+        at_once: int,
+        in_use: Callable[[dict[str, str]], Sequence[str]],
+        unread_reasons: Collection[str],
+        halted_in: str = "",
+        log: Callable[[str], None] = print,
+        answers: Callable[[str], bool] = ssh_answers,
+        ready: Callable[[dict[str, str]], bool] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if at_once < 1:
+            raise ValueError("at least one VM at a time")
+        self.ec2, self.scope, self.in_use, self.log = ec2, scope, in_use, log
+        self.answers, self.ready, self.sleep, self.clock = answers, ready, sleep, clock
+        self.slots = threading.BoundedSemaphore(at_once)
+        self.cells: dict[str, str] = {}
+        self.unread_reasons = frozenset(unread_reasons)
+        self.off, self.halted = "", halted(halted_in) if halted_in else ""
+        self.tripped = False  # this run's own breaker halted it (`admin_common.HALTED_EXIT`)
+        self.unread = 0  # started VMs in a row whose use couldn't be read
+        self.vms: dict[str, tuple[str, str]] = {}  # slug → (instance id, address)
+        self._lock = threading.Lock()
+        try:
+            found = ec2.find_instances(scope_tags(scope), LIVE_STATES)
+        except Exception as exc:  # botocore: an expired credential, UnauthorizedOperation
+            self.off = f"the EC2 lookup failed: {error_line(exc)}"
+            return
+        by_ip = {ip: i for i in found if has_participant(i) for ip in instance_ips(i)}
+        for row in rows:
+            slug, ip = slug_of(row), (row.get("ip") or "").strip()
+            inst = by_ip.get(ip) if ip else None
+            target = Target(slug, ip, host=row.get("host", ""))
+            if inst is not None and not owner_problem(target, inst):
+                self.vms[slug] = (inst["InstanceId"], ip)
+
+    def around(
+        self, row: dict[str, str], work: Callable[[], R], refused: Callable[[str], R],
+        keep: Callable[[R], str] | None = None,
+    ) -> R:  # fmt: skip
+        """The row's `work`, its VM started first and stopped after if it is stopped (above);
+        `keep`, why the work's result leaves the VM running whatever its use (a repair that may
+        still run there, `trust_fix.py`'s), or ""."""
+        slug = slug_of(row)
+        if slug not in self.vms:
+            return work()
+        iid, ip = self.vms[slug]
+        try:
+            state = self._settled(iid)
+        except Exception as exc:  # unknown: as before, the work alone
+            self._cell(slug, f"? (EC2: {error_line(exc)})")
+            return work()
+        if state == "stopped":
+            with self.slots:
+                if self.halted:  # said once, when it halted
+                    return refused(self._cell(slug, f"not started: {self.halted}"))
+                state, why = self._start(row, slug, iid, ip)
+                if why:
+                    return refused(why)
+                if state == "started":
+                    done: list[R] = []
+                    try:
+                        done.append(work())
+                    finally:
+                        held = keep(done[0]) if keep is not None and done else ""
+                        self._after(row, slug, iid, held)
+                    return done[0]
+        if state == START_FAILED:  # up after a start that failed: never stopped, its cell set
+            self._up(row, iid, ip, self.clock() + START_WAIT_S)
+            return work()
+        if state not in DONE[True]:
+            after = f" after {START_WAIT_S / 60:g} minutes" * (state == "stopping")
+            return refused(self._cell(slug, f"not started: it is {state or 'gone'}{after}"))
+        if state == "pending":  # someone else's start, the waker's say: up first, left running
+            self._up(row, iid, ip, self.clock() + START_WAIT_S)
+        self._cell(slug, RUNNING)
+        return work()
+
+    def summary(self) -> str:
+        """One line on the VMs started, or "" when none was."""
+        with self._lock:
+            cells = dict(self.cells)
+
+        def named(test: Callable[[str], bool]) -> list[str]:
+            return [slug for slug, cell in cells.items() if test(cell)]
+
+        started = named(lambda c: c.startswith("started"))
+        failed = named(lambda c: c.startswith(("not started", "started, but")))
+        unclaimed = named(lambda c: c.startswith(START_FAILED))
+        if not started and not failed and not unclaimed:
+            return ""
+        again = named(lambda c: c == STOPPED_AGAIN or c.endswith(": stopped again"))
+        out = f"stopped VMs: {len(started)} started, {len(again)} stopped again"
+        for label, names in (
+            ("left running", named(lambda c: c.startswith("started, left running"))),
+            ("NOT stopped again", named(lambda c: "NOT stopped again" in c)),
+            ("failed", failed),
+            ("up after a failed start, left running", unclaimed),
+        ):
+            out += f"; {label}: {', '.join(names)}" * bool(names)
+        return out + f"; {self.halted}" * bool(self.halted)
+
+    def _cell(self, slug: str, cell: str) -> str:
+        with self._lock:
+            self.cells[slug] = cell
+        return cell
+
+    def _say(self, line: str) -> None:
+        with self._lock:
+            self.log(f"power: {line}")
+
+    def _state(self, iid: str) -> str:
+        found = self.ec2.find_instances(scope_tags(self.scope), LIVE_STATES)
+        return next((str(i["State"]["Name"]) for i in found if i.get("InstanceId") == iid), "")
+
+    def _settled(self, iid: str) -> str:
+        """Its state, once it isn't `stopping`, or after `START_WAIT_S`."""
+        deadline = self.clock() + START_WAIT_S
+        state = self._state(iid)
+        while state == "stopping" and self.clock() < deadline:
+            self.sleep(POLL_S)
+            state = self._state(iid)
+        return state
+
+    def _shown(self, iid: str) -> str:
+        """After a start whose answer was lost: `pending` or `running` once EC2 shows it so,
+        within `LOST_START_S`; else its last state read, "" when none could be."""
+        deadline, state = self.clock() + LOST_START_S, ""
+        while True:
+            try:
+                state = self._state(iid)
+            except Exception:  # read again, up to the deadline
+                state = state or ""
+            if state in DONE[True] or self.clock() >= deadline:
+                return state
+            self.sleep(POLL_S)
+
+    def _start(self, row: dict[str, str], slug: str, iid: str, ip: str) -> tuple[str, str]:
+        """(`started` once this run started it and it is up, `pending` for someone else's
+        start, `START_FAILED` for a VM up after this run's start failed; why its row is
+        refused, or "")."""
+        deadline = self.clock() + START_WAIT_S
+        try:
+            answer = self.ec2.start([iid]) or []
+            before = next(
+                (str((s.get("PreviousState") or {}).get("Name") or "") for s in answer
+                 if isinstance(s, dict) and s.get("InstanceId") == iid),
+                "",
+            )  # fmt: skip
+        except Exception as exc:  # refused, or its answer lost: never this run's (`_unclaimed`)
+            return self._unclaimed(slug, iid, exc)
+        if before != "stopped":  # someone else's start, or one EC2 didn't say: left running
+            said = f"{before} already, started by someone else" if before else (
+                "EC2 didn't say it was stopped before this start")  # fmt: skip
+            self._say(f"{slug} {iid}: {said}: left running")
+            return "pending", ""
+        self._say(f"{slug} {iid}: started for its row")
+        why = self._up(row, iid, ip, deadline)
+        if not why:
+            return "started", ""
+        stopped = self._stop(iid)
+        again = "stopped again" if not stopped else f"NOT stopped again ({stopped}): !stop {slug}"
+        self._say(f"{slug} {iid}: {why}: {again}")
+        return "", self._cell(slug, f"started, but {why}: {again}")
+
+    def _unclaimed(self, slug: str, iid: str, exc: Exception) -> tuple[str, str]:
+        """After `StartInstances` raised: never this run's start (review round 2 of #1026; Codex's
+        P2 there), since someone else's, the waker's, may have come between this run's read and
+        its request. An error EC2 answered (`answered`) means this start didn't act: one read
+        says whether the VM is up all the same. Any other error (a timeout, a lost connection,
+        a server error) may hide a start that acted, or will: EC2 is read for `LOST_START_S`. A
+        VM up is left running, never stopped, and said so; one still stopped is refused, with
+        whether a start may still reach it."""
+        state = self._read(iid) if answered(exc) else self._shown(iid)
+        if state in DONE[True]:
+            cell = f"{START_FAILED} ({error_line(exc)}), VM up: left running"
+            self._say(f"{slug} {iid}: {cell}")
+            self._cell(slug, cell)
+            return START_FAILED, ""
+        if answered(exc):
+            return "", self._cell(slug, f"not started: {error_line(exc)}")
+        unread = "its state can't be read" if not state else "a start may still reach it"
+        return "", self._cell(slug, f"not started: {error_line(exc)}; {unread}: look at it")
+
+    def _read(self, iid: str) -> str:
+        """One read of its state, "" when it fails."""
+        try:
+            return self._state(iid)
+        except Exception:
+            return ""
+
+    def _up(self, row: dict[str, str], iid: str, ip: str, deadline: float) -> str:
+        """ "" once it runs, its port 22 answers and it lets a login in (`ready`); why not, at
+        the deadline or before. A failed EC2 lookup is read again until the deadline."""
+        state, failed, reached = "stopped", "", False
+        while True:
+            try:
+                state, failed = self._state(iid), ""
+            except Exception as exc:  # throttled, say
+                failed = f"the EC2 lookup failed: {error_line(exc)}"
+            if not failed:
+                if state == "running" and self.answers(ip):
+                    reached = True
+                    if self.ready is None or self._ready(row):
+                        return ""
+                if state not in ("pending", "running", "stopped"):  # EC2's reads lag its writes
+                    return f"it is {state or 'gone'} now"
+            if self.clock() >= deadline:
+                break
+            self.sleep(POLL_S)
+        after = f"after {START_WAIT_S / 60:g} minutes"
+        if failed:
+            return f"{failed}, still {after}"
+        if state == "running":
+            return f"its SSH ({ip}:22) " + (
+                f"lets no login in {after}" if reached else f"doesn't answer {after}")  # fmt: skip
+        return f"it is still {state} {after}"
+
+    def _ready(self, row: dict[str, str]) -> bool:
+        try:
+            return bool(self.ready(row)) if self.ready is not None else True
+        except Exception:
+            return False
+
+    def _stop(self, iid: str) -> str:
+        """ "" once EC2 has the request; its error otherwise."""
+        try:
+            self.ec2.stop([iid])
+        except Exception as exc:
+            return error_line(exc)
+        return ""
+
+    def _after(self, row: dict[str, str], slug: str, iid: str, held: str = "") -> None:
+        """A VM this run started, its work done: stopped, unless its work `held` it, it was used
+        since its start, or its use couldn't be read (`UNREAD`, `UNREAD_PREFIX`; counted towards
+        `UNREAD_LIMIT`)."""
+        try:
+            reasons = [held] if held else [str(r) for r in self.in_use(row)]
+        except Exception as exc:  # unknown: left running
+            reasons = [f"{UNREAD_PREFIX}{type(exc).__name__}"]
+        if not held:  # a work that holds its VM is no read of its use
+            unread = self.unread_reasons
+            self._count(any(r in unread or r.startswith(UNREAD_PREFIX) for r in reasons))
+        why = "; ".join(reasons)
+        if why:
+            self._say(f"{slug} {iid}: left running: {why}")
+            self._cell(slug, f"started, left running: {why}")
+            return
+        stopped = self._stop(iid)
+        if stopped:
+            self._say(f"{slug} {iid}: NOT stopped again: {stopped}")
+            self._cell(slug, f"{NOT_STOPPED_AGAIN} ({stopped}): !stop {slug}")
+            return
+        self._say(f"{slug} {iid}: stopped again")
+        self._cell(slug, STOPPED_AGAIN)
+
+    def _count(self, unread: bool) -> None:
+        """One more started VM whose use couldn't be read, or none: at `UNREAD_LIMIT` in a row,
+        the run starts no more."""
+        with self._lock:
+            self.unread = self.unread + 1 if unread else 0
+            halt = self.unread >= UNREAD_LIMIT and not self.halted
+            if halt:
+                self.halted, self.tripped = halted(), True
+        if halt:
+            self._say(self.halted)
+
+
+def halted(where: str = "") -> str:
+    """Why `StartStop` starts no more VMs: its own breaker, or that of the run of the same plan
+    in workshop `where` (#1031)."""
+    return (f"the use of {UNREAD_LIMIT} started VMs in a row couldn't be read"
+            + f" in {where}" * bool(where) + ", so no more are started")  # fmt: skip
+
+
+def answered(exc: BaseException) -> bool:
+    """Whether EC2 answered a request with `exc`, so that the request did nothing
+    (`StartStop._unclaimed`): botocore's `ClientError` carries EC2's `response`; a timeout or a
+    lost connection doesn't. A server error (HTTP 5xx: `InternalError`, `ServiceUnavailable`) is
+    no proof that EC2 didn't act (#1031; review of #1026, N1), unless it says why it couldn't:
+    no capacity (`Insufficient…Capacity`) or the request throttled (`REFUSALS`). An answer
+    without its HTTP status, which botocore always gives, is taken as answered, as before."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    meta, error = response.get("ResponseMetadata"), response.get("Error")
+    status = meta.get("HTTPStatusCode") if isinstance(meta, dict) else None
+    if type(status) is not int or status < 500:
+        return True
+    code = str(error.get("Code") or "") if isinstance(error, dict) else ""
+    return code in REFUSALS or (code.startswith("Insufficient") and code.endswith("Capacity"))
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -31,13 +31,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from zab.admin import autogrow
 from zab.admin import runner as runner_mod
 from zab.admin.actions import PROTECT_SETTLE, Ending, Protection, protect_applying
 from zab.admin.approvals import DESTRUCTIVE_VERBS, PHRASE_ABOVE_HALF
 from zab.admin.bot import ACK
 from zab.admin.fleet import REINSTALL, TOUCH
 from zab.admin.grammar import _GROUPS, LATER, SPECS, Command, Context, Roster, parse
-from zab.admin.planning import STATUS_COLUMNS, Planning, left_out
+from zab.admin.planning import STATUS_COLUMNS, Planning, growth_busy, left_out
 from zab.admin.plans import APPLYING, PENDING, PLANNING, REFUSED, Plan, Requirement
 from zab.admin.runner import TIMEOUT, TIMEOUTS, Ran, Runner, roster_wait
 from zab.admin.wakerdown import down_line, down_text, up_text
@@ -199,8 +200,9 @@ def test_the_rules_the_runbook_states_are_the_bots() -> None:
     assert (TIMEOUT, TIMEOUTS) == (900, {"launch": 3600, "trust-fix": 3600} | dict.fromkeys(
         ("rollout", "final-sync", "export", "teardown", "upgrade-server"), 1800))  # fmt: skip
     assert (
-        "The limits are 60 minutes for `!launch`; for `!trust-fix`, 60 minutes, or 2 minutes a "
-        "row above 30 (§4.4); 30 minutes for `!rollout`, `!final-sync`, "
+        "The limits are 60 minutes for `!launch`; for `!trust-fix`, 60 minutes, or 2.5 minutes "
+        "a row above 24 (§4.4); for `!rollout`, 30 minutes, or a minute a row above 30 (§3.5); "
+        "30 minutes for `!final-sync`, "
         "`!export`, `!teardown` and a deployer's `!upgrade-server`; for `!retire`, 60 minutes, "
         "or 20 minutes a row above three, "
         "and 55 minutes more a row with `export` (§5.3); 15 minutes for anything else." in TEXT
@@ -209,12 +211,17 @@ def test_the_rules_the_runbook_states_are_the_bots() -> None:
         EXPORT_ROW_S,
         RETIRE_FLOOR_S,
         RETIRE_ROW_S,
+        ROLLOUT_FLOOR_S,
+        ROLLOUT_ROW_S,
+        START_AT_ONCE,
         TRUST_FIX_FLOOR_S,
         TRUST_FIX_ROW_S,
     )
 
-    assert (TRUST_FIX_FLOOR_S, TRUST_FIX_ROW_S) == (3600, 120)  # #992, §4.4
-    assert "within 60 minutes, or 2 minutes a row above 30 (82 minutes for 41 rows)" in TEXT
+    assert (TRUST_FIX_FLOOR_S, TRUST_FIX_ROW_S) == (3600, 150)  # #992, §4.4; #995
+    assert (ROLLOUT_FLOOR_S, ROLLOUT_ROW_S, START_AT_ONCE) == (1800, 60, 8)  # #995, §3.5
+    assert "At most 8 at a time." in TEXT and "`power`" in TEXT
+    assert "within 60 minutes, or 2.5 minutes a row above 24 (103 minutes for 41 rows)" in TEXT
 
     assert (RETIRE_FLOOR_S, RETIRE_ROW_S, EXPORT_ROW_S) == (3600, 1200, 3300)  # the review of #566
     assert "The apply stops at 60 minutes, or 20 minutes a row above three, and 55" in TEXT
@@ -560,7 +567,7 @@ async def results() -> list[str]:
                 Requirement("above-half", 1, ("rollout", "2")), (), "0" * 64, None, None,
                 None, "", None)  # fmt: skip
     action = SimpleNamespace(steps=(1, 2), applied=(1, 2), verb="rollout", timeout=None)
-    job = SimpleNamespace(plan=plan, bot=None, action=action)
+    job = SimpleNamespace(plan=plan, bot=None, action=action, part="")
     said, push = Said(), "admin/push_config.py"
     outcomes = (
         ("done", [Ran(push, 0), Ran("admin/status.py", 0)], 245, "ok\n" * 100),
@@ -691,7 +698,7 @@ async def test_the_bots_answers_are_quoted_whole_both_ways(run_site, tmp_path_fa
     must = [*answers, *expected, header, plan_line, *approvals, *reasons, *plans, *endings, *framed,
             *await results(), *guard(rendered), ends_stale(rendered), STARTING, *waker_down(),
             *retire_results(), vms_stale(rendered), retired_line(), *roster_waits(),
-            WAITING]  # fmt: skip
+            WAITING, disk_grown(), growth_busy("alice", "P-42")]  # fmt: skip
     unquoted = [x for x in must if quoted(x) is None]
     assert not unquoted, "rendered by the product, not quoted whole by the runbook:\n" + "\n".join(
         unquoted
@@ -704,6 +711,14 @@ async def test_the_bots_answers_are_quoted_whole_both_ways(run_site, tmp_path_fa
     ]  # fmt: skip
     assert not stale, "quoted by the runbook, rendered by nothing here:\n" + "\n".join(stale)
     assert all(span in SPANS for span in UNPINNED)
+
+
+def disk_grown() -> str:
+    """The automatic growth's line in fleet-alerts (#998; §4.1's disk row)."""
+    r = {"outcome": "grown", "instance": "i-1", "from": 80, "to": 120, "fs": "grown", "used": 58,
+         "again": None, "reason": ""}  # fmt: skip
+    read = calendar.timegm((2026, 10, 28, 14, 2, 0))
+    return autogrow.alert("alice", 87, read, r, autogrow.Vm()) or ""
 
 
 def waker_down() -> list[str]:

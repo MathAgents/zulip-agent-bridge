@@ -75,6 +75,7 @@ BUILT_IN_FUNCTIONS = {
     ("admin/actions.py", "normalize_dry_run"): "an escaped path, an optional fixed suffix",
     ("admin/actions.py", "_build_roster_import"): "an escaped path and fixed text",
     ("admin/config.py", "_config"): "`RELEASE_PATTERNS`, no group repeated",
+    ("admin/confighelper.py", "_rewrite"): "a key of `SETTABLE`, blanks, `=`, `_STRING` (#1043)",
     ("admin/scrub.py", "_class"): "one character class",
     ("admin/starter.py", "fleet_vm"): "an escaped region and a letter",
     ("backends/claude.py", "_rewrite_paths"): "an escaped path between two lookarounds",

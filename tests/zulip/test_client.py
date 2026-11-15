@@ -1,7 +1,8 @@
+import httpx
 import pytest
 
 from zab.testing.fake_zulip import FakeZulip
-from zab.zulip.client import ZulipClient, ZulipError
+from zab.zulip.client import ZulipClient, ZulipError, transient
 
 pytestmark = pytest.mark.integration
 
@@ -154,3 +155,23 @@ async def test_every_client_shares_one_tls_context(monkeypatch):
     assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname is True
     for client in clients:
         await client.close()
+
+
+async def test_transient_errors_are_those_a_retry_may_pass():
+    """Zulip didn't answer, or asked for a retry (#1022): a 5xx, a 429, a response that isn't
+    JSON, a refused, reset or timed-out connection. A refusal is not: a 4xx with Zulip's code,
+    or anything that isn't a Zulip or transport error. A proxy's 502 page, not JSON, reads
+    as transient through the client."""
+    page = httpx.MockTransport(lambda request: httpx.Response(502, text="<html>Bad gateway"))
+    client = ZulipClient("https://zulip.example", "bot", "decoy", transport=page)
+    with pytest.raises(ZulipError) as caught:
+        await client.request("GET", "users")
+    assert transient(caught.value) and caught.value.status == 502
+    await client.close()
+    transients = [ZulipError("BAD_GATEWAY", 503), ZulipError("RATE_LIMIT_HIT", 429)]
+    transients += [ZulipError("INVALID_RESPONSE", 200), httpx.ConnectError("refused")]
+    transients += [httpx.ReadTimeout("slow"), httpx.ReadError("reset")]
+    assert all(transient(exc) for exc in transients)
+    refusals = [ZulipError("UNAUTHORIZED", 401), ZulipError("BAD_REQUEST", 400)]
+    refusals += [ZulipError("BAD_EVENT_QUEUE_ID", 400), KeyError("members"), ValueError()]
+    assert not any(transient(exc) for exc in refusals)

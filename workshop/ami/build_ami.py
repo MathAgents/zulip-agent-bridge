@@ -49,7 +49,12 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "aws"))
 sys.path.insert(0, str(HERE))  # m2_debs, also under `python -I` (review of #950)
 import m2_debs  # noqa: E402 - next to this script
-from aws_common import WARM_VOLUME, ZAB_REPO_URL  # noqa: E402 - the path is set up above
+from aws_common import (  # noqa: E402 - the path is set up above
+    ROOT_GB,
+    WARM_VOLUME,
+    ZAB_REPO_URL,
+    root_gb_of,
+)
 
 BUILD_SH = HERE / "build.sh"
 AMI_FILES = HERE / "files"  # instructions, smoke sources, comparator-run (build.sh AMI_FILES)
@@ -201,6 +206,20 @@ check as_lean bash -c "$lean"
 echo "time second Mathlib import: $((SECONDS - start)) s"
 cmp="t=\$(mktemp -d) && cp -r $d/comparator/. \$t && cd \$t"
 check as_lean bash -c "$cmp && timeout 300 comparator-run config.json"
+# #997: a fresh project's first `lake build` (lean-project's template imports Mathlib.Tactic)
+# in a network namespace of its own, so with no network at all: Lake fetches nothing, and
+# ~/.cache/mathlib is as it was (gone from images since #997), so nothing ran Mathlib's cache.
+# The scratch project goes at the exit, passed or not: its link first, never what it points to.
+fresh='had=$(ls -d ~/.cache/mathlib 2>/dev/null); t=$(mktemp -d) || exit 1'
+fresh="$fresh"'; end() { cd / && rm -f "$t/fresh/.lake/packages" && rm -rf "$t"; }; trap end EXIT'
+fresh="$fresh"'; lean-project "$t/fresh" && cd "$t/fresh" && timeout 900 lake build'
+fresh="$fresh"' && test "$(ls -d ~/.cache/mathlib 2>/dev/null)" = "$had"'
+start=$SECONDS
+check sudo unshare --net -- runuser -u agent -- env -i HOME=/home/agent \
+  PATH=/home/agent/.elan/bin:/usr/local/bin:/usr/bin:/bin bash -c "$fresh"
+echo "time a fresh project's first lake build, offline: $((SECONDS - start)) s"
+archives=$(sudo du -sh /home/agent/.cache/mathlib 2>/dev/null | cut -f1)
+echo "Mathlib's downloaded archives on the image: ${archives:-none}"
 # AMI v3: Julia and Oscar. The first `using Oscar` reads the depot, which EBS fetches lazily;
 # it must load from the precompiled cache ("Precompiling" would mean a rebuild): timed twice.
 # On failure the output's tail is shown. Before the timed loads Julia says whether it takes
@@ -373,11 +392,12 @@ def console_fingerprints(text: str) -> set[str]:
 
 
 def instance_params(
-    opts: argparse.Namespace, image: str, sg: str, key: str, name: str
+    opts: argparse.Namespace, image: str, sg: str, key: str, name: str, root_gb: int = ROOT_GB
 ) -> dict[str, Any]:
     """The builder's (and the smoke instance's) `run_instances` parameters, the fleet's shape
     (workshop/aws/README.md, "The VMs"). The smoke instance runs on the fleet's type (D23), the
-    builder on `--instance-type`."""
+    builder on `--instance-type`. `root_gb`: the fleet's root, or the image's own where it is
+    larger (`launch`)."""
     tags = {"Name": name, **scope_tags(opts), "role": "ami-build"}
     smoke = name == "zab-ami-smoke"
     params: dict[str, Any] = {
@@ -388,7 +408,8 @@ def instance_params(
         "BlockDeviceMappings": [
             {
                 "DeviceName": "/dev/sda1",
-                "Ebs": {"VolumeSize": 100, "VolumeType": "gp3", "DeleteOnTermination": True},
+                # the fleet's (#998): EC2 launches no volume smaller than the image's snapshot
+                "Ebs": {"VolumeSize": root_gb, "VolumeType": "gp3", "DeleteOnTermination": True},
             }
         ],
         "MetadataOptions": {"HttpTokens": "required", "HttpEndpoint": "enabled"},
@@ -455,6 +476,10 @@ class Ec2:
             Owners=["self"], Filters=[{"Name": "name", "Values": [name]}]
         )["Images"]
         return bool(images)
+
+    def image_root_gb(self, image_id: str) -> int | None:
+        """The size in GB of the image's root volume (`aws_common.root_gb_of`)."""
+        return root_gb_of(self._ec2.describe_images(ImageIds=[image_id])["Images"])
 
     def latest_ubuntu_image(self) -> str:
         images = self._ec2.describe_images(
@@ -826,8 +851,14 @@ def launch(
     log: Callable[[str], None],
 ) -> tuple[str, str, str]:
     """One instance from `image`, registered for cleanup; returns (id, ip, host fingerprint)
-    once its host key is pinned and verified and a strict ssh session works."""
-    params = instance_params(opts, image, res.security_group, res.key_pair, name)
+    once its host key is pinned and verified and a strict ssh session works. Its root is the
+    fleet's, or the image's own where that is larger, as launch.py's: `--smoke-only` of an image
+    built before #998, on 100 GB (Codex round 1 on #1004)."""
+    size = ec2.image_root_gb(image)
+    root = max(ROOT_GB, size or 0)
+    if root > ROOT_GB:
+        log(f"{name}: {image}'s root is {root} GB, so the instance's is too, not {ROOT_GB} GB")
+    params = instance_params(opts, image, res.security_group, res.key_pair, name, root)
     instance = ec2.run_instance(**params)
     res.instances.append(instance)
     log(f"{name}: {instance} launched; waiting")

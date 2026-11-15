@@ -4,6 +4,7 @@ a fake SSH, and its remote script `GROW` against a fake sysfs and fake tools."""
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import shlex
 import stat
@@ -492,6 +493,138 @@ def test_a_failed_or_slow_modification_fails_the_apply():
     assert code == 1 and clock.now == gd.MODIFY_WAIT_S
     slow = "alice: FAILED: vol-1 is still modifying after 240 s: EC2 may finish it later; then"
     assert out[-1] == f"{slow} {FINISH}"
+
+
+# ------------------------------------------------------------------ automatic growth (#998)
+
+
+def auto(ec2, *, cap=400, ssh=None, now=NOW, expect=None):
+    """`--auto-cap`: its exit, its lines, and its last line's JSON."""
+    out: list[str] = []
+    clock = Clock()
+    code = gd.run(
+        ROWS, ec2, slug="alice", size=0, scope=SCOPE, dry_run=False, runner=ssh or Ssh(),
+        known_hosts="/kh", log=out.append, sleep=clock.sleep, clock=clock, now=lambda: now,
+        cap=cap, expect=expect,
+    )  # fmt: skip
+    assert out[-1].startswith(gd.AUTO) and sum(line.startswith(gd.AUTO) for line in out) == 1
+    return code, out, json.loads(out[-1][len(gd.AUTO) :])
+
+
+SIX = dt.timedelta(hours=6).total_seconds()
+
+
+@pytest.mark.parametrize(("size", "cap", "new"), [(80, 400, 120), (81, 400, 122), (300, 400, 400)])
+def test_auto_grows_by_half_rounded_up_to_the_cap_then_the_file_system(size, cap, new):
+    ec2, ssh = Ec2(size=size), Ssh()
+    code, _, r = auto(ec2, cap=cap, ssh=ssh)
+    assert code == 0 and ("modify_volume", "vol-1", new) in ec2.calls
+    assert shlex.split(ssh.argvs[-1][-1]) == ["bash", "-c", gd.GROW, "bash", str(new)]
+    assert r == {"outcome": "grown", "instance": "i-1", "from": size, "to": new, "fs": "grown",
+                 "used": 53, "again": NOW.timestamp() + SIX, "reason": ""}  # fmt: skip
+
+
+def test_auto_at_the_cap_or_on_a_vm_not_running_changes_nothing():
+    """Nothing grows, and nothing failed (exit NOTHING); a stopped VM is neither grown nor
+    started, nor reached over SSH."""
+    ec2, ssh = Ec2(size=400), Ssh()
+    code, out, r = auto(ec2, ssh=ssh)
+    assert (code, r["outcome"], r["from"], r["to"]) == (gd.NOTHING, "capped", 400, 400)
+    assert r["instance"] == "i-1" and not ec2.changed()
+    assert out[0] == "nothing grows now: alice's volume vol-1 is 400 GB, the cap of 400 GB"
+    for state in ("stopped", "stopping", "pending"):
+        ec2, ssh = Ec2(state=state, size=80), Ssh()
+        code, out, r = auto(ec2, ssh=ssh)
+        assert (code, r["outcome"]) == (gd.NOTHING, "stopped") and not ec2.changed()
+        assert not ssh.argvs and f"is {state}: it grows only while it runs" in out[0]
+
+
+def test_auto_grows_only_the_instance_whose_disk_was_read():
+    """Codex round 3 on #1003: with `--expect-instance`, a row whose VM is another instance now
+    (a spare handed over since the read) changes nothing and reaches no VM, before any
+    check of the volume; the instance read grows."""
+    ec2, ssh = Ec2(size=80), Ssh()
+    code, _, r = auto(ec2, ssh=ssh, expect="i-0old")
+    assert (code, r["outcome"], r["instance"], r["from"]) == (
+        gd.NOTHING,
+        "replaced",
+        "i-0old",
+        None,
+    )
+    assert r["reason"] == "alice's VM is i-1 now, not i-0old, whose disk was read"
+    assert not ec2.changed() and not ssh.argvs
+    assert [c[0] for c in ec2.calls] == ["find_instances"]
+    code, _, r = auto(Ec2(size=80), expect="i-1")
+    assert (code, r["outcome"], r["instance"], r["to"]) == (0, "grown", "i-1", 120)
+
+
+def test_auto_within_six_hours_grows_the_file_system_alone_or_waits():
+    """After an earlier change, EBS's 6 hours: a file system that didn't grow grows alone, at
+    the volume's size; one that fills it already waits, with the time EBS allows the next."""
+    ec2, ssh = interrupted(), Ssh()  # 300 GB, changed 10 minutes ago
+    code, _out, r = auto(ec2, ssh=ssh)
+    assert code == 0 and not ec2.changed()
+    again = (NOW - dt.timedelta(minutes=10)).timestamp() + SIX
+    assert (r["outcome"], r["from"], r["to"], r["fs"], r["again"]) == (
+        "grown", 300, 300, "grown", again)  # fmt: skip
+
+    class Full(Ssh):
+        def __call__(self, argv, **kwargs):
+            res = super().__call__(argv, **kwargs)
+            text = res.stdout.replace(
+                "ext4 on /dev/nvme0n1p1 resized",
+                "ext4 on /dev/nvme0n1p1 fills it already: nothing to resize",
+            )
+            return RunResult(res.exit_code, text, res.stderr)  # fmt: skip
+
+    code, _, r = auto(interrupted(), ssh=Full())
+    assert (code, r["outcome"], r["fs"], r["again"]) == (gd.NOTHING, "wait", "unchanged", again)
+    ec2 = interrupted("modifying")  # still modifying: the VM may not see the size yet
+    code, _, r = auto(ec2)
+    assert (code, r["outcome"]) == (1, "failed") and "still modifying" in r["reason"]
+
+
+def test_auto_failures_say_why_and_how_far_it_got():
+    ec2 = Ec2(size=80)
+    ec2.refuse = True
+    code, _, r = auto(ec2)
+    assert (code, r["outcome"], r["from"], r["to"]) == (1, "failed", 80, 80)
+    assert r["reason"].startswith("ModifyVolume of vol-1 (VolumeModificationRateExceeded): ")
+    code, _out, r = auto(Ec2(size=80), ssh=Ssh(grow_ok=False))  # the volume grew, not its fs
+    assert (code, r["outcome"], r["from"], r["to"], r["fs"]) == (1, "failed", 80, 120, "not grown")
+    assert r["reason"] == "its file system was not grown (exit 6)"
+
+    class Stops(Ec2):
+        def modify_volume(self, vid, size):
+            super().modify_volume(vid, size)
+            self.instances[0]["State"]["Name"] = "stopped"
+
+    code, _, r = auto(Stops(size=80))
+    assert (code, r["outcome"], r["to"], r["fs"]) == (0, "grown", 120, "next boot")
+    code, _, r = auto(Ec2(size=80, vtags={"workshop": "nt-agents-2026"}))
+    assert (code, r["outcome"]) == (1, "failed") and "lacks zab-scope=mathagents" in r["reason"]
+
+
+def test_auto_cap_takes_the_place_of_size_and_its_line_is_the_bots(capsys):
+    """`--auto-cap` or `--size`, never both; the bot reads the same line, and the same 6 hours
+    (`zab.admin.autogrow`)."""
+    from zab.admin import autogrow
+
+    assert (gd.AUTO, gd.MODIFY_EVERY_S) == (autogrow.AUTO, autogrow.EVERY)
+    common = ["--roster", "r.csv", "--slug", "alice", "--region", "us-west-2", "--tag", "a=b"]
+    for extra in ([], ["--size", "300", "--auto-cap", "400"]):
+        with pytest.raises(SystemExit):
+            gd.main([*common, *extra])
+    assert "one of the arguments --size --auto-cap is required" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        gd.main([*common, "--size", "300", "--expect-instance", "i-1"])
+    assert "--expect-instance goes with --auto-cap" in capsys.readouterr().err
+    assert gd.main([*common, "--auto-cap", "400"]) == 1  # no roster: refused, as with --size
+    assert "refusing: " in capsys.readouterr().out
+    _, out, _ = auto(Ec2(size=80))
+    assert autogrow.result("\n".join(out)) == {
+        "outcome": "grown", "instance": "i-1", "from": 80, "to": 120, "fs": "grown", "used": 53,
+        "again": NOW.timestamp() + SIX, "reason": ""}  # fmt: skip
 
 
 def test_the_waits_fit_the_bots_timeout():

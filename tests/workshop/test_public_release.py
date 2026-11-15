@@ -27,7 +27,6 @@ the public repository by the same key as the private tag.
 import dataclasses
 import pathlib
 import re
-import shutil
 import tarfile
 import tempfile
 
@@ -49,7 +48,10 @@ from workshop.test_adminserver_deploy import server as server
 from workshop.test_adminserver_upgrade import Upgrade
 from zab.admin import upgradehelper as uh
 
-pytestmark = pytest.mark.skipif(bool(_tools_missing()), reason=_tools_missing() or "ok")
+pytestmark = [
+    pytest.mark.skipif(bool(_tools_missing()), reason=_tools_missing() or "ok"),
+    pytest.mark.deploy_rig,  # a pull request runs it in CI's rigs (3.12) job (#988)
+]
 #: A file of the private releases that the export leaves out, as it leaves out its own list.
 DROPPED = "notes/private.md"
 #: What deploy.sh prints for a reviewed diff: its SHA-256 and its release tree.
@@ -277,6 +279,27 @@ def test_without_the_base_tag_the_deploy_clone_is_refused(server):
     assert rig.current().endswith("v0.3.0")
 
 
+def test_the_deploy_clone_starts_no_maintenance(server):
+    """#1024: step 2's fetch brings `~/zab`'s history into the deploy clone as a second pack,
+    and from git 2.54 on the maintenance that a fetch starts then goes on writing in the clone
+    in the background, beside steps 3 and 4: a commit-graph of that history, and a repack when
+    neither of the two packs holds twice as many objects as the other, as in this rig. The
+    fetch turns it off on its own command line, as deploy.sh's does (#933), so a trace of the
+    step shows that fetch and no `maintenance run` or `gc --auto` (git 2.43 runs one in the
+    foreground without it)."""
+    rig = server
+    private = private_release(rig, "v0.3.1")
+    public = public_repo(rig)
+    export(rig, "v0.3.1", public)
+    trace = rig.tmp / "trace"
+    rig.env["GIT_TRACE"] = str(trace)
+    made, _ = as_documented(rig, public, "2. **The deploy clone,**", "v0.3.1", private)
+    assert made.returncode == 0, made.stderr
+    lines = trace.read_text().splitlines()
+    assert any(re.search(r"git fetch -q --no-tags \S+/zab ", line) for line in lines)
+    assert [line for line in lines if re.search("maintenance run|gc --auto", line)] == []
+
+
 def test_an_export_whose_other_files_differ_is_caught_before_the_deploy(server):
     """#961's review, B3: the review's SHA-256 covers the release paths alone, not the rest of
     `src/zab`, `README.md`, `LICENSE` and `.gitignore`, from which `--with-wheel` builds the fleet
@@ -322,8 +345,11 @@ def test_an_export_of_another_commit_or_without_an_installed_file_is_caught(serv
         "src/zab/bridge.py",
     ], tied.stdout + tied.stderr
     assert "nothing installed removed" not in tied.stdout
-    # reviewed as another commit than the one exported: the trailer and the hash differ
-    shutil.rmtree(pathlib.Path(rig.env["HOME"]) / "zab-deploy-v0.3.1")
+    # reviewed as another commit than the one exported: the trailer and the hash differ. Step 2
+    # again, in a fresh HOME: removing the first clone could race whatever git left running in
+    # it, as the background repack of a fetch did before step 2 turned maintenance off (#1024)
+    rig.env["HOME"] = str(rig.tmp / "home-again")
+    pathlib.Path(rig.env["HOME"]).mkdir()
     as_documented(rig, public, "2. **The deploy clone,**", "v0.3.1", other)
     tied, _ = as_documented(rig, public, "3. **The published `V` is `C`", "v0.3.1", other)
     assert tied.stdout.splitlines()[:2] == [f"Exported-from: {private}", other]

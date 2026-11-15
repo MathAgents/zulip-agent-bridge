@@ -88,6 +88,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from admin_common import (
     DEFAULT_KNOWN_HOSTS,
+    ConnectRetry,
     Runner,
     column_snapshot,
     first_line,
@@ -99,6 +100,7 @@ from admin_common import (
     run_parallel,
     save_roster_changes,
     ssh_argv,
+    stderr_line,
     subprocess_runner,
 )
 from zulip_provision import ZulipAdmin, _field_value, find_user, github_field_id, recorded_id
@@ -1228,6 +1230,7 @@ def main(
     parser.add_argument("--known-hosts", default=str(DEFAULT_KNOWN_HOSTS))
     parser.add_argument("--template", default=str(TEMPLATE_DIR))
     args = parser.parse_args(argv)
+    runner = ConnectRetry(runner, log=stderr_line)  # one per run (#1009)
     if not _SLUG_RE.match(args.org):
         print(f"invalid organization {args.org!r}", file=sys.stderr)
         return 2

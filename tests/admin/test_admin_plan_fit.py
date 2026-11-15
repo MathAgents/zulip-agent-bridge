@@ -293,8 +293,9 @@ async def test_a_three_vm_rollout_fits_inline(site):
     assert all("scp lean-project; lean-project + shared Mathlib; lean check; " in x for x in vms)
     assert all(line.endswith("; idle-stop probe; staging removed; hold released") for line in vms)
     assert max(len(line) for line in dry) < 600 and len(dry) < 20
-    assert fenced_after(text, "**Status**")[1:] == [
-        f"{s}  active, sign-in pending  0.2.3  15 min     0" for s in slugs
+    assert fenced_after(text, "**Status**")[1:] == [  # #995: each left running, as it runs
+        f"{s}  active, sign-in pending  0.2.3  15 min     0              left running"
+        for s in slugs
     ]
     # the hash covers the dry run's output, all of it shown in the message
     kind, hashed, _ = runner.hashed[plan.name]

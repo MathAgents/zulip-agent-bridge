@@ -56,7 +56,12 @@ read it), with `?` as null and four things the table does not show: the zab vers
 --version`), idle stop (whether `zab-idle-stop.timer` is enabled and active, its minutes, and the
 last line of `/var/log/zab-idle-stop.log`, its last verdict), the last activity (`zab status
 --json`'s `last_activity`, newer than 0.2.3; null before), and the root file system's size, use
-and available space in bytes (`disk`, from the same `df -Pk /` line as the percentage, #552).
+and available space in bytes (`disk`, from the same `df -Pk /` line as the percentage, #552),
+and the instance at the row's address as the EC2 lookup before the reads had it (`instance`,
+#998: the VM the read reached; null with `--no-ec2` or a failed lookup).
+`--read-user-only` (#998) reads as `zab-monitor` alone, never as `ubuntu`, so that no read is a
+login, whatever the VM's idle stop: a VM that user can't read (no idle stop, or one set up
+before #507) is left out of the answer. The admin server's collector sweeps so (ADMIN §4.1).
 `--tag KEY=VALUE` (repeatable, required: #808) is the EC2 lookup's scope, as for the
 `workshop/aws/` scripts. A VM's owner controls what it answers: in the JSON, a value zab would
 not write (a name that is not a config name, an implausible time or number) is null, long lists
@@ -155,6 +160,8 @@ READ_SCRIPT = (
 #: What the read user asks for: its forced command runs instead (sshd keeps this in
 #: `SSH_ORIGINAL_COMMAND`).
 READ_REQUEST = "status"
+#: `--read-user-only` (#998): a VM the read user couldn't read, which is left out of the answer.
+NOT_READ = "not read"
 COLUMNS = [
     "participant",
     "host",
@@ -196,6 +203,8 @@ class VmStatus:
     running_turns: list[dict[str, Any]] | None = None  # running_turns_json()
     doctor_failures: list[str] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)  # load_numbers()
+    #: the instance at the row's address, as the EC2 lookup before the read had it (#998)
+    instance: str | None = None
 
     def row(self) -> list[str]:
         return [
@@ -378,9 +387,9 @@ def disk_gb(n: int) -> str:
     """Bytes as binary "GB" (2**30 bytes), rounded up as `df -h` rounds them: to a tenth below
     10 GB, whole from there; `0` for none. The disk's unit (#552) is memory's and `!vm`'s (#204;
     SPEC §13.5: "GB means binary gigabytes"), and `df -h`'s; `!vm` rounds
-    its size to the nearest GB, so the two can differ by one (the fleet's 200 GiB root, 193.6
-    GiB, reads 194 in both). The console and `!status` use the same (`zab.admin.pages.disk_gb`;
-    a test keeps the two equal)."""
+    its size to the nearest GB, so the two can differ by one (a 200 GiB root, the fleet's
+    before #998, 193.6 GiB, reads 194 in both). The console and `!status` use the same
+    (`zab.admin.pages.disk_gb`; a test keeps the two equal)."""
     if n <= 0:
         return "0"
     tenths = -(-n * 10 // 2**30)
@@ -564,9 +573,14 @@ def as_ubuntu(res: RunResult) -> bool:
 
 
 def gather_vm(
-    row: Mapping[str, str], runner: Runner, *, known_hosts: str = str(DEFAULT_KNOWN_HOSTS)
+    row: Mapping[str, str],
+    runner: Runner,
+    *,
+    known_hosts: str = str(DEFAULT_KNOWN_HOSTS),
+    fallback: bool = True,
 ) -> VmStatus:
-    """One VM's row: read as `READ_USER`, else as `ubuntu` (`as_ubuntu`)."""
+    """One VM's row: read as `READ_USER`, else as `ubuntu` (`as_ubuntu`); without `fallback`
+    (`--read-user-only`), `NOT_READ` instead of the read as `ubuntu`."""
     try:
         host = host_of(row)  # the roster's ip; host keys pinned to known_hosts (README.md §0)
     except ValueError as exc:
@@ -575,6 +589,8 @@ def gather_vm(
         ssh_argv(host, READ_REQUEST, user=READ_USER, known_hosts=known_hosts), timeout_s=180
     )
     if MARK not in res.stdout and as_ubuntu(res):
+        if not fallback:
+            return VmStatus(slug=slug_of(row), host=host, bridge=NOT_READ)
         res = runner(ssh_argv(host, STATUS_CMD, known_hosts=known_hosts), timeout_s=180)
     if not res.ok and MARK not in res.stdout:
         st = VmStatus(slug=slug_of(row), host=host)
@@ -598,12 +614,12 @@ def instance_ips(inst: Mapping[str, Any]) -> set[str]:
 
 
 def ec2_states(
-    regions: set[str], make_ec2: Any = None, *, tag: Scope
+    regions: set[str], make_ec2: Any = None, *, tag: Scope, ids: dict[str, str] | None = None
 ) -> tuple[dict[str, str], str]:
     """`{public ip: state}` for the workshop's instances, and "" or why the lookup failed (no
     boto3, no credential, no permission), in which case the result is partial: a region that
     fails is said, and the others are still read. One reason for every region is said alone;
-    otherwise each reason names its regions.
+    otherwise each reason names its regions. `ids` gets each address's instance ID.
 
     Keyed by address, not by the `participant` tag: after a hand-over the roster's `ip` is a
     spare's (ORGANIZERS §7.2), whose tag still names the spare, while the participant's broken
@@ -617,6 +633,8 @@ def ec2_states(
             for inst in ec2.find_instances(scope_tags(tag), (*EC2_LABELS, "running")):
                 for ip in instance_ips(inst):
                     states[ip] = inst["State"]["Name"]
+                    if ids is not None and isinstance(inst.get("InstanceId"), str):
+                        ids[ip] = inst["InstanceId"]
         except Exception as exc:  # boto3/botocore errors: say why, read the other regions
             why = f"{type(exc).__name__}: {first_line(str(exc), 100)}"
             failed.setdefault(why, []).append(region)
@@ -636,12 +654,13 @@ def gather_or_down(
     states: dict[str, str],
     *,
     known_hosts: str = str(DEFAULT_KNOWN_HOSTS),
+    fallback: bool = True,
 ) -> VmStatus:
     """`gather_vm`, unless EC2 already said the VM is not running (`states`, read first): then
     its row from that state alone, with no SSH attempt (#439)."""
     label = ec2_label(row, states)
     if not label:
-        return gather_vm(row, runner, known_hosts=known_hosts)
+        return gather_vm(row, runner, known_hosts=known_hosts, fallback=fallback)
     try:
         host = host_of(row)
     except ValueError:
@@ -741,6 +760,7 @@ def vm_json(st: VmStatus) -> dict[str, Any]:
     return {
         "slug": st.slug,
         "host": st.host,
+        "instance": st.instance,  # new in #998: older readers ignore it
         "bridge": known(st.bridge),
         "sentinel": known(st.sentinel),  # new in #588: older readers ignore it
         "zab_version": st.zab_version,
@@ -806,6 +826,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--json", action="store_true", help="print JSON (docs/ADMIN.md §4.1), not the table"
     )
+    parser.add_argument(
+        "--read-user-only",
+        action="store_true",
+        help=f"read as {READ_USER} alone, never as ubuntu, which idle stop counts as a login; a "
+        "VM it can't read is left out (the collector's sweep, #998)",
+    )
     args = parser.parse_args(argv)
     try:
         scope = parse_tags(args.tag)
@@ -817,14 +843,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"roster: {exc}", file=sys.stderr)
         return 1
     states: dict[str, str] = {}
+    ids: dict[str, str] = {}  # each address's instance, as the lookup before the reads has it
     problem = ""
     if not args.no_ec2:  # first, so that no SSH waits on a VM that isn't running (#439)
         # the regions of rows with a VM: a row without an `ip` matches no instance
         launched = {region_of(row) for row in rows if (row.get("ip") or "").strip()}
-        states, problem = ec2_states(launched, tag=scope)
+        states, problem = ec2_states(launched, tag=scope, ids=ids)
     results = run_parallel(
         rows,
-        lambda row: gather_or_down(row, subprocess_runner, states, known_hosts=args.known_hosts),
+        lambda row: gather_or_down(
+            row,
+            subprocess_runner,
+            states,
+            known_hosts=args.known_hosts,
+            fallback=not args.read_user_only,
+        ),
         parallel=args.parallel,
         on_error=lambda row, exc: VmStatus(
             slug=slug_of(row), last_error=f"{type(exc).__name__}: {exc}"
@@ -844,6 +877,9 @@ def main(argv: list[str] | None = None) -> int:
                 "`uv run --with boto3` and AWS_PROFILE set, or pass --no-ec2",
                 file=sys.stderr,
             )
+    for st, row in zip(results, rows, strict=True):  # the VM each read reached (#998)
+        st.instance = ids.get((row.get("ip") or "").strip())
+    results = [r for r in results if r.bridge != NOT_READ]
     if args.json:
         print(json.dumps(fleet_json(results, problem), indent=2))
     else:

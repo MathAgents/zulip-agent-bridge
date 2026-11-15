@@ -45,7 +45,10 @@ UNCHANGED = re.compile(
 )
 LINK = re.compile(r"\]\((/user_uploads/[^)\s]+)\)")
 #: The header of a plan's status table (`zab.admin.planning.STATUS_COLUMNS`).
-STATUS_HEAD = re.compile(r"^VM {2,}state {2,}zab {2,}idle stop {2,}running turns$", re.M)
+#: ... and a `power` column in a plan that starts the stopped VMs it needs (#995)
+STATUS_HEAD = re.compile(
+    r"^VM {2,}state {2,}zab {2,}idle stop {2,}running turns(?: {2,}power)?$", re.M
+)
 #: What a bot answers `!status` with (#439): the plans' table, then readable lines; or `❌`.
 STATUS_ANSWER = r"running turns|^❌"
 #: A one-VM `!status`'s last error, in its code span (`planning._said`).

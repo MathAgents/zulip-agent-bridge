@@ -317,6 +317,34 @@ def test_the_read_user_first_then_ubuntu_where_it_is_refused():
     assert [c[2] for c in calls if c[0] == "zab-monitor"] == [st.READ_REQUEST] * 5
     assert [r.bridge for r in rows][3:] == ["unreachable"] * 2
     assert all(r.bridge.startswith("active") for r in rows[:3])
+    calls.clear()  # #998, the collector's sweep: as the read user alone, never as ubuntu
+    rows = [st.gather_vm({"github": ip[-1], "ip": ip}, runner, fallback=False) for ip in first]
+    assert [c[0] for c in calls] == ["zab-monitor"] * 5
+    assert [r.bridge for r in rows][1:] == [st.NOT_READ] * 2 + ["unreachable"] * 2
+    assert rows[0].bridge.startswith("active")
+
+
+def test_read_user_only_leaves_out_what_that_user_cant_read(tmp_path, monkeypatch, capsys):
+    """#998: `--read-user-only` never reads as ubuntu, which idle stop counts as a login; a VM
+    the read user can't read is left out of the answer, and an unreachable one is in it."""
+    calls = []
+
+    def runner(argv, *, timeout_s=120.0, env=None, stdin=None):
+        calls.append(argv[-3])
+        if argv[-3].endswith("203.0.113.6"):  # bob: no read user (idle stop before #507)
+            return ac.RunResult(255, "", "zab-monitor@x: Permission denied (publickey).")
+        return FakeRunner()(argv)
+
+    monkeypatch.setattr(st, "subprocess_runner", runner)
+    roster = tmp_path / "roster.csv"
+    roster.write_text(ROSTER)
+    argv = ["--roster", str(roster), "--no-ec2", "--json", "--read-user-only"]
+    assert with_tag(st.main, argv) == 0
+    vms = json.loads(capsys.readouterr().out)["vms"]
+    assert [(vm["slug"], vm["bridge"]) for vm in vms] == [
+        ("alice", "active, sign-in pending"), ("carol", "unreachable")]  # fmt: skip
+    assert [vm["instance"] for vm in vms] == [None, None]  # no EC2 lookup: no VM known
+    assert sorted(calls) == [f"zab-monitor@203.0.113.{n}" for n in (5, 6, 7)]
 
 
 def test_the_read_script_is_the_same_read_as_agent(tmp_path):
@@ -635,6 +663,7 @@ class FakeEc2:
         }
         return [
             {
+                "InstanceId": f"i-{who}",
                 "State": {"Name": state},
                 "Tags": [{"Key": "participant", "Value": who}],
                 "NetworkInterfaces": [{"Association": {"PublicIp": ip}}],
@@ -679,9 +708,12 @@ def test_a_handed_over_vm_is_matched_by_address_not_by_name(fake_ec2):
     his name, must not hide that the spare he uses now is unreachable."""
     rows = [{"slug": "frank", "region": "us-west-2", "ip": "203.0.113.30"}]
     results = [st.VmStatus(slug="frank", bridge="unreachable", last_error="timeout")]
-    states, _ = st.ec2_states({"us-west-2"}, tag=FLEET_SCOPE)
+    ids: dict[str, str] = {}
+    states, _ = st.ec2_states({"us-west-2"}, tag=FLEET_SCOPE, ids=ids)
     st.mark_stopped(results, rows, states)
     assert (results[0].bridge, results[0].last_error) == ("unreachable", "timeout")
+    # #998 (Codex round 4 on #1003): the VM a read of frank reaches is the spare, by address
+    assert ids["203.0.113.30"] == "i-zab-spare-1" and ids["203.0.113.20"] == "i-frank"
 
 
 def test_a_failed_ec2_lookup_says_why_and_changes_nothing(fake_ec2):

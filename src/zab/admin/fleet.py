@@ -247,7 +247,10 @@ class ApplyEnd:
     are its `Action.targets`, the slugs and spares acted on (`all` listed), and the runner
     writes them in its `apply_start` record too (`start_fields`). None: not written. `rows`,
     a `!retire`'s alone (#559): each row → each of its stages → `ok`, `skipped: …`, `failed:
-    …` or `not run`, and whether the row was retired (`retire_rows` reads it back)."""
+    …` or `not run`, and whether the row was retired (`retire_rows` reads it back). `halted`,
+    written only when set (#1031): every step exited 0 but a push_config.py or trust_fix.py that
+    halted its starts with every row done (`actions.STARTS_HALTED`), which the ledger takes as
+    an exit 0."""
 
     workshop: str
     plan: str  # "P-<n>"
@@ -256,6 +259,12 @@ class ApplyEnd:
     exit: int
     targets: tuple[str, ...] | None = None
     rows: Mapping[str, RowEnd] | None = None
+    halted: bool = False
+
+    @property
+    def done(self) -> bool:
+        """Every step did its work: exit 0, or `halted` with every row done (#1031)."""
+        return self.exit == 0 or self.halted
 
     def fields(self) -> dict[str, Any]:
         out = {
@@ -268,7 +277,7 @@ class ApplyEnd:
         out |= {} if self.targets is None else {"targets": list(self.targets)}
         if self.rows is not None:
             out["rows"] = {row: end.fields() for row, end in self.rows.items()}
-        return out
+        return out | ({"halted": True} if self.halted else {})
 
     @staticmethod
     def start_fields(targets: tuple[str, ...]) -> dict[str, Any]:
@@ -286,7 +295,9 @@ class ApplyEnd:
         if _words(args) is None or (targets is None and "targets" in record):
             return None
         assert isinstance(args, list)
-        return cls(*values, tuple(args), record["exit"], targets)  # type: ignore[arg-type]
+        halted = record.get("halted") is True
+        return cls(*values, tuple(args), record["exit"], targets,  # type: ignore[arg-type]
+                   halted=halted)  # fmt: skip
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,7 +453,7 @@ class Ledger:
             self._ending(record)
         if event in ("apply_start", "apply_end", "interrupted"):
             self._protection(record)
-        if event == "apply_end" and (end := ApplyEnd.read(record)) and end.exit == 0:
+        if event == "apply_end" and (end := ApplyEnd.read(record)) and end.done:
             self._applied(end)
         if event == "month_end" and record.get("what") == "retired":
             self._recovered(record)

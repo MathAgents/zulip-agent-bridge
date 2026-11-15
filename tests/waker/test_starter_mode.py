@@ -285,10 +285,16 @@ async def test_a_vm_the_starter_does_not_vouch_for_is_missing(rig, caplog):
 
 
 async def test_a_starter_refusal_is_a_failed_wake(rig, caplog):
+    """Logged with the starter's reason, the workshop and the message (#1017)."""
+    caplog.set_level(logging.INFO, "zab.waker")
     rig.starter.starts[A] = rig.clock[0]  # rate-limited
     message = rig.fake.post_as(20, "hi", "wake")
     await wake(rig.wakers["alpha"], message)
     assert "Wake failed (StarterError)" in caplog.text
+    assert f"Wake start: workshop=alpha vm={A} bot=codex-alice message={message['id']}" in (
+        caplog.text
+    )  # fmt: skip
+    assert "result=rate-limited" in caplog.text
     assert not rig.east.starts() and not rig.fake.messages[message["id"]].get("reactions")
 
 

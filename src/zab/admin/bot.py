@@ -60,6 +60,8 @@ the `[global]` one. They share the plan store, the audit log's chain, the scrubb
   have been taken.
 - **Wakes.** A task of its own checks each start the starter made against the participant's
   Zulip messages, and alerts the global admins when none matches (`wakes`, #359).
+- **Disks.** A task of its own grows a filling root volume, and says so in the workshop's
+  alerts channel (`autogrow`, #998).
 """
 
 from __future__ import annotations
@@ -81,7 +83,18 @@ from typing import Any, Protocol
 import httpx
 
 import zab
-from zab.admin import backup, checks, fleet, planning, provider, reads, runner, wakerdown, wakes
+from zab.admin import (
+    autogrow,
+    backup,
+    checks,
+    fleet,
+    planning,
+    provider,
+    reads,
+    runner,
+    wakerdown,
+    wakes,
+)
 from zab.admin.actions import LAYOUT, Fleet, Layout
 from zab.admin.approvals import Approvals
 from zab.admin.audit import AuditLog, Head, verify
@@ -616,6 +629,7 @@ class AdminServer:
         self.backups = backup.Backups(self)
         self.wakes = wakes.Monitor(self)
         self.waker = wakerdown.Watch(self)
+        self.grower = autogrow.Grower(self)
         specs = [(ws.bot, ws) for ws in config.workshops]
         specs += [(config.global_bot, None)] if config.global_bot else []
         self.bots = [AdminBot(self, spec, ws) for spec, ws in specs]
@@ -674,6 +688,7 @@ class AdminServer:
             self.backups.observe(record)
             self.wakes.observe(record)
             self.waker.observe(record)
+            self.grower.observe(record)
 
     async def run(self) -> None:
         try:
@@ -684,6 +699,7 @@ class AdminServer:
                 group.create_task(self.loop())
                 group.create_task(self.wakes.run())
                 group.create_task(self.waker.run())
+                group.create_task(self.grower.run())
         finally:
             with contextlib.suppress(Exception):
                 await self.flush(every=True)

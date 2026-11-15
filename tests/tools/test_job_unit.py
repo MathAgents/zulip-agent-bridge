@@ -244,12 +244,18 @@ def wait_for_line(log: Path, line: bytes) -> None:
         time.sleep(0.05)
 
 
-#: A job that saves its work on SIGTERM for a second, then exits 3; each TERM it gets is a line
+#: A job that saves its work on SIGTERM for a second, then exits 3; each TERM it gets is a line.
+#: `ready` says that its handler is in place and that the line reached the pipe, not that the
+#: job is past it (#1020). So it writes with `os.write`, never `print`: a `print`'s flush looks
+#: for signals after its write, still holding stdout's buffer, and a TERM handled there whose
+#: handler prints died of `RuntimeError: reentrant call`, exit 1. And it waits in short sleeps:
+#: a TERM that lands just before a `time.sleep(60)` enters it waits out the whole sleep.
 TRAPS_TERM = (
-    "import signal, sys, time\n"
+    "import os, signal, sys, time\n"
     "def save(*_):\n"
-    "    print('term', flush=True); time.sleep(1); print('saved', flush=True); sys.exit(3)\n"
-    "signal.signal(signal.SIGTERM, save)\nprint('ready', flush=True)\ntime.sleep(60)\n"
+    "    os.write(1, b'term\\n'); time.sleep(1); os.write(1, b'saved\\n'); sys.exit(3)\n"
+    "signal.signal(signal.SIGTERM, save)\nos.write(1, b'ready\\n')\n"
+    "for _ in range(6000):\n    time.sleep(0.01)\n"
 )
 
 
@@ -267,6 +273,77 @@ def test_a_stop_gives_the_job_one_term_and_its_save_completes(tmp_path):
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(wrapper.pid, signal.SIGKILL)
+
+
+#: `_exec` with a stop's TERM sent to its process group as it starts the job, its handler in
+#: place: `before` the job's process is forked, when the wrapper alone gets it, or `after`, in
+#: the job's process before its exec, when both do
+STOP_AS_IT_STARTS = """\
+import os, signal, subprocess, sys
+from pathlib import Path
+from zab.tools.job import run_job
+
+popen = subprocess.Popen
+
+def stop():
+    os.killpg(0, signal.SIGTERM)
+
+def starting(*args, **kwargs):
+    if sys.argv[2] == "before":
+        stop()
+    else:
+        gate = kwargs.get("preexec_fn")
+        def after():
+            stop()
+            if gate is not None:
+                gate()
+        kwargs["preexec_fn"] = after
+    return popen(*args, **kwargs)
+
+subprocess.Popen = starting
+sys.exit(run_job(Path(sys.argv[1])))
+"""
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_a_stop_as_the_job_starts_ends_it_before_it_runs(tmp_path, when):
+    """#1020: a stop's TERM that came as the wrapper started the job, before the job's process
+    existed, reached the wrapper alone, which took no action: the job ran on, unstopped, until
+    systemd's SIGKILL 15 s later. Now the job's process takes such a stop on before its exec, as
+    it does one that reaches it there, between its fork and its exec (where a handler it kept
+    from the wrapper would take it and the exec drop it): the job never runs, and the wrapper
+    ends by that signal."""
+    job = made(tmp_path, [sys.executable, "-c", TRAPS_TERM])
+    wrapper = subprocess.Popen(  # noqa: S603 - this interpreter, a fixed snippet
+        [sys.executable, "-c", STOP_AS_IT_STARTS, str(job.directory), when],
+        start_new_session=True,
+    )
+    try:
+        assert wrapper.wait(10) == -signal.SIGTERM
+        assert job.log.read_bytes() == b""  # the job never ran
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(wrapper.pid, signal.SIGKILL)
+
+
+def test_pending_reads_a_blocked_signal_of_another_process(tmp_path):
+    """`gate` reads the wrapper's blocked signals from `/proc`: a TERM sent to a process that
+    blocks it waits there, and only the signals `_exec` ignores are read."""
+    code = (
+        "import os, signal, sys, time\n"
+        "signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGTERM, signal.SIGUSR1])\n"
+        "os.write(1, b'blocked\\n'); time.sleep(30)\n"
+    )
+    with subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE) as blocker:  # noqa: S603
+        try:
+            assert blocker.stdout is not None and blocker.stdout.readline() == b"blocked\n"
+            assert cli.pending(blocker.pid) == []
+            os.kill(blocker.pid, signal.SIGUSR1)
+            os.kill(blocker.pid, signal.SIGTERM)  # pending once `kill` returns
+            assert cli.pending(blocker.pid) == [signal.SIGTERM]
+        finally:
+            blocker.kill()
+    assert cli.pending(2**22 + 1) == []  # above any pid: no such process
 
 
 def test_a_term_to_the_wrapper_alone_leaves_the_job_running(tmp_path):

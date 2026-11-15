@@ -279,6 +279,8 @@ def test_the_macaulay2_step_installs_the_checked_files_and_keeps_the_sources(tmp
         apt = next(c for c in calls if c.startswith("apt install"))
         assert apt.count(".deb") == 5 and "--no-install-recommends" in apt
         assert "/macaulay2-common_1.26.06+ds-5~ubuntu24.04.1_all.deb" in apt
+        db = "/usr/lib/x86_64-linux-gnu/Macaulay2/Macaulay2Doc/cache/rawdocumentation-dcba-8.db"
+        assert calls.index(f"test -s {db}") == calls.index(apt) + 1  # help's database (#997)
         assert not [c for c in calls if "apt-mark" in c]  # held in step 14, after the smoke test
         installs = [c for c in calls if c.startswith("install -m 0644")]
         assert len(installs) == 2  # the one source file, and the manifest as SHA256SUMS

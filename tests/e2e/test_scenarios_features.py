@@ -387,7 +387,11 @@ async def test_lean_cold_import(rig, ec2, instance_id, vm, scenario):
     whether the warm-up was still running then, and when it finished (`record_warm_up`).
     `ZAB_E2E_WARM=off` disables the unit for this boot, to measure the time without it;
     `ZAB_E2E_WARM=wait` starts the import only once the warm-up has finished, to show whether
-    it covers what `import Mathlib` reads (then close to a warm import: 4.9 s on the test VM)."""
+    it covers what `import Mathlib` reads (then close to a warm import: 4.9 s on the test VM).
+
+    The test waker may start the VM again, for an owner message it saw just before the stop
+    (#1017): that start counts as the part's, timed from the poll that saw it, the cache as cold
+    after it; the part starts the VM only if it is still stopped."""
     if not vm.run(as_agent("test", "-d", "/home/agent/lean/workspace"), check=False).ok:
         pytest.skip("no ~/lean/workspace on the VM")
     mode = os.environ.get("ZAB_E2E_WARM", "")
@@ -398,8 +402,14 @@ async def test_lean_cold_import(rig, ec2, instance_id, vm, scenario):
         vm.run(["sudo", "systemctl", "disable", "--quiet", WARM_UNIT])
     try:
         ec2.stop(instance_id)
-        ec2.wait_state(instance_id, "stopped", timeout=600)
-        ec2.start(instance_id)
+        stopped = time.monotonic()
+        if (state := ec2.wait_stopped(instance_id, timeout=600)) == "stopped":
+            ec2.start(instance_id)
+        else:
+            scenario.notes.append(
+                f"the VM was started again {time.monotonic() - stopped:.0f} s after the stop, "
+                f"not by this part (EC2 {state}; the test waker, #1017): timed from that read"
+            )
         started = time.monotonic()
         ec2.wait_state(instance_id, "running", timeout=600, every=2)
         for _ in range(60):

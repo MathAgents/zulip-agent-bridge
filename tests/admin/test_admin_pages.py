@@ -270,7 +270,7 @@ def test_the_index_and_the_actions(snapshot):
 def test_cost_is_shown_as_estimates(snapshot):
     ws = harvard(snapshot)
     html = pages.workshop("harvard-2026", ws, [], NOW, user="Drew")
-    said = "$9 this month, $57 projected (estimates) · 2 of 3 running · spares: 1 of 1 running"
+    said = "$5 this month, $33 projected (estimates) · 2 of 3 running · spares: 1 of 1 running"
     assert said in html  # the spares apart (#715), as !status's cost line has them
     ws["cost"]["unpriced"] = ["x9.huge"]
     shown = pages.workshop("harvard-2026", ws, [], NOW, user="Drew")
