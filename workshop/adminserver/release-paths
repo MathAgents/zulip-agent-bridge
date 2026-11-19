@@ -71,13 +71,14 @@ workshop/aws/protect.py
 workshop/aws/spare_idle_stop.py
 workshop/aws/teardown.py
 # What the scripts above copy to the VMs or into a repository: collect_exports.py's export.sh,
-# final_sync.py's and trust_fix.py's remote halves, push_config.py's six scripts, the Oct 9
+# final_sync.py's and trust_fix.py's remote halves, push_config.py's seven scripts, the Oct 9
 # image's list of its software and the AMI's three files it installs again (the sage wrapper
 # since #482), the AMI's trust check that trust_fix.py sends with its own, and
 # provision_repos.py's template, an empty repository's first commit.
 workshop/admin/export.sh
 workshop/admin/final_sync_remote.py
 workshop/admin/trust_fix_remote.py
+workshop/admin/agent_clis.py
 workshop/admin/agent_instructions.py
 workshop/admin/apt_repair.py
 workshop/admin/idle_stop.py

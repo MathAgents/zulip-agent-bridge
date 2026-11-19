@@ -249,6 +249,39 @@ async def test_a_claude_turn_runs_as_the_bridge_runs_one(tmp_path, monkeypatch):
     assert "--input-format" in call["argv"] and call["env"]["CLAUDE_CONFIG_DIR"] == str(account)
 
 
+@pytest.mark.parametrize("configured", [True, False])
+async def test_a_configured_model_the_account_cant_use_falls_back(
+    tmp_path, monkeypatch, configured
+):
+    """#1077: the config's `claude-fable-5-2` needs usage credits on the test account, so the
+    probe's turn runs again on Claude's own default, as a new session of the bridge does, and so
+    do its later turns. A `--claude-model` is never replaced."""
+    from zab.backends.claude import ClaudeConfig
+    from zab.core.types import SessionSettings
+
+    monkeypatch.setattr(js, "SETTLE_S", 0.0)
+    account = tmp_path / "account"
+    claude = ClaudeConfig(binary=str(FAKE_CLAUDE), accounts={"main": str(account)}, steer=True)
+    log = tmp_path / "calls.jsonl"
+    base = {**os.environ, "ZAB_FAKE_CLAUDE_FIXTURE": str(FIXTURES / "simple.jsonl"),
+            "ZAB_FAKE_CLAUDE_LOG": str(log),
+            "ZAB_FAKE_CLAUDE_CREDIT_MODELS": "claude-fable-5-2"}  # fmt: skip
+    setup = (claude, SessionSettings(model="claude-fable-5-2", effort="high"), str(account), "b")
+    used, result = await js.claude_turn_or_default(
+        setup, base, "a prompt", str(tmp_path), "zab-probe655-x", configured=configured
+    )
+    models = [c["argv"][c["argv"].index("--model") + 1] if "--model" in c["argv"] else None
+              for c in map(json.loads, log.read_text().splitlines())]  # fmt: skip
+    if configured:
+        assert models == ["claude-fable-5-2", None] and used[1].model is None
+        assert result["fell_back_from"] == "claude-fable-5-2" and used[1].effort == "high"
+        assert result["code"] == 0 and result["final"]["status"] == "completed"
+        assert not result["model_unavailable"] and result["model"] is None
+    else:
+        assert models == ["claude-fable-5-2"] and used == setup and "fell_back_from" not in result
+        assert result["model_unavailable"] and result["final"]["status"] == "failed"
+
+
 async def test_a_claude_turns_parser_is_the_bridges(tmp_path, monkeypatch):
     """#925's review, N1: with steering, `ClaudeBackend._run` joins a turn's several results
     (`multi_result`, as in the live Monitor turn's two) and knows its steers; the probe's parser

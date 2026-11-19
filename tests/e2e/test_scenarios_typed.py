@@ -7,7 +7,9 @@ the same way, so that one of the two answers.
 
 1. **DMs.** `!VM`, `` `!vm` ``, `@**Claude · …** !vm` and `@claude !VM` each get exactly one
    reply: the sentinel's where it is installed, else the bridge's. `!Help`, `` `!status` ``,
-   `@**Claude · …** !STATUS` and ``@Codex `!help` `` each get exactly one, the bridge's.
+   `@**Claude · …** !STATUS` and ``@Codex `!help` `` each get exactly one, the bridge's. Where
+   the build has #987, ``@claude !new Reply with exactly `DM-NEW` …`` gets exactly one, that
+   `!new` works in a channel topic and that the prompt wasn't sent to Claude.
 2. **A session topic** (Claude's, started with a mention), under #713's rules: `` `!help` `` and
    `!Usage`, unmentioned, go to both bots and are answered once, by Claude (the VM's first bot,
    and the one with a session here); a prompt that starts with a code span, after a typed
@@ -42,7 +44,7 @@ from e2e.test_scenarios_features import SENTINEL_VM, check_vm, vm_format
 from e2e.test_scenarios_sentinel import DOCTOR, replies, sentinel_up_for
 from zab.backends.claude_login import INSTRUCTIONS
 from zab.backends.codex import device_code_reply
-from zab.core.commands import DM_HELP, HELP, new_with_session
+from zab.core.commands import DM_HELP, HELP, new_in_dm, new_with_session
 
 pytestmark = pytest.mark.e2e
 #: The sentinel answers a DM sent `CLOCK_MARGIN_S` (5 s) after its queue was registered: one
@@ -181,9 +183,15 @@ async def test_dm_commands_as_people_type_them(chat: Chat, vm, scenario):
         check_vm(await only_reply(chat, "claude", text, r"\S"), fmt, dm=True)
     for kind, text, pattern in bridge_forms(name):
         await only_reply(chat, kind, text, pattern)
+    # #987: a DM `!new <prompt>` gets one answer, that the prompt wasn't sent, and no session
+    if dm_new := installed.has(vm, installed.NEW_IN_DM):
+        text = new_again("DM-NEW")
+        said = new_in_dm("claude", text)
+        await only_reply(chat, "claude", typed("claude", text), "^" + re.escape(said) + "$")
     scenario.notes.append(
         f"DM: {', '.join(vm_forms('…'))}: one reply each, "
         f"{'the sentinel' if sentinel else 'the bridge'}'s; !Help, `!status`, @… !STATUS: one each"
+        + ("; @claude !new <prompt>: not sent, one answer" if dm_new else "")
     )
 
 
@@ -209,6 +217,8 @@ async def test_topic_commands_as_people_type_them(chat: Chat, vm, scenario, nonc
         text = new_again(f"NEW-{nonce}")
         again = await chat.say("claude", topic, typed("claude", text), mention_bot=False)
         said = new_with_session("claude", text)
+        if not installed.has(vm, installed.NEW_IN_DM):  # #985's, before #987's "then mention me"
+            said = said.replace(", then mention me.", ".")
         await chat.reply(again, "^" + re.escape(said) + "$", within=120)
         after_new = await replies(chat, again)
         assert after_new == [said], f"`@claude !new …` with a session: {after_new}"

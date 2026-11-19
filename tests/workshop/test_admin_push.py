@@ -30,6 +30,8 @@ bob,Bob,Jones,bob@example.org,sandbox,2,ws-bob,203.0.113.7,102,
 ALICE = "203.0.113.5"
 BOB = "203.0.113.7"
 KH = "/tmp/kh test"  # noqa: S108 - a known_hosts path with a space, for the quoting check
+#: The default models this release names in its `zab/pins.py` (Drew, Nov 18, #1074)
+THIS_RELEASES_MODELS = {"codex": "gpt-6.2-astra", "claude": "claude-fable-5-2"}
 #: The `sage` wrapper's step (#482), and its answer on a VM that has the wrapper already
 SAGE_STEP = "sage_wrapper.py install "
 SAGE_UNCHANGED = "sage: unchanged: /home/agent/.local/bin/sage is the wrapper\n"
@@ -133,7 +135,7 @@ class FakeRunner:
 
 def test_render_config_toml_round_trips_and_matches_the_profile(tmp_path):
     row = {"github": "alice", "repo": "alice/thesis", "zulip_user_id": "101"}
-    text = pc.render_config_toml(row)
+    text = pc.render_config_toml(row, models=THIS_RELEASES_MODELS)
     data = tomllib.loads(text)
     assert data["bridge"] == {
         "machine": "alice",
@@ -148,15 +150,19 @@ def test_render_config_toml_round_trips_and_matches_the_profile(tmp_path):
     assert [b["name"] for b in data["bots"]] == ["codex", "claude"]
     assert all(b["allow_user_ids"] == [101] for b in data["bots"])
     assert data["bots"][0]["zuliprc"] == "~/.config/zab/codex.zuliprc"
+    # the workshops' default models, as this release names them, at effort high (Drew, Nov 18,
+    # #1074; SPEC §5.3)
     assert data["backends"]["codex"]["defaults"] == {
         "approval": "never",
         "sandbox": "danger-full-access",
+        "model": "gpt-6.2-astra",
         "effort": "high",
     }
     assert data["backends"]["codex"]["connect"] == "daemon"
     assert data["backends"]["codex"]["binary"] == "/home/agent/.local/bin/codex"
     assert data["backends"]["claude"]["defaults"] == {
         "approval": "bypassPermissions",
+        "model": "claude-fable-5-2",  # the full name: Claude Code 2.1.311's `fable` is 5.1
         "effort": "high",
     }
     assert data["backends"]["claude"]["accounts"] == {"main": "~/.claude"}
@@ -171,6 +177,8 @@ def test_render_config_toml_round_trips_and_matches_the_profile(tmp_path):
     assert cfg.bridge.service_path_prepend == [str(home / "venv/bin"), str(home / ".elan/bin")]
     assert cfg.bridge.service_env == {"VIRTUAL_ENV": str(home / "venv")}
     assert {b.name for b in cfg.bots} == {"codex", "claude"}
+    assert cfg.backends["codex"].defaults["model"] == "gpt-6.2-astra"
+    assert cfg.backends["claude"].defaults["model"] == "claude-fable-5-2"
 
 
 def test_status_lists_every_turn_a_vm_may_run():
@@ -256,17 +264,23 @@ def test_rollout_vm_sequence_and_quoting(out_dir, monkeypatch):
     ]
     assert scps[1][-2] == str(out_dir / "alice" / "codex.zuliprc")
     assert all(c[1 : 1 + len(options)] == options for c in scps)
-    # files installed 0600 owner agent, then uv tool install from the tag, then the service step
+    # the keys installed 0600 owner agent, then uv tool install from the tag, then config.toml
+    # (after the release, so that a failed install leaves the config its bridge knows: #996),
+    # then the service step
     assert (
         "sudo install -d -o agent -g agent -m 0700 /home/agent/.config/zab && "
         f"sudo install -o agent -g agent -m 0600 {STAGING}/codex.zuliprc "
         "/home/agent/.config/zab/codex.zuliprc && "
     ) in remotes[2]
-    assert remotes[2].endswith(f"{STAGING}/config.toml /home/agent/.config/zab/config.toml")
+    assert remotes[2].endswith(f"{STAGING}/claude.zuliprc /home/agent/.config/zab/claude.zuliprc")
     # the upgrade runs as agent from / (ssh starts in the unreadable /home/ubuntu; round 3)
     assert remotes[3] == (
         "sudo -u agent -H bash -lc 'cd / && /home/agent/.local/bin/uv tool install --force "
         "git+https://github.com/MathAgents/zulip-agent-bridge@v0.1.0rc1'"
+    )
+    assert remotes.pop(4) == (
+        "sudo install -d -o agent -g agent -m 0700 /home/agent/.config/zab && sudo install -o "
+        f"agent -g agent -m 0600 {STAGING}/config.toml /home/agent/.config/zab/config.toml"
     )
     assert remotes[1].startswith('d=$(mktemp -d /tmp/zab-push.XXXXXX) && chmod 0755 "$d"')
     assert remotes[4] == pc.SERVICE_INSTALL_CMD
@@ -706,8 +720,9 @@ def test_main_dry_run_contacts_nothing(roster, out_dir, monkeypatch, capsys):
     assert [line for line in out.splitlines() if line.startswith("dry-run")] == [
         f"dry-run alice ({ALICE}): owner check; staging dir; idle-stop hold; scp config.toml "
         "alice/codex.zuliprc alice/claude.zuliprc agent-instructions.md agent_instructions.py "
-        "tools_list.py tools-nt-agents-2026-v3.json sage_wrapper.py sage apt_repair.py; config "
-        "installed; zab installed; service install + doctor; sage wrapper; tools list; "
+        "tools_list.py tools-nt-agents-2026-v3.json sage_wrapper.py sage apt_repair.py; keys; "
+        "zab installed; config installed; service install + doctor; sage wrapper; "
+        "tools list; "
         "apt source; agent instructions; "
         "scp warm_cache.py zab-warm-cache.service; warm-up on; staging removed; "
         "hold released"
@@ -1740,6 +1755,11 @@ CHECKOUT_CONFIG = (pc.CHECKOUT / "src" / "zab" / "config.py").read_text(encoding
 @pytest.fixture(autouse=True)
 def _release_is_this_checkout(monkeypatch):
     monkeypatch.setattr(pc, "artifact_config", lambda wheel, tag, runner=None: CHECKOUT_CONFIG)
+    # and names no agent CLIs' pins, so that the rollouts here leave the CLIs alone; the tests
+    # of the step (test_agent_clis.py) give it this checkout's
+    monkeypatch.setattr(pc, "release_pins", lambda wheel, tag, runner=None: None)
+    # nor default models (#1074): the tests of `release_models` give it this checkout's
+    monkeypatch.setattr(pc, "release_models", lambda wheel, tag, runner=None: {})
 
 
 CONFIG_WITH = "class BridgeConfig:\n    machine: str = ''\n    multi_party: bool = True\n"
@@ -2114,12 +2134,149 @@ def test_main_steers_unless_told_not_to(tmp_path, monkeypatch, capsys, source, f
 @pytest.mark.parametrize("flags", [["--uninstall"], ["--idle-stop", "15"]])
 def test_a_run_that_installs_no_release_has_no_steer_line(monkeypatch, capsys, flags):
     """`--uninstall` and the steps alone write no config: no line and no refusal, whatever
-    the steering flag says."""
+    the steering flag says; nor a line about the default models (#1074)."""
     monkeypatch.setattr(pc, "load_roster", lambda path: [])
     monkeypatch.setattr(pc, "run_parallel", lambda *a, **k: [])
+    monkeypatch.setattr(pc, "release_models", lambda *a: pytest.fail("no release to read"))
     for steer in (["--claude-steer"], ["--no-claude-steer"], []):
         assert pc.main(["--roster", "r.csv", *flags, *steer, "--dry-run"]) == 0
-        assert "claude steer" not in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "claude steer" not in out and "default models" not in out
+
+
+# ------------------------------------------------------------ the default models (#1074)
+
+#: The real probe; the autouse fixture stubs it for every other test
+REAL_RELEASE_MODELS = pc.release_models
+PINS_SOURCE = (pc.CHECKOUT / "src" / "zab" / "pins.py").read_text(encoding="utf-8")
+#: A release's pins.py from before the models (0.2.22's first candidates), and one naming one
+PINS_ONLY = 'CODEX_VERSION = "0.169.1"\nCLAUDE_VERSION = "2.1.311"\n'
+CODEX_ONLY = PINS_ONLY + 'CODEX_MODEL = "gpt-6.2-astra"\n'
+
+
+def pins_wheel(tmp_path, name: str, pins: str | None) -> str:
+    """A release's wheel with this checkout's config.py and `pins` as its pins.py (None: a
+    release without one, 0.2.21 and older)."""
+    import zipfile
+
+    path = tmp_path / name
+    with zipfile.ZipFile(path, "w") as whl:
+        whl.writestr("zab/config.py", CHECKOUT_CONFIG)
+        if pins is not None:
+            whl.writestr("zab/pins.py", pins)
+    return str(path)
+
+
+def test_the_default_models_are_the_release_s(tmp_path):
+    """Drew, Nov 18 (#1074): read from the wheel or the tag being installed, never this
+    checkout, which runs push_config for every release (the server's own copy, `!rollout`).
+    This release names both; one before it names none, so a rollback to it writes none; a
+    release may name one. A value that isn't a model name is an error."""
+    from zab import pins
+
+    this = REAL_RELEASE_MODELS(pins_wheel(tmp_path, "this.whl", PINS_SOURCE), "")
+    assert this == THIS_RELEASES_MODELS == {"codex": pins.CODEX_MODEL, "claude": pins.CLAUDE_MODEL}
+    assert REAL_RELEASE_MODELS(pins_wheel(tmp_path, "v0.2.21.whl", None), "") == {}
+    assert REAL_RELEASE_MODELS(pins_wheel(tmp_path, "rc1.whl", PINS_ONLY), "") == {}
+    one = REAL_RELEASE_MODELS(pins_wheel(tmp_path, "one.whl", CODEX_ONLY), "")
+    assert one == {"codex": "gpt-6.2-astra"}
+    tag = lambda argv, **kw: pc.RunResult(0, PINS_SOURCE, "")  # noqa: E731
+    assert REAL_RELEASE_MODELS(None, "v0.2.22", tag) == THIS_RELEASES_MODELS
+    gone = lambda argv, **kw: pc.RunResult(128, "", "fatal: path does not exist")  # noqa: E731
+    assert REAL_RELEASE_MODELS(None, "v0.2.21", gone) == {}
+    for bad in (
+        'CODEX_MODEL = ""',
+        "CODEX_MODEL = MODEL",
+        'CLAUDE_MODEL = "a b"',
+        "CLAUDE_MODEL = 5",
+    ):
+        with pytest.raises(ValueError, match="is not a model name"):
+            REAL_RELEASE_MODELS(pins_wheel(tmp_path, "bad.whl", PINS_ONLY + bad + "\n"), "")
+
+
+@pytest.mark.parametrize(
+    "models",
+    [THIS_RELEASES_MODELS, {}, {"codex": "gpt-6.2-astra"}],
+    ids=["this release", "a release naming none", "a release naming one"],
+)
+def test_the_config_names_the_models_the_release_names(tmp_path, out_dir, models):
+    """Each beside `effort = "high"`, which stays, whatever the release; the VM's zab loads it,
+    and a rollout sends it."""
+    from zab.config import load_config
+
+    row = {"slug": "alice", "email": "alice@example.org", "repo": ""}
+    path = tmp_path / "config.toml"
+    path.write_text(pc.render_config_toml(row, models=models))
+    config = load_config(path)
+    for kind in ("codex", "claude"):
+        assert config.backends[kind].defaults.get("model") == models.get(kind)
+        assert config.backends[kind].defaults["effort"] == "high"
+
+    class Reading(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sent: list[dict] = []  # each config.toml sent, read while it is staged
+
+        def __call__(self, argv, **kw):
+            staged = [w for w in argv if w.endswith("/config.toml") and os.path.isfile(w)]
+            self.sent += [tomllib.loads(pathlib.Path(w).read_text()) for w in staged]
+            return super().__call__(argv, **kw)
+
+    runner = Reading()
+    opts = pc.Options(tag="v0.2.22", out_dir=out_dir, known_hosts=KH, default_models=models)
+    assert pc.rollout_vm(ALICE_ROW, opts, runner).ok
+    [sent] = runner.sent
+    assert {k: sent["backends"][k]["defaults"].get("model") for k in ("codex", "claude")} == {
+        k: models.get(k) for k in ("codex", "claude")
+    }
+
+
+@pytest.mark.parametrize(
+    "pins,models,line",
+    [
+        (
+            PINS_SOURCE,
+            THIS_RELEASES_MODELS,
+            "default models: codex gpt-6.2-astra, claude claude-fable-5-2 (the release's)",
+        ),
+        (None, {}, "default models: the agents' own (this release names none)"),
+        (PINS_ONLY, {}, "default models: the agents' own (this release names none)"),
+        (
+            CODEX_ONLY,
+            {"codex": "gpt-6.2-astra"},
+            "default models: codex gpt-6.2-astra, claude its own (the release's)",
+        ),
+    ],
+    ids=["this release", "0.2.21", "pins without models", "one"],
+)
+def test_main_takes_the_release_s_models_and_says_so(
+    tmp_path, monkeypatch, capsys, pins, models, line
+):
+    """The line is what a `!rollout` plan's dry run shows, beside the agent CLIs'."""
+    captured = {}
+    real = pc.Options
+    monkeypatch.setattr(pc, "release_models", REAL_RELEASE_MODELS)
+
+    def options(**kw):
+        captured.update(kw)
+        return real(**kw)
+
+    monkeypatch.setattr(pc, "Options", options)
+    monkeypatch.setattr(pc, "load_roster", lambda path: [])
+    wheel = pins_wheel(tmp_path, "r.whl", pins)
+    assert pc.main(["--roster", "r.csv", "--wheel", wheel, "--dry-run"]) == 0
+    assert captured["default_models"] == models
+    out = capsys.readouterr().out.splitlines()
+    assert [x for x in out if x.startswith("default models: ")] == [line]
+    assert pc.default_models_line(models) == line
+
+
+def test_main_stops_at_a_release_s_model_that_isn_t_one(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(pc, "release_models", REAL_RELEASE_MODELS)
+    monkeypatch.setattr(pc, "load_roster", lambda path: [])
+    wheel = pins_wheel(tmp_path, "r.whl", PINS_ONLY + "CODEX_MODEL = 'two words'\n")
+    assert pc.main(["--roster", "r.csv", "--wheel", wheel, "--dry-run"]) == 2
+    assert "the release's zab/pins.py: CODEX_MODEL is not a model name" in capsys.readouterr().err
 
 
 # ------------------------------------------------------------------- --idle-stop (issue #207)
@@ -2449,6 +2606,62 @@ def test_a_rollout_holds_idle_stop_off_from_its_first_change_to_its_end(out_dir)
     pc.steps_vm(ALICE_ROW, pc.Options(known_hosts=KH, idle_stop=15), runner)
     remotes = runner.remotes(ALICE, holds=True)
     assert remotes.count(pc.IDLE_HOLD_ON_CMD) == 1 and remotes[-1] == pc.IDLE_HOLD_OFF_CMD
+
+
+class OldRelease(FakeRunner):
+    """A VM whose release lacks `bridge.worktree_post_create`, which zab would refuse (#996):
+    `config` is the config.toml installed, `knows` whether the release installed has the key."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.staged, self.config, self.knows = "", "[bridge]\n", False
+
+    def __call__(self, argv, **kw):
+        res, remote = super().__call__(argv, **kw), argv[-1]
+        if res.ok and argv[0] == "scp" and remote.endswith("/config.toml"):
+            self.staged = pathlib.Path(argv[-2]).read_text()
+        self.knows = self.knows or (res.ok and " tool install " in remote)
+        if res.ok and argv[0] == "ssh" and f"{pc.ZAB_CONFIG_DIR}/config.toml" in remote:
+            self.config = self.staged
+        return res
+
+    @property
+    def bridge_starts(self) -> bool:
+        return self.knows or "worktree_post_create" not in tomllib.loads(self.config)["bridge"]
+
+
+def test_a_failed_release_install_leaves_the_config_its_bridge_starts_on(out_dir):
+    """Design §6 of #996: the config is written for the release being installed, and zab refuses
+    keys it doesn't know. Before #996 config.toml went in first, so a failed `uv tool install`
+    left a bridge that refused it at its next start. Now the keys and config follow the release,
+    once it is installed."""
+    opts = pc.Options(tag="v9.9.9", out_dir=out_dir, known_hosts=KH, worktree_hook=True)
+    vm = OldRelease(fail={"tool install": "error: No space left on device"})
+    result = pc.rollout_vm(ALICE_ROW, opts, vm)
+    assert "worktree_post_create" in tomllib.loads(vm.staged)["bridge"]
+    assert result.failures == ["uv tool install: error: No space left on device"]
+    assert vm.bridge_starts and not vm.knows and not result.installed
+    # the bots' keys went in all the same: new ones (`--regenerate-keys`, ADMIN §1.7) reach
+    # the VM for its bridge's next start (review of #1057, N2)
+    keys = [r for r in vm.remotes(ALICE) if f"{pc.ZAB_CONFIG_DIR}/codex.zuliprc" in r]
+    assert len(keys) == 1 and "config.toml" not in keys[0]
+    vm = OldRelease()
+    assert pc.rollout_vm(ALICE_ROW, opts, vm).ok and vm.bridge_starts
+    assert vm.config == vm.staged
+
+
+def test_a_config_that_fails_after_its_release_says_the_release_is_in(out_dir):
+    """Review of #1057, N1: the release installed, its config.toml not; the row says so, the
+    service step and the doctor are skipped, and the later steps run."""
+    runner = FakeRunner(fail={"0600 /tmp/zab-push.AbC123/config.toml": "No space left on device"})
+    result = pc.rollout_vm(ALICE_ROW, pc.Options(tag="v9.9.9", out_dir=out_dir), runner)
+    assert result.failures == ["install config: No space left on device"]
+    assert pc.CONFIG_NOT_INSTALLED in result.notes and not result.installed
+    remotes = runner.remotes(ALICE)
+    assert pc.SERVICE_INSTALL_CMD not in remotes and remotes[-2] == pc.warm_on_cmd(STAGING)
+    assert "FAIL" in pc.render([result]) and "the new release is installed, but not" in (
+        pc.render([result])
+    )
 
 
 def test_the_idle_stop_service_is_bounded():

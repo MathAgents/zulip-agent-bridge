@@ -12,7 +12,7 @@ import logging
 import re
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 from zab.backends.claude import WAITED_TASK_TYPES, StreamInput, run_turn, shorten
@@ -249,25 +249,51 @@ def _sum_usage(total: TokenUsage | None, more: TokenUsage) -> TokenUsage:
 # ---------------------------------------------------------------------------- parser (§9.4)
 
 
+#: A model the account can use only with usage credits (#1077): 2.1.311 answers it with a 429
+#: whose text starts with the model's name, "Fable requires usage credits. Switch to another
+#: model, …" ("Fable 5.1 requires …" for `fable`), as the CLI's own test of the text has it.
+#: A reached limit ("You've reached your Fable limit.", "You've hit your …", "You're out of
+#: usage credits"), fast mode's "Fast mode requires usage credits", and a sentence that only
+#: mentions credits further on are no such answer (DECISIONS, 2026-11-18).
+_CREDITS_RE = re.compile(r"(?!fast mode )[\w .-]{1,60} requires usage credits\b", re.I)
+
+
+def needs_usage_credits(obj: Mapping[str, Any]) -> str | None:
+    """The CLI's sentence when a failed `result` says the model needs usage credits, redacted
+    and cut to one line (§7.9, #1077); None otherwise."""
+    text = obj.get("result")
+    if not obj.get("is_error") or not isinstance(text, str):
+        return None
+    if not _CREDITS_RE.match(text.lstrip()):
+        return None
+    line = " ".join(redact_secrets(text.replace("\x00", "")).split())
+    return line[:300]
+
+
 def is_model_unavailable(obj: Mapping[str, Any]) -> bool:
     """Whether a failed `result` means the model does not exist or the account cannot use it.
 
     The CLI answers a missing model with exit 1, `api_error_status` 404 and "There's an issue
-    with the selected model (X)…" (2.1.283 and 2.1.289, DECISIONS; the `error` fixture). Its
-    stderr `[claude-code:unrecognized_model]` tag is no evidence: it also marks models that work.
+    with the selected model (X)…" (2.1.283 and 2.1.289, DECISIONS; the `error` fixture), and a
+    model that needs usage credits on this account with a 429 that says so (2.1.311,
+    `needs_usage_credits`); any other 429 is a limit, not the model. Its stderr
+    `[claude-code:unrecognized_model]` tag is no evidence: it also marks models that work.
     """
     text = obj.get("result")
     return bool(obj.get("is_error")) and (
         obj.get("api_error_status") == 404
         or (isinstance(text, str) and "issue with the selected model" in text)
+        or needs_usage_credits(obj) is not None
     )
 
 
-def model_unavailable_message(model: str | None) -> str:
-    """The error text for a turn that failed on its model (§7.9)."""
+def model_unavailable_message(model: str | None, said: str | None = None) -> str:
+    """The error text for a turn that failed on its model (§7.9), with the CLI's own sentence
+    when it says what would enable the model (`needs_usage_credits`)."""
     name = f"`{model.replace('`', '')}`" if model else "The selected model"
+    cli = f" {CLAUDE_CODE} said: “{said}”" if said else ""
     return (
-        f"Model {name} isn't available on this Claude account, so the turn did not run. "
+        f"Model {name} isn't available on this Claude account, so the turn did not run.{cli} "
         'Pick another with `!model` (for example `!model opus`), or `!model ""` for the default.'
     )
 
@@ -839,8 +865,12 @@ class StreamParser:
             if self.info.refresh_race:
                 error = classify_error(None, race_text, "")
             if is_model_unavailable(obj):
+                # never `usage_limit`, which the credits answer's 429 would give (#1077)
                 self.info.model_unavailable = True
-                error = replace(error, message=model_unavailable_message(self.info.model))
+                said = needs_usage_credits(obj)
+                error = ErrorInfo(
+                    kind=ErrorKind.OTHER, message=model_unavailable_message(self.info.model, said)
+                )
         denials = obj.get("permission_denials") or []
         if not isinstance(denials, list):
             denials = []

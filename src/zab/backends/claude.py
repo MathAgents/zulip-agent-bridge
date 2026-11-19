@@ -34,6 +34,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from zab import pins
 from zab.core.presentation import bridge_note
 from zab.core.reason import doctor_reason
 from zab.core.types import (
@@ -65,7 +66,7 @@ from zab.render.redact import redact_secrets
 
 log = logging.getLogger("zab.backends.claude")
 
-PINNED_VERSION = "2.1.283"  # docs/DECISIONS.md, Pins
+PINNED_VERSION = pins.CLAUDE_VERSION  # zab/pins.py, docs/DECISIONS.md, Pins (SPEC §8.3)
 
 #: The doctor's line for a signed-out account: the workshop path is `!login` in a DM (issue #36).
 NOT_SIGNED_IN = "not signed in: send !login to this bot in a direct message"
@@ -1319,6 +1320,9 @@ class _Session:
     plan: dict[str, tuple[str, str]] = field(default_factory=dict)  # carried across turns
     resolved_model: str | None = None  # from the last `system/init` or model check, for display
     effort_supported: bool | None = None  # ditto (`per_turn_effort_active`); None = unknown
+    # made by `create_session` and its settings not yet accepted: the model it was made with, a
+    # configured default above all, hasn't been tried (#1074, `update_settings`)
+    unchecked: bool = False
     turn: Any = None  # the running ClaudeTurn, once its process exists
     turn_id: str | None = None
     busy: bool = False  # a turn was started and has not completed (§7.10 per-session lock)
@@ -1347,6 +1351,7 @@ class ModelCheck:
     model: str | None = None  # resolved, from `system/init`; None when the check could not tell
     effort_supported: bool | None = None  # `per_turn_effort_active`
     unavailable: bool = False  # the CLI refused the model (`is_model_unavailable`)
+    said: str | None = None  # its sentence, when the model needs usage credits (#1077)
 
 
 def transcript_path(config_dir: str, cwd: str, session_id: str) -> str:
@@ -1469,6 +1474,10 @@ class ClaudeBackend:
         self._closed = False
         self._discovery: asyncio.Task[None] | None = None
         self._side_questions: set[asyncio.Task[tuple[int, str]]] = set()  # `!btw` processes
+        # A new session's model checks (#1074), by config directory and model: conclusive ones
+        # only, for this process (`_first_check`)
+        self._model_checks: dict[tuple[str, str], ModelCheck] = {}
+        self._model_check_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     # --- identity
 
@@ -1644,6 +1653,9 @@ class ClaudeBackend:
         ok = await run_login(
             binary, env, send, receive, status=lambda: logged_in(binary, env, capture)
         )
+        if ok:  # perhaps another sign-in: a new session's model is tried afresh (#1074)
+            for key in [k for k in self._model_checks if k[0] == config_dir]:
+                del self._model_checks[key]
         log.info(
             "claude: login for account %s %s",
             account or self.config.default_account,
@@ -1696,6 +1708,7 @@ class ClaudeBackend:
             git_identity=spec.git_identity,
             bot=spec.bot,
             session=spec.session,
+            unchecked=True,
         )
         self._sessions[session.native_id] = session
         return self._info(session)
@@ -1826,7 +1839,13 @@ class ClaudeBackend:
         """
         self._require_up()
         native_id = self._resolve(native_id)
-        settings = effective_settings(self.config, spec.settings)
+        # The model the core stored, into which it folded the backend default at creation
+        # (§7.2 step 2), never that default again (#1074): None there is the agent's own
+        # default (`!model ""`, a configured model creation fell back from, or a session from
+        # before the default was configured), and it stays so across restarts
+        settings = replace(
+            effective_settings(self.config, spec.settings), model=spec.settings.model or None
+        )
         config_dir = self.config.config_dir(settings.account)
         session = self._sessions.get(native_id)
         if session is None:
@@ -2243,6 +2262,12 @@ class ClaudeBackend:
           (PM on issue #36). The check also gives the resolved name and whether the model takes
           an effort: an inherited effort it does not take is cleared. When the check cannot
           tell (network, usage limit, timeout), the model is accepted;
+        - so is the model a session was created with, at the first settings after
+          `create_session`, which the core sends at creation (#1074): a configured default the
+          account can't use is refused, and the core falls back to the agent's own. That check
+          is made once per account and model in this process (`_first_check`). There an effort
+          the model doesn't take is refused, not cleared: the core clears a configured one and
+          refuses `!new --effort` (§7.9);
         - a new effort on a model known not to take one (haiku) is refused.
 
         Returns the accepted overrides, which the next turn runs on as they are: `None` omits
@@ -2263,16 +2288,34 @@ class ClaudeBackend:
             extra=dict(settings.extra),
         )
         resolved, supported = session.resolved_model, session.effort_supported
-        if accepted.model != session.settings.model:
+        check = None
+        if session.unchecked:  # just created (#1074): its own default needs no check
+            if accepted.model and accepted.model == session.settings.model:
+                check = await self._first_check(session, accepted.model)  # what it was made with
+            elif accepted.model:
+                check = await self.check_model(session, accepted.model)
+        elif accepted.model != session.settings.model:
             check = await self.check_model(session, accepted.model)
+        if check is not None:
             if check.unavailable:
                 raise InvalidSetting(
                     "model",
                     accepted.model,
                     [*MODEL_ALIASES, FULL_NAME_CHOICE],
-                    f"Model {accepted.model or 'default'} isn't available on this Claude account.",
+                    f"Model {accepted.model or 'default'} isn't available on this Claude account."
+                    + (f" Claude Code said: {check.said}" if check.said else ""),
                 )
             resolved, supported = check.model, check.effort_supported
+            if supported is False and accepted.effort is not None and session.unchecked:
+                # at creation, refused, never cleared (Codex round 1 on #1075): the core clears
+                # a configured effort with a warning and refuses `!new --effort` (§7.9)
+                raise InvalidSetting(
+                    "effort",
+                    accepted.effort,
+                    [],
+                    f"{resolved or accepted.model} takes no effort level. Leave out --effort, "
+                    "or choose a model that takes one, for example --model opus.",
+                )
             if supported is False and accepted.effort is not None:
                 accepted = replace(accepted, effort=None)  # the core notes the reset (§7.9)
         elif accepted.effort is not None and accepted.effort != session.settings.effort:
@@ -2286,7 +2329,22 @@ class ClaudeBackend:
                 )
         session.settings = accepted
         session.resolved_model, session.effort_supported = resolved, supported
+        session.unchecked = False
         return accepted
+
+    async def _first_check(self, session: _Session, model: str) -> ModelCheck:
+        """`check_model` for the model a new session was created with (#1074): once per account
+        (config directory) and model in this process, sessions created at once waiting for the
+        one check. Its answer is kept when it is conclusive, the model available or not; one
+        that couldn't tell is not, so the next new session tries again. A completed `!login`
+        drops the account's kept answers (`login`); a sign-in at the terminal doesn't."""
+        key = (session.config_dir, model)
+        async with self._model_check_locks.setdefault(key, asyncio.Lock()):
+            if (known := self._model_checks.get(key)) is None:
+                known = await self.check_model(session, model)
+                if known.unavailable or known.model is not None:
+                    self._model_checks[key] = known
+            return known
 
     async def check_model(self, session: _Session, model: str | None) -> ModelCheck:
         """One short turn with `model` (None: the default) on the session's account (§7.9).
@@ -2296,7 +2354,7 @@ class ClaudeBackend:
         `system/init` and the result said; an empty `ModelCheck` when the check itself failed
         for another reason (the caller then accepts the model, as before the check existed).
         """
-        from zab.backends.claude_stream import is_model_unavailable
+        from zab.backends.claude_stream import is_model_unavailable, needs_usage_credits
 
         argv = [
             self.config.binary,
@@ -2337,7 +2395,7 @@ class ClaudeBackend:
             return ModelCheck()
         result = found.get("result") or {}
         if is_model_unavailable(result):
-            return ModelCheck(unavailable=True)
+            return ModelCheck(unavailable=True, said=needs_usage_credits(result))
         init = found.get("init") or {}
         if result.get("is_error") or not init:
             log.warning("claude: model check inconclusive; model accepted")

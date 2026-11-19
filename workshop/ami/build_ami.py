@@ -5,7 +5,7 @@
         [--magma-dir /opt/magma --magma-passfile <licence file>] \\
         [--magma-licence-setup <your licence setup script>] [--with-sage] \\
         [--ssh-public-key ~/.ssh/id_ed25519.pub] [--deps-release OWNER/REPO@TAG] \\
-        [--smoke] [--dry-run]
+        [--codex-version X.Y.Z --codex-sha256 <its package's sha256>] [--smoke] [--dry-run]
     uv run --with boto3 python workshop/ami/build_ami.py --profile P --account-id ACCOUNT \\
         --region REGION --tag zab-build=ami --smoke-only ami-…
 
@@ -48,6 +48,8 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "aws"))
 sys.path.insert(0, str(HERE))  # m2_debs, also under `python -I` (review of #950)
+sys.path.append(str(HERE.parent / "admin"))  # agent_clis, which reads the pins
+import agent_clis  # noqa: E402 - the path is set up above
 import m2_debs  # noqa: E402 - next to this script
 from aws_common import (  # noqa: E402 - the path is set up above
     ROOT_GB,
@@ -56,8 +58,15 @@ from aws_common import (  # noqa: E402 - the path is set up above
     root_gb_of,
 )
 
+#: The agent CLIs' pins of this checkout (`src/zab/pins.py`, SPEC §8.3), read as push_config.py
+#: reads a release's: the defaults of --codex-version and --claude-version
+PINS = agent_clis.read_pins((HERE.parents[1] / "src/zab/pins.py").read_text(encoding="utf-8"))
 BUILD_SH = HERE / "build.sh"
 AMI_FILES = HERE / "files"  # instructions, smoke sources, comparator-run (build.sh AMI_FILES)
+#: build.sh's CODEX_VERSION, the pin, whose package's sha256 build.sh pins; any other release
+#: needs its own, `--codex-sha256`, passed as CODEX_PKG_SHA256
+CODEX_VERSION = PINS.codex
+CODEX_PACKAGE = "codex-package-x86_64-unknown-linux-musl.tar.gz"  # build.sh's asset
 
 
 def scope_tags(opts: argparse.Namespace) -> dict[str, str]:
@@ -154,6 +163,17 @@ check bash -c 'test "$(gp -q -f <<<"print(type(galoisgetpol(10,1)))" 2>/dev/null
 check bash -c 'test "$(gp -q -f <<<"print(type(nflist(\"A5\",[1,2000])))" 2>/dev/null)" = t_VEC'
 check bash -c 'test "$(gap -q <<<"Print(Size(SmallGroup(8,3)), \"\\n\");" 2>/dev/null)" = 8'
 check as_agent bash -c "codex --version | grep -q '$CODEX_VERSION'"
+if [ -n "${CODEX_PKG_SHA256:-}" ]; then  # --codex-sha256: the package build.sh checked and recorded
+  check as_agent grep -qx "$CODEX_PKG_SHA256" \
+    "/home/agent/.local/lib/codex-$CODEX_VERSION/codex-package.sha256"
+fi
+# Every bin/ entry codex-package.json names is there and executable: 0.169.1's codex-exec-server
+# (build.sh's codex_members), without which OpenAI's installer counts the package incomplete
+codex_bins='set -o pipefail; jq -r ".. | strings | select(startswith(\"bin/\"))"'
+codex_bins="$codex_bins"' "$1/codex-package.json" | { n=0; while IFS= read -r f; do'
+codex_bins="$codex_bins"' test -f "$1/$f" && test -x "$1/$f" || exit 1; n=$((n + 1)); done'
+codex_bins="$codex_bins"'; test "$n" -gt 0; }'
+check as_agent bash -c "$codex_bins" _ "/home/agent/.local/lib/codex-$CODEX_VERSION"
 check as_agent bash -c "claude --version | grep -q '$CLAUDE_VERSION'"
 check as_agent zab --version
 check as_agent /home/agent/venv/bin/python -c "import cypari2"
@@ -436,6 +456,8 @@ def build_knobs(opts: argparse.Namespace, remote: dict[str, str]) -> dict[str, s
         "PARI_VERSION": opts.pari_version,
         "IMAGE_NAME": opts.name,  # /etc/zab/tools.json's "image" (issue #474)
     }
+    if getattr(opts, "codex_sha256", None):  # else build.sh checks against its pin's
+        knobs["CODEX_PKG_SHA256"] = opts.codex_sha256
     knobs.update(remote)
     if opts.with_sage:
         knobs["WITH_SAGE"] = "1"
@@ -954,6 +976,8 @@ def smoke(
         "SAGE": "1" if opts.with_sage or opts.assume_sage else "0",
         **identity,
     }
+    if getattr(opts, "codex_sha256", None):  # the hash build.sh recorded beside the package
+        env["CODEX_PKG_SHA256"] = opts.codex_sha256
     if opts.smoke_warm:  # what a fleet VM's first boot does, here in the foreground and timed
         warm = f'start=$SECONDS; {WARM_VOLUME}; echo "time warm-up: $((SECONDS - start)) s"'
         log(ssh.run(ip, "sudo bash -c " + shlex.quote(warm), check=False).stdout.rstrip())
@@ -1064,8 +1088,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--ssh-key-file", help="private key for ssh -i (default: the agent/default)"
     )
-    parser.add_argument("--codex-version", default="0.157.1")
-    parser.add_argument("--claude-version", default="2.1.283")
+    parser.add_argument("--codex-version", default=CODEX_VERSION)
+    parser.add_argument(
+        "--codex-sha256",
+        metavar="SHA256",
+        help=f"the sha256 of --codex-version's {CODEX_PACKAGE}, 64 lowercase hex: required with"
+        f' any release but {CODEX_VERSION}, whose hash build.sh pins (README.md, "Build")',
+    )
+    parser.add_argument("--claude-version", default=PINS.claude)
     parser.add_argument(
         "--zab-tag", help="the release to install; required without --zab-wheel (else its version)"
     )
@@ -1143,6 +1173,21 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if not opts.zab_wheel and not opts.zab_tag and not opts.smoke_only:
         print("--zab-tag is required without --zab-wheel: the release to install", file=sys.stderr)
+        return 2
+    if opts.codex_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", opts.codex_sha256):
+        print("--codex-sha256 must be a sha256, 64 lowercase hex digits", file=sys.stderr)
+        return 2
+    if opts.codex_version != CODEX_VERSION and not opts.codex_sha256 and not opts.smoke_only:
+        url = (
+            "https://github.com/openai/codex/releases/download/"
+            f"rust-v{opts.codex_version}/{CODEX_PACKAGE}"
+        )
+        print(
+            f"--codex-version {opts.codex_version} needs --codex-sha256, the sha256 of its"
+            f" package, which build.sh checks the download against ({CODEX_VERSION}'s is the"
+            f" only one it pins): {url}",
+            file=sys.stderr,
+        )
         return 2
     if opts.zab_wheel and not opts.zab_tag:  # the wheel's own version
         found = re.match(r"zulip_agent_bridge-([^-]+)-", Path(opts.zab_wheel).name)

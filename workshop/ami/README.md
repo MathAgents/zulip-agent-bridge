@@ -70,9 +70,13 @@ tags ("Build", below).
 - **For `agent`:**
   - `uv`, and `~/venv`, pinned with hashes (`files/venv-requirements.txt`, compiled from
     `venv-requirements.in`, which lists the packages and says why each is pinned);
-  - **the Codex CLI**, pinned ([SPEC §8.3](../../docs/SPEC.md#83-version-pinning)): the release package of `rust-v0.157.1`, sha256-pinned,
-    in `~/.local/lib/codex-0.157.1`, with `~/.local/bin/codex` a link to its `bin/codex`. The
-    package carries `codex-code-mode-host`, through which Codex runs every tool call. Its config:
+  - **the Codex CLI**, pinned ([SPEC §8.3](../../docs/SPEC.md#83-version-pinning)): the release package of `rust-v0.169.1` (`src/zab/pins.py`), sha256-pinned,
+    in `~agent/.local/lib/codex-<version>`, with `~/.local/bin/codex` a link to its `bin/codex`,
+    and the sha256 the download was checked against in
+    `~agent/.local/lib/codex-<version>/codex-package.sha256`. The package carries
+    `codex-code-mode-host`, through which Codex runs every tool call, and, from a newer release
+    such as 0.169.1, `bin/codex-exec-server` and any other `bin/` entry its `codex-package.json`
+    names. Its config:
     `approval_policy = "never"`, `sandbox_mode = "danger-full-access"`,
     `check_for_update_on_startup = false` and the LMFDB server, `[mcp_servers.lmfdb]`. The VM is
     disposable and single-purpose, and the agents need `sudo`;
@@ -283,6 +287,14 @@ tail -f ~/ami-build.log                                    # "AMI ami-…" appea
 Magma and SageMath are optional: leave out the `--magma-…` options, or `--with-sage`, to build
 without them. A release the builder can't fetch, such as one of a private repository, goes in as a
 wheel built from its tag instead: `--zab-wheel dist/zulip_agent_bridge-X.Y.Z-py3-none-any.whl`.
+A Codex release other than the pinned one (`src/zab/pins.py`) needs its package's sha256 too, which `build.sh`
+checks the download against (`build_ami.py` refuses the version without it). GitHub gives it as
+the release asset's digest (or run `sha256sum` on the package once you've downloaded it to a
+file). If the lookup fails, the value is empty, and `build_ami.py` refuses an empty one:
+
+```bash
+--codex-version 0.169.1 --codex-sha256 "$(gh api repos/openai/codex/releases/tags/rust-v0.169.1 --jq '.assets[] | select(.name == "codex-package-x86_64-unknown-linux-musl.tar.gz") | .digest | ltrimstr("sha256:")')"
+```
 
 **Pre-flight on the building machine** (about 10 minutes):
 1. `aws sts get-caller-identity --profile "$P"` shows the account; `--account-id` is required, and
@@ -490,10 +502,13 @@ image, before and after a reboot:
   `ellinit("11a1")` (elldata), `polgalois` in degree 8 (galdata), `ellsea` over a 31-digit prime
   (seadata), `galoisgetpol(10,1)` (galpol) and `nflist("A5", …)` (nflistdata) work; GAP's
   `SmallGroup`, and its Alnuth package, which needs `/usr/bin/gp`;
-- `codex --version` and `claude --version` match the pins; `claude doctor` says
-  `Auto-updates: disabled`; both CLIs have the LMFDB server configured; `zab --version`;
+- `codex --version` and `claude --version` match the pins. With `--codex-sha256`, the hash
+  recorded in `~agent/.local/lib/codex-<version>/codex-package.sha256` matches it. `claude
+  doctor` says `Auto-updates: disabled`; both CLIs have the LMFDB server configured; `zab --version`;
   `import cypari2`; sudo for `agent`; `/etc/machine-id` and the SSH host keys differ from the
   builder's;
+- every `bin/` entry that the Codex package's `codex-package.json` names, such as 0.169.1's
+  `bin/codex-exec-server`, is an executable file in the installed package;
 - `codex-code-mode-host --help` runs next to the real `codex`; `claude mcp get lean-lsp` reports
   Connected, and `lean4@lean4-skills` is enabled; both instruction files exist; `latexmk -pdf`
   builds the smoke file (amsart, tikz-cd, xy, biblatex, cleveref); `lake env lean` runs the

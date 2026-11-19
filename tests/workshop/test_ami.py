@@ -463,6 +463,88 @@ def test_codex_comes_from_the_pinned_package_with_its_code_mode_host():
     )
     assert 'ln -sfn "$CODEX_DIR/bin/codex" "$AGENT_HOME/.local/bin/codex"' in text
     assert 'check as_agent "$CODEX_DIR/bin/codex-code-mode-host" --help' in text
+    # the hash the package was checked against, recorded beside it on that same path (#1062)
+    install = text.split('fetch_checked "$CODEX_PKG_SHA256"', 1)[1].split("\nfi\n", 1)[0]
+    assert '| sudo -u "$AGENT" tee "$CODEX_DIR/codex-package.sha256" >/dev/null' in install
+    assert "#   CODEX_PKG_SHA256  sha256 of that release's package" in text
+
+
+def codex_members_fn() -> str:
+    """The `codex_members` function as defined in build.sh."""
+    text = BUILD_SH.read_text()
+    start = text.index("codex_members() {")
+    return text[start : text.index("\n}\n", start) + 3]
+
+
+#: The Codex package's core members, which build.sh always extracts (and tar then requires)
+CODEX_CORE = ["bin/codex", "bin/codex-code-mode-host", "codex-package.json", "codex-path"]
+CODEX_CORE += ["codex-resources"]
+
+
+def codex_package(path: pathlib.Path, bins: list[str], manifest: str | None) -> pathlib.Path:
+    """A package laid out like the release's: `bins` under bin/, rg, bwrap, the manifest."""
+    import tarfile
+
+    with tarfile.open(path, "w:gz") as tar:
+        for name, data in [
+            *((f"bin/{b}", b"\x7fELF") for b in bins),
+            *([("codex-package.json", manifest.encode())] if manifest is not None else []),
+            ("codex-path/rg", b"\x7fELF"),
+            ("codex-resources/bwrap", b"\x7fELF"),
+        ]:
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(data), 0o755
+            tar.addfile(info, io.BytesIO(data))
+    return path
+
+
+@pytest.mark.skipif(not (shutil.which("bash") and shutil.which("jq")), reason="needs bash, jq")
+def test_codex_members_adds_the_bin_members_a_newer_package_has(tmp_path):
+    """#1062, review round 1: 0.169.1's package ships bin/codex-exec-server, which its
+    codex-package.json names ("execServer") and without which OpenAI's installer counts the
+    package incomplete. build.sh extracts the core members as before, and with them the
+    package's bin/codex-exec-server and every other bin/ entry its manifest names, where the
+    archive has it: 0.157.1's package, which has neither, gives the core alone."""
+    v157 = '{"version": "0.157.1", "entrypoint": "bin/codex", "pathDir": "codex-path"}'
+    v169 = (
+        '{"version": "0.169.1", "entrypoint": "bin/codex", "execServer": "bin/codex-exec-server"}'
+    )
+    named = (
+        '{"entrypoint": "bin/codex", "x": {"helper": "bin/codex-helper"}, "gone": "bin/absent",'
+        ' "odd": ["bin/a b", "bin/../x", "bin/$(id)", "bin/"], "other": "codex-path/rg"}'
+    )
+    host = ["codex", "codex-code-mode-host"]
+    script = (
+        "set -euo pipefail\n" + codex_members_fn() + '\nlist=$(codex_members "$1")\necho "$list"\n'
+    )
+
+    def members(bins: list[str], manifest: str | None) -> subprocess.CompletedProcess[str]:
+        pkg = codex_package(tmp_path / "codex-package.tar.gz", bins, manifest)
+        return subprocess.run(  # noqa: S603
+            ["bash", "-c", script, "bash", str(pkg)],  # noqa: S607
+            capture_output=True,
+            text=True,
+        )
+
+    for bins, manifest, extra in (
+        (host, v157, []),  # 0.157.1: as before
+        ([*host, "codex-exec-server"], v169, ["bin/codex-exec-server"]),  # 0.169.1
+        ([*host, "codex-exec-server"], v157, ["bin/codex-exec-server"]),  # unnamed, still taken
+        (host, v169, []),  # named but not in the archive: tar is never asked for it
+        ([*host, "codex-helper", "codex-other"], named, ["bin/codex-helper"]),  # nested, named
+    ):
+        res = members(bins, manifest)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.split() == CODEX_CORE + extra, (bins, manifest)
+    # an unreadable manifest, or none, stops the build, even from the command substitution
+    for manifest in ("{not json", None):
+        res = members([*host, "codex-exec-server"], manifest)
+        assert res.returncode != 0 and res.stdout == "", manifest
+    text = BUILD_SH.read_text()
+    step5 = text.split("# --- 5.", 1)[1].split("# --- 6.", 1)[0]
+    assert 'codex_list=$(codex_members "$tmp/codex-package.tar.gz")' in step5
+    assert 'mapfile -t codex_files <<<"$codex_list"' in step5
+    assert 'tar -xzf "$tmp/codex-package.tar.gz" -C "$CODEX_DIR" "${codex_files[@]}"' in step5
 
 
 def test_every_new_download_is_pinned():

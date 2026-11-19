@@ -265,6 +265,7 @@ async def test_list_sessions_newest_first(home):
 
 
 async def test_doctor(home, monkeypatch):
+    monkeypatch.setenv("ZAB_FAKE_CLAUDE_VERSION", cb.PINNED_VERSION)  # zab/pins.py's
     backend = make_backend(home)
     checks = {c.name: c for c in await backend.doctor()}
     assert checks["claude version"].ok and not checks["claude version"].warning

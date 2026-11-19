@@ -47,9 +47,21 @@ no home config or credential files were opened or modified by the test driver.
 - No Zulip messages or workshop infrastructure were involved. This verifies MCP
   configuration and tool use, not the full VM installation acceptance test.
 
+## 0.169.1
+
+Read on 2026-11-18 from the source at `rust-v0.169.1`, not run (SPEC §8.3). Its
+`codex-rs/core/config.schema.json` still has `check_for_update_on_startup` (boolean,
+root) and `mcp_servers.<id>.url`, and its `get_upgrade_version` still returns first
+when `check_for_update_on_startup` is false. So the lines above serve 0.169.1 too.
+The LMFDB call above was not repeated with 0.169.1. Its generated app-server schema
+is `docs/protocol/codex-0.169.1`, against which the recorded fixtures validate
+(DECISIONS, 2026-11-18).
+
 ## Sources
 
 - [0.157.1 config schema](https://github.com/openai/codex/blob/rust-v0.157.1/codex-rs/core/config.schema.json)
 - [0.157.1 startup update check](https://github.com/openai/codex/blob/rust-v0.157.1/codex-rs/tui/src/updates.rs)
+- [0.169.1 config schema](https://github.com/openai/codex/blob/rust-v0.169.1/codex-rs/core/config.schema.json)
+- [0.169.1 startup update check](https://github.com/openai/codex/blob/rust-v0.169.1/codex-rs/tui/src/updates.rs)
 - [OpenAI configuration reference](https://developers.openai.com/codex/config-reference/)
 - [OpenAI MCP configuration](https://developers.openai.com/codex/mcp/)

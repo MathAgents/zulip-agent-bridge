@@ -11,4 +11,7 @@ by `zab dev scrub --home /home/gpt --cwd /tmp/zab-codex-live-repo`, then
 inspected. Home/cwd/host strings are placeholders; UUIDs are test-session IDs.
 
 `uv run pytest tests/backends/test_codex_fixtures.py` validates every wire
-record against the pinned generated schemas and replays the mapper offline.
+record against the generated schemas of the pinned version, and of any newer
+version committed (`tests/backends/codex_schemas.py`), and replays the mapper
+offline. These recordings also validate against 0.169.1's schema (DECISIONS,
+2026-11-18); nothing has been recorded with 0.169.1.

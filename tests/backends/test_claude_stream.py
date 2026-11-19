@@ -17,7 +17,7 @@ import sys
 import pytest
 
 from zab.backends import claude_stream as cs
-from zab.backends.claude import PINNED_VERSION, ClaudeConfig, build_argv, new_turn_id, turn_env
+from zab.backends.claude import ClaudeConfig, build_argv, new_turn_id, turn_env
 from zab.core.types import (
     ErrorKind,
     ItemCompleted,
@@ -35,7 +35,8 @@ from zab.core.types import (
 
 pytestmark = pytest.mark.contract
 
-FIXTURES = pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "claude" / PINNED_VERSION
+FIXTURE_VERSION = "2.1.283"  # the version the fixtures were recorded on
+FIXTURES = pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "claude" / FIXTURE_VERSION
 FAKE = pathlib.Path(__file__).resolve().parents[2] / "src" / "zab" / "testing" / "fake_claude.py"
 
 
@@ -87,7 +88,7 @@ def test_simple_turn():
     assert done.usage.cost_usd is not None and done.usage.context_window == 200000
     assert parser.info.model == "claude-haiku-4-5-20251001"
     assert parser.info.permission_mode == "bypassPermissions"
-    assert parser.info.cli_version == PINNED_VERSION
+    assert parser.info.cli_version == FIXTURE_VERSION
     assert not any(isinstance(e, SessionChanged) for e in events)
 
 

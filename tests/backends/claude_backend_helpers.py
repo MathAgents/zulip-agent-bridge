@@ -10,7 +10,8 @@ import pathlib
 from zab.backends import claude as cb
 from zab.core.types import SessionSettings, TurnCompleted
 
-FIXTURES = pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "claude" / cb.PINNED_VERSION
+#: The recorded fixtures, of 2.1.283 (the pin before zab/pins.py moved it, SPEC §8.3)
+FIXTURES = pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "claude" / "2.1.283"
 FAKE = pathlib.Path(__file__).resolve().parents[2] / "src" / "zab" / "testing" / "fake_claude.py"
 
 

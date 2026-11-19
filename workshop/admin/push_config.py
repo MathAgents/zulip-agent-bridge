@@ -37,6 +37,10 @@ removes it elsewhere, and a hand-over (`--adopt-spare`) without either idle-stop
 `--restart-codex` also stops the old bridge and restarts the Codex daemon before the new bridge
 starts, unless a Codex turn is running (reported, never a failure): the first rollout of the per-bot
 git identity needs it (issue #214).
+Right after the release, every release rollout brings the VM's Codex and Claude Code to the pins of
+the release it installs, its `zab/pins.py`, where they differ (SPEC §8.3; `agent_clis.py`), before
+`zab service install`, which rewrites the Codex daemon's unit to the new package and restarts it,
+and the doctor.
 Before the instructions, every release rollout installs the Oct 9 image's list of its software as
 `/etc/zab/tools.json` where the image has none (`tools_list.py`, #475). Before that list, it
 replaces the Oct 9 image's `sage` link by the new images' wrapper, which puts the Sage
@@ -74,6 +78,7 @@ from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+import agent_clis
 from admin_common import (
     DEFAULT_KNOWN_HOSTS,
     GITHUB_OWNER,
@@ -346,6 +351,31 @@ SERVICE_INSTALL_CMD = _SERVICE_ENV + (
 SERVICE_UNINSTALL_CMD = _SERVICE_ENV + f"'cd / && {{ {SENTINEL_OFF}; zab service uninstall; }}'"
 #: The doctor alone, for the retries below.
 DOCTOR_CMD = _SERVICE_ENV + "'cd / && zab doctor --service-env --json'"
+#: The agent CLIs' step (SPEC §8.3): its script; the bound it keeps on the VM for two downloads of
+#: about 200 and 300 MB and an unpacking, past which it switches nothing (`agent_clis.install`);
+#: and the wait for it, longer, so that a run no longer waited for can't switch the links later.
+#: Both well under `!rollout`'s 1800 s (ADMIN; `zab.admin.actions.ROLLOUT_FLOOR_S`)
+AGENT_CLIS_SCRIPT = pathlib.Path(__file__).resolve().parent / "agent_clis.py"
+AGENT_CLIS_DEADLINE_S = 720
+AGENT_CLIS_TIMEOUT_S = 900
+#: The step's line when it replaced Codex: `agent CLIs: codex <old> → <pin>, …`
+CODEX_MOVED = re.compile(r"agent CLIs: codex \S{1,60} → ")
+#: The notes of a failed agent CLIs' step, which comes after the release and its config.toml:
+#: when its failure line says it changed nothing, and when it may have changed some (it failed
+#: after a switch, or its ssh was cut while the VM's run went on)
+AGENT_CLIS_KEPT = (
+    "agent CLIs: not replaced; the release and its config are installed, and the VM's CLIs "
+    "work as before: roll this row out again"
+)
+AGENT_CLIS_PARTLY = (
+    "agent CLIs: the step failed partway, so they may be partly replaced; the release and its "
+    "config are installed: the doctor's version checks say which, and rolling this row out "
+    "again finishes it"
+)
+#: `agent_clis_step`'s answer then: Codex may have been replaced, under a daemon of any version
+CODEX_MAYBE = "?"
+#: `restart_codex_step`'s note when the daemon restarted
+CODEX_RESTARTED = "codex daemon restarted"
 #: `--restart-codex` (issue #214, the v0.2.0 migration): Codex threads loaded in the daemon before
 #: the per-bot git identity keep their old shell environment until the daemon restarts (VERIFY on
 #: #230), so the first rollout restarts it, only while no Codex turn runs. Both fixed literals.
@@ -421,23 +451,100 @@ def config_fields(source: str, cls: str) -> set[str]:
     return set()
 
 
-def artifact_config(wheel: str | None, tag: str, runner: Runner | None = None) -> str | None:
-    """The `zab/config.py` of what push_config is about to install: read from the wheel, or
-    from the tag in this checkout (`git show <tag>:src/zab/config.py`); None when unknown.
-    zab refuses unknown config keys, so a key may only go into a VM's config when the release
-    installed there knows it (codex on #167: the admin checkout may differ from the artifact)."""
+def artifact_file(
+    wheel: str | None, tag: str, name: str, runner: Runner | None = None
+) -> str | None:
+    """The `zab/<name>` of what push_config is about to install: read from the wheel, or from
+    the tag in this checkout (`git show <tag>:src/zab/<name>`); None when unknown or absent."""
     if wheel:
         try:
             with zipfile.ZipFile(wheel) as whl:
-                return whl.read("zab/config.py").decode("utf-8")
+                return whl.read(f"zab/{name}").decode("utf-8")
         except (OSError, KeyError, zipfile.BadZipFile, UnicodeDecodeError):
             return None
     if tag:
         res = (runner or subprocess_runner)(
-            ["git", "-C", str(CHECKOUT), "show", f"{tag}:src/zab/config.py"], timeout_s=30
+            ["git", "-C", str(CHECKOUT), "show", f"{tag}:src/zab/{name}"], timeout_s=30
         )
         return res.stdout if res.ok else None
     return None
+
+
+def artifact_config(wheel: str | None, tag: str, runner: Runner | None = None) -> str | None:
+    """The `zab/config.py` of what push_config is about to install; None when unknown.
+    zab refuses unknown config keys, so a key may only go into a VM's config when the release
+    installed there knows it (codex on #167: the admin checkout may differ from the artifact)."""
+    return artifact_file(wheel, tag, "config.py", runner)
+
+
+def release_pins(
+    wheel: str | None, tag: str, runner: Runner | None = None
+) -> agent_clis.Pins | None:
+    """The agent CLIs' pins of what push_config is about to install, its `zab/pins.py` (SPEC
+    §8.3), never this checkout's: None for a release without them, whose rollout leaves each
+    VM's CLIs as they are. A file that names them wrongly is a ValueError."""
+    source = artifact_file(wheel, tag, "pins.py", runner)
+    return agent_clis.read_pins(source) if source and source.strip() else None
+
+
+def agent_clis_line(pins: agent_clis.Pins | None) -> str:
+    """The one line push_config prints about the agent CLIs, which a plan's dry run shows. The
+    dry run connects to nothing: what each VM had is in its row once it runs."""
+    if pins is None:
+        return "agent CLIs: left as they are (this release names no pins: zab/pins.py)"
+    return (
+        f"agent CLIs: codex {pins.codex}, claude {pins.claude}, the release's pins: a VM on "
+        "another version gets them, and its row notes `codex <its version> → <pin>`; where Codex "
+        "is replaced, its daemon restarts onto it, ending a Codex turn running then"
+    )
+
+
+#: The default models a release names in its `zab/pins.py` (#1074), by its names there.
+MODEL_NAMES = {"CODEX_MODEL": "codex", "CLAUDE_MODEL": "claude"}
+#: A model name as the agents take one: `gpt-6.2-astra`, `claude-fable-5-2`, `opus[1m]`.
+MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,99}")
+
+
+def release_models(wheel: str | None, tag: str, runner: Runner | None = None) -> dict[str, str]:
+    """The workshops' default models of what push_config is about to install (#1074, SPEC §5.3),
+    by backend kind: the `CODEX_MODEL` and `CLAUDE_MODEL` its `zab/pins.py` names (`ast`, string
+    literals only), never this checkout's. Only a release that names one gets it in its config:
+    one from before 0.2.22 falls back only from an effort, and its Claude `open_session` would
+    put the model on every session stored without one (SPEC §7.9). A name that isn't a model
+    name is a ValueError."""
+    source = artifact_file(wheel, tag, "pins.py", runner)
+    if not source or not source.strip():
+        return {}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise ValueError(f"doesn't parse: {exc}") from exc
+    found: dict[str, str] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in MODEL_NAMES
+        ):
+            name = node.targets[0].id
+            value = node.value.value if isinstance(node.value, ast.Constant) else None
+            if not isinstance(value, str) or not MODEL.fullmatch(value):
+                raise ValueError(f"{name} is not a model name")
+            found[MODEL_NAMES[name]] = value
+    return found
+
+
+def default_models_line(models: Mapping[str, str]) -> str:
+    """The one line push_config prints about the default models (#1074), which a plan's dry run
+    shows."""
+    if not models:
+        return "default models: the agents' own (this release names none)"
+    named = ", ".join(
+        f"{kind} {models[kind]}" if kind in models else f"{kind} its own"
+        for kind in ("codex", "claude")
+    )
+    return f"default models: {named} (the release's)"
 
 
 def supports_multi_party(config_source: str | None) -> bool:
@@ -540,6 +647,7 @@ def render_config_toml(
     claude_steer: bool | None = None,
     worktree_hook: bool = False,
     mention_after_s: int = MENTION_AFTER_S,
+    models: Mapping[str, str] | None = None,
 ) -> str:
     """The workshop profile (SPEC §5.2, §5.3) for one participant, round-trippable by tomllib.
 
@@ -549,7 +657,9 @@ def render_config_toml(
     recorded the Zulip id. Codex runs with approvals off and full access, Claude with
     `bypassPermissions` (§5.3, §9.5: the VM is dedicated to the agent). Both start at effort
     `high` (Drew, Oct 4): the Claude CLI never reports the effort it defaults to, so zab passes
-    one and the status line can show it. Everything is named after
+    one and the status line can show it. `models`, by backend kind, are the default models the
+    release names (`release_models`, #1074), each written beside the effort; a kind without one
+    gets none, and runs its agent's own default. Everything is named after
     the slug; the checkout is `~/work/<slug>` (README.md §4). The services get the workshop venv and
     Lean's `elan` on PATH directly: Ubuntu's `~/.bashrc` returns early in non-interactive shells, so
     the lines `build.sh` appends there never reach the agents' tool commands (PM's AMI v2 list,
@@ -559,6 +669,7 @@ def render_config_toml(
     `github_org` (#693): the bridge publishes no snapshot for a checkout outside it.
     """
     slug = slug_of(dict(row))
+    models = models or {}
     uid = (row.get("zulip_user_id") or "").strip()
     email = (row.get("email") or "").strip()
     if uid and not uid.isdigit():
@@ -624,7 +735,12 @@ def render_config_toml(
             "kind": "codex",
             "binary": codex_binary,
             "connect": "daemon",
-            "defaults": {"approval": "never", "sandbox": "danger-full-access", "effort": "high"},
+            "defaults": {
+                "approval": "never",
+                "sandbox": "danger-full-access",
+                **({"model": models["codex"]} if "codex" in models else {}),
+                "effort": "high",
+            },
         },
     )
     _table(
@@ -635,7 +751,11 @@ def render_config_toml(
             "binary": claude_binary,
             "accounts": {"main": "~/.claude"},
             "default_account": "main",
-            "defaults": {"approval": "bypassPermissions", "effort": "high"},
+            "defaults": {
+                "approval": "bypassPermissions",
+                **({"model": models["claude"]} if "claude" in models else {}),
+                "effort": "high",
+            },
             # mid-turn steering (PM on issue #36, Fri Oct 9). `main()` passes True unless
             # `--no-claude-steer` (Drew, Oct 15, issue #310), written either way since releases
             # up to 0.2.3 default to off; None (the default, and a release without the key)
@@ -692,6 +812,9 @@ class Options:
     claude_steer: bool | None = None  # [backends.claude] steer; None: left out (main decides)
     idle_stop: int | None = None  # minutes; 0 removes the timer; None leaves it as it is
     restart_codex: bool = False  # restart the Codex daemon before the bridge, when idle (#214)
+    agent_pins: agent_clis.Pins | None = None  # the release's (`release_pins`); None: left alone
+    #: the release's default models by backend kind (`release_models`, #1074); none: left out
+    default_models: Mapping[str, str] = field(default_factory=dict)
     worktree_hook: bool = False  # the release has bridge.worktree_post_create (#205)
     mention_after_s: int = MENTION_AFTER_S  # [bridge] mention_after_s, the workshop's (#711)
     lean_shared: bool = False  # share the workspace's Mathlib and install lean-project (#205)
@@ -967,11 +1090,60 @@ def restart_codex_step(result: VmResult, runner: Runner, ssh: Any) -> bool:
     else:
         res = runner(ssh(CODEX_RESTART_CMD), timeout_s=120)
         if res.ok:
-            result.notes.append("codex daemon restarted")
+            result.notes.append(CODEX_RESTARTED)
         else:
             detail = first_line(res.stderr) or f"exit {res.exit_code}"
             result.notes.append(f"codex daemon restart failed: {detail}")
     return True
+
+
+def agent_clis_cmd(staging: str, pins: agent_clis.Pins) -> str:
+    """As agent: the uploaded `agent_clis.py install` with the release's pins."""
+    script = f"{staging}/{AGENT_CLIS_SCRIPT.name}"
+    flags = ["--codex", pins.codex, pins.codex_sha256, "--claude", pins.claude, pins.claude_sha256]
+    flags += ["--deadline-s", str(AGENT_CLIS_DEADLINE_S)]
+    return remote_chain(
+        ["sudo", "chmod", "0644", script], as_agent(VM_PYTHON, script, "install", *flags)
+    )
+
+
+def agent_clis_step(result: VmResult, opts: Options, runner: Runner, staging: str) -> list[str]:
+    """Every release rollout whose release has pins (SPEC §8.3): each agent CLI not at its pin
+    replaced by it, as agent (`agent_clis.py`). Noted when it replaced one, quiet otherwise; a
+    failure, after which that VM's CLIs are as they were, is recorded and holds nothing up.
+    Returns, when it replaced Codex, the versions that zab's Codex daemon still runs, and
+    `CODEX_MAYBE` when it failed partway and may have."""
+    pins, kh = opts.agent_pins, opts.known_hosts
+    if pins is None:
+        return []
+    name = AGENT_CLIS_SCRIPT.name
+    scp = scp_argv(str(AGENT_CLIS_SCRIPT), result.host, f"{staging}/{name}", known_hosts=kh)
+    res = runner(scp, timeout_s=300)
+    if not res.ok:
+        _fail(result, f"scp {name}", res)
+        return []
+    ssh = ssh_argv(result.host, agent_clis_cmd(staging, pins), known_hosts=kh)
+    res = runner(ssh, timeout_s=AGENT_CLIS_TIMEOUT_S)
+    if not res.ok:
+        said = next((x for x in res.stderr.splitlines() if x.startswith("agent CLIs: ")), "")
+        why = first_line(res.stderr) or f"exit {res.exit_code}"
+        result.failures.append(first_line(said, 300) if said else f"agent CLIs: {why}")
+        if said.rstrip().endswith("nothing changed"):
+            result.notes.append(AGENT_CLIS_KEPT)
+            return []
+        result.notes.append(AGENT_CLIS_PARTLY)
+        moved = f"; codex {pins.codex} installed" in said  # Claude's placement failed after
+        return ["its previous version" if moved else CODEX_MAYBE]
+    out = res.stdout.splitlines()
+    line = next((first_line(x, 200) for x in out if x.startswith("agent CLIs: ")), "")
+    if not line.startswith(agent_clis.CURRENT):
+        result.notes.append(line or "agent CLIs: the step said nothing")
+    if not CODEX_MOVED.match(line):  # Codex not replaced: its daemon's unit is as it was
+        return []
+    marked = [
+        x.removeprefix(agent_clis.DAEMON_MARK) for x in out if x.startswith(agent_clis.DAEMON_MARK)
+    ]
+    return [v for v in marked if agent_clis.PIN.fullmatch(v) or v == "another binary"]
 
 
 def as_agent(*argv: str) -> list[str]:
@@ -1137,6 +1309,7 @@ def rollout_vm(row: Mapping[str, str], opts: Options, runner: Runner) -> VmResul
             claude_steer=opts.claude_steer,
             worktree_hook=opts.worktree_hook,
             mention_after_s=opts.mention_after_s,
+            models=opts.default_models,
         )
     except ValueError as exc:
         result.failures.append(str(exc))
@@ -1218,26 +1391,9 @@ def rollout_vm(row: Mapping[str, str], opts: Options, runner: Runner) -> VmResul
                 if not res.ok:
                     _fail(result, f"scp {name}", res)
                     return result
-
-            install_files = remote_chain(
-                ["sudo", "install", "-d", "-o", AGENT, "-g", AGENT, "-m", "0700", ZAB_CONFIG_DIR],
-                *[
-                    [
-                        "sudo",
-                        "install",
-                        "-o",
-                        AGENT,
-                        "-g",
-                        AGENT,
-                        "-m",
-                        "0600",
-                        f"{staging}/{name}",
-                        f"{ZAB_CONFIG_DIR}/{name}",
-                    ]
-                    for name in ("codex.zuliprc", "claude.zuliprc", "config.toml")
-                ],
-            )
-            res = runner(ssh(install_files), timeout_s=60)
+            # the bots' keys before the release: they don't depend on it, and new ones
+            # (`--regenerate-keys`, ADMIN §1.7) must reach the VM even if its install fails
+            res = runner(ssh(install_files_cmd(staging, KEYS)), timeout_s=60)
             if not res.ok:
                 _fail(result, "install files", res)
                 return result
@@ -1261,9 +1417,39 @@ def rollout_vm(row: Mapping[str, str], opts: Options, runner: Runner) -> VmResul
                 if not res.ok:
                     _fail(result, "uv tool install", res)
                     return
+                # config.toml after the release (#996): it is written for that release, and zab
+                # refuses unknown keys, so a failed install leaves the VM's config
+                res = runner(ssh(install_files_cmd(staging, ("config.toml",))), timeout_s=60)
+                if not res.ok:
+                    _fail(result, "install config", res)
+                    result.notes.append(CONFIG_NOT_INSTALLED)
+                    return
                 result.installed = True
 
-                stopped = opts.restart_codex and restart_codex_step(result, runner, ssh)
+                # the agent CLIs before the services and the doctor. The bridge's config
+                # resolves both links, so the Codex daemon's unit names the package, and the
+                # bridge runs the Claude version it found at its start: the service install
+                # rewrites the unit and restarts a daemon still on the old package, running
+                # Codex turn or not, and restarts the bridge, after which Claude turns run the
+                # new version. --restart-codex's own restart, before it, would run the old
+                # package, so it is left out then
+                running = agent_clis_step(result, opts, runner, staging)
+                pins = opts.agent_pins
+                stopped = False
+                if running and pins:
+                    head = (
+                        f"codex {pins.codex} may be installed: if so, the daemon restarts onto it"
+                        if running == [CODEX_MAYBE]
+                        else f"codex {pins.codex} installed: the daemon, on "
+                        f"{', '.join(running)}, restarts onto it"
+                    )
+                    result.notes.append(
+                        f"{head} at the service install, which rewrites its unit to the new "
+                        "package (a Codex turn running then ends)"
+                        + ("; so --restart-codex's own restart isn't run" * opts.restart_codex)
+                    )
+                elif opts.restart_codex:
+                    stopped = restart_codex_step(result, runner, ssh)
                 res = runner(ssh(SERVICE_INSTALL_CMD), timeout_s=300)
                 doctor = parse_doctor(res.stdout)
                 result.notes += LIMIT_NOTE_RE.findall(res.stdout)
@@ -1371,6 +1557,25 @@ def rollout_vm(row: Mapping[str, str], opts: Options, runner: Runner) -> VmResul
             spare_timer_off_step(result, opts, runner)
         runner(ssh(remote_chain(["rm", "-rf", "--", staging])), timeout_s=60)
         runner(ssh(IDLE_HOLD_OFF_CMD), timeout_s=60)
+
+
+#: The bots' keys, installed before the release; config.toml after it (#996)
+KEYS = ("codex.zuliprc", "claude.zuliprc")
+#: A row whose release went in and whose config.toml didn't (#996)
+CONFIG_NOT_INSTALLED = (
+    "the new release is installed, but not its config.toml: the old bridge still runs, and its "
+    "next start runs the new release on the old config; roll this row out again"
+)
+
+
+def install_files_cmd(staging: str, names: tuple[str, ...]) -> str:
+    """The staged bot keys or config into agent's config directory, 0600, agent's."""
+    own = ["-o", AGENT, "-g", AGENT]
+    return remote_chain(
+        ["sudo", "install", "-d", *own, "-m", "0700", ZAB_CONFIG_DIR],
+        *[["sudo", "install", *own, "-m", "0600", f"{staging}/{n}", f"{ZAB_CONFIG_DIR}/{n}"]
+          for n in names],
+    )  # fmt: skip
 
 
 def check_owner(
@@ -1868,11 +2073,13 @@ _DRY_NAMES = {
 }
 #: The commands built from the row, the release or the staged files: a part of each, in order.
 _DRY_PARTS = (
-    (shlex.join(["sudo", "install", "-d", "-o", AGENT, "-g", AGENT]), "config installed"),
+    (f"{ZAB_CONFIG_DIR}/config.toml", "config installed"),
+    (f"{ZAB_CONFIG_DIR}/codex.zuliprc", "keys"),
     (" tool install --force ", "zab installed"),
     (INSTRUCTIONS_SCRIPT.name, "agent instructions"),
     (f"{TOOLS_SCRIPT.name} install ", "tools list"),
     (f"{SAGE_SCRIPT.name} install ", "sage wrapper"),
+    (f"{AGENT_CLIS_SCRIPT.name} install ", "agent CLIs"),
     (" git config --global user.name ", "git identity"),
     (shlex.join(["sudo", "test", "!", "-e"]), "checkout probe"),
 )
@@ -1936,6 +2143,8 @@ class DryRunner:
             return RunResult(0, '[{"name": "dry-run", "ok": true}]\n', "")
         if argv[0] == "ssh" and f"{SAGE_SCRIPT.name} install " in argv[-1]:
             return RunResult(0, f"{SAGE_IN_PLACE[2]}dry run\n", "")  # no note on every row
+        if argv[0] == "ssh" and f"{AGENT_CLIS_SCRIPT.name} install " in argv[-1]:
+            return RunResult(0, f"{agent_clis.CURRENT} (dry run)\n", "")  # agent_clis_line's
         if argv[0] == "ssh" and argv[-1].endswith(LEAN_PROJECT_PROBE):
             return RunResult(0, LEAN_NOT_SHARED + "\n", "")
         if argv[0] == "ssh" and argv[-1] == IDLE_STOP_PROBE_CMD:
@@ -2196,6 +2405,12 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    try:
+        pins = None if no_release else release_pins(args.wheel, args.tag)
+        models = {} if no_release else release_models(args.wheel, args.tag)
+    except ValueError as exc:
+        print(f"the release's zab/pins.py: {exc}", file=sys.stderr)
+        return 2
     if not no_release and not supports_multi_party(source):
         if not args.multi_party:
             print(
@@ -2221,6 +2436,8 @@ def main(argv: list[str] | None = None) -> int:
         for line in default_lines(args.lean_shared_default, args.idle_stop_default, selected,
                                   selected & set(woken)):  # fmt: skip
             print(line)
+        print(agent_clis_line(pins))
+        print(default_models_line(models))
     opts = Options(
         tag=args.tag,
         wheel=args.wheel,
@@ -2237,6 +2454,8 @@ def main(argv: list[str] | None = None) -> int:
         claude_steer=claude_steer,
         idle_stop=args.idle_stop,
         restart_codex=args.restart_codex,
+        agent_pins=pins,
+        default_models=models,
         worktree_hook=not no_release and supports_worktree_post_create(source),
         mention_after_s=mention_after_s,
         lean_shared=args.lean_shared,

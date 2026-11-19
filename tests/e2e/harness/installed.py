@@ -46,6 +46,9 @@ HAS_FORK_REPORT = "import zab.core.peer_context as p; print(hasattr(p, 'fork_con
 HAS_FORK_BOTH = "import zab.core.fork as f; print(hasattr(f, 'fork_of_message'))"
 #: `!new` where the bot has a session in the topic: an answer, never "Unknown command" (#985)
 NEW_WITH_SESSION = "from zab.core import commands as c; print(hasattr(c, 'new_with_session'))"
+#: ... ending "then mention me", answered for the topic where every bot an unmentioned one
+#: reaches has a session, and in a DM, that it works in a channel topic (#987)
+NEW_IN_DM = "from zab.core import commands as c; print(hasattr(c, 'new_in_dm'))"
 #: `!btw` (#716): the help text lists it once the command exists, and each backend answers
 #: side questions once it implements them
 HAS_BTW = "from zab.core import commands as c; print('!btw' in c.HELP)"

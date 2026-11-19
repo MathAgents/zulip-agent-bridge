@@ -1,5 +1,5 @@
 """Codex sub-agents across a turn's end (#660), against the scripted app-server `FakeAppServer`
-(SPEC §15.2), whose wire is checked against the pinned 0.157.1 schemas; Codex itself never runs
+(SPEC §15.2), whose wire is checked against the pinned version's schemas; Codex itself never runs
 on the development machine. Case 2: a sub-agent still running when its parent's turn ends is
 reported in that turn's answer, not lost without a word (DECISIONS, 2026-10-25, B2)."""
 
@@ -7,13 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-import json
 import logging
-from pathlib import Path
 
 import pytest
-from jsonschema import Draft7Validator
 
+from backends.codex_schemas import CHECKED, validator
 from zab.backends import codex as cx
 from zab.backends.codex import CodexBackend, remember_identity
 from zab.backends.codex_rpc import RpcError
@@ -22,7 +20,6 @@ from zab.core import types as t
 from zab.testing.fake_codex import FakeAppServer
 
 pytestmark = pytest.mark.contract
-SCHEMAS = Path(__file__).resolve().parents[2] / "docs/protocol/codex-0.157.1"
 
 
 @pytest.fixture
@@ -58,10 +55,9 @@ async def started(fake, backend, tmp_path):
 
 
 def valid_wire(fake):
-    notifications = Draft7Validator(json.loads((SCHEMAS / "ServerNotification.json").read_text()))
-    for direction, message in fake.wire:
+    for schemas, (direction, message) in itertools.product(CHECKED, fake.wire):
         if direction == "receive" and "method" in message and "id" not in message:
-            notifications.validate(message)
+            validator("ServerNotification", schemas).validate(message)
 
 
 async def test_a_subagent_left_running_is_reported_in_the_answer(codex, tmp_path):

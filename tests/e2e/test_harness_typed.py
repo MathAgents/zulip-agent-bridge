@@ -16,7 +16,7 @@ from zab.backends.claude_login import INSTRUCTIONS
 from zab.backends.codex import device_code_reply
 from zab.core.addressing import mention
 from zab.core.command_text import as_command
-from zab.core.commands import DM_HELP, HELP, UNKNOWN, new_with_session
+from zab.core.commands import DM_HELP, HELP, UNKNOWN, new_in_dm, new_with_session
 from zab.core.router import Router
 from zab.core.store import Store
 from zab.tools import sentinel
@@ -89,6 +89,17 @@ def test_the_new_it_sends_reads_as_a_new_with_a_prompt(tmp_path):
     said = new_with_session("claude", route.text)
     assert "already has a Claude session, so your prompt wasn't sent" in said
     assert UNKNOWN not in said
+    # an installed build before #987 answers without "then mention me", which the step drops
+    assert said.replace(", then mention me.", ".").endswith(", or use !detach first.")
+
+
+def test_the_new_it_sends_in_a_dm_reads_as_a_new_with_a_prompt(tmp_path):
+    """#987's DM step: Claude's bot reads the typed `@claude !new …` in a DM as `!new …`, which
+    the bridge answers, saying that the prompt wasn't sent."""
+    assert "new_in_dm" in installed.NEW_IN_DM
+    text = s16.new_again("DM-NEW")
+    assert dm_route(tmp_path, "claude", s16.typed("claude", text)) == text
+    assert new_in_dm("claude", text).startswith("Your prompt wasn't sent to Claude: ")
 
 
 def test_the_reply_patterns_match_the_products_replies():

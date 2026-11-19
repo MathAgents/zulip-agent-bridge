@@ -10,10 +10,10 @@ import asyncio
 import json
 
 import pytest
-from jsonschema import Draft7Validator
 
-from backends.test_codex_fork import SCHEMAS, spec, turn, until
+from backends.codex_schemas import CHECKED, validator
 from backends.test_codex_fork import codex as codex
+from backends.test_codex_fork import spec, turn, until
 from zab.backends import codex as cx
 from zab.backends import codex_rpc
 from zab.core import types as t
@@ -433,32 +433,25 @@ async def test_the_side_question_speaks_the_pinned_schemas(codex):
         while not fake.responses:  # noqa: ASYNC110
             await asyncio.sleep(0.01)
 
-    def validator(name, closed=False):
-        schema = json.loads(next(SCHEMAS.rglob(f"{name}.json")).read_text())
-        if closed:
-            for key, definition in schema["definitions"].items():
-                if key.endswith("Params") and definition.get("type") == "object":
-                    definition["additionalProperties"] = False
-        return Draft7Validator(schema)
-
-    sides = {s: validator(s) for s in ("ServerNotification", "ServerRequest")}
-    sides["ClientRequest"] = validator("ClientRequest", closed=True)
-    methods, checked = {}, set()
-    for direction, message in fake.wire[start:]:
-        if "method" in message:
-            side = "Client" if direction == "send" else "Server"
-            kind = "Request" if "id" in message else "Notification"
-            sides[side + kind].validate(message)
-            methods[message.get("id")] = message["method"]
-        elif "result" in message:
-            method = methods[message["id"]]
-            names = {
-                "item/commandExecution/requestApproval": "CommandExecutionRequestApproval",
-                "mcpServerStatus/list": "ListMcpServerStatus",
-            }
-            name = names.get(method, "".join(p.title() for p in method.split("/")))
-            validator(f"{name}Response").validate(message["result"])
-        checked.add(message.get("method") or methods[message["id"]])
+    names = {
+        "item/commandExecution/requestApproval": "CommandExecutionRequestApproval",
+        "mcpServerStatus/list": "ListMcpServerStatus",
+    }
+    for schemas in CHECKED:  # the pinned version's, and any newer one committed
+        sides = {s: validator(s, schemas) for s in ("ServerNotification", "ServerRequest")}
+        sides["ClientRequest"] = validator("ClientRequest", schemas, closed=True)
+        methods, checked = {}, set()
+        for direction, message in fake.wire[start:]:
+            if "method" in message:
+                side = "Client" if direction == "send" else "Server"
+                kind = "Request" if "id" in message else "Notification"
+                sides[side + kind].validate(message)
+                methods[message.get("id")] = message["method"]
+            elif "result" in message:
+                method = methods[message["id"]]
+                name = names.get(method, "".join(p.title() for p in method.split("/")))
+                validator(f"{name}Response", schemas).validate(message["result"])
+            checked.add(message.get("method") or methods[message["id"]])
     assert {
         "thread/turns/list",
         "thread/items/list",

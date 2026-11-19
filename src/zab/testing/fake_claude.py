@@ -61,7 +61,11 @@ Environment:
   `per_turn_effort_active` false for haiku only. Any other name, or one listed in
   `ZAB_FAKE_CLAUDE_MISSING_MODELS` (comma-separated), replays the `error` fixture next to the
   given one (the recorded answer to a missing model) under that name instead. Without
-  `--model` the fixture's own `system/init` is kept.
+  `--model` the fixture's own `system/init` is kept. A model listed, as given or resolved, in
+  `ZAB_FAKE_CLAUDE_CREDIT_MODELS` (comma-separated) gets the fixture up to `system/init`, then
+  2.1.311's answer to a model that needs usage credits (#1077): an API-error message
+  (`error: "rate_limit"`) and a failed result with `api_error_status` 429 and `CREDITS_TEXT`,
+  exit 1.
 
 Like the real CLI, after a replay without `--no-session-persistence` it writes a minimal
 transcript to
@@ -211,7 +215,18 @@ def _with_model(records: list[dict[str, Any]], fixture: str, model: str) -> list
             data = {**data, "model": resolved, "per_turn_effort_active": "haiku" not in resolved}
             rec = {**rec, "data": data}
         out.append(rec)
+    credits = {m for m in os.environ.get("ZAB_FAKE_CLAUDE_CREDIT_MODELS", "").split(",") if m}
+    if model in credits or resolved in credits:
+        return _with_error(out, CREDITS_TEXT, error="rate_limit", status=429)
     return out
+
+
+#: Claude Code 2.1.311's `-p` answer to a model the account can use only with usage credits
+#: (#1077, DECISIONS 2026-11-18): a 429 with this text ("Fable 5.1 requires …" for `fable`).
+CREDITS_TEXT = (
+    "Fable requires usage credits. Switch to another model, or manage usage credits at "
+    "https://claude.ai/admin-settings/usage, to continue."
+)
 
 
 #: Claude Code's `-p` text for a lost OAuth refresh race (2.1.251 to 2.1.299, DECISIONS).
@@ -246,31 +261,47 @@ def _refresh_race_due() -> bool:
 
 def _with_refresh_race(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """`records` up to `system/init`, then the CLI's answer to a lost refresh race."""
+    return _with_error(records, REFRESH_RACE_TEXT, error="server_error")
+
+
+def _with_error(
+    records: list[dict[str, Any]], text: str, *, error: str, status: int | None = None
+) -> list[dict[str, Any]]:
+    """`records` up to `system/init`, then an API error's message and result (`error_records`)."""
     inits = [
         i
         for i, r in enumerate(records)
         if r.get("kind") == "stdout" and (r.get("data") or {}).get("subtype") == "init"
     ]
     head = records[: inits[0] + 1] if inits else [r for r in records if r.get("kind") == "meta"]
-    return [*head, *refresh_race_records(float(head[-1].get("t") or 0.0) if head else 0.0)]
+    t = float(head[-1].get("t") or 0.0) if head else 0.0
+    return [*head, *error_records(t, text, error=error, status=status)]
 
 
 def refresh_race_records(t: float) -> list[dict[str, Any]]:
     """The CLI's lost refresh race at time `t`: the API-error message, the result, exit 1."""
-    error = {
+    return error_records(t, REFRESH_RACE_TEXT, error="server_error")
+
+
+def error_records(
+    t: float, text: str, *, error: str, status: int | None = None
+) -> list[dict[str, Any]]:
+    """An API error at time `t`, as the CLI reports one in `-p` mode: the API-error message
+    (its `error` code), the failed result (with `api_error_status`, when given), exit 1."""
+    message = {
         "type": "assistant",
         "message": {
-            "id": "fake-refresh-race",
+            "id": "fake-api-error",
             "model": "<synthetic>",
             "role": "assistant",
             "type": "message",
             "stop_reason": "stop_sequence",
-            "content": [{"type": "text", "text": REFRESH_RACE_TEXT}],
+            "content": [{"type": "text", "text": text}],
             "usage": {"input_tokens": 0, "output_tokens": 0},
         },
         "parent_tool_use_id": None,
         "session_id": "",
-        "error": "server_error",
+        "error": error,
         "is_api_error_message": True,
     }
     result = {
@@ -278,7 +309,7 @@ def refresh_race_records(t: float) -> list[dict[str, Any]]:
         "subtype": "success",  # sic, as for every API error (the `error` fixture)
         "is_error": True,
         "num_turns": 1,
-        "result": REFRESH_RACE_TEXT,
+        "result": text,
         "terminal_reason": "api_error",
         "total_cost_usd": 0,
         "usage": {"input_tokens": 0, "output_tokens": 0},
@@ -286,8 +317,10 @@ def refresh_race_records(t: float) -> list[dict[str, Any]]:
         "permission_denials": [],
         "session_id": "",
     }
+    if status is not None:
+        result["api_error_status"] = status
     return [
-        {"kind": "stdout", "t": t, "data": error},
+        {"kind": "stdout", "t": t, "data": message},
         {"kind": "stdout", "t": t, "data": result},
         {"kind": "exit", "t": t, "code": 1},
     ]

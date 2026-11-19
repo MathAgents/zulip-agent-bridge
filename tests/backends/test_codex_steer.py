@@ -5,19 +5,17 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from pathlib import Path
+import itertools
 
 import pytest
-from jsonschema import Draft7Validator
 
+from backends.codex_schemas import CHECKED, validator
 from zab.backends.codex import CodexBackend
 from zab.config import BackendConfig
 from zab.core import types as t
 from zab.testing.fake_codex import FakeAppServer
 
 pytestmark = pytest.mark.contract
-SCHEMAS = Path(__file__).resolve().parents[2] / "docs/protocol/codex-0.157.1"
 
 
 async def test_a_steer_is_reported_when_codex_takes_it_in(tmp_path):
@@ -52,9 +50,8 @@ async def test_a_steer_is_reported_when_codex_takes_it_in(tmp_path):
         (tid, "c1", "go"),
         (tid, "c2", "also this"),
     ]
-    notifications = Draft7Validator(json.loads((SCHEMAS / "ServerNotification.json").read_text()))
     steered = [m for d, m in fake.wire if d == "receive" and m.get("params", {}).get("item", {})
                .get("clientId") == "c2"]  # fmt: skip
     assert [m["method"] for m in steered] == ["item/started", "item/completed"]
-    for message in steered:
-        notifications.validate(message)
+    for schemas, message in itertools.product(CHECKED, steered):
+        validator("ServerNotification", schemas).validate(message)

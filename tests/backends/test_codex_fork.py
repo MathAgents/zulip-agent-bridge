@@ -7,11 +7,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 
 import pytest
-from jsonschema import Draft7Validator
 
+from backends.codex_schemas import CHECKED, validator
 from zab.backends.codex import CodexBackend
 from zab.backends.codex_rpc import RpcError
 from zab.config import BackendConfig
@@ -19,7 +18,6 @@ from zab.core import types as t
 from zab.testing.fake_codex import FakeAppServer
 
 pytestmark = pytest.mark.contract
-SCHEMAS = Path(__file__).resolve().parents[2] / "docs/protocol/codex-0.157.1"
 WHO = t.GitIdentity("Codex · test", "codex-bot@example.zulipchat.com")
 
 
@@ -279,8 +277,8 @@ async def test_a_closed_parent_is_reopened_as_its_next_turn_would(codex):
 
 async def test_the_fake_speaks_the_pinned_schemas(codex):
     """Every message of a fork while the parent runs, both ways, against the generated schemas,
-    with the requests' params closed: zab sends no field 0.157.1 doesn't define, and the fake
-    answers in the shapes it defines (types, required fields)."""
+    with the requests' params closed: zab sends no field the pinned version doesn't define, and
+    the fake answers in the shapes it defines (types, required fields)."""
     fake, backend = codex
     parent = (await backend.create_session(spec("/w/parent", "topic", approval="never"))).native_id
     await turn(backend, parent, "first")
@@ -293,36 +291,29 @@ async def test_the_fake_speaks_the_pinned_schemas(codex):
     await until(backend, t.TurnCompleted, parent)
 
     stray = {"id": 1, "method": "thread/fork", "params": {"threadId": "t", "effort": "low"}}
-    closed = validator("ClientRequest", closed=True)
-    assert not closed.is_valid(stray)  # a field 0.157.1 doesn't define fails
+    for schemas in CHECKED:  # a field the version doesn't define fails
+        assert not validator("ClientRequest", schemas, closed=True).is_valid(stray)
     checked = check_wire(fake)
     assert {"thread/fork", "thread/turns/list", "turn/start", "turn/completed"} <= checked
 
 
-def validator(name, closed=False):
-    schema = json.loads(next(SCHEMAS.rglob(f"{name}.json")).read_text())
-    if closed:  # the pinned *Params leave additional properties open (review of #568)
-        for key, definition in schema["definitions"].items():
-            if key.endswith("Params") and definition.get("type") == "object":
-                definition["additionalProperties"] = False
-    return Draft7Validator(schema)
-
-
 def check_wire(fake) -> set[str]:
-    """Validate every message of `fake.wire`, both ways, against the pinned schemas, the
-    requests' params closed; the methods seen."""
-    sides = {s: validator(s) for s in ("ClientNotification", "ServerNotification")}
-    sides["ClientRequest"] = validator("ClientRequest", closed=True)
-    methods, checked = {}, set()
-    for direction, message in fake.wire:
-        if "method" in message:
-            side = "Client" if direction == "send" else "Server"
-            kind = "Request" if "id" in message else "Notification"
-            sides[side + kind].validate(message)
-            methods[message.get("id")] = message["method"]
-        elif "result" in message:
-            name = "".join(p.title() for p in methods[message["id"]].split("/"))
-            name = {"ThreadNameSet": "ThreadSetName"}.get(name, name)
-            validator(f"{name}Response").validate(message["result"])
-        checked.add(message.get("method") or methods[message["id"]])
+    """Validate every message of `fake.wire`, both ways, against the pinned schemas and any
+    newer ones committed (`codex_schemas.CHECKED`), the requests' params closed; the methods
+    seen."""
+    for schemas in CHECKED:
+        sides = {s: validator(s, schemas) for s in ("ClientNotification", "ServerNotification")}
+        sides["ClientRequest"] = validator("ClientRequest", schemas, closed=True)
+        methods, checked = {}, set()
+        for direction, message in fake.wire:
+            if "method" in message:
+                side = "Client" if direction == "send" else "Server"
+                kind = "Request" if "id" in message else "Notification"
+                sides[side + kind].validate(message)
+                methods[message.get("id")] = message["method"]
+            elif "result" in message:
+                name = "".join(p.title() for p in methods[message["id"]].split("/"))
+                name = {"ThreadNameSet": "ThreadSetName"}.get(name, name)
+                validator(f"{name}Response", schemas).validate(message["result"])
+            checked.add(message.get("method") or methods[message["id"]])
     return checked

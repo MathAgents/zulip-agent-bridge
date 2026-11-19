@@ -2,13 +2,15 @@
 
 `FakeCodex` replays a scrubbed JSON-RPC transcript. `FakeAppServer` is a scripted app-server: it
 keeps threads and turns in memory and answers the requests zab sends, over the daemon's
-unix-socket websocket, so the real `CodexBackend` runs against it. Its shapes follow the pinned
-0.157.1 schemas (`docs/protocol/codex-0.157.1`), and its `thread/fork` the native behaviour the
-#202 VERIFY recorded (DECISIONS, 2026-10-10): the child holds the parent's turns through
-`lastTurnId`, a turn still in progress is refused as `lastTurnId` (-32600), the child runs in
-the `cwd` it was given, and it inherits none of the parent's model, effort or sandbox. An
-`ephemeral` fork (a side question, #716) is gone at its `thread/unsubscribe`; whether the real
-one leaves any trace is the test VM's VERIFY (DECISIONS).
+unix-socket websocket, so the real `CodexBackend` runs against it. Its shapes follow the
+generated schemas (`docs/protocol/codex-<version>`): written to 0.157.1's, its wire is checked
+against the pinned version's and any newer one committed (`tests/backends/codex_schemas.py`).
+Its `thread/fork` follows the native behaviour the #202 VERIFY recorded (DECISIONS,
+2026-10-10): the child holds the parent's turns through `lastTurnId`, a turn still in progress
+is refused as `lastTurnId` (-32600), the child runs in the `cwd` it was given, and it inherits
+none of the parent's model, effort or sandbox. An `ephemeral` fork (a side question, #716) is
+gone at its `thread/unsubscribe`; whether the real one leaves any trace is the test VM's VERIFY
+(DECISIONS).
 
 It also models which threads the app-server holds loaded (#632), as 0.157.1's source does
 (DECISIONS, 2026-11-05): `thread/start`, `thread/resume` and `thread/fork` load one, which on a

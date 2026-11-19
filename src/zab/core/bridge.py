@@ -30,6 +30,9 @@ from zab.core.commands import (
     FORK_DM,
     HELP,
     UNKNOWN,
+    is_new,
+    new_in_dm,
+    new_with_sessions,
     status_login_hint,
 )
 from zab.core.creation import create_session
@@ -448,6 +451,31 @@ class BotBridge:
         ]
         mine = rank(self, self.router.full_name)
         return all(mine < other for other in others)
+
+    def new_for_topic(self, message: dict[str, Any], peers: tuple[str, ...]) -> list[str]:
+        """For an unmentioned `!new` that reached this bot, which has a session in its topic,
+        beside `peers` (`Route.quiet`): where each of them had a session there too, so that none
+        started one with it, the first of them all by full name answers for the topic (SPEC
+        §4.6, #987), naming their sessions. The backend kinds of them all, in that order, where
+        this bot is the one; else none. The bots read the message each in its own turn, in any
+        order: one that has read it is taken as it read it, by its claim (`inbound`), which
+        names the session it had then, and which a session started with the message rewrites as
+        that session's first prompt (`turn`); one that hasn't read it yet, as it is now."""
+        rows = self.store.rows("sessions", stream_id=message["stream_id"], topic=message["subject"])
+        live = {row["bot"] for row in rows if row["state"] != "detached"}
+        bridges = {self.full_name_of(p): p for p in self.all_bridges if p is not self and p.router}
+
+        def had(name: str) -> bool:
+            if (bridge := bridges.get(name)) is None:
+                return False  # unknown: never "wasn't sent"
+            claim = self.store.rows("inbound", bot=bridge.bot.name, message_id=message["id"])
+            if claim:
+                return claim[0]["session_id"] is not None and claim[0]["disposition"] != "turn"
+            return bridge.bot.name in live
+
+        if not peers or not all(had(name) and self.router.full_name < name for name in peers):
+            return []
+        return [self.backend.kind, *(bridges[name].backend.kind for name in sorted(peers))]
 
     async def siblings(
         self,
@@ -1411,6 +1439,8 @@ class BotBridge:
                         if is_fork(route.text.strip())
                         else BTW_DM
                         if btw.is_btw(route.text.strip())
+                        else new_in_dm(self.backend.kind, route.text.strip())
+                        if is_new(route.text.strip())
                         else UNKNOWN
                         if route.text.lstrip().startswith("!")
                         else DM_HINT,
@@ -1462,6 +1492,11 @@ class BotBridge:
                 await self.fork(message, route.text, user, channel)
             elif route.action == "command" and route.session and btw.is_btw(route.text):
                 btw.start(self, message, route.text, user)  # beside the actor (§7.13)
+            elif route.action == "command" and route.session and route.quiet and is_new(route.text):
+                # its actor would say nothing (#985): one bot answers for the topic (#987)
+                if kinds := self.new_for_topic(message, route.peers):
+                    text = new_with_sessions(kinds, route.text)
+                    await self.poster.send(message["stream_id"], message["subject"], text)
             elif route.session:
                 actor = self.actors.get(route.session["native_id"])
                 if actor:

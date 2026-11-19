@@ -7,8 +7,10 @@
 # (SPEC §9.1), and the VMs carry no IAM role (workshop/aws/README.md, "The VMs"; IMDSv2 only).
 #
 # Knobs (environment variables):
-#   CODEX_VERSION     Codex CLI release to install            (default 0.157.1, docs/DECISIONS.md, SPEC §8.3)
-#   CLAUDE_VERSION    Claude Code version for the installer   (default 2.1.283, docs/DECISIONS.md)
+#   CODEX_VERSION     Codex CLI release to install            (default 0.169.1, src/zab/pins.py, SPEC §8.3)
+#   CODEX_PKG_SHA256  sha256 of that release's package; required with any other CODEX_VERSION
+#                     (default 0.169.1's, pinned below; build_ami.py passes --codex-sha256)
+#   CLAUDE_VERSION    Claude Code version for the installer   (default 2.1.311, src/zab/pins.py)
 #   ZAB_TAG           zab git tag to install with uv; required without ZAB_WHEEL (DECISIONS D16)
 #   ZAB_WHEEL         path to a zab wheel copied to the builder; used instead of the git URL by
 #                     a private deployment, built from the tag
@@ -43,8 +45,8 @@
 # Never commit the Magma files: build_ami.py copies them from the build's machine, for the build only.
 set -euo pipefail
 
-CODEX_VERSION="${CODEX_VERSION:-0.157.1}"   # the M1 pin (docs/DECISIONS.md, SPEC §8.3)
-CLAUDE_VERSION="${CLAUDE_VERSION:-2.1.283}"
+CODEX_VERSION="${CODEX_VERSION:-0.169.1}"   # src/zab/pins.py's, which a test checks (SPEC §8.3)
+CLAUDE_VERSION="${CLAUDE_VERSION:-2.1.311}"
 ZAB_TAG="${ZAB_TAG:-}"
 ZAB_WHEEL="${ZAB_WHEEL:-}"
 ZAB_REPO="${ZAB_REPO:-https://github.com/MathAgents/zulip-agent-bridge}"
@@ -93,12 +95,14 @@ declare -A PARI_DATA_SHA256=(
   [nflistdata]="2c19a3e02afd3bba2af3071a7faa80924a75b00bb9713286c886b7fb460944bc"
 )
 PARI_URL="https://pari.math.u-bordeaux.fr/pub/pari"
-# The Codex release package of rust-v0.157.1 (sha256 of the downloaded asset, 2026-10-03). Its
+# The Codex release package of rust-v0.169.1, its sha256 in src/zab/pins.py (0.157.1 before it,
+# checked on 2026-10-03). In 0.157.1 its
 # bin/codex is byte-identical to the plain codex-x86_64-unknown-linux-musl binary v1 installed;
 # the package adds bin/codex-code-mode-host, which 0.157.1 runs every tool call through
 # (feature code_mode_host, stable and on by default) and without which no shell command runs
-# (AMI v1, PM on #36), plus codex-path/rg and codex-resources/bwrap.
-CODEX_PKG_SHA256="${CODEX_PKG_SHA256:-0e211868c9fd73cb49ad35ac675b5eafdf6b9f453df8a493df980c59a590fe5f}"
+# (AMI v1, PM on #36), plus codex-path/rg and codex-resources/bwrap. Another release's package
+# comes with its own hash, CODEX_PKG_SHA256 (build_ami.py --codex-sha256).
+CODEX_PKG_SHA256="${CODEX_PKG_SHA256:-738df5b3182e2b858a48143f0c2fff288d8dd200330dadfe4c5c9f3eac7e2244}"
 
 log() { printf '\n==> %s\n' "$*"; }
 magma_layout() {  # tarball → "nested" (one top-level directory holding magma.exe) or "flat"
@@ -109,6 +113,24 @@ magma_layout() {  # tarball → "nested" (one top-level directory holding magma.
   tar -tzf "$1" > "$listing"
   top=$(head -n1 "$listing" | cut -d/ -f1)
   if [ -n "$top" ] && grep -qxF "$top/magma.exe" "$listing"; then echo nested; else echo flat; fi
+  rm -f "$listing"
+}
+codex_members() {  # Codex package tarball → the members step 5 extracts, one per line
+  # The core ones, which tar then requires, and the package's other bin/ members: those its
+  # codex-package.json names (0.169.1's "execServer", bin/codex-exec-server, without which
+  # OpenAI's installer counts the package incomplete) and bin/codex-exec-server itself, each
+  # where the archive has it (0.157.1 has neither). Returns non-zero on an unreadable listing or
+  # manifest: it runs in a command substitution, where set -e doesn't reach.
+  local listing names m
+  listing=$(mktemp)
+  tar -tzf "$1" > "$listing" || { rm -f "$listing"; return 1; }  # read whole first (magma_layout)
+  names=$(tar -xzOf "$1" codex-package.json | jq -r '.. | strings | select(startswith("bin/"))') \
+    || { rm -f "$listing"; return 1; }
+  printf '%s\n' bin/codex bin/codex-code-mode-host codex-package.json codex-path codex-resources
+  while IFS= read -r m; do
+    case "$m" in bin/codex | bin/codex-code-mode-host) continue ;; esac
+    if [[ "$m" =~ ^bin/[A-Za-z0-9._-]+$ ]] && grep -qxF "$m" "$listing"; then echo "$m"; fi
+  done < <(printf '%s\n' bin/codex-exec-server "$names" | sort -u)
   rm -f "$listing"
 }
 as_agent() { sudo -u "$AGENT" -H env HOME="$AGENT_HOME" PATH="$AGENT_HOME/.local/bin:$PATH" "$@"; }
@@ -444,7 +466,8 @@ as_agent "$AGENT_HOME/.local/bin/uv" tool install -q --force --exclude-newer 202
 # its bin/codex. Codex canonicalizes its own path, recognises the package by bin/ next to
 # codex-package.json, and finds codex-code-mode-host and bwrap there (codex-rs
 # install-context/src/lib.rs at rust-v0.157.1). The members are named explicitly: v1 picked the
-# binary with `find | head -n1` and shipped without the host (PM on #36).
+# binary with `find | head -n1` and shipped without the host (PM on #36). A newer release's other
+# bin/ members, such as 0.169.1's codex-exec-server, come too (codex_members).
 log "codex $CODEX_VERSION"
 CODEX_URL="https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-package-x86_64-unknown-linux-musl.tar.gz"
 CODEX_DIR="$AGENT_HOME/.local/lib/codex-$CODEX_VERSION"
@@ -456,9 +479,12 @@ if ! as_agent test -x "$CODEX_DIR/bin/codex-code-mode-host" \
   sudo install -d -o "$AGENT" -g "$AGENT" -m 0755 "$AGENT_HOME/.local/lib"
   as_agent rm -rf "$CODEX_DIR"
   as_agent mkdir "$CODEX_DIR"
-  as_agent tar -xzf "$tmp/codex-package.tar.gz" -C "$CODEX_DIR" \
-    bin/codex bin/codex-code-mode-host codex-package.json codex-path codex-resources
+  codex_list=$(codex_members "$tmp/codex-package.tar.gz")  # a failure stops the build (set -e)
+  mapfile -t codex_files <<<"$codex_list"
+  as_agent tar -xzf "$tmp/codex-package.tar.gz" -C "$CODEX_DIR" "${codex_files[@]}"
   as_agent ln -sfn "$CODEX_DIR/bin/codex" "$AGENT_HOME/.local/bin/codex"
+  # the hash the package was checked against, which build_ami.py's smoke test compares
+  printf '%s\n' "$CODEX_PKG_SHA256" | sudo -u "$AGENT" tee "$CODEX_DIR/codex-package.sha256" >/dev/null
   rm -rf "$tmp"
 fi
 # Codex config (README.md, "What the image holds"): approvals off, full access; the update
@@ -910,6 +936,13 @@ fi
 check as_agent test -x "$CODEX_DIR/bin/codex-code-mode-host"
 check as_agent "$CODEX_DIR/bin/codex-code-mode-host" --help
 check as_agent bash -c "test \"\$(readlink -f $AGENT_HOME/.local/bin/codex)\" = '$CODEX_DIR/bin/codex'"
+# Every bin/ entry codex-package.json names is there and executable (codex_members); the same
+# lines as build_ami.py's smoke test
+codex_bins='set -o pipefail; jq -r ".. | strings | select(startswith(\"bin/\"))"'
+codex_bins="$codex_bins"' "$1/codex-package.json" | { n=0; while IFS= read -r f; do'
+codex_bins="$codex_bins"' test -f "$1/$f" && test -x "$1/$f" || exit 1; n=$((n + 1)); done'
+codex_bins="$codex_bins"'; test "$n" -gt 0; }'
+check as_agent bash -c "$codex_bins" _ "$CODEX_DIR"
 check as_agent grep -q '^\[mcp_servers\.lean-lsp\]' "$codexrc"
 warn as_agent bash -c 'timeout 60 codex plugin list </dev/null 2>/dev/null | grep -q "lean4@lean4-skills"'
 # Claude: lean-lsp connects, the lean4 plugin is installed and enabled.

@@ -2,7 +2,7 @@
 
 The design of zab's workshop administration, kept in step with what is built (issue #267).
 
-**Status at v0.2.21.**
+**Status at v0.2.22.**
 - **Built:** the admin server, which serves several workshops at once, each through its own admin bot, and a global admin bot (§2.1); the command grammar, dry-run plans, approvals bound to a plan's hash, scrubbing and the hash-chained audit log (§2.2–§2.8); every workshop verb of §2.2's table but `!rebind`, the end-of-workshop verbs and `!retire` included (§3), and the automatic disk growth (§3.4, from v0.2.21); the automated month-end, `!keep-until` and `!month-end` (§11.5); `!new-workshop` and its root config helper (§2.9); the deploy gate and `deploy.sh` (§1.6), and the in-band `!upgrade-server` with its two root helpers (§1.6, #569, from v0.2.19); encrypted backups (§1.7); the waker, its starter and the wake monitor, and the export sandbox (§1.2); the read-only console (§4), whose collector sweeps every running VM (§4.1, from v0.2.21).
 - **Not built:** `!cancel`, which the bots answer as not offered yet (`grammar.LATER`), as they answer `!rebind`, which is not planned (#369): a deployer rebinds by hand (§2.5); the `Provider` protocol of §6; a daily backup (§1.7). §8 lists the stages, built and not.
 - **Where the procedures are:** setting up a server and its first workshop, `docs/BOOTSTRAP.md`; adding a workshop, `docs/NEW-WORKSHOP.md`; running one, `docs/ORGANIZERS.md`; deploying, backups and recovery, `workshop/adminserver/README.md`. The manual path, the scripts of `workshop/admin/README.md` and `workshop/aws/README.md` from a deployer's laptop, stays the fallback.
@@ -1659,7 +1659,7 @@ The design was built in stages, between Oct 13 and Nov 7, 2026, in priority orde
 
 ### 8.1 The stages
 
-| Stage | What | PRs (§8.3) | E2E (§7) | Status at v0.2.21 |
+| Stage | What | PRs (§8.3) | E2E (§7) | Status at v0.2.22 |
 |---|---|---|---|---|
 | 1. core | several workshops, one admin bot each, one region each; the grammar; typed approvals with one approver, and phrases above half the fleet; the plan hash with target sets and reconcilers; the audit log; scrubbing; the foreign-sender guard; roster import (no rebind), provisioning, launch, protect, rollout, idle stop, start, stop, status; adopt-spare; later `!grow-disk`, its automatic growth (§3.4) and `!roster sync` | 1–10 | A1–A7, A15, A21, A22, A24–A26 | built |
 | 2. server | the server's units and policy, `deploy.sh` (bootstrap, deploy, wheels), backups | 11–13 | A10, A12–A14 | built |

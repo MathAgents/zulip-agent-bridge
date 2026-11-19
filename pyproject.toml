@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zulip-agent-bridge"
-version = "0.2.21"
+version = "0.2.22"
 description = "Drive Codex and Claude Code sessions on your own machines from Zulip topics"
 readme = "README.md"
 license = "MIT"

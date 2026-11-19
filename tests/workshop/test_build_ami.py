@@ -218,8 +218,9 @@ def opts(**kw):
         "my_ip": "203.0.113.5",
         "ssh_public_key": "/dev/null",
         "ssh_key_file": None,
-        "codex_version": "0.157.1",
-        "claude_version": "2.1.283",
+        "codex_version": ba.CODEX_VERSION,  # the pin (src/zab/pins.py)
+        "codex_sha256": None,
+        "claude_version": ba.PINS.claude,
         "zab_tag": "v0.0.2",
         "zab_wheel": None,
         "pari_version": "2.17.4",
@@ -478,8 +479,8 @@ def test_build_flow_copies_files_runs_build_sh_and_images(tmp_path, quiet_time):
     stream = next(c for c in ssh.calls if c[0] == "stream")[2]
     assert stream.endswith(" bash build.sh") and stream.startswith("env ")
     for knob in (
-        "CODEX_VERSION=0.157.1",
-        "CLAUDE_VERSION=2.1.283",
+        f"CODEX_VERSION={ba.CODEX_VERSION}",
+        f"CLAUDE_VERSION={ba.PINS.claude}",
         "ZAB_TAG=v0.0.2",
         "PARI_VERSION=2.17.4",
         f"ZAB_WHEEL=/home/ubuntu/{wheel.name}",
@@ -1493,3 +1494,115 @@ def test_the_pari_sets_refusal_never_shows_the_origins_token(monkeypatch, pubkey
     assert with_build(ba.main, [*argv, "--dry-run", "--deps-release", "o/r@deps/x"]) == 2
     out = capsys.readouterr()
     assert "pass --pari-data-release" in out.err and "FAKETOKEN" not in out.out + out.err
+
+
+#: A Codex release other than build.sh's pin, and a well-formed hash for its package (#1062)
+CODEX_NEW, CODEX_SHA = "0.170.0", "0123456789abcdef" * 4
+
+
+def test_codex_sha256_goes_to_build_sh_and_to_the_smoke_checks(quiet_time):
+    """#1062: build.sh checks the Codex package against CODEX_PKG_SHA256, which was 0.157.1's
+    alone; --codex-sha256 passes another release's, and the smoke test finds it recorded beside
+    the package. Without the flag, the knobs and the smoke environment are as before."""
+    knobs = ba.build_knobs(opts(), {})
+    assert "CODEX_PKG_SHA256" not in knobs and knobs["CODEX_VERSION"] == ba.CODEX_VERSION
+    knobs = ba.build_knobs(opts(codex_version=CODEX_NEW, codex_sha256=CODEX_SHA), {})
+    assert knobs["CODEX_VERSION"] == CODEX_NEW and knobs["CODEX_PKG_SHA256"] == CODEX_SHA
+    identity = {"BUILDER_MACHINE_ID": "builder-id", "BUILDER_HOST_FP": "SHA256:builder"}
+
+    def smoke_env(o) -> str:  # the `env K=V …` line of the first smoke script
+        ssh = FakeSsh()
+        res = ba.Resources(security_group="sg", key_pair="k")
+        assert ba.smoke(FakeEc2(), ssh, o, res, "ami-new", identity, lambda m: None) is True
+        return next(c[2] for c in ssh.calls if c[0] == "run" and "ZAB_EOF" in c[2]).split("\n")[0]
+
+    assert "CODEX_PKG_SHA256" not in smoke_env(opts())
+    env = smoke_env(opts(codex_version=CODEX_NEW, codex_sha256=CODEX_SHA))
+    assert f"CODEX_PKG_SHA256={CODEX_SHA}" in env and f"CODEX_VERSION={CODEX_NEW}" in env
+    # the check runs only when the hash is given (`set -u`; an older image has no record)
+    check = 'check as_agent grep -qx "$CODEX_PKG_SHA256" \\\n'
+    check += '    "/home/agent/.local/lib/codex-$CODEX_VERSION/codex-package.sha256"'
+    assert 'if [ -n "${CODEX_PKG_SHA256:-}" ]; then' in ba.SMOKE_SCRIPT
+    assert check in ba.SMOKE_SCRIPT
+
+
+def test_another_codex_release_needs_a_well_formed_sha256(capsys, pubkey):
+    """#1062: refused before anything in AWS (here, in a dry run) rather than at build.sh's
+    fetch_checked on the builder: another --codex-version without --codex-sha256, or a hash
+    that isn't 64 lowercase hex digits. A smoke-only run fetches nothing and needs none."""
+    argv = ["--dry-run", "--account-id", "123456789012", "--zab-tag", "v0.0.2"]
+    argv += ["--ssh-public-key", pubkey]
+    assert with_build(ba.main, [*argv, "--codex-version", CODEX_NEW]) == 2
+    err = capsys.readouterr().err
+    assert f"--codex-version {CODEX_NEW} needs --codex-sha256" in err
+    url = f"https://github.com/openai/codex/releases/download/rust-v{CODEX_NEW}/{ba.CODEX_PACKAGE}"
+    assert url in err
+    for bad in (CODEX_SHA.upper(), CODEX_SHA[:-1], CODEX_SHA + "0", "g" * 64, ""):
+        new = ["--codex-version", CODEX_NEW, "--codex-sha256", bad]
+        assert with_build(ba.main, [*argv, *new]) == 2, bad
+        assert "64 lowercase hex digits" in capsys.readouterr().err
+    new = ["--codex-version", CODEX_NEW, "--codex-sha256", CODEX_SHA]
+    assert with_build(ba.main, [*argv, *new]) == 0
+    out = capsys.readouterr().out
+    assert f"CODEX_PKG_SHA256={CODEX_SHA}" in out and f"CODEX_VERSION={CODEX_NEW}" in out
+    assert with_build(ba.main, argv) == 0  # the default release: as before, no hash passed
+    out = capsys.readouterr().out
+    assert f"CODEX_VERSION={ba.CODEX_VERSION}" in out and "CODEX_PKG_SHA256" not in out
+    smoke = [*argv, "--smoke-only", "ami-0123456789abcdef0", "--my-ip", "203.0.113.5"]
+    assert with_build(ba.main, [*smoke, "--codex-version", CODEX_NEW]) == 0
+
+
+def test_the_default_codex_release_is_build_sh_s():
+    """build_ami.py's CODEX_VERSION decides when --codex-sha256 is required: the release whose
+    package build.sh pins, as build.sh names it."""
+    text = ba.BUILD_SH.read_text()
+    assert f'CODEX_VERSION="${{CODEX_VERSION:-{ba.CODEX_VERSION}}}"' in text
+    assert f"rust-v${{CODEX_VERSION}}/{ba.CODEX_PACKAGE}" in text
+    assert f"(default {ba.CODEX_VERSION}," in text.split("#   CODEX_VERSION ", 1)[1].split("\n")[0]
+
+
+def codex_bins(text: str) -> str:
+    """The `codex_bins` check's definition: its four lines, in build.sh or the smoke script."""
+    lines = [ln for ln in text.splitlines() if ln.startswith("codex_bins=")]
+    assert len(lines) == 4
+    return "\n".join(lines)
+
+
+@pytest.mark.skipif(not (shutil.which("bash") and shutil.which("jq")), reason="needs bash, jq")
+def test_every_bin_entry_the_codex_manifest_names_is_checked(tmp_path):
+    """#1062, review round 1: build.sh's checks and the smoke test, on the same lines, require
+    every bin/ entry of codex-package.json (0.169.1's execServer among them) to be a file that
+    is executable in the installed package; a missing or unreadable manifest fails too."""
+    defined = codex_bins(ba.BUILD_SH.read_text())
+    assert codex_bins(ba.SMOKE_SCRIPT) == defined
+    assert 'check as_agent bash -c "$codex_bins" _ "$CODEX_DIR"' in ba.BUILD_SH.read_text()
+    smoke = 'check as_agent bash -c "$codex_bins" _ "/home/agent/.local/lib/codex-$CODEX_VERSION"'
+    assert smoke in ba.SMOKE_SCRIPT
+    v169 = '{"entrypoint": "bin/codex", "execServer": "bin/codex-exec-server"}'
+
+    def package(manifest: str | None, bins: dict[str, int]) -> Path:
+        d = Path(tempfile.mkdtemp(dir=tmp_path))
+        (d / "bin").mkdir()
+        for name, mode in bins.items():
+            (d / "bin" / name).write_bytes(b"\x7fELF")
+            (d / "bin" / name).chmod(mode)
+        if manifest is not None:
+            (d / "codex-package.json").write_text(manifest)
+        return d
+
+    def ok(d: Path) -> bool:
+        script = defined + '\nbash -c "$codex_bins" _ "$1"\n'
+        res = subprocess.run(["bash", "-c", script, "bash", str(d)], capture_output=True)  # noqa: S603, S607
+        return res.returncode == 0
+
+    both = {"codex": 0o755, "codex-exec-server": 0o755}
+    assert ok(package(v169, both))
+    assert ok(package('{"entrypoint": "bin/codex"}', {"codex": 0o755}))  # 0.157.1's
+    assert not ok(package(v169, {"codex": 0o755}))  # named, missing: incomplete
+    assert not ok(package(v169, {**both, "codex-exec-server": 0o644}))  # not executable
+    named_dir = package(v169, {"codex": 0o755})
+    (named_dir / "bin" / "codex-exec-server").mkdir()
+    assert not ok(named_dir)  # a directory is no binary
+    assert not ok(package(None, both))  # no manifest
+    assert not ok(package("{not json", both))
+    assert not ok(package('{"pathDir": "codex-path"}', both))  # no bin/ entry at all

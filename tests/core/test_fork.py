@@ -34,7 +34,7 @@ from zab.zulip.client import ZulipClient
 pytestmark = pytest.mark.integration
 ROOT = Path(__file__).resolve().parents[2]
 FAKE_CLAUDE = ROOT / "src/zab/testing/fake_claude.py"
-FIXTURES = ROOT / "tests/fixtures/claude" / cb.PINNED_VERSION
+FIXTURES = ROOT / "tests/fixtures/claude" / "2.1.283"  # recorded on that version
 OWNER, OTHER = 20, 21
 KINDS = ("claude", "codex")
 STORY = "Write a 200-word story about a lighthouse keeper. Do not use any tools."

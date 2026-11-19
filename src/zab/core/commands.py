@@ -87,28 +87,71 @@ BTW_NO_SESSION = (
     "commands."
 )
 BTW_DM = "!btw works in a topic with a session: send it there, and I answer about that topic."
+NEW_DM = "!new works in a channel topic: send it in a new topic, and it starts a session there."
+
+
+def is_new(text: str) -> bool:
+    """Whether a command is `!new`, with or without options and a prompt."""
+    return text.split(maxsplit=1)[:1] == ["!new"]
+
+
+def _new_parts(command: str) -> tuple[bool, bool]:
+    """Whether a `!new` command carries a prompt after its options, and whether those set a
+    model or an effort. With options it can't read, each word after `!new` that isn't an
+    option may be a prompt, so that one is never dropped without a word (#985)."""
+    try:
+        options, prompt = new_options(command)
+    except (ValueError, argparse.ArgumentError):
+        return any(not word.startswith("-") for word in command.split()[1:]), False
+    return bool(prompt.strip()), bool(options.model or options.effort)
+
+
+def _listed(items: list[str], last: str) -> str:
+    """`A`, `A and B`, `A, B and C`, for `last` "and"; "or" likewise."""
+    return f"{', '.join(items[:-1])} {last} {items[-1]}" if len(items) > 1 else items[0]
 
 
 def new_with_session(kind: str, command: str) -> str:
     """The answer to a `!new` that reaches a bot with a session in the topic, named or as the
     one bot an unmentioned one reaches (SPEC §4.6, #985): it starts nothing, and a prompt after
-    its options was not sent. With options it can't read, each word after `!new` that isn't an
-    option may be a prompt, so that one is never dropped without a word. `kind` is the bot's
-    backend kind."""
-    agent = AGENT_NAMES.get(kind, kind)
-    try:
-        _, prompt = new_options(command)
-    except (ValueError, argparse.ArgumentError):
-        prompt = " ".join(w for w in command.split()[1:] if not w.startswith("-"))
-    if not prompt.strip():
+    its options was not sent. `kind` is the bot's backend kind."""
+    return new_with_sessions([kind], command)
+
+
+def new_with_sessions(kinds: list[str], command: str) -> str:
+    """`new_with_session` for the topic's sessions of the agents of `kinds`: one bot's, or, from
+    the bot that answers for the topic, those of the bots an unmentioned `!new` reached where
+    none started a session with it (SPEC §4.6, #987). After `!detach`, a session starts on a
+    mention (§4.5), and options without a prompt likely meant `!model` or `!effort`, which
+    change a running session's."""
+    agents = [AGENT_NAMES.get(kind, kind) for kind in kinds]
+    one = len(agents) == 1
+    has = _listed([f"a {agent} session" for agent in agents], "and")
+    new = (
+        f"for {'a new one' if one else 'new ones'}, start a new topic, or use !detach first, "
+        f"then mention {'me' if one else 'the agents you want'}."
+    )
+    prompt, settings = _new_parts(command)
+    if prompt:
         return (
-            f"This topic already has a {agent} session; for a new one, start a new topic, "
-            "or use !detach first."
+            f"This topic already has {has}, so your prompt wasn't sent to "
+            f"{_listed(agents, 'or')}. To continue {'that session' if one else 'those sessions'}, "
+            f"send the prompt again without !new; {new}"
         )
+    whose = "this session's" if one else "those sessions'"
+    hint = f" To change {whose} model or effort, use !model or !effort."
+    return f"This topic already has {has}; {new}" + (hint if settings else "")
+
+
+def new_in_dm(kind: str, command: str) -> str:
+    """The answer to `!new` in a direct message, where no session starts (SPEC §4.6, #987): a
+    session is a channel topic's, and a DM takes only commands. A prompt after its options was
+    not sent to the bot's agent (`kind`)."""
+    if not _new_parts(command)[0]:
+        return NEW_DM
     return (
-        f"This topic already has a {agent} session, so your prompt wasn't sent to {agent}. "
-        "To continue that session, send the prompt again without !new; for a new one, start a "
-        "new topic, or use !detach first."
+        f"Your prompt wasn't sent to {AGENT_NAMES.get(kind, kind)}: !new works in a channel "
+        "topic, so send it in a new topic, and it starts a session there with your prompt."
     )
 
 

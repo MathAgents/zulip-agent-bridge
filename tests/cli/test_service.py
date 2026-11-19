@@ -436,6 +436,45 @@ def test_a_daemon_whose_unit_changed_otherwise_too_is_restarted(setup, monkeypat
     assert not any(a.startswith("--pid=") for argv in seen for a in argv)
 
 
+def test_a_codex_version_change_rewrites_the_unit_and_restarts_the_daemon(
+    setup, monkeypatch, tmp_path
+):
+    """SPEC §8.3: the configuration resolves the Codex binary, so the daemon's unit names the
+    package, `…/codex-<version>/bin/codex`. Once the rollout's step has relinked
+    ~/.local/bin/codex, the install after it writes the new path and restarts the running
+    daemon onto it; a plain restart before it would run the old one."""
+    from zab.config import load_config
+
+    _, control, _ = setup
+    which = lambda name: real_which(name) if "/" in name else "/usr/bin/" + name  # noqa: E731
+    monkeypatch.setattr(service.shutil, "which", which)  # the Codex binary as the VM's
+    link = tmp_path / "bin" / "codex"
+    link.parent.mkdir()
+    for version in ("0.157.1", "0.169.1"):
+        program = tmp_path / f"codex-{version}" / "bin" / "codex"
+        program.parent.mkdir(parents=True)
+        program.write_text("#!/bin/sh\n")
+        program.chmod(0o755)
+    link.symlink_to(tmp_path / "codex-0.157.1" / "bin" / "codex")
+    toml = tmp_path / "zab.toml"
+    toml.write_text(f'[backends.codex]\nkind = "codex"\nbinary = "{link}"\n')
+    monkeypatch.setattr(service, "load_config", lambda path: load_config(toml))
+    assert service.main(["install"]) == 0
+    unit = service.unit_directory() / "codex-app-server.service"
+    old = (tmp_path / "codex-0.157.1" / "bin" / "codex").resolve()
+    assert f'ExecStart="{old}" ' in unit.read_text()
+    link.unlink()
+    link.symlink_to(tmp_path / "codex-0.169.1" / "bin" / "codex")
+    run, _ = _systemd()
+    monkeypatch.setattr(service, "run", run)
+    control.reset_mock()
+    assert service.main(["install"]) == 0
+    new = (tmp_path / "codex-0.169.1" / "bin" / "codex").resolve()
+    assert f'ExecStart="{new}" ' in unit.read_text() and str(old) not in unit.read_text()
+    restarts = [c.args for c in control.call_args_list if c.args[0] == "try-restart"]
+    assert restarts and "codex-app-server.service" in restarts[0]
+
+
 def test_reload_only_reads_the_limit_and_oom_policy_lines_alone():
     old = "[Service]\nExecStart=x\nRestart=on-failure\n"
     new = "[Service]\nExecStart=x\nOOMPolicy=continue\nLimitNOFILE=65536\nRestart=on-failure\n"

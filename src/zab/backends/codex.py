@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from zab import pins
 from zab.backends.codex_events import EventMapper, error_info, item_info, turn_summary
 from zab.backends.codex_rpc import CodexRpc, RpcError
 from zab.backends.codex_settings import ModelCatalog
@@ -26,7 +27,7 @@ from zab.core import types as t
 from zab.core.reason import must_verify
 from zab.render.redact import redact_secrets
 
-PIN = "0.157.1"
+PIN = pins.CODEX_VERSION  # zab/pins.py: the release moves it, a rollout applies it (SPEC §8.3)
 #: Why a thread another client loaded is refused (§5.5): its shells run in that client's
 #: environment. After a boot or wake, typically a terminal's `codex resume` that loaded it before
 #: the topic's next message (#632); the app-server unloads it once no client holds it and no turn

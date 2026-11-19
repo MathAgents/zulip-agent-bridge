@@ -25,6 +25,7 @@ from zab.core.commands import (
     SUBAGENTS_UNCHECKED,
     TURN_ELSEWHERE,
     UNKNOWN,
+    is_new,
     login_required,
     new_with_session,
     run_command,
@@ -1164,9 +1165,10 @@ class SessionActor:
                 await self.post(keeps_running(jobs))  # the turn only (§7.14, D44)
         elif command == "!stop":  # no turn running
             await self.stop_idle(delivery)
-        elif command.split(maxsplit=1)[:1] == ["!new"]:
+        elif is_new(command):
             # a session here already (§4.6, #985): unmentioned, beside the VM's other bots, it
-            # says nothing (one without a session starts its own); else it says so, and that a
+            # says nothing (one without a session starts its own, and else the bridge has one bot
+            # answer for the topic, `BotBridge.new_for_topic`, #987); else it says so, and that a
             # prompt wasn't sent
             if not quiet:
                 await self.post(new_with_session(self.backend.kind, command))

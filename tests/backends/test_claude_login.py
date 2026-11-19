@@ -207,3 +207,21 @@ async def test_a_missing_cli_is_unavailable_not_a_failed_sign_in(signed_out, tmp
     with pytest.raises(BackendUnavailable):
         await asyncio.wait_for(backend.login(None, dm.send, dm.receive), 30)
     assert dm.sent == [] and dm.timeouts == []
+
+
+async def test_a_sign_in_drops_the_account_s_kept_model_checks(signed_out):
+    """Review of #1075 (N4): after a `!login`, which may sign another account in, a new
+    session's model is tried afresh (#1074); a failed sign-in keeps the answers, and another
+    account's stay."""
+    from zab.backends.claude import ModelCheck
+
+    backend = make_backend(signed_out)
+    mine = (backend.config.config_dir(None), "claude-fable-5-2")
+    other = ("/elsewhere", "claude-fable-5-2")
+    backend._model_checks.update({mine: ModelCheck(unavailable=True), other: ModelCheck()})
+    dm = Dm("wrong-code#not-it")
+    assert await asyncio.wait_for(backend.login(None, dm.send, dm.receive), 30) is False
+    assert set(backend._model_checks) == {mine, other}
+    dm = Dm(GOOD)
+    assert await asyncio.wait_for(backend.login(None, dm.send, dm.receive), 30) is True
+    assert set(backend._model_checks) == {other}

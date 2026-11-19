@@ -32,8 +32,11 @@ every check passed, 1 when one failed.
    for the test; if swap takes the excess instead, again with `MemorySwapMax=0` on the slice).
 5. **V1 and V4, Claude:** a turn run as the bridge runs one (`build_argv`, `turn_env` over
    `zab.service`'s environment, `run_parsed_turn` with steering), whose `Bash` runs `start-job`,
-   a stand-in for `zab job start`. The turn is the probe's child, so it runs in the probe's
-   cgroup rather than `zab.service`'s: the user manager forks the unit either way. Then two
+   a stand-in for `zab job start`. It runs on the config's default model, or on Claude's own
+   default where the account can't use that one, as a new session of the bridge does (#1077);
+   `--claude-model` names a model instead, never replaced. The turn is the probe's child, so it
+   runs in the probe's cgroup rather than `zab.service`'s: the user manager forks the unit
+   either way. Then two
    turns asked to use `Monitor` and `ScheduleWakeup` and to end at once, reported without a
    verdict: their tools, background tasks, results and timings.
 6. **V5, Codex:** a thread of the daemon with the bridge's parameters, whose turn runs
@@ -800,7 +803,16 @@ class Probe:
         for key, label, prompt in runs:
             if key in self.skip:
                 continue
-            result = asyncio.run(claude_turn(setup, base, prompt, str(self.workdir), self.marker))
+            setup, result = asyncio.run(
+                claude_turn_or_default(
+                    setup,
+                    base,
+                    prompt,
+                    str(self.workdir),
+                    self.marker,
+                    configured=not self.claude_model,
+                )
+            )
             if key != "claude":  # V4's other questions: what happens, no verdict
                 emit(phase=label, informative=True, **result)
                 continue
@@ -1184,6 +1196,7 @@ async def claude_turn(
         "seconds": round(total, 1),
         "after_last_result_s": round(total - last, 1) if last is not None else None,
         "model": settings.model,
+        "model_unavailable": parser.info.model_unavailable,
         "approval": settings.approval,
         "allowed_tools": claude.allowed_tools,
         "disallowed_tools": claude.disallowed_tools,
@@ -1193,6 +1206,30 @@ async def claude_turn(
         "final": final,
         "stream": summary,
     }
+
+
+async def claude_turn_or_default(
+    setup: tuple[Any, Any, str, str],
+    base: dict[str, str],
+    prompt: str,
+    cwd: str,
+    marker: str,
+    *,
+    configured: bool,
+) -> tuple[tuple[Any, Any, str, str], dict[str, Any]]:
+    """`claude_turn`, then once more on Claude's own default when a `configured` default model
+    failed it as one the account can't use, as the bridge's new session falls back (SPEC §7.9,
+    #1077): the configured `claude-fable-5-2` needs usage credits on some accounts. Returns the
+    setup the turn ran with, for the next turns, and its result, with `fell_back_from`."""
+    result = await claude_turn(setup, base, prompt, cwd, marker)
+    claude, settings, account, bot = setup
+    if configured and settings.model and result["model_unavailable"]:
+        setup = (claude, replace(settings, model=None), account, bot)
+        result = {
+            **await claude_turn(setup, base, prompt, cwd, marker),
+            "fell_back_from": settings.model,
+        }
+    return setup, result
 
 
 async def codex_turn(params: dict[str, Any], prompt: str) -> dict[str, Any]:

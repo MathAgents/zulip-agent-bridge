@@ -1,9 +1,8 @@
-import json
 from pathlib import Path
 
 import pytest
-from jsonschema import Draft7Validator
 
+from backends.codex_schemas import CHECKED, SCHEMAS, validator
 from zab.core.types import (
     ItemCompleted,
     ItemKind,
@@ -16,13 +15,21 @@ from zab.testing.fake_codex import FakeCodex
 
 pytestmark = pytest.mark.contract
 ROOT = Path(__file__).resolve().parents[2]
+#: Recorded with 0.157.1 (SPEC §15.2); they validate against 0.169.1's schema too (DECISIONS,
+#: 2026-11-18)
 FIXTURES = ROOT / "tests/fixtures/codex/0.157.1"
-SCHEMAS = ROOT / "docs/protocol/codex-0.157.1"
 
 
-def test_every_recorded_message_matches_installed_schema():
+def test_the_pinned_version_has_its_generated_schema():
+    """SPEC §8.3: a pinned version's `generate-json-schema` output is committed with the pin."""
+    assert (SCHEMAS / "ClientRequest.json").is_file(), f"no generated schema at {SCHEMAS}"
+    assert CHECKED[0] == SCHEMAS
+
+
+@pytest.mark.parametrize("schemas", CHECKED, ids=lambda p: p.name)
+def test_every_recorded_message_matches_installed_schema(schemas):
     validators = {
-        name: Draft7Validator(json.loads((SCHEMAS / f"{name}.json").read_text()))
+        name: validator(name, schemas)
         for name in [
             "ClientRequest",
             "ClientNotification",
@@ -49,10 +56,7 @@ def test_every_recorded_message_matches_installed_schema():
                 validators["JSONRPCMessage"].validate(message)
                 if row["direction"] == "receive" and "result" in message:
                     name = "".join(p.title() for p in calls[message["id"]].split("/"))
-                    schema = SCHEMAS / "v2" / f"{name}Response.json"
-                    if not schema.exists():
-                        schema = next(SCHEMAS.rglob(f"{name}Response.json"))
-                    Draft7Validator(json.loads(schema.read_text())).validate(message["result"])
+                    validator(f"{name}Response", schemas).validate(message["result"])
             checked += 1
     assert checked == total and checked > 100
 

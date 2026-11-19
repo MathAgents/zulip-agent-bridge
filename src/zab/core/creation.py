@@ -294,26 +294,38 @@ async def _create(
             context_prompt=context_prompt(bridge.config.bridge.multi_party),
         )
         info = None
-        for attempt in range(2):
+        # A configured default (backend or project, never a `!new` option) that the agent
+        # refuses is cleared once, with a warning, and the agent's own default runs (§7.9): the
+        # effort, and since #1074 the model, which may then refuse the effort. At most one
+        # retry per field, so at most three tries.
+        cleared: set[str] = set()
+        while True:
             try:
                 if info is None:
                     info = await bridge.backend.create_session(spec)
-                if settings.model is not None or settings.effort is not None or attempt:
+                if settings.model is not None or settings.effort is not None or cleared:
                     accepted = await bridge.backend.update_settings(info.native_id, settings)
                     info = replace(info, settings=accepted)
                 break
             except t.InvalidSetting as exc:
+                field = exc.field
                 if (
-                    attempt
-                    or exc.field != "effort"
-                    or args.effort is not None
-                    or settings.effort is None
+                    field not in ("model", "effort")
+                    or field in cleared
+                    or getattr(args, field) is not None
+                    or getattr(settings, field) is None
                 ):
                     raise ValueError(view.invalid_setting(exc)) from None
-                logging.getLogger("zab.creation").warning(
-                    "Configured default effort unsupported; using the model default"
-                )
-                settings = replace(settings, effort=None)
+                log = logging.getLogger("zab.creation")
+                if field == "effort":
+                    log.warning("Configured default effort unsupported; using the model default")
+                else:
+                    log.warning(
+                        "Configured default model %s unavailable; using the agent's default",
+                        settings.model,
+                    )
+                cleared.add(field)
+                settings = replace(settings, **{field: None})
                 spec = replace(spec, settings=settings)
         assert info is not None
         row = dict(

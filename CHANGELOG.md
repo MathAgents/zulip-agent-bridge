@@ -1,5 +1,166 @@
 # Changelog
 
+## 0.2.22
+
+What is new since 0.2.21: newer agent CLIs on the participants' VMs, Codex 0.169.1 and Claude Code
+2.1.311: a release now pins them, and its rollout brings every VM to its pins (#1066), so that
+participants get the Codex models that 0.157.1 can't see; and the workshops' default models,
+`gpt-6.2-astra` and `claude-fable-5-2` at effort `high` (#1074). Also a `!new` that can't start a session
+says so (#987); a Claude model that needs usage credits counts as unavailable (#1077); a VM's
+config is installed only once its release is (#996); an image can be built with a newer Codex
+(#1062); the contract tests check Codex 0.169.1's schema (#1069); and documentation. Each change
+cites its issue and then its pull request.
+
+**Upgrade notes.**
+
+- **The upgrade from 0.2.21 is in-band, and published in one command** (#991; ADMIN §1.6,
+  BOOTSTRAP §13.4). 0.2.21's own `workshop/adminserver/upgrade.py v0.2.22 --commit <commit>
+  --review-sha256 <the review's SHA-256> --publish`, from its checkout, pages the review by
+  0.2.21's `deploy.sh`, signs the tag once you type the version, exports and publishes the
+  release, and prints the line to send to the global admin bot, `!upgrade-server v0.2.22
+  sha256=<the review's SHA-256>`, whose plan takes one deployer's approval. That plan names the
+  plans in flight on every bot (#989), so no `!plans` round comes first. The deploy takes no new
+  `admin.toml` key, and changes no IAM policy and no unit: of `workshop/adminserver/`, only
+  `release-paths` changes, which now installs `workshop/admin/agent_clis.py` (#1066). The files
+  host has nothing to deploy: `workshop/files/` and `zab.workspace` are unchanged.
+- **A rollout brings each VM's agent CLIs to the release's pins** (#1066, below; SPEC §8.3): Codex
+  0.169.1 and Claude Code 2.1.311, where VMs from the images of October have 0.157.1 and 2.1.283.
+  Where Codex is replaced, the rollout restarts the VM's Codex daemon onto it, with or without
+  `restart-codex`, and a Codex turn running then ends: roll out at a quiet time, once the plan's
+  status table shows no running turn. Claude turns run the new Claude Code from the bridge's
+  restart, as at every rollout. A failed download or check fails that VM's row and leaves its CLIs
+  as they were. The previous versions stay on the VM.
+- **A rollout of an older release leaves the CLIs as they are** (#1066), **and writes no default
+  model** (#1074): 0.2.21 and older name no pins and no models, so `!rollout v0.2.21 …` installs
+  that bridge beside Codex 0.169.1 and Claude Code 2.1.311, with `effort = "high"` alone in its
+  config, as before; a session started on 0.2.22 keeps the model it stored, and `!model ""` in
+  its topic puts it on the agent's own.
+  Going back to the old CLIs is a deployer's change on the VM: the links `codex` and `claude` in
+  `~agent/.local/bin` pointed again at the previous versions, which the VM keeps, then `zab
+  service install` and a restart of the bridge, which the next rollout of a release with pins
+  undoes.
+- **New topics start on the default models; existing ones keep theirs** (#1074, below; SPEC §5.3,
+  §7.2 step 2). After the rollout, a new session takes `gpt-6.2-astra` or `claude-fable-5-2`, at
+  effort `high`. A session that already exists keeps the model and effort it had, across the
+  rollout's restart and every later one: `!model gpt-6.2-astra` (or `!model claude-fable-5-2`)
+  in its topic switches it. A Claude account that can't use Fable 5.2, such as one where it
+  needs usage credits (#1077), starts new Claude sessions on Claude Code's own default, and so
+  does a VM whose Codex is still 0.157.1, after a failed CLIs' step, when its model list loads
+  (it has 2 seconds); where it doesn't, the new Codex session keeps `gpt-6.2-astra`, which that
+  Codex can't run, and `!model ""` in its topic puts it on Codex's own default. The models are
+  the release's, in its `zab/pins.py`, so a rollout of an older release writes none (above).
+- **On your own machines,** `zab doctor` warns where Codex isn't 0.169.1 or Claude Code isn't
+  2.1.311, a warning and not a failure. A rollout changes only the VMs' CLIs.
+- **A new image** gets the pinned CLIs, which `build_ami.py`'s defaults now are (#1062, #1066). A
+  VM from an older image gets them at its next rollout.
+
+**Changes since 0.2.21**
+
+**The bridge, on the participants' VMs and your own machines**
+
+- **A `!new` that can't start a session no longer drops its prompt without a word** (#987, PR
+  #1056; SPEC §4.6), in the two cases #985 left. An unmentioned `!new <prompt>` in a topic where
+  both agents already have a session reached both, and both stayed quiet: now the bot first by
+  name (Claude's on the VMs) answers for the topic that it has a Claude session and a Codex
+  session, and that the prompt wasn't sent to either. It answers so whichever bot reads the
+  message first, and never where an agent without a session took the prompt to start its own;
+  one sent while an agent is still starting its session from an earlier message still gets no
+  answer (SPEC §4.6). A `!new` in a direct message answered "Unknown command; use !help.": now
+  the bot answers that `!new` works in a channel topic, sent in a new topic, and with a prompt,
+  that the prompt wasn't sent. #985's answer now also says to mention the agent after
+  `!detach`, since a message without a mention doesn't reach it there, and, to a
+  `!new --model …` or `--effort …` without a prompt, that `!model` and `!effort` change the
+  session's.
+- **A configured default model the agent can't use no longer blocks `!new`** (#1074, PR #1075;
+  SPEC §7.9, §9.1). The new session starts on the agent's own default instead, with a warning in the log,
+  as a configured effort the model doesn't take already did, and then without that effort if
+  the agent's own default doesn't take it. Codex can't use a model missing from its catalog.
+  For Claude, the model a new session is created with is tried with the short check `!model`
+  makes, once per account and model while the bridge runs, so the first new session waits for
+  it; a check that can't tell accepts the model, as before, and a completed `!login` has the
+  account's models tried again. An explicit `!new --model` or
+  `!model` is still refused, and a Claude model the account can't use is now refused at
+  `!new --model` too, where every turn of the session failed before. A Claude session keeps its
+  model across restarts: one whose model was the agent's own (`!model ""`, a session from
+  before a default model was configured, or one that fell back) took the configured default
+  model at its reopen before.
+- **A Claude model that needs usage credits counts as one the account can't use** (#1077, PR
+  #1078; SPEC §7.9, §9.1). On an account where Fable needs usage credits, Claude Code 2.1.311
+  answers `claude-fable-5-2` with a 429 and "Fable requires usage credits. Switch to another
+  model, …", which the check took for a limit reached, so it accepted the model and every turn
+  of a new session failed as `usage_limit`. Now such a session starts on Claude Code's own
+  default, as for a missing model, and the answer is kept per account and model; `!model fable`
+  is refused, and a turn that meets the answer says the model isn't available on this account,
+  both with Claude Code's sentence. A usage limit reached is still one. The kept answer lasts
+  until the bridge restarts or a `!login`, even if the account gets credits sooner, and
+  `!new --model` uses it too; `!model` checks again.
+
+**Workshop scripts**
+
+- **The workshops' default models** (#1074, PR #1075; SPEC §5.3). A release names them in its
+  `zab/pins.py`, 0.2.22 `CODEX_MODEL = "gpt-6.2-astra"` and `CLAUDE_MODEL = "claude-fable-5-2"`
+  (Drew, Nov 18), and `push_config.py` reads them from the release it installs, as it reads the
+  CLIs' pins, and writes each as `model` in `[backends.codex].defaults` or
+  `[backends.claude].defaults`, beside `effort = "high"`, which stays for every release. A release
+  that names none, 0.2.21 among them, gets none: its bridge falls back only from an effort, and
+  its Claude sessions stored without a model would take the configured one at every reopen. The
+  plan's dry run says which (`default models: …`). Claude's is the full name: Claude Code 2.1.311
+  resolves `fable` to `claude-fable-5-1`.
+- **A failed release install leaves a VM's config as it was** (#996, PR #1057;
+  `workshop/admin/README.md` §2). `push_config.py` installed `config.toml` before the
+  release, so a failed `uv tool install` left the old release a config written for the new
+  one, refused at its next start if it had a new key. The config now goes in once the
+  release is installed, at every rollout; the bots'
+  keys still go in before it. A config that fails after its release says the release is in.
+- **A rollout brings the agents' CLIs to the release's pins** (#1066, PR #1067; SPEC §8.3;
+  `workshop/admin/README.md` §2). The pins move to Codex 0.169.1, whose models endpoint offers
+  models that 0.157.1's doesn't, and Claude Code 2.1.311. They are in one place,
+  `src/zab/pins.py`, with the SHA-256 of each download, read by `zab doctor`, the image build and
+  `push_config.py`, which reads them from the release it installs. Before, an image's CLIs stayed
+  until the VM was replaced. Right after installing zab and its config, every release rollout
+  downloads each CLI whose version isn't its pin, checks its SHA-256 and its `--version`, and
+  switches its link in one rename, keeping the previous version (`workshop/admin/agent_clis.py`).
+  Codex gets every `bin/` program its package lists, `codex-exec-server` new among them. A failed
+  download or check changes nothing on that VM, and fails its row; a step that fails after a
+  switch, or whose connection is lost, fails its row with a note that the CLIs may be partly
+  replaced, and a rerun finishes it. The bridge, which resolves the links when it starts, runs the
+  new Claude Code from the rollout's restart of it on. The Codex daemon's unit names the binary by
+  its resolved path, so the rollout's `zab service install` rewrites it and restarts the daemon
+  onto the new Codex, with or without `--restart-codex`, ending a Codex turn running then; the row
+  says so.
+
+**Images**
+
+- **An image can pin a newer Codex release** (#1062, PR #1064; `workshop/ami/README.md`, "Build"):
+  `build_ami.py --codex-sha256` passes the release package's sha256, which `build.sh` checks the
+  download against, and is required with any `--codex-version` but the pinned one, which
+  `build_ami.py` otherwise refuses before anything is created in AWS. `build.sh` records the hash
+  in `~agent/.local/lib/codex-<version>/codex-package.sha256`, and `build_ami.py --smoke`
+  checks it there. The package's other `bin/` members come too, where it has them: 0.169.1's
+  `bin/codex-exec-server`, which its `codex-package.json` names, and any other `bin/` entry that
+  file names. The build's checks and the smoke test require each of those entries to be an
+  executable file.
+
+**Docs**
+
+- SPEC and ADMIN describe v0.2.22.
+- `docs/testing/codex-workshop-settings.md` has a section for Codex 0.169.1 (#1069, PR #1070):
+  read in its source, its configuration still has `check_for_update_on_startup` and
+  `mcp_servers.<id>.url`, and an update check still stops first when the former is false.
+  DECISIONS' verification log has a row for 0.169.1's schema.
+
+**Tests and CI**
+
+- **The contract tests follow the Codex pin** (#1069, PR #1070; SPEC §8.3, §15.2). Codex 0.169.1's
+  app-server schema is committed as `docs/protocol/codex-0.169.1/`, generated as 0.157.1's was
+  (`codex app-server generate-json-schema`, without `--experimental`), and the tests that read a
+  schema take the pinned version's, `docs/protocol/codex-<pin>/`, and any newer one committed: a
+  move of the pin needs its schema, and no test edit. The six fixtures recorded with 0.157.1
+  validate against 0.169.1's schema, every message and every result, and so does the scripted
+  app-server's wire, with the requests' params closed. 0.169.1 removes no method, and removes or
+  retypes no field that zab sends or reads (DECISIONS, 2026-11-18). Nothing is
+  recorded with 0.169.1 yet: the end-to-end suite checks it live.
+
 ## 0.2.21
 
 What is new since 0.2.20: a participant's disk that grows by itself, online, once it is 85% used

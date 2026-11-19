@@ -384,6 +384,26 @@ independently:
    for a row named in `--adopt-spare <slug>` (repeatable), which rewrites the record and the
    hostname for the new owner first, and gives `agent` the row's git name and e-mail.
 1. It upgrades zab as `agent` (`uv tool install --force`, from the wheel or the tag).
+   Once the release and its `config.toml` (step 3) are in, and before the services and the
+   doctor (step 4), it brings the agents' CLIs to the pins of the release it installs (SPEC §8.3), its `src/zab/pins.py`, read from the wheel or the tag (a
+   release before v0.2.22 has none, and the CLIs stay as they are). As `agent`,
+   `agent_clis.py` downloads each CLI whose `--version` isn't its pin, checks its SHA-256
+   and its `--version`, and only then switches: Codex's package into
+   `~/.local/lib/codex-<version>` (build.sh's members, and every `bin/` program its
+   `codex-package.json` lists, each an executable), Claude Code's binary into
+   `~/.local/share/claude/versions/<version>`, as the native installer keeps it, each link in
+   `~/.local/bin` replaced in one rename. The previous version stays; older ones are removed.
+   Sign-ins, `~/.codex/config.toml` and Claude's managed settings are not touched. The row
+   notes `agent CLIs: codex 0.157.1 → 0.169.1, claude 2.1.283 → 2.1.311`, and nothing when both
+   are current; a failed download or checksum fails the row with `agent CLIs: failed: …;
+   nothing changed`, and a note that the release and its config are in and the VM keeps its
+   CLIs, which work as before; the rest goes on. The bridge's config resolves both links when
+   it starts, so step 4 makes the switch take effect: its bridge restart runs Claude turns on
+   the new Claude Code, and its `zab service install` rewrites the Codex daemon's unit, which
+   names `…/codex-<version>/bin/codex`, and restarts a running daemon onto the new Codex. A Codex
+   turn running then ends, and `--restart-codex`'s own restart, which would run the old package,
+   is left out. Such a row notes `codex 0.169.1 installed: the daemon,
+   on 0.157.1, restarts onto it at the service install, …`.
 2. It installs the two zuliprc files into `/home/agent/.config/zab/` (0600, owner `agent`).
 3. It writes `config.toml` from the workshop profile (SPEC §5.3): `machine = <slug>`,
    `default_project = ~/work/<repo>`, `default_workspace = "worktree"` (each topic works on its
@@ -392,7 +412,10 @@ independently:
    participant (`allow_emails` set
    to the roster e-mail, and `allow_user_ids` to the participant's id once `zulip_provision.py`
    has recorded it), Codex `never` +
-   `danger-full-access`, Claude `bypassPermissions`, both at effort `high`, and `[render]
+   `danger-full-access`, Claude `bypassPermissions`, both at effort `high`, with the default
+   models the release names in its `zab/pins.py`, 0.2.22's `gpt-6.2-astra` and
+   `claude-fable-5-2` (#1074: new sessions take them, on the agent's own default where it can't
+   use its model; existing ones keep theirs; a release naming none gets none), and `[render]
    refserve_url`, `--refserve-url`'s value, the central file server for turn snapshots (SPEC
    §10.7): a turn whose answer or diff links a file pushes its snapshot to the participant's
    repository as `refs/zab/turns/<session>/<turn>` (never a branch), and the links point to
@@ -404,7 +427,9 @@ independently:
    a repository of it, so a workshop of another organization than the default, `MathAgents`,
    passes its own, or gets no file links. A VM keeps the value until a run with a release
    rewrites its `config.toml`; a config written before #693 has none, and its bridge takes
-   `MathAgents`.
+   `MathAgents`. `config.toml` goes in only once the release is installed (#996): zab refuses
+   a key it doesn't know, so a failed install leaves the config that the VM's release starts
+   on. The zuliprc files go in before the release, so that new keys reach the VM even then.
 4. It installs the services and checks them, as `agent`, with the user runtime directory set
    (lingering makes it exist):
 
@@ -436,7 +461,10 @@ rollout holds idle stop off the VM while it runs (§8).
 `--dry-run` connects to nothing. It prints one line per VM with each command by name, and the
 files it would send (a bot key with the `out/` directory it comes from), then the table:
 `dry-run alice (203.0.113.5): owner check; staging dir; idle-stop hold; scp config.toml
-alice/codex.zuliprc …; config installed; zab installed; service install + doctor; …`. That line
+alice/codex.zuliprc …; keys; zab installed; config installed; scp agent_clis.py; agent CLIs;
+service install + doctor; …`, after a line with the release's pins, `agent CLIs: codex 0.169.1,
+claude 2.1.311, …`: the dry run can't know each VM's versions, which its row gives once it runs.
+That line
 is what an admin bot's plan shows and hashes (docs/ADMIN.md §2.4, #361). `--dry-run --verbose`
 prints every `ssh` and `scp` command whole instead.
 
